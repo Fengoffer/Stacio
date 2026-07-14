@@ -1,0 +1,3 @@
+name,host,port,username,folder,private_key_path,password
+API Server,api.example.com,2222,deploy,Production,~/.ssh/prod,do-not-import
+Cache,cache.example.com,22,cache,Production,,

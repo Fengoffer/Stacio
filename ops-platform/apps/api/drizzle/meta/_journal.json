@@ -1,0 +1,90 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1783647761451,
+      "tag": "0000_dusty_micromax",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1783657886751,
+      "tag": "0001_fast_iron_lad",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783660863121,
+      "tag": "0002_remarkable_zaladane",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1783682089794,
+      "tag": "0003_nostalgic_psylocke",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783703860000,
+      "tag": "0004_plan_payment_placeholders",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1783705000000,
+      "tag": "0005_agent_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1783706800000,
+      "tag": "0006_notification_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1783790000000,
+      "tag": "0007_idempotency_records",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1783791200000,
+      "tag": "0008_refresh_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1783800000000,
+      "tag": "0009_product_data_retention_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1783803600000,
+      "tag": "0010_website_analytics",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1783807200000,
+      "tag": "0011_release_publications",
+      "breakpoints": true
+    }
+  ]
+}

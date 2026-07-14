@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.bootstrap-credentials
+.DS_Store
+.git
+.gitignore
+data
+node_modules
+dist
+coverage
+npm-debug.log*
+Dockerfile
+docker-compose.override.yml

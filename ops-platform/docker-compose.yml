@@ -1,0 +1,114 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      API_PORT: 8080
+      DATABASE_URL: ${DATABASE_URL:-postgres://stacio_ops:change-me@postgres:5432/stacio_ops}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8080}:8080"
+    mem_limit: ${API_MEMORY_LIMIT:-512m}
+    pids_limit: 256
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-5}"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/v1/health').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1}
+        VITE_DEMO_MODE: ${VITE_DEMO_MODE:-false}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-8081}:80"
+    mem_limit: ${WEB_MEMORY_LIMIT:-128m}
+    pids_limit: 128
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://stacio_ops:change-me@postgres:5432/stacio_ops}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      DATABASE_AUTO_MIGRATE: "false"
+      DATABASE_SEED_DEFAULTS: "false"
+    command: ["node", "dist/api/jobs/worker.js"]
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: ${WORKER_MEMORY_LIMIT:-384m}
+    pids_limit: 256
+    logging: *default-logging
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stacio_ops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-stacio_ops}
+    volumes:
+      - "${DATA_ROOT:-./data}/postgres:/var/lib/postgresql/data"
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
+    pids_limit: 256
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-stacio_ops} -d $${POSTGRES_DB:-stacio_ops}"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - "${DATA_ROOT:-./data}/redis:/data"
+    mem_limit: ${REDIS_MEMORY_LIMIT:-128m}
+    pids_limit: 128
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

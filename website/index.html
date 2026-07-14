@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN" data-public-api-base="https://ops.stacio.cn/api/v1" data-public-product-id="stacio">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stacio - Native Remote Operations Station for macOS</title>
+  <meta name="description" content="Stacio 是一个本地优先的 macOS 远程操作工作台，整合终端、远程文件、SCP 传输、隧道、设备指标、诊断和 AI 辅助排查。" />
+  <meta name="keywords" content="Stacio, macOS SSH client, remote operations, SCP file transfer, SSH tunnels, developer tools, homelab, remote files" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Stacio - Native Remote Operations Station for macOS" />
+  <meta property="og:description" content="A local-first macOS remote operations workspace for terminals, remote files, SCP transfers, tunnels, device metrics, diagnostics, and AI-assisted troubleshooting." />
+  <meta property="og:image" content="assets/stacio-logo.png" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="Stacio - Native Remote Operations Station for macOS" />
+  <meta name="twitter:description" content="A local-first macOS remote operations workspace for terminals, remote files, SCP transfers, tunnels, device metrics, diagnostics, and AI-assisted troubleshooting." />
+  <meta name="twitter:image" content="assets/stacio-logo.png" />
+  <meta name="theme-color" content="#f4f7fb" />
+  <link rel="icon" href="assets/stacio-logo.png" type="image/png" />
+  <link rel="stylesheet" href="styles.css?v=20260711-download-availability" />
+</head>
+<body>
+  <header class="site-header" data-od-id="site-header">
+    <div class="nav-wrap">
+      <a class="brand" href="#top" aria-label="Stacio 首页" data-i18n-attr="aria-label:brand.aria" data-od-id="brand-link">
+        <img src="assets/stacio-logo.png" alt="Stacio 标志" data-i18n-attr="alt:brand.logoAlt" />
+        <span>Stacio</span>
+      </a>
+      <nav class="nav-links" aria-label="主导航" data-i18n-attr="aria-label:nav.aria" data-od-id="main-nav">
+        <a href="#features" data-i18n="nav.features" data-od-id="nav-features">能力</a>
+        <a href="#workflow" data-i18n="nav.workflow" data-od-id="nav-workflow">流程</a>
+        <a href="#security" data-i18n="nav.security" data-od-id="nav-security">安全</a>
+        <a href="#releases" data-i18n="nav.releases" data-od-id="nav-releases">版本</a>
+        <a class="github-link" href="https://github.com/Fengoffer/Stacio" data-event="homepage_github_clicked" data-od-id="nav-github"><span class="github-icon" aria-hidden="true"></span><span>GitHub</span></a>
+      </nav>
+      <div class="nav-actions">
+        <button class="theme-toggle" type="button" aria-label="主题：跟随系统" title="自动" data-i18n-attr="aria-label:theme.ariaAuto,title:theme.auto" data-od-id="theme-toggle">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v4"/><path d="m16 4 2 2-2 2"/></svg>
+        </button>
+        <button class="language-toggle" type="button" aria-label="Switch language" data-od-id="language-toggle">EN</button>
+        <a class="btn primary" href="#download" data-event="homepage_download_dmg_clicked" data-i18n="nav.download" data-od-id="header-download">下载</a>
+        <button class="menu-button" type="button" aria-label="打开导航" aria-expanded="false" data-i18n-attr="aria-label:nav.menu" data-od-id="menu-button">☰</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="top" data-od-id="main-content">
+    <section class="hero" aria-labelledby="hero-title" data-od-id="hero-section">
+      <div class="hero-copy-wrap">
+        <p class="eyebrow" data-i18n="hero.eyebrow">LOCAL-FIRST MACOS WORKBENCH</p>
+        <h1 id="hero-title" data-od-id="hero-title">Stacio</h1>
+        <p class="tagline" data-i18n="hero.tagline" data-od-id="hero-tagline">Native remote operations station for macOS.</p>
+        <p class="hero-copy" data-i18n="hero.copy" data-od-id="hero-copy">把终端、远程文件、SCP 传输、隧道、设备看板和 AI 辅助排查放进一个本地优先的 Mac 工作台。</p>
+        <div class="hero-actions" data-od-id="hero-actions">
+          <a class="btn primary" href="#download" data-event="homepage_download_dmg_clicked" data-i18n="hero.download" data-od-id="hero-download">下载适合当前设备的版本</a>
+          <a class="btn github-link" href="https://github.com/Fengoffer/Stacio" data-event="homepage_github_clicked" data-od-id="hero-github"><span class="github-icon" aria-hidden="true"></span><span>GitHub</span></a>
+          <a class="btn ghost" href="#releases" data-event="homepage_release_notes_clicked" data-i18n="hero.releaseNotes" data-od-id="hero-release-notes">查看更新日志</a>
+        </div>
+        <div class="trust-line" aria-label="产品状态" data-i18n-attr="aria-label:hero.trustAria" data-od-id="hero-trust-line">
+          <span><i class="dot" aria-hidden="true"></i>Beta</span>
+          <span data-i18n="hero.platform">macOS 14+ 当前可用</span>
+          <span data-i18n="hero.distribution">GitHub Releases / DMG</span>
+        </div>
+      </div>
+
+      <div class="hero-visual" data-od-id="hero-product-visual">
+        <div class="icon-orb" aria-hidden="true"><img src="assets/stacio-logo.png" alt="" /></div>
+        <div class="app-window" role="img" aria-label="Stacio 主工作台示意，包含会话侧栏、远程终端、传输队列和设备指标" data-od-id="product-window">
+          <div class="window-bar">
+            <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="window-title">Stacio Workbench</div>
+            <div style="width:56px"></div>
+          </div>
+          <div class="workbench">
+            <aside class="sidebar">
+              <div class="side-label">Sessions</div>
+              <div class="host-list">
+                <div class="host active">prod-api-02</div>
+                <div class="host">staging-web</div>
+                <div class="host">homelab-nas</div>
+                <div class="host">jump-host</div>
+              </div>
+            </aside>
+            <div class="terminal-pane">
+              <div class="tabs"><span class="tab active">SSH</span><span class="tab">Files</span><span class="tab">Tunnels</span></div>
+              <div class="terminal" aria-hidden="true">
+                <div><span class="muted">stacio@prod-api-02</span> ~ % systemctl status api</div>
+                <div class="accent">● api.service - remote operations backend</div>
+                <div>   Loaded: loaded (/etc/systemd/system/api.service)</div>
+                <div>   Active: active (running) since Thu 09:42</div>
+                <div class="warn">   Tasks: 42 · Memory: 1.2G · CPU: 18%</div>
+                <div><span class="muted">AI</span> 建议先检查最近 200 行错误日志，并保留命令确认。</div>
+              </div>
+              <div class="queue">
+                <div class="mini-card"><strong>SCP Queue</strong><span>2 个上传 · 1 个下载正在跟踪</span></div>
+                <div class="mini-card"><strong>Remote Files</strong><span>/var/log 已连接，可直接编辑文本</span></div>
+                <div class="mini-card"><strong>Tunnel</strong><span>localhost:15432 正在转发</span></div>
+              </div>
+            </div>
+            <aside class="inspector">
+              <div class="side-label">Metrics</div>
+              <div class="metric"><div class="metric-row"><span>CPU</span><span>18%</span></div><div class="meter"><b style="width:18%"></b></div></div>
+              <div class="metric"><div class="metric-row"><span>Memory</span><span>64%</span></div><div class="meter"><b style="width:64%"></b></div></div>
+              <div class="metric"><div class="metric-row"><span>Disk I/O</span><span>31%</span></div><div class="meter"><b style="width:31%"></b></div></div>
+              <div class="mini-card"><strong>Keychain</strong><span>凭据留在 macOS 本地</span></div>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="features" data-od-id="features-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow" data-i18n="features.eyebrow">CAPABILITIES</p>
+          <h2 data-i18n="features.title" data-od-id="features-title">不是终端外壳，是完整远程工作台。</h2>
+        </div>
+        <p class="section-lead" data-i18n="features.lead" data-od-id="features-lead">每个能力块都对应真实产品表面：终端、文件、传输、隧道、指标、AI 建议和本地凭据管理。</p>
+      </div>
+      <div class="capability-grid" data-od-id="capability-grid">
+        <article class="capability-card" data-od-id="feature-terminal"><div><h3 data-i18n="features.terminalTitle">Terminal Workspace</h3><p data-i18n="features.terminalCopy">本地终端、远程 SSH、标签页、会话侧栏和终端上下文联动。</p></div><div class="ui-cue">tab: SSH · context: prod-api-02 · shell: zsh</div></article>
+        <article class="capability-card" data-od-id="feature-files"><div><h3 data-i18n="features.filesTitle">Remote Files / SCP</h3><p data-i18n="features.filesCopy">浏览远程目录、编辑文本文件、上传下载、查看传输队列。默认走 Stacio 内置 SCP / SSH 路径。</p></div><div class="ui-cue">/var/log · upload 2 · download 1</div></article>
+        <article class="capability-card" data-od-id="feature-tunnels"><div><h3 data-i18n="features.tunnelsTitle">Tunnels</h3><p data-i18n="features.tunnelsCopy">管理 local / remote / dynamic forward，显示状态、日志和关闭提醒。</p></div><div class="ui-cue">local 15432 -> db.internal:5432 · active</div></article>
+        <article class="capability-card" data-od-id="feature-metrics"><div><h3 data-i18n="features.metricsTitle">Device Metrics</h3><p data-i18n="features.metricsCopy">查看 CPU、内存、磁盘、网络和 I/O 指标，辅助判断机器状态。</p></div><div class="ui-cue">cpu 18% · mem 64% · i/o 31%</div></article>
+        <article class="capability-card" data-od-id="feature-ai"><div><h3 data-i18n="features.aiTitle">AI-Assisted Troubleshooting</h3><p data-i18n="features.aiCopy">AI 可以读取可见终端上下文，生成排查建议和可执行命令卡片。</p></div><div class="ui-cue" data-i18n="features.aiCue">建议命令需确认后执行 · sensitive actions stay controlled</div></article>
+        <article class="capability-card" data-od-id="feature-security"><div><h3 data-i18n="features.securityTitle">Local-First Security</h3><p data-i18n="features.securityCopy">会话数据保存在本地，凭据走 macOS Keychain，诊断和日志默认脱敏。</p></div><div class="ui-cue">Keychain · local sessions · redacted logs</div></article>
+      </div>
+    </section>
+
+    <section class="section" id="workflow" data-od-id="workflow-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow" data-i18n="workflow.eyebrow">WORKFLOW</p>
+          <h2 data-i18n="workflow.title" data-od-id="workflow-title">一次远程操作，从连接到解决。</h2>
+        </div>
+        <p class="section-lead" data-i18n="workflow.lead" data-od-id="workflow-lead">Stacio 把 SSH、文件、传输、隧道和诊断放进同一个操作循环，减少在终端、Finder、脚本和笔记之间来回切换。</p>
+      </div>
+      <div class="workflow-grid" data-od-id="workflow-grid">
+        <article class="workflow-step is-active" data-od-id="workflow-connect"><span class="step-index">01</span><div><h3 data-i18n="workflow.connectTitle">Connect</h3><p data-i18n="workflow.connectCopy">从保存会话或快速连接进入本地/远程终端。</p></div></article>
+        <article class="workflow-step" data-od-id="workflow-inspect"><span class="step-index">02</span><div><h3 data-i18n="workflow.inspectTitle">Inspect</h3><p data-i18n="workflow.inspectCopy">查看终端上下文、远程目录、日志和设备状态。</p></div></article>
+        <article class="workflow-step" data-od-id="workflow-transfer"><span class="step-index">03</span><div><h3 data-i18n="workflow.transferTitle">Transfer</h3><p data-i18n="workflow.transferCopy">通过 Stacio 内置 SCP 工作流上传、下载和跟踪传输。</p></div></article>
+        <article class="workflow-step" data-od-id="workflow-tunnel"><span class="step-index">04</span><div><h3 data-i18n="workflow.tunnelTitle">Tunnel</h3><p data-i18n="workflow.tunnelCopy">创建并监控 SSH 隧道，避免后台连接失控。</p></div></article>
+        <article class="workflow-step" data-od-id="workflow-resolve"><span class="step-index">05</span><div><h3 data-i18n="workflow.resolveTitle">Resolve</h3><p data-i18n="workflow.resolveCopy">结合诊断信息和 AI 建议完成排查。</p></div></article>
+      </div>
+    </section>
+
+    <section class="section" id="security" data-od-id="security-section">
+      <div class="why-panel">
+        <div>
+          <p class="eyebrow" data-i18n="security.eyebrow">SECURITY</p>
+          <h2 data-i18n="security.title" data-od-id="security-title">本地优先，敏感操作始终由用户确认。</h2>
+          <p class="section-lead" data-i18n="security.lead" data-od-id="security-lead">Stacio 把远程工作流收进同一个 macOS 应用，但凭据、会话和敏感动作仍遵循本地优先与显式确认。</p>
+        </div>
+        <div class="proof-list" data-od-id="proof-list">
+          <div class="proof-item" data-i18n="security.proof1">凭据交给 macOS Keychain，本地会话元数据不默认外传。</div>
+          <div class="proof-item" data-i18n="security.proof2">AI 建议只生成排查思路和命令卡片，敏感命令需要用户确认后执行。</div>
+          <div class="proof-item" data-i18n="security.proof3">诊断、日志和设备信息默认脱敏，减少复制粘贴排查时的泄露风险。</div>
+          <div class="proof-item" data-i18n="security.proof4">Windows / Linux 入口保持预留状态，不写成已开放安装包。</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="releases" data-od-id="releases-section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow" data-i18n="releases.eyebrow">BETA TRUST</p>
+          <h2 data-i18n="releases.title" data-od-id="releases-title">当前是 Beta，适合先试核心工作流。</h2>
+        </div>
+        <p class="section-lead" data-i18n="releases.lead" data-od-id="releases-lead">Stacio 正在快速迭代。Beta 版本适合试用核心工作流，并通过 GitHub Issues 或应用反馈提交问题。</p>
+      </div>
+      <div class="beta-grid" data-od-id="beta-grid">
+        <article class="beta-card" data-od-id="beta-status"><small data-i18n="releases.statusLabel">Status</small><strong>Beta</strong><p data-i18n="releases.statusCopy">围绕远程操作主链路持续迭代。</p></article>
+        <article class="beta-card" data-od-id="beta-platform"><small data-i18n="releases.platformLabel">Platform</small><strong data-i18n="releases.platformValue">macOS 14+ 当前可用</strong><p data-i18n="releases.platformCopy">Windows 和 Linux 已预留下载与价格状态，但尚未开放安装包。</p></article>
+        <article class="beta-card" data-od-id="beta-distribution"><small data-i18n="releases.distributionLabel">Distribution</small><strong data-i18n="releases.distributionValue">GitHub Releases / DMG</strong><p data-i18n="releases.distributionCopy">下载、更新日志和反馈路径保持公开可查。</p></article>
+      </div>
+    </section>
+
+    <section class="section final-cta" id="download" data-od-id="download-section">
+      <div>
+        <p class="eyebrow" data-i18n="download.eyebrow">DOWNLOAD</p>
+        <h2 data-i18n="download.title" data-od-id="download-title">下载适合当前设备的 Stacio。</h2>
+        <p data-i18n="download.copy" data-od-id="download-copy">页面会自动识别你的系统和 CPU 架构，优先显示匹配版本；也可以手动切换到 macOS、Windows 或 Linux。</p>
+      </div>
+      <div class="download-console" data-od-id="download-console">
+        <div class="detected-platform" data-od-id="detected-platform">
+          <span><span data-i18n="download.detectedLabel">已识别</span><strong id="detected-label">macOS · Apple Silicon</strong></span>
+          <span class="price-pill" id="price-label">Beta</span>
+        </div>
+        <div class="platform-picker" role="tablist" aria-label="选择下载平台" data-i18n-attr="aria-label:download.platformAria" data-od-id="platform-picker">
+          <button class="platform-option" type="button" data-platform="macos" role="tab" data-od-id="platform-macos">macOS</button>
+          <button class="platform-option" type="button" data-platform="windows" role="tab" data-od-id="platform-windows">Windows</button>
+          <button class="platform-option" type="button" data-platform="linux" role="tab" data-od-id="platform-linux">Linux</button>
+        </div>
+        <div class="download-card" aria-live="polite" data-od-id="download-card">
+          <div class="download-row">
+            <div><strong id="package-title">Stacio for macOS</strong><span id="package-meta">DMG · macOS 14+ · Apple Silicon</span></div>
+            <span class="price-pill" id="status-label">当前可用</span>
+          </div>
+          <div class="arch-picker" id="arch-picker" aria-label="选择 CPU 架构" data-i18n-attr="aria-label:download.archAria" data-od-id="arch-picker"></div>
+          <a class="btn primary" id="download-button" href="#download" data-event="homepage_download_selected_clicked" data-od-id="final-download">下载 Stacio DMG</a>
+        </div>
+        <a class="btn github-link" href="https://github.com/Fengoffer/Stacio" data-event="homepage_github_clicked" data-od-id="final-github"><span class="github-icon" aria-hidden="true"></span><span data-i18n="download.github">查看 GitHub</span></a>
+        <a class="btn ghost" href="#releases" data-event="homepage_release_notes_clicked" data-i18n="download.releaseNotes" data-od-id="final-release-notes">阅读更新日志</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer" data-od-id="site-footer">
+    <span data-i18n="footer.tagline">Stacio · Native remote operations station for macOS.</span>
+    <div class="footer-links">
+      <a href="#download" data-event="homepage_download_dmg_clicked" data-i18n="footer.download" data-od-id="footer-download">下载</a>
+      <a class="github-link" href="https://github.com/Fengoffer/Stacio" data-event="homepage_github_clicked" data-od-id="footer-github"><span class="github-icon" aria-hidden="true"></span><span>GitHub</span></a>
+      <a href="#releases" data-event="homepage_release_notes_clicked" data-i18n="footer.releaseNotes" data-od-id="footer-releases">更新日志</a>
+      <a href="https://github.com/Fengoffer/Stacio/issues" data-event="homepage_feedback_clicked" data-i18n="footer.feedback" data-od-id="footer-feedback">反馈问题</a>
+    </div>
+  </footer>
+
+  <div class="modal-backdrop" id="release-modal" hidden data-od-id="release-modal-backdrop">
+    <section class="release-modal" role="dialog" aria-modal="true" aria-labelledby="release-modal-title" aria-describedby="release-modal-copy" tabindex="-1" data-od-id="release-modal-panel">
+      <div class="modal-head">
+        <div>
+          <p class="eyebrow" data-i18n="modal.eyebrow">UPDATE NOTES</p>
+          <h2 id="release-modal-title" data-od-id="release-modal-title">Stacio 0.13.3-Beta 更新说明</h2>
+        </div>
+        <button class="modal-close" type="button" aria-label="关闭更新清单" data-i18n-attr="aria-label:modal.close" data-od-id="release-modal-close">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <p class="section-lead" id="release-modal-copy" data-od-id="release-modal-copy">本次更新重点提升远程终端稳定性，并完善更新、反馈和许可管理体验。</p>
+      <div class="release-list release-notes" id="release-notes" data-od-id="release-list">
+        <section class="release-note-section" data-od-id="release-note-highlights">
+          <h3>更新亮点</h3>
+          <ul>
+            <li>修复部分 macOS 27 设备在打开 SSH 终端时可能闪退的问题。</li>
+            <li>改进 SSH 会话启动、重连和远程目录联动，连接过程更加稳定。</li>
+            <li>完善 AI 服务商与模型管理，可集中配置兼容 OpenAI API 的服务和模型。</li>
+            <li>新增应用内更新通道、手动检查更新、用户反馈和许可状态入口。</li>
+            <li>优化设备看板、终端、文件面板、隧道和设置页面的 macOS 原生界面细节。</li>
+          </ul>
+        </section>
+        <section class="release-note-section" data-od-id="release-note-upgrade">
+          <h3>安装说明</h3>
+          <ul>
+            <li>支持 macOS 14 及以上版本，当前安装包适用于 Apple Silicon Mac。</li>
+            <li>首次打开未公证 Beta 包时，可能需要在 Finder 中右键 Stacio 并选择“打开”。</li>
+            <li>已保存的会话、凭据引用、AI 配置、传输记录和应用设置会继续保留。</li>
+          </ul>
+        </section>
+      </div>
+      <div class="modal-foot">
+        <a class="btn primary github-link" href="https://github.com/Fengoffer/Stacio/releases/tag/v0.13.3-beta" data-event="homepage_release_modal_github_clicked" data-od-id="release-modal-github"><span class="github-icon" aria-hidden="true"></span><span data-i18n="modal.github">打开 GitHub Releases</span></a>
+        <button class="btn ghost" type="button" data-i18n="modal.done" data-od-id="release-modal-done">知道了</button>
+      </div>
+    </section>
+  </div>
+  <script src="main.js?v=20260714-release-0133"></script>
+</body>
+</html>

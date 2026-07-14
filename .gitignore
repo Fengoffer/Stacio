@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+DerivedData/
+node_modules/
+StacioCore/target/
+StacioAdapters/RDPBridge/**/target/
+.worktrees/
+worktrees/
+.DS_Store
+dist/
+.superpowers/
+/竞品截图/
