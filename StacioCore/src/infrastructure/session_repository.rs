@@ -1,11 +1,18 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
     serial::{validate_serial_config, SerialConnectionConfig},
-    session::{SessionDraft, SessionError, SessionFolder, SessionRecord, SessionUpdate},
+    session::{
+        SessionDraft, SessionError, SessionFolder, SessionIconAssignment, SessionRecord,
+        SessionSidebarOrderItem, SessionSidebarSnapshot, SessionUpdate,
+    },
 };
 
 const SESSION_COLUMNS: &str = "id, folder_id, name, protocol, host, port, username, private_key_path, credential_id, tags_json, last_opened_at";
@@ -34,12 +41,16 @@ impl SessionRepository {
             name: name.to_string(),
         };
         let now = Utc::now().to_rfc3339();
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let position = next_sidebar_position(&transaction, folder.parent_id.as_deref())?;
 
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO folders (id, parent_id, name, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![folder.id, folder.parent_id, folder.name, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![folder.id, folder.parent_id, folder.name, position, now],
         )?;
+        transaction.commit()?;
 
         Ok(folder)
     }
@@ -62,19 +73,54 @@ impl SessionRepository {
     }
 
     pub fn delete_folder(&self, id: String) -> Result<(), SessionError> {
-        let changed = self
-            .connection
-            .execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let parent_id = transaction
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                params![id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(parent_id) = parent_id else {
+            return Err(SessionError::NotFound);
+        };
+        let root_items_before = sidebar_items_for_parent(&transaction, None)?;
+        let mut moved_sessions = Vec::new();
+        collect_folder_subtree_sessions(
+            &transaction,
+            &id,
+            &mut HashSet::new(),
+            &mut moved_sessions,
+        )?;
+
+        let changed = transaction.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
         if changed == 0 {
             return Err(SessionError::NotFound);
         }
+        let mut root_items = root_items_before
+            .into_iter()
+            .filter(|item| item.kind != "folder" || item.id != id)
+            .collect::<Vec<_>>();
+        root_items.extend(moved_sessions.into_iter().map(|mut session| {
+            session.parent_id = None;
+            session
+        }));
+        rewrite_sidebar_positions(&transaction, &root_items)?;
+        if let Some(parent_id) = parent_id.as_deref() {
+            let parent_items = sidebar_items_for_parent(&transaction, Some(parent_id))?;
+            rewrite_sidebar_positions(&transaction, &parent_items)?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn list_folders(&self) -> Result<Vec<SessionFolder>, SessionError> {
         let mut statement = self.connection.prepare(
             "SELECT id, parent_id, name
-             FROM folders ORDER BY parent_id IS NOT NULL, name COLLATE NOCASE",
+             FROM folders
+             ORDER BY parent_id IS NOT NULL, COALESCE(parent_id, ''), position,
+                      name COLLATE NOCASE, id",
         )?;
         let folders = statement
             .query_map([], read_folder)?
@@ -107,11 +153,14 @@ impl SessionRepository {
             &session,
             config_json_override.as_deref(),
         )?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let position = next_sidebar_position(&transaction, session.folder_id.as_deref())?;
 
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO sessions
-             (id, folder_id, name, protocol, host, port, username, private_key_path, credential_id, tags_json, config_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+             (id, folder_id, name, protocol, host, port, username, private_key_path, credential_id, tags_json, config_json, position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
             params![
                 session.id,
                 session.folder_id,
@@ -124,9 +173,11 @@ impl SessionRepository {
                 session.credential_id,
                 tags_json,
                 config_json,
+                position,
                 now
             ],
         )?;
+        transaction.commit()?;
 
         Ok(session)
     }
@@ -139,7 +190,8 @@ impl SessionRepository {
             self.query_sessions(
                 &format!(
                     "SELECT {SESSION_COLUMNS}
-                     FROM sessions WHERE folder_id = ?1 ORDER BY name COLLATE NOCASE"
+                     FROM sessions WHERE folder_id = ?1
+                     ORDER BY position, name COLLATE NOCASE, id"
                 ),
                 params![folder_id],
             )
@@ -147,7 +199,8 @@ impl SessionRepository {
             self.query_sessions(
                 &format!(
                     "SELECT {SESSION_COLUMNS}
-                     FROM sessions WHERE folder_id IS NULL ORDER BY name COLLATE NOCASE"
+                     FROM sessions WHERE folder_id IS NULL
+                     ORDER BY position, name COLLATE NOCASE, id"
                 ),
                 [],
             )
@@ -156,9 +209,67 @@ impl SessionRepository {
 
     pub fn list_all_sessions(&self) -> Result<Vec<SessionRecord>, SessionError> {
         self.query_sessions(
-            &format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY name COLLATE NOCASE"),
+            &format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY name COLLATE NOCASE, id"),
             [],
         )
+    }
+
+    pub fn list_session_sidebar_order(&self) -> Result<Vec<SessionSidebarOrderItem>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, id, parent_id
+             FROM (
+                 SELECT 'folder' AS kind, id, parent_id, position, name
+                 FROM folders
+                 UNION ALL
+                 SELECT 'session' AS kind, id, folder_id AS parent_id, position, name
+                 FROM sessions
+             )
+             ORDER BY parent_id IS NOT NULL, COALESCE(parent_id, ''), position,
+                      CASE
+                          WHEN parent_id IS NULL AND kind = 'session' THEN 0
+                          WHEN parent_id IS NULL THEN 1
+                          WHEN kind = 'folder' THEN 0
+                          ELSE 1
+                      END,
+                      name COLLATE NOCASE, id",
+        )?;
+        let items = statement
+            .query_map([], read_sidebar_order_item)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SessionError::from)?;
+        Ok(items)
+    }
+
+    pub fn load_session_sidebar_snapshot(&self) -> Result<SessionSidebarSnapshot, SessionError> {
+        Ok(SessionSidebarSnapshot {
+            folders: self.list_folders()?,
+            sessions: self.list_all_sessions()?,
+            order_items: self.list_session_sidebar_order()?,
+            manual_icon_assignments: self.list_session_icon_assignments()?,
+        })
+    }
+
+    fn list_session_icon_assignments(&self) -> Result<Vec<SessionIconAssignment>, SessionError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, config_json
+             FROM sessions
+             WHERE LOWER(TRIM(protocol)) IN ('ssh', 'scp')
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut assignments = Vec::new();
+        for row in rows {
+            let (session_id, config_json) = row?;
+            if let Some(icon_id) = safe_session_icon_id(config_json.as_deref()) {
+                assignments.push(SessionIconAssignment {
+                    session_id,
+                    icon_id,
+                });
+            }
+        }
+        Ok(assignments)
     }
 
     pub fn mark_session_opened(&self, id: String) -> Result<SessionRecord, SessionError> {
@@ -191,6 +302,12 @@ impl SessionRepository {
             .optional()?
             .flatten();
         let mut current = self.get_session(&id)?.ok_or(SessionError::NotFound)?;
+        let original_folder_id = current.folder_id.clone();
+        let current_position = self.connection.query_row(
+            "SELECT position FROM sessions WHERE id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
         if let Some(name) = update.name {
             current.name = name;
         }
@@ -228,11 +345,16 @@ impl SessionRepository {
             &current,
             config_json_override.as_deref(),
         )?;
+        let position = if current.folder_id == original_folder_id {
+            current_position
+        } else {
+            next_sidebar_position(&self.connection, current.folder_id.as_deref())?
+        };
         let now = Utc::now().to_rfc3339();
 
         self.connection.execute(
             "UPDATE sessions
-             SET folder_id = ?2, name = ?3, protocol = ?4, host = ?5, port = ?6, username = ?7, private_key_path = ?8, credential_id = ?9, tags_json = ?10, config_json = ?11, updated_at = ?12
+             SET folder_id = ?2, name = ?3, protocol = ?4, host = ?5, port = ?6, username = ?7, private_key_path = ?8, credential_id = ?9, tags_json = ?10, config_json = ?11, position = ?12, updated_at = ?13
              WHERE id = ?1",
             params![
                 current.id,
@@ -246,6 +368,7 @@ impl SessionRepository {
                 current.credential_id,
                 tags_json,
                 config_json,
+                position,
                 now
             ],
         )?;
@@ -254,8 +377,23 @@ impl SessionRepository {
     }
 
     pub fn delete_session(&self, id: String) -> Result<(), SessionError> {
-        self.connection
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let parent_id = transaction
+            .query_row(
+                "SELECT folder_id FROM sessions WHERE id = ?1",
+                params![id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(parent_id) = parent_id else {
+            transaction.commit()?;
+            return Ok(());
+        };
+        transaction.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        let remaining = sidebar_items_for_parent(&transaction, parent_id.as_deref())?;
+        rewrite_sidebar_positions(&transaction, &remaining)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -286,23 +424,69 @@ impl SessionRepository {
         target_folder_id: Option<String>,
     ) -> Result<SessionRecord, SessionError> {
         let current = self.get_session(&id)?.ok_or(SessionError::NotFound)?;
-        let now = Utc::now().to_rfc3339();
-        self.connection.execute(
-            "UPDATE sessions SET folder_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id.as_str(), target_folder_id, now],
+        if current.folder_id == target_folder_id {
+            return Ok(current);
+        }
+        self.place_session_sidebar_item(
+            "session".to_string(),
+            id.clone(),
+            target_folder_id,
+            u32::MAX,
         )?;
+        self.get_session(&id)?.ok_or(SessionError::NotFound)
+    }
 
-        let mut moved = current;
-        moved.folder_id = self
-            .connection
-            .query_row(
-                "SELECT folder_id FROM sessions WHERE id = ?1",
-                params![id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(moved)
+    pub fn place_session_sidebar_item(
+        &self,
+        kind: String,
+        id: String,
+        target_parent_id: Option<String>,
+        target_index: u32,
+    ) -> Result<SessionSidebarOrderItem, SessionError> {
+        let kind = normalized_sidebar_kind(&kind)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let source_parent_id = sidebar_parent_for_item(&transaction, kind, &id)?;
+
+        if kind == "folder" && source_parent_id != target_parent_id {
+            return Err(invalid_sidebar_placement(
+                "folders can only be reordered inside their current parent",
+            ));
+        }
+        if kind == "session" {
+            validate_sidebar_parent(&transaction, target_parent_id.as_deref())?;
+        }
+
+        let mut source_items = sidebar_items_for_parent(&transaction, source_parent_id.as_deref())?;
+        source_items.retain(|item| item.kind != kind || item.id != id);
+        let same_parent = source_parent_id == target_parent_id;
+        let mut target_items = if same_parent {
+            source_items.clone()
+        } else {
+            sidebar_items_for_parent(&transaction, target_parent_id.as_deref())?
+        };
+        let insertion_index = usize::try_from(target_index)
+            .unwrap_or(usize::MAX)
+            .min(target_items.len());
+        let placed = SessionSidebarOrderItem {
+            kind: kind.to_string(),
+            id: id.clone(),
+            parent_id: target_parent_id.clone(),
+        };
+        target_items.insert(insertion_index, placed.clone());
+
+        if kind == "session" {
+            transaction.execute(
+                "UPDATE sessions SET folder_id = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id.as_str(), target_parent_id, Utc::now().to_rfc3339()],
+            )?;
+        }
+        if !same_parent {
+            rewrite_sidebar_positions(&transaction, &source_items)?;
+        }
+        rewrite_sidebar_positions(&transaction, &target_items)?;
+        transaction.commit()?;
+        Ok(placed)
     }
 
     pub fn export_sessions_without_secrets(&self) -> Result<Vec<SessionRecord>, SessionError> {
@@ -310,11 +494,12 @@ impl SessionRepository {
     }
 
     pub fn export_sessions_json(&self) -> Result<String, SessionError> {
+        let sessions = self.export_session_records(self.export_sessions_without_secrets()?)?;
         let bundle = SessionExportBundle {
             format: "stacio.sessions.v1".to_string(),
             exported_at: Utc::now().to_rfc3339(),
             folders: self.list_folders()?,
-            sessions: self.export_sessions_without_secrets()?,
+            sessions,
         };
         serde_json::to_string_pretty(&bundle).map_err(|error| SessionError::Database {
             message: error.to_string(),
@@ -330,15 +515,34 @@ impl SessionRepository {
             .iter()
             .map(|folder| folder.id.clone())
             .collect::<Vec<_>>();
+        let sessions =
+            self.export_session_records(self.list_sessions_for_folder_ids(&folder_ids)?)?;
         let bundle = SessionExportBundle {
             format: "stacio.sessions.v1".to_string(),
             exported_at: Utc::now().to_rfc3339(),
             folders,
-            sessions: self.list_sessions_for_folder_ids(&folder_ids)?,
+            sessions,
         };
         serde_json::to_string_pretty(&bundle).map_err(|error| SessionError::Database {
             message: error.to_string(),
         })
+    }
+
+    fn export_session_records(
+        &self,
+        sessions: Vec<SessionRecord>,
+    ) -> Result<Vec<SessionExportRecord>, SessionError> {
+        sessions
+            .into_iter()
+            .map(|session| {
+                let stored_config_json = self.get_session_config_json(&session.id)?;
+                let config_json = export_safe_config_json(stored_config_json.as_deref());
+                Ok(SessionExportRecord {
+                    session,
+                    config_json,
+                })
+            })
+            .collect()
     }
 
     pub fn get_session_config_json(&self, id: &str) -> Result<Option<String>, SessionError> {
@@ -402,16 +606,17 @@ impl SessionRepository {
 
     fn list_folder_subtree(&self, folder_id: &str) -> Result<Vec<SessionFolder>, SessionError> {
         let mut statement = self.connection.prepare(
-            "WITH RECURSIVE folder_tree(id, parent_id, name, depth) AS (
-                 SELECT id, parent_id, name, 0 FROM folders WHERE id = ?1
+            "WITH RECURSIVE folder_tree(id, parent_id, name, position, depth) AS (
+                 SELECT id, parent_id, name, position, 0 FROM folders WHERE id = ?1
                  UNION ALL
-                 SELECT folders.id, folders.parent_id, folders.name, folder_tree.depth + 1
+                 SELECT folders.id, folders.parent_id, folders.name, folders.position,
+                        folder_tree.depth + 1
                  FROM folders
                  JOIN folder_tree ON folders.parent_id = folder_tree.id
              )
              SELECT id, parent_id, name
              FROM folder_tree
-             ORDER BY depth, name COLLATE NOCASE",
+             ORDER BY depth, COALESCE(parent_id, ''), position, name COLLATE NOCASE, id",
         )?;
         let folders = statement
             .query_map(params![folder_id], read_folder)?
@@ -436,7 +641,7 @@ impl SessionRepository {
                 "SELECT {SESSION_COLUMNS}
                  FROM sessions
                  WHERE folder_id IN ({placeholders})
-                 ORDER BY name COLLATE NOCASE"
+                 ORDER BY folder_id, position, name COLLATE NOCASE, id"
             ),
             params_from_iter(folder_ids.iter()),
         )
@@ -476,12 +681,153 @@ impl SessionRepository {
     }
 }
 
+fn normalized_sidebar_kind(kind: &str) -> Result<&'static str, SessionError> {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "folder" => Ok("folder"),
+        "session" => Ok("session"),
+        _ => Err(invalid_sidebar_placement("unsupported sidebar item kind")),
+    }
+}
+
+fn invalid_sidebar_placement(message: &str) -> SessionError {
+    SessionError::Database {
+        message: message.to_string(),
+    }
+}
+
+fn validate_sidebar_parent(
+    connection: &Connection,
+    parent_id: Option<&str>,
+) -> Result<(), SessionError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+        params![parent_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(SessionError::NotFound)
+    }
+}
+
+fn sidebar_parent_for_item(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+) -> Result<Option<String>, SessionError> {
+    let sql = match kind {
+        "folder" => "SELECT parent_id FROM folders WHERE id = ?1",
+        "session" => "SELECT folder_id FROM sessions WHERE id = ?1",
+        _ => return Err(invalid_sidebar_placement("unsupported sidebar item kind")),
+    };
+    connection
+        .query_row(sql, params![id], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .ok_or(SessionError::NotFound)
+}
+
+fn next_sidebar_position(
+    connection: &Connection,
+    parent_id: Option<&str>,
+) -> Result<i64, SessionError> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1
+             FROM (
+                 SELECT position FROM folders WHERE parent_id IS ?1
+                 UNION ALL
+                 SELECT position FROM sessions WHERE folder_id IS ?1
+             )",
+            params![parent_id],
+            |row| row.get(0),
+        )
+        .map_err(SessionError::from)
+}
+
+fn sidebar_items_for_parent(
+    connection: &Connection,
+    parent_id: Option<&str>,
+) -> Result<Vec<SessionSidebarOrderItem>, SessionError> {
+    let mut statement = connection.prepare(
+        "SELECT kind, id, parent_id
+         FROM (
+             SELECT 'folder' AS kind, id, parent_id, position, name
+             FROM folders WHERE parent_id IS ?1
+             UNION ALL
+             SELECT 'session' AS kind, id, folder_id AS parent_id, position, name
+             FROM sessions WHERE folder_id IS ?1
+         )
+         ORDER BY position,
+                  CASE
+                      WHEN ?1 IS NULL AND kind = 'session' THEN 0
+                      WHEN ?1 IS NULL THEN 1
+                      WHEN kind = 'folder' THEN 0
+                      ELSE 1
+                  END,
+                  name COLLATE NOCASE, id",
+    )?;
+    let items = statement
+        .query_map(params![parent_id], read_sidebar_order_item)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(SessionError::from)?;
+    Ok(items)
+}
+
+fn rewrite_sidebar_positions(
+    connection: &Connection,
+    items: &[SessionSidebarOrderItem],
+) -> Result<(), SessionError> {
+    for (position, item) in items.iter().enumerate() {
+        let sql = match item.kind.as_str() {
+            "folder" => "UPDATE folders SET position = ?2 WHERE id = ?1",
+            "session" => "UPDATE sessions SET position = ?2 WHERE id = ?1",
+            _ => return Err(invalid_sidebar_placement("unsupported sidebar item kind")),
+        };
+        let changed = connection.execute(sql, params![item.id.as_str(), position as i64])?;
+        if changed != 1 {
+            return Err(SessionError::NotFound);
+        }
+    }
+    Ok(())
+}
+
+fn collect_folder_subtree_sessions(
+    connection: &Connection,
+    folder_id: &str,
+    visited_folder_ids: &mut HashSet<String>,
+    sessions: &mut Vec<SessionSidebarOrderItem>,
+) -> Result<(), SessionError> {
+    if !visited_folder_ids.insert(folder_id.to_string()) {
+        return Err(invalid_sidebar_placement("cyclic folder hierarchy"));
+    }
+    for item in sidebar_items_for_parent(connection, Some(folder_id))? {
+        if item.kind == "folder" {
+            collect_folder_subtree_sessions(connection, &item.id, visited_folder_ids, sessions)?;
+        } else {
+            sessions.push(item);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct SessionExportBundle {
     format: String,
     exported_at: String,
     folders: Vec<SessionFolder>,
-    sessions: Vec<SessionRecord>,
+    sessions: Vec<SessionExportRecord>,
+}
+
+#[derive(Serialize)]
+struct SessionExportRecord {
+    #[serde(flatten)]
+    session: SessionRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_json: Option<String>,
 }
 
 fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFolder> {
@@ -489,6 +835,14 @@ fn read_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionFolder> {
         id: row.get(0)?,
         parent_id: row.get(1)?,
         name: row.get(2)?,
+    })
+}
+
+fn read_sidebar_order_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSidebarOrderItem> {
+    Ok(SessionSidebarOrderItem {
+        kind: row.get(0)?,
+        id: row.get(1)?,
+        parent_id: row.get(2)?,
     })
 }
 
@@ -544,6 +898,7 @@ fn protocol_config_json_for_session_with_override(
             username: session.username.as_deref(),
             private_key_path: session.private_key_path.as_deref(),
             credential_id: session.credential_id.as_deref(),
+            session_icon_id: session_icon_id_for_session(config_json_override)?,
             tag_style: tag_style_for_session(config_json_override)?,
             automation: automation_metadata_for_session(config_json_override)?,
         })?,
@@ -596,6 +951,50 @@ fn protocol_config_json_for_session_with_override(
     };
 
     Ok(Some(config))
+}
+
+fn session_icon_id_for_session(
+    config_json_override: Option<&str>,
+) -> Result<Option<String>, SessionError> {
+    let Some(config_json) = config_json_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let object = serde_json::from_str::<serde_json::Value>(config_json).map_err(|error| {
+        SessionError::Database {
+            message: error.to_string(),
+        }
+    })?;
+    Ok(object
+        .get("sessionIconID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+fn export_safe_config_json(config_json: Option<&str>) -> Option<String> {
+    let icon_id = safe_session_icon_id(config_json)?;
+    serde_json::to_string(&serde_json::json!({ "sessionIconID": icon_id })).ok()
+}
+
+fn safe_session_icon_id(config_json: Option<&str>) -> Option<String> {
+    let object = serde_json::from_str::<serde_json::Value>(config_json?.trim())
+        .ok()?
+        .as_object()?
+        .clone();
+    let icon_id = object.get("sessionIconID")?.as_str()?.trim();
+    if icon_id.is_empty()
+        || icon_id.len() > 64
+        || !icon_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(icon_id.to_string())
 }
 
 fn tag_style_for_session(
@@ -798,6 +1197,8 @@ struct NetworkAuthSessionConfig<'a> {
     username: Option<&'a str>,
     private_key_path: Option<&'a str>,
     credential_id: Option<&'a str>,
+    #[serde(rename = "sessionIconID", skip_serializing_if = "Option::is_none")]
+    session_icon_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_style: Option<TagStyleConfig>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -1013,7 +1414,10 @@ mod session_repository_tests {
                 private_key_path: None,
                 credential_id: None,
                 tags: vec![],
-                config_json: None,
+                config_json: Some(
+                    r#"{"sessionIconID":"ubuntu","startupCommand":"export TOKEN=folder-secret","postConnectScript":"curl intranet.example/run","environmentVariables":["PASSWORD=folder-password"]}"#
+                        .to_string(),
+                ),
             })
             .expect("primary session");
         repository
@@ -1040,6 +1444,12 @@ mod session_repository_tests {
         assert!(json.contains("Database"));
         assert!(json.contains("Primary"));
         assert!(json.contains("Primary DB"));
+        assert!(json.contains(r#"\"sessionIconID\":\"ubuntu\""#));
+        assert!(!json.contains("startupCommand"));
+        assert!(!json.contains("postConnectScript"));
+        assert!(!json.contains("environmentVariables"));
+        assert!(!json.contains("folder-secret"));
+        assert!(!json.contains("folder-password"));
         assert!(!json.contains("Lab"));
         assert!(!json.contains("Lab Box"));
     }
@@ -1546,6 +1956,9 @@ mod session_repository_tests {
         let folder = repository
             .create_folder(None, "Production")
             .expect("folder");
+        let child_folder = repository
+            .create_folder(Some(folder.id.clone()), "Database")
+            .expect("child folder");
         let credential_id = insert_test_credential(&repository);
         let original = repository
             .create_session(SessionDraft {
@@ -1570,7 +1983,7 @@ mod session_repository_tests {
             .expect("duplicate");
 
         assert_ne!(duplicate.id, original.id);
-        assert_eq!(duplicate.folder_id, Some(folder.id));
+        assert_eq!(duplicate.folder_id, Some(folder.id.clone()));
         assert_eq!(duplicate.name, "API Server 副本");
         assert_eq!(duplicate.protocol, original.protocol);
         assert_eq!(duplicate.host, original.host);
@@ -1581,6 +1994,10 @@ mod session_repository_tests {
         assert_eq!(duplicate.tags, original.tags);
         assert_eq!(duplicate.last_opened_at, None);
         assert!(opened.last_opened_at.is_some());
+        assert_eq!(
+            sidebar_ids(&repository, Some(folder.id.as_str())),
+            vec![child_folder.id, duplicate.id]
+        );
     }
 
     #[test]
@@ -1619,6 +2036,257 @@ mod session_repository_tests {
     }
 
     #[test]
+    fn moving_session_to_its_current_folder_preserves_sidebar_order() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let folder = repository
+            .create_folder(None, "Production")
+            .expect("folder");
+        let first = create_test_session(&repository, Some(folder.id.clone()), "First");
+        let second = create_test_session(&repository, Some(folder.id.clone()), "Second");
+        let order_before = sidebar_ids(&repository, Some(folder.id.as_str()));
+
+        let unchanged = repository
+            .move_session(first.id.clone(), Some(folder.id.clone()))
+            .expect("same-folder move");
+
+        assert_eq!(unchanged.id, first.id);
+        assert_eq!(
+            sidebar_ids(&repository, Some(folder.id.as_str())),
+            order_before
+        );
+        assert_eq!(order_before, vec![first.id, second.id]);
+    }
+
+    #[test]
+    fn sidebar_snapshot_loads_tree_and_only_safe_manual_icon_assignments() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let folder = repository
+            .create_folder(None, "Production")
+            .expect("folder");
+        let safe = repository
+            .create_session(SessionDraft {
+                folder_id: Some(folder.id.clone()),
+                name: "Safe".to_string(),
+                protocol: "ssh".to_string(),
+                host: "safe.example.com".to_string(),
+                port: 22,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: Some(
+                    r#"{"sessionIconID":"ubuntu","startupCommand":"export TOKEN=hidden"}"#
+                        .to_string(),
+                ),
+            })
+            .expect("safe session");
+        repository
+            .create_session(SessionDraft {
+                folder_id: None,
+                name: "Unsafe".to_string(),
+                protocol: "ssh".to_string(),
+                host: "unsafe.example.com".to_string(),
+                port: 22,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: Some(
+                    r#"{"sessionIconID":"../../payload","postConnectScript":"hidden"}"#.to_string(),
+                ),
+            })
+            .expect("unsafe session");
+
+        let snapshot = repository
+            .load_session_sidebar_snapshot()
+            .expect("sidebar snapshot");
+
+        assert_eq!(snapshot.folders, vec![folder]);
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.order_items.len(), 3);
+        assert_eq!(snapshot.manual_icon_assignments.len(), 1);
+        assert_eq!(snapshot.manual_icon_assignments[0].session_id, safe.id);
+        assert_eq!(snapshot.manual_icon_assignments[0].icon_id, "ubuntu");
+        assert!(!format!("{snapshot:?}").contains("TOKEN"));
+        assert!(!format!("{snapshot:?}").contains("startupCommand"));
+        assert!(!format!("{snapshot:?}").contains("postConnectScript"));
+    }
+
+    #[test]
+    fn places_mixed_sidebar_items_across_parents_and_persists_order() {
+        let database = tempfile::NamedTempFile::new().expect("temp database");
+        let path = database.path().to_path_buf();
+        let (root_a_id, root_b_id, folder_id, child_folder_id, inside_id);
+
+        {
+            let connection = Connection::open(&path).expect("open database");
+            apply_migrations(&connection).expect("migrate");
+            let repository = SessionRepository::new(connection);
+            let root_a = create_test_session(&repository, None, "Root A");
+            let folder = repository
+                .create_folder(None, "Production")
+                .expect("root folder");
+            let root_b = create_test_session(&repository, None, "Root B");
+            let child_folder = repository
+                .create_folder(Some(folder.id.clone()), "Database")
+                .expect("child folder");
+            let inside = create_test_session(&repository, Some(folder.id.clone()), "Inside");
+
+            assert_eq!(
+                sidebar_ids(&repository, None),
+                vec![root_a.id.clone(), folder.id.clone(), root_b.id.clone()]
+            );
+            repository
+                .place_session_sidebar_item("folder".to_string(), folder.id.clone(), None, 0)
+                .expect("reorder root folder");
+            repository
+                .place_session_sidebar_item(
+                    "session".to_string(),
+                    root_b.id.clone(),
+                    Some(folder.id.clone()),
+                    1,
+                )
+                .expect("move session into folder");
+
+            assert_eq!(
+                sidebar_ids(&repository, None),
+                vec![folder.id.clone(), root_a.id.clone()]
+            );
+            assert_eq!(
+                sidebar_ids(&repository, Some(folder.id.as_str())),
+                vec![
+                    child_folder.id.clone(),
+                    root_b.id.clone(),
+                    inside.id.clone()
+                ]
+            );
+            let root_before_invalid_move = sidebar_ids(&repository, None);
+            let error = repository
+                .place_session_sidebar_item(
+                    "folder".to_string(),
+                    folder.id.clone(),
+                    Some(folder.id.clone()),
+                    0,
+                )
+                .expect_err("reject folder parent change");
+            assert!(matches!(
+                error,
+                crate::domain::session::SessionError::Database { .. }
+            ));
+            assert_eq!(sidebar_ids(&repository, None), root_before_invalid_move);
+            let folder_before_invalid_move = sidebar_ids(&repository, Some(folder.id.as_str()));
+            let error = repository
+                .place_session_sidebar_item(
+                    "session".to_string(),
+                    root_a.id.clone(),
+                    Some("missing-folder".to_string()),
+                    0,
+                )
+                .expect_err("reject missing target folder");
+            assert_eq!(error, crate::domain::session::SessionError::NotFound);
+            assert_eq!(sidebar_ids(&repository, None), root_before_invalid_move);
+            assert_eq!(
+                sidebar_ids(&repository, Some(folder.id.as_str())),
+                folder_before_invalid_move
+            );
+
+            root_a_id = root_a.id;
+            root_b_id = root_b.id;
+            folder_id = folder.id;
+            child_folder_id = child_folder.id;
+            inside_id = inside.id;
+        }
+
+        let connection = Connection::open(&path).expect("reopen database");
+        apply_migrations(&connection).expect("reapply migrations");
+        let repository = SessionRepository::new(connection);
+        assert_eq!(
+            sidebar_ids(&repository, None),
+            vec![folder_id.clone(), root_a_id]
+        );
+        assert_eq!(
+            sidebar_ids(&repository, Some(folder_id.as_str())),
+            vec![child_folder_id, root_b_id, inside_id]
+        );
+    }
+
+    #[test]
+    fn existing_move_appends_session_to_mixed_destination_order() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let folder = repository
+            .create_folder(None, "Production")
+            .expect("folder");
+        let child = repository
+            .create_folder(Some(folder.id.clone()), "Database")
+            .expect("child folder");
+        let existing = create_test_session(&repository, Some(folder.id.clone()), "Existing");
+        let moving = create_test_session(&repository, None, "Moving");
+
+        repository
+            .move_session(moving.id.clone(), Some(folder.id.clone()))
+            .expect("move session");
+
+        assert_eq!(
+            sidebar_ids(&repository, Some(folder.id.as_str())),
+            vec![child.id, existing.id, moving.id]
+        );
+    }
+
+    #[test]
+    fn deleting_folder_appends_descendant_sessions_to_root_in_stable_order() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let root = create_test_session(&repository, None, "Root");
+        let survivor = repository
+            .create_folder(None, "Survivor")
+            .expect("survivor folder");
+        let doomed = repository
+            .create_folder(None, "Doomed")
+            .expect("doomed folder");
+        let direct = create_test_session(&repository, Some(doomed.id.clone()), "Direct");
+        let child = repository
+            .create_folder(Some(doomed.id.clone()), "Child")
+            .expect("child folder");
+        let nested = create_test_session(&repository, Some(child.id), "Nested");
+        repository
+            .place_session_sidebar_item("folder".to_string(), doomed.id.clone(), None, 1)
+            .expect("place doomed folder");
+
+        repository
+            .delete_folder(doomed.id)
+            .expect("delete folder subtree");
+
+        assert_eq!(
+            sidebar_ids(&repository, None),
+            vec![
+                root.id.clone(),
+                survivor.id,
+                direct.id.clone(),
+                nested.id.clone(),
+            ]
+        );
+        repository
+            .delete_session(root.id)
+            .expect("delete root session");
+        assert_eq!(
+            repository
+                .list_sessions(None)
+                .expect("list moved sessions")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![direct.id, nested.id]
+        );
+    }
+
+    #[test]
     fn exports_json_bundle_without_secret_values() {
         let connection = Connection::open_in_memory().expect("open database");
         apply_migrations(&connection).expect("migrate");
@@ -1638,7 +2306,10 @@ mod session_repository_tests {
                 private_key_path: Some("~/.ssh/prod".to_string()),
                 credential_id: Some(credential_id.clone()),
                 tags: vec!["prod".to_string()],
-                config_json: None,
+                config_json: Some(
+                    r#"{"sessionIconID":"aliyun","startupCommand":"export TOKEN=all-secret","postConnectScript":"source /private/credentials","environmentVariables":["PASSWORD=all-password"]}"#
+                        .to_string(),
+                ),
             })
             .expect("session");
 
@@ -1653,6 +2324,15 @@ mod session_repository_tests {
         assert!(json.contains("API Server"));
         assert!(json.contains(&credential_id));
         assert!(json.contains("~/.ssh/prod"));
+        assert_eq!(
+            value["sessions"][0]["config_json"].as_str(),
+            Some(r#"{"sessionIconID":"aliyun"}"#)
+        );
+        assert!(!json.contains("startupCommand"));
+        assert!(!json.contains("postConnectScript"));
+        assert!(!json.contains("environmentVariables"));
+        assert!(!json.contains("all-secret"));
+        assert!(!json.contains("all-password"));
         assert!(!json.contains("password"));
         assert!(!json.contains("secret"));
         assert!(!json.contains("ssh "));
@@ -1672,5 +2352,39 @@ mod session_repository_tests {
             )
             .expect("insert credential");
         credential_id
+    }
+
+    fn create_test_session(
+        repository: &SessionRepository,
+        folder_id: Option<String>,
+        name: &str,
+    ) -> crate::domain::session::SessionRecord {
+        repository
+            .create_session(SessionDraft {
+                folder_id,
+                name: name.to_string(),
+                protocol: "ssh".to_string(),
+                host: format!(
+                    "{}.example.com",
+                    name.to_ascii_lowercase().replace(' ', "-")
+                ),
+                port: 22,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: None,
+            })
+            .expect("create test session")
+    }
+
+    fn sidebar_ids(repository: &SessionRepository, parent_id: Option<&str>) -> Vec<String> {
+        repository
+            .list_session_sidebar_order()
+            .expect("list sidebar order")
+            .into_iter()
+            .filter(|item| item.parent_id.as_deref() == parent_id)
+            .map(|item| item.id)
+            .collect()
     }
 }

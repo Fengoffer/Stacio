@@ -176,7 +176,7 @@ public final class AIAssistantCoordinator {
             envelope: settings.aiProviderSettings,
             requestedSelection: requestedSelection
         ) {
-        case .stacioRules:
+        case .unconfigured:
             return AppSettings.clampedAIContextCharacterLimit(settings.aiContextCharacterLimit)
         case let .external(provider, modelID):
             return provider.models
@@ -368,6 +368,11 @@ public final class AIAssistantCoordinator {
     @MainActor
     public func takeOverTask(requestID: String) -> AgentTraceEvent? {
         (executionCoordinator as? AgentTaskControlling)?.takeOverTask(requestID: requestID)
+    }
+
+    @MainActor
+    public func confirmTaskComplete(requestID: String) -> AgentTraceEvent? {
+        (executionCoordinator as? AgentTaskControlling)?.confirmTaskComplete(requestID: requestID)
     }
 }
 

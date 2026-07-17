@@ -12,6 +12,28 @@ public enum AIProviderSettingsStoreError: Error, Equatable {
 
 public enum BuiltInAIProvider {
     public static let stacioRulesID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+    public static let mozheAPIID = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+    public static let mozheAPIDisplayName = "mozheAPI"
+    public static let mozheAPIBaseURL = "https://openai.mozhevip.top"
+    public static let mozheAPIWebsiteURL = "https://openai.mozhevip.top/register?aff=79LZW99ZKN8S"
+
+    public static var defaultConfiguration: AIProviderConfiguration {
+        AIProviderConfiguration(
+            id: mozheAPIID,
+            profile: .openAICompatible,
+            displayName: mozheAPIDisplayName,
+            baseURL: mozheAPIBaseURL,
+            models: [],
+            defaultModelID: nil,
+            compatibilityProtocol: .chatCompletions,
+            maxRetryCount: 1,
+            requestTimeoutSeconds: 45,
+            userAgent: "Stacio",
+            isEnabled: true,
+            lastVerifiedAt: nil,
+            lastModelSyncAt: nil
+        )
+    }
 }
 
 public struct AIModelSelection: Codable, Equatable, Hashable {
@@ -327,21 +349,51 @@ public struct AIProviderSettingsEnvelope: Codable, Equatable {
         defaultAIProviderID: BuiltInAIProvider.stacioRulesID,
         legacyKeyMigrationProviderID: nil
     )
+
+    public static var defaultConfiguration: AIProviderSettingsEnvelope {
+        AIProviderSettingsEnvelope(
+            aiProviders: [BuiltInAIProvider.defaultConfiguration],
+            defaultAIProviderID: BuiltInAIProvider.mozheAPIID,
+            legacyKeyMigrationProviderID: nil
+        )
+    }
 }
 
 public enum AIProviderSettingsNormalizer {
     public static func normalized(_ envelope: AIProviderSettingsEnvelope) -> AIProviderSettingsEnvelope {
         var result = envelope
-        result.aiProviders = envelope.aiProviders.map(normalizedProvider)
+        var hasMozheAPIProvider = false
+        result.aiProviders = envelope.aiProviders.compactMap { provider in
+            if provider.id == BuiltInAIProvider.mozheAPIID {
+                guard hasMozheAPIProvider == false else {
+                    return nil
+                }
+                hasMozheAPIProvider = true
+                return normalizedProvider(provider)
+            }
+            guard provider.id != BuiltInAIProvider.stacioRulesID,
+                  provider.profile.usesModelInterface
+            else {
+                return nil
+            }
+            return normalizedProvider(provider)
+        }
+        if hasMozheAPIProvider == false {
+            result.aiProviders.append(
+                normalizedProvider(BuiltInAIProvider.defaultConfiguration)
+            )
+        }
 
-        if envelope.defaultAIProviderID == BuiltInAIProvider.stacioRulesID {
-            result.defaultAIProviderID = BuiltInAIProvider.stacioRulesID
+        if envelope.defaultAIProviderID == BuiltInAIProvider.stacioRulesID
+            || envelope.defaultAIProviderID == BuiltInAIProvider.mozheAPIID
+        {
+            result.defaultAIProviderID = BuiltInAIProvider.mozheAPIID
         } else if eligibleProvider(
             id: envelope.defaultAIProviderID,
             in: result.aiProviders
         ) == nil {
             result.defaultAIProviderID = result.aiProviders.first(where: isEligible)?.id
-                ?? BuiltInAIProvider.stacioRulesID
+                ?? BuiltInAIProvider.mozheAPIID
         }
 
         if let migrationProviderID = result.legacyKeyMigrationProviderID,
@@ -356,6 +408,11 @@ public enum AIProviderSettingsNormalizer {
         _ provider: AIProviderConfiguration
     ) -> AIProviderConfiguration {
         var result = provider
+        if result.id == BuiltInAIProvider.mozheAPIID {
+            result.profile = .openAICompatible
+            result.displayName = BuiltInAIProvider.mozheAPIDisplayName
+            result.baseURL = BuiltInAIProvider.mozheAPIBaseURL
+        }
         var seenModelIDs = Set<String>()
         result.models = provider.models.compactMap { model in
             let normalizedID = AppSettings.normalizedAIModelName(model.id)
@@ -378,7 +435,8 @@ public enum AIProviderSettingsNormalizer {
             result.defaultModelID = result.models.first(where: \.isEnabled)?.id
         }
 
-        if result.defaultModelID == nil {
+        if result.defaultModelID == nil,
+           result.id != BuiltInAIProvider.mozheAPIID {
             result.isEnabled = false
         }
 

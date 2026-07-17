@@ -18,6 +18,10 @@ public final class TerminalTraceController {
             .joined(separator: "\n")
     }
 
+    public var eventsSnapshot: [TerminalTraceEvent] {
+        events
+    }
+
     public func append(_ event: TerminalTraceEvent) {
         events.append(event)
         if events.count > 50 {

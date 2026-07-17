@@ -73,6 +73,8 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertTrue(terminal.traceSnapshot.contains("running"))
         XCTAssertEqual(events.map(\.state), [.queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput])
         XCTAssertEqual(events.last?.metadata?["completionConfidence"], "manualRequired")
+        XCTAssertEqual(events.last?.metadata?["actorKind"], AgentActorKind.externalCLI.rawValue)
+        XCTAssertEqual(events.last?.metadata?["actorName"], "codex")
         XCTAssertEqual(auditStore.events.map(\.state), ["running"])
         XCTAssertEqual(auditStore.events.first?.requestId, "req-1")
         XCTAssertEqual(auditStore.events.first?.actorName, "codex")
@@ -378,6 +380,8 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(events.last?.metadata?["executionMode"], "backgroundTask")
         XCTAssertEqual(events.last?.metadata?["sourceRuntimeID"], "term_1")
         XCTAssertEqual(events.last?.metadata?["targetTitle"], "dev@example.com")
+        XCTAssertEqual(events.last?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
+        XCTAssertEqual(events.last?.metadata?["actorName"], "Stacio AI")
         XCTAssertTrue(terminal.traceSnapshot.contains("独立任务"))
         XCTAssertTrue(terminal.traceSnapshot.contains("输出将同步显示"))
     }
@@ -461,6 +465,8 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(backgroundRunner.cancelledRequestIDs, ["req-background-cancel"])
         XCTAssertEqual(event?.state, .cancelled)
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
+        XCTAssertEqual(event?.metadata?["actorName"], "Stacio AI")
         XCTAssertTrue(terminal.traceSnapshot.contains("cancelled"))
         XCTAssertTrue(terminal.traceSnapshot.contains("AI 独立任务已取消"))
         XCTAssertEqual(auditStore.events.map(\.state), ["running", "cancelled"])
@@ -497,11 +503,51 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(terminal.sentInput, ["tail -f /var/log/messages\n"])
         XCTAssertEqual(event?.state, .paused)
         XCTAssertEqual(event?.metadata?["control"], "pause")
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
         XCTAssertTrue(event?.message.contains("AI 后续自动动作已暂停") ?? false)
         XCTAssertTrue(terminal.traceSnapshot.contains("paused"))
         XCTAssertTrue(terminal.traceSnapshot.contains("AI 后续自动动作已暂停"))
         XCTAssertEqual(auditStore.events.map(\.state), ["running", "paused"])
         XCTAssertEqual(auditStore.events.last?.requestId, "req-visible-pause")
+    }
+
+    func testCoordinatorConfirmsVisibleTerminalTaskCompleteAndClosesTrackedTask() throws {
+        let terminal = RecordingAgentTerminalTarget(
+            runtimeID: "term_1",
+            agentTitle: "dev@example.com"
+        )
+        let auditStore = RecordingAgentActionAuditStore()
+        let coordinator = makeVisibleCoordinator(
+            target: terminal,
+            authorizer: PolicyAllowedAgentActionAuthorizer(),
+            auditRecorder: auditStore
+        )
+
+        _ = try coordinator.runCommand(
+            AgentBridgeRequest(
+                id: "req-visible-confirm",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_1"),
+                        command: "tail -f /var/log/messages",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        let event = coordinator.confirmTaskComplete(requestID: "req-visible-confirm")
+
+        XCTAssertEqual(event?.state, .completed)
+        XCTAssertEqual(event?.metadata?["completionConfidence"], "userConfirmed")
+        XCTAssertEqual(event?.metadata?["completionReason"], "userConfirmed")
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
+        XCTAssertTrue(terminal.traceSnapshot.contains("completed"))
+        XCTAssertTrue(terminal.traceSnapshot.contains("已确认本步结束"))
+        XCTAssertEqual(auditStore.events.map(\.state), ["running", "completed"])
+        XCTAssertEqual(auditStore.events.last?.requestId, "req-visible-confirm")
+        XCTAssertNil(coordinator.confirmTaskComplete(requestID: "req-visible-confirm"))
     }
 
     func testCoordinatorCancelsVisibleTerminalTaskBySendingInterrupt() throws {
@@ -536,6 +582,7 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(event?.state, .cancelled)
         XCTAssertEqual(event?.metadata?["control"], "cancel")
         XCTAssertEqual(event?.metadata?["executionMode"], "visibleTerminal")
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
         XCTAssertTrue(event?.message.contains("已向可见终端发送中断") ?? false)
         XCTAssertTrue(terminal.traceSnapshot.contains("cancelled"))
         XCTAssertTrue(terminal.traceSnapshot.contains("中断"))
@@ -612,6 +659,7 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(event?.state, .takenOver)
         XCTAssertEqual(event?.metadata?["control"], "takeover")
         XCTAssertEqual(event?.metadata?["executionMode"], "backgroundTask")
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
         XCTAssertTrue(event?.message.contains("已切换为人工接管") ?? false)
         XCTAssertTrue(terminal.traceSnapshot.contains("takenOver"))
         XCTAssertTrue(terminal.traceSnapshot.contains("人工接管"))
@@ -654,6 +702,7 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(event?.state, .takenOver)
         XCTAssertEqual(event?.metadata?["control"], "takeover")
         XCTAssertEqual(event?.metadata?["executionMode"], "visibleTerminal")
+        XCTAssertEqual(event?.metadata?["actorKind"], AgentActorKind.builtInAI.rawValue)
         XCTAssertTrue(event?.message.contains("可见终端") ?? false)
         XCTAssertTrue(event?.message.contains("AI 不再继续自动执行") ?? false)
         XCTAssertTrue(terminal.traceSnapshot.contains("takenOver"))
@@ -753,6 +802,61 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(backgroundRunner.commands, ["df -h"])
         XCTAssertTrue(secondEvents.contains { $0.state == .awaitingApproval })
         XCTAssertEqual(authorizer.confirmationChecks, [false, true])
+    }
+
+    func testAgentBridgeFollowWaitsForBackgroundTerminalResultBeforeCompleting() throws {
+        let terminal = RecordingAgentTerminalTarget(
+            runtimeID: "term_1",
+            agentTitle: "dev@example.com",
+            agentLiveSessionContext: makeTunnelLiveSessionContext()
+        )
+        let backgroundRunner = RecordingAgentBackgroundCommandRunner()
+        let coordinator = AgentExecutionCoordinator(
+            terminalResolver: StaticAgentTerminalResolver(target: terminal),
+            authorizer: PolicyAllowedAgentActionAuthorizer(),
+            executionMode: .backgroundTask,
+            backgroundCommandRunner: backgroundRunner
+        )
+        let request = AgentBridgeRequest(
+            id: "req-bridge-follow",
+            actor: AgentActor(kind: .externalCLI, name: "codex", processID: 100),
+            action: .runCommand(
+                AgentRunCommandRequest(
+                    target: .runtimeID("term_1"),
+                    command: "uptime",
+                    follow: true
+                )
+            )
+        )
+        var streamed: [AgentTraceEvent] = []
+        var completionCount = 0
+
+        try coordinator.handleAgentBridgeRequest(
+            request,
+            emit: { streamed.append($0) },
+            completion: { completionCount += 1 }
+        )
+
+        XCTAssertEqual(completionCount, 0)
+        XCTAssertEqual(streamed.last?.state, .running)
+
+        backgroundRunner.emit(
+            AgentTraceEvent(
+                requestID: request.id,
+                state: .completed,
+                message: "AI 独立任务已完成：up 2 days",
+                redactedCommand: "uptime",
+                metadata: [
+                    "executionMode": "backgroundTask",
+                    "terminalOutputSummary": "up 2 days"
+                ]
+            ),
+            requestID: request.id
+        )
+
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertEqual(streamed.last?.state, .completed)
+        XCTAssertEqual(streamed.last?.metadata?["terminalOutputSummary"], "up 2 days")
     }
 
     func testRemoteSSHBackgroundRunnerStartsDedicatedRuntimeAndEmitsOutputTrace() throws {
@@ -945,7 +1049,7 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
             "checking disk",
             "done [redacted]"
         ])
-        XCTAssertEqual(emitted.last?.metadata?["terminalOutputSummary"], "checking disk done [redacted]")
+        XCTAssertEqual(emitted.last?.metadata?["terminalOutputSummary"], "checking disk\ndone [redacted]")
         guard let firstOutput = outputEvents.first,
               let firstOutputIndex = emitted.firstIndex(of: firstOutput),
               let completedIndex = emitted.firstIndex(where: { $0.state == .completed }) else {
@@ -1472,13 +1576,19 @@ private final class RecordingAgentBackgroundCommandRunner: AgentBackgroundComman
     private(set) var commands: [String] = []
     private(set) var cancelledRequestIDs: [String] = []
     var eventsToEmit: [AgentTraceEvent] = []
+    private var emittersByRequestID: [String: @MainActor (AgentTraceEvent) -> Void] = [:]
 
     func runBackgroundCommand(
         _ request: AgentBackgroundCommandRequest,
         emit: @escaping @MainActor (AgentTraceEvent) -> Void
     ) throws {
         commands.append(request.command)
+        emittersByRequestID[request.requestID] = emit
         eventsToEmit.forEach(emit)
+    }
+
+    func emit(_ event: AgentTraceEvent, requestID: String) {
+        emittersByRequestID[requestID]?(event)
     }
 
     func cancel(requestID: String) -> AgentTraceEvent? {

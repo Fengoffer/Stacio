@@ -54,6 +54,10 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
         super.send(source: source, data: data)
     }
 
+    public func sendProgrammaticInput(_ bytes: [UInt8]) {
+        super.send(source: self, data: ArraySlice(bytes))
+    }
+
     private func configureStacioLinkInteraction() {
         linkReporting = .implicit
         linkHighlightMode = .hoverWithModifier

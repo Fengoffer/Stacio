@@ -38,7 +38,9 @@ export STACIO_RELEASE_SOURCE_ROOT="$SOURCE_ROOT"
 touch "$APP_DIR/Contents/MacOS/Stacio"
 chmod +x "$APP_DIR/Contents/MacOS/Stacio"
 printf 'fake dylib\n' >"$APP_DIR/Contents/Frameworks/libstacio_core.dylib"
-printf 'fake sparkle framework\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Sparkle"
+printf 'fake sparkle framework\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+ln -s "B" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/Current"
+ln -s "Versions/Current/Sparkle" "$APP_DIR/Contents/Frameworks/Sparkle.framework/Sparkle"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
@@ -47,7 +49,7 @@ printf 'loader\n' >"$APP_DIR/Contents/Resources/MonacoEditor/vs/loader.js"
 printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' >"$APP_DIR/Contents/Resources/About/wechat-official-account.svg"
 touch "$APP_DIR/Contents/Helpers/stacio" "$APP_DIR/Contents/Adapters/vnc"
 chmod +x \
-  "$APP_DIR/Contents/Frameworks/Sparkle.framework/Sparkle" \
+  "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" \
   "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" \
   "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater" \
   "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" \
@@ -68,7 +70,7 @@ cat >"$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Stacio</string>
   <key>CFBundleIdentifier</key><string>com.stacio.Stacio</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.13.3-Beta</string>
+  <key>CFBundleShortVersionString</key><string>0.13.3</string>
   <key>CFBundleVersion</key><string>11</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSQuitAlwaysKeepsWindows</key><false/>
@@ -115,51 +117,51 @@ EOF
 
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-valid.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "1" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-missing-version.xml" \
   "" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "1" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-missing-build.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "1" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-missing-url.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
   "" \
   "1" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-missing-length.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-missing-signature.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "1" \
   ""
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-length-mismatch.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "2" \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
@@ -171,9 +173,9 @@ write_stable_appcast \
   "$ED25519_TEST_SIGNATURE"
 write_stable_appcast \
   "$APPCAST_FIXTURE_DIR/stable-invalid-signature.xml" \
-  "0.13.3-Beta" \
+  "0.13.3" \
   "11" \
-  "Stacio-0.13.3-Beta.dmg" \
+  "Stacio-0.13.3.dmg" \
   "1" \
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 cat >"$APPCAST_FIXTURE_DIR/stable-with-history.xml" <<EOF
@@ -182,10 +184,10 @@ cat >"$APPCAST_FIXTURE_DIR/stable-with-history.xml" <<EOF
   <channel>
     <title>Stacio Stable Updates</title>
     <item>
-      <title>Stacio 0.13.3-Beta</title>
-      <sparkle:shortVersionString>0.13.3-Beta</sparkle:shortVersionString>
+      <title>Stacio 0.13.3</title>
+      <sparkle:shortVersionString>0.13.3</sparkle:shortVersionString>
       <sparkle:version>11</sparkle:version>
-      <enclosure url="Stacio-0.13.3-Beta.dmg" length="1" type="application/octet-stream" sparkle:edSignature="$ED25519_TEST_SIGNATURE" />
+      <enclosure url="Stacio-0.13.3.dmg" length="1" type="application/octet-stream" sparkle:edSignature="$ED25519_TEST_SIGNATURE" />
     </item>
     <item>
       <title>Stacio 0.1.0</title>
@@ -201,9 +203,9 @@ cat >"$APPCAST_FIXTURE_DIR/stable-wrong-namespace.xml" <<EOF
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:wrong="https://wrong.example/ns">
   <channel>
     <item>
-      <wrong:shortVersionString>0.13.3-Beta</wrong:shortVersionString>
+      <wrong:shortVersionString>0.13.3</wrong:shortVersionString>
       <wrong:version>11</wrong:version>
-      <enclosure url="Stacio-0.13.3-Beta.dmg" length="1" wrong:edSignature="$ED25519_TEST_SIGNATURE" />
+      <enclosure url="Stacio-0.13.3.dmg" length="1" wrong:edSignature="$ED25519_TEST_SIGNATURE" />
     </item>
   </channel>
 </rss>
@@ -372,7 +374,7 @@ done
 mode="${STACIO_RELEASE_TEST_APPCAST_MODE:-valid}"
 stable_url="https://ops.stacio.cn/updates/stacio/stable/appcast.xml"
 beta_url="https://ops.stacio.cn/updates/stacio/beta/appcast.xml"
-enclosure_url="https://ops.stacio.cn/updates/stacio/stable/Stacio-0.13.3-Beta.dmg"
+enclosure_url="https://ops.stacio.cn/updates/stacio/stable/Stacio-0.13.3.dmg"
 history_url="https://ops.stacio.cn/updates/stacio/stable/removed-history.dmg"
 
 if [[ "$url" == "$stable_url" ]]; then
@@ -448,7 +450,7 @@ grep -Fq "PASS Developer ID Application signature present" "$TMP_DIR/readiness.o
 grep -Fq "PASS notarization tickets validate for App and DMG" "$TMP_DIR/readiness.out"
 grep -Fq "PASS DMG root contains Stacio.app" "$TMP_DIR/readiness.out"
 grep -Fq "PASS stable Appcast contains 2 update item(s)" "$TMP_DIR/readiness.out"
-grep -Fq "PASS stable Appcast item 1 has version 0.13.3-Beta and build 11" "$TMP_DIR/readiness.out"
+grep -Fq "PASS stable Appcast item 1 has version 0.13.3 and build 11" "$TMP_DIR/readiness.out"
 grep -Fq "PASS stable Appcast item 1 has a positive enclosure length" "$TMP_DIR/readiness.out"
 grep -Fq "PASS stable Appcast item 1 has a Sparkle Ed25519 signature" "$TMP_DIR/readiness.out"
 grep -Fq "PASS stable Appcast item 1 enclosure is accessible" "$TMP_DIR/readiness.out"
@@ -588,7 +590,7 @@ expect_remote_appcast_failure "stable-missing-signature" "FAIL stable Appcast it
 expect_remote_appcast_failure "enclosure-http-404" "FAIL stable Appcast item 1 enclosure is not accessible"
 expect_remote_appcast_failure "signature-invalid" "FAIL stable Appcast item 1 Sparkle Ed25519 signature verification failed"
 expect_remote_appcast_failure "stable-length-mismatch" "FAIL stable Appcast item 1 enclosure length does not match downloaded bytes"
-expect_remote_appcast_failure "stable-wrong-target" "FAIL stable Appcast does not contain current release 0.13.3-Beta (build 11)"
+expect_remote_appcast_failure "stable-wrong-target" "FAIL stable Appcast does not contain current release 0.13.3 (build 11)"
 expect_remote_appcast_failure "stable-wrong-namespace" "FAIL stable Appcast uses an invalid Sparkle XML namespace"
 expect_remote_appcast_failure "remote-package-mismatch" "FAIL stable Appcast item 1 enclosure does not match local release DMG"
 
@@ -608,8 +610,26 @@ fi
 grep -Fq "FAIL app is ad-hoc signed" "$TMP_DIR/formal-bypass.out"
 grep -Fq "FAIL notary credentials missing" "$TMP_DIR/formal-bypass.out"
 
+PATH="$FAKE_BIN_DIR:$PATH" \
+  STACIO_RELEASE_TEST_LOG="$LOG_FILE" \
+  STACIO_RELEASE_TEST_SIGNATURE_MODE=adhoc \
+  STACIO_NOTARY_PROFILE= \
+  STACIO_RELEASE_DISTRIBUTION_MODE=adhoc \
+  STACIO_RELEASE_APP_PATH="$APP_DIR" \
+  STACIO_RELEASE_DMG_PATH="$DMG_PATH" \
+  STACIO_RELEASE_SKIP_PACKAGE=1 \
+  "$ROOT_DIR/scripts/release-readiness.sh" >"$TMP_DIR/formal-adhoc.out"
+grep -Fq "Distribution mode: adhoc" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "WARN ad-hoc distribution will require users to bypass normal macOS Gatekeeper trust prompts" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "SKIP Developer ID Application signature not present; current app is ad-hoc signed" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "SKIP notarization and staple validation are not available in ad-hoc distribution mode" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "PASS formal release update channel is stable" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "PASS stable Appcast item 1 has version 0.13.3 and build 11" "$TMP_DIR/formal-adhoc.out"
+grep -Fq "Summary: 0 failure(s)" "$TMP_DIR/formal-adhoc.out"
+
 BETA_REQUIRED_APP_DIR="$TMP_DIR/beta-required.app"
 cp -R "$APP_DIR" "$BETA_REQUIRED_APP_DIR"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.13.3-Beta" "$BETA_REQUIRED_APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :StacioProductOpsUpdateChannel beta" "$BETA_REQUIRED_APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :StacioProductOpsBetaUpdatesEnabled true" "$BETA_REQUIRED_APP_DIR/Contents/Info.plist"
 if PATH="$FAKE_BIN_DIR:$PATH" \
@@ -617,6 +637,7 @@ if PATH="$FAKE_BIN_DIR:$PATH" \
   STACIO_RELEASE_APP_PATH="$BETA_REQUIRED_APP_DIR" \
   STACIO_RELEASE_DMG_PATH="$DMG_PATH" \
   STACIO_RELEASE_SKIP_PACKAGE=1 \
+  STACIO_RELEASE_EXPECTED_CHANNEL=beta \
   "$ROOT_DIR/scripts/release-readiness.sh" >"$TMP_DIR/beta-required.out" 2>&1; then
   echo "expected beta-enabled release readiness with an empty beta Appcast to fail" >&2
   exit 1
@@ -626,13 +647,16 @@ grep -Fq "FAIL beta Appcast contains no update items while beta updates are enab
 BETA_ENABLED_STABLE_APP_DIR="$TMP_DIR/beta-enabled-stable.app"
 cp -R "$APP_DIR" "$BETA_ENABLED_STABLE_APP_DIR"
 /usr/libexec/PlistBuddy -c "Set :StacioProductOpsBetaUpdatesEnabled true" "$BETA_ENABLED_STABLE_APP_DIR/Contents/Info.plist"
-PATH="$FAKE_BIN_DIR:$PATH" \
+if PATH="$FAKE_BIN_DIR:$PATH" \
   STACIO_RELEASE_TEST_LOG="$LOG_FILE" \
   STACIO_RELEASE_APP_PATH="$BETA_ENABLED_STABLE_APP_DIR" \
   STACIO_RELEASE_DMG_PATH="$DMG_PATH" \
   STACIO_RELEASE_SKIP_PACKAGE=1 \
-  "$ROOT_DIR/scripts/release-readiness.sh" >"$TMP_DIR/beta-enabled-stable.out"
-grep -Fq "SKIP beta Appcast contains no update items; beta updates are disabled" "$TMP_DIR/beta-enabled-stable.out"
+  "$ROOT_DIR/scripts/release-readiness.sh" >"$TMP_DIR/beta-enabled-stable.out" 2>&1; then
+  echo "expected stable release readiness with Beta updates enabled to fail" >&2
+  exit 1
+fi
+grep -Fq "FAIL formal stable release requires StacioProductOpsBetaUpdatesEnabled=false" "$TMP_DIR/beta-enabled-stable.out"
 
 MISMATCH_APP_DIR="$TMP_DIR/mismatched-dmg.app"
 cp -R "$APP_DIR" "$MISMATCH_APP_DIR"

@@ -9,6 +9,7 @@ public final class AgentTaskOrchestrator {
     private var activeAIRequest: AIAssistantRequestCancelling?
     private var stopState: AgentTaskRunState?
     private var onUpdate: ((AgentTaskUpdate) -> Void)?
+    private var activeTraceContinuation: AsyncStream<AgentTraceEvent>.Continuation?
 
     public init(
         coordinator: AIAssistantCoordinator,
@@ -22,6 +23,7 @@ public final class AgentTaskOrchestrator {
     public func run(
         goal: String,
         context: AITerminalContext,
+        contextProvider: (() -> AITerminalContext?)? = nil,
         attachments: [AIAssistantAttachment] = [],
         initialResponse: AIAssistantResponse? = nil,
         continuingFrom previousSteps: [AgentTaskStepResult] = [],
@@ -31,11 +33,14 @@ public final class AgentTaskOrchestrator {
         stopState = nil
         activeRequestID = nil
         activeAIRequest = nil
+        activeTraceContinuation?.finish()
+        activeTraceContinuation = nil
         var steps = previousSteps
         var observations = previousSteps.map { observationBlock(for: $0) }
         var pendingInitialResponse = initialResponse
         let startedAt = Date()
         let stepLimit = steps.count + limits.maxSteps
+        let runNamespace = UUID().uuidString.lowercased()
 
         while steps.count < stepLimit {
             if let stopState {
@@ -58,9 +63,10 @@ public final class AgentTaskOrchestrator {
                 response = initialResponse
             } else {
                 onUpdate(.init(kind: .thinking, message: steps.isEmpty ? "AI 正在决定第一步" : "AI 正在根据执行结果决定下一步"))
+                let currentContext = contextProvider?() ?? context
                 response = try await ask(
                     question: loopQuestion(goal: goal, observations: observations, stepIndex: steps.count + 1),
-                    context: context,
+                    context: currentContext,
                     attachments: attachments
                 )
             }
@@ -70,7 +76,7 @@ public final class AgentTaskOrchestrator {
                 return runResult
             }
             let thought = response.message.trimmingCharacters(in: .whitespacesAndNewlines)
-            if thought.isEmpty == false {
+            if thought.isEmpty == false, response.commandProposals.isEmpty == false {
                 onUpdate(.init(kind: .thinking, message: thought))
             }
             guard let proposal = response.commandProposals.first else {
@@ -86,28 +92,52 @@ public final class AgentTaskOrchestrator {
                 return runResult
             }
 
-            let requestID = "agent-step-\(steps.count + 1)"
+            let requestID = "agent-step-\(runNamespace)-\(steps.count + 1)"
             activeRequestID = requestID
             onUpdate(.init(
                 kind: .step,
                 message: stepPreparationText(for: proposal, stepIndex: steps.count + 1)
             ))
             var events: [AgentTraceEvent] = []
+            var traceContinuation: AsyncStream<AgentTraceEvent>.Continuation?
+            let traceStream = AsyncStream<AgentTraceEvent> { continuation in
+                traceContinuation = continuation
+            }
+            activeTraceContinuation = traceContinuation
             let executedEvents = try coordinator.executeProposedCommand(
                 proposal.command,
                 context: context,
                 requestID: requestID,
                 emit: { [weak self] event in
                     events.append(event)
+                    traceContinuation?.yield(event)
                     self?.onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+                    if Self.isTerminalTraceState(event.state) {
+                        traceContinuation?.finish()
+                    }
                 }
             )
             if events.isEmpty {
                 events = executedEvents
                 events.forEach { event in
+                    traceContinuation?.yield(event)
                     onUpdate(.init(kind: .trace, message: event.message, traceEvent: event))
                 }
             }
+
+            if events.contains(where: { $0.metadata?["executionMode"] == "backgroundTask" }),
+               events.last.map({ Self.isTerminalTraceState($0.state) }) != true {
+                for await event in traceStream {
+                    if events.contains(event) == false {
+                        events.append(event)
+                    }
+                    if Self.isTerminalTraceState(event.state) {
+                        break
+                    }
+                }
+            }
+            traceContinuation?.finish()
+            activeTraceContinuation = nil
 
             let stepState = stepState(from: events)
             let observation = observationText(from: events)
@@ -186,7 +216,10 @@ public final class AgentTaskOrchestrator {
         }
         if let event = coordinator.pauseTask(requestID: activeRequestID) {
             onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+            activeTraceContinuation?.yield(event)
         }
+        activeTraceContinuation?.finish()
+        activeTraceContinuation = nil
         activeAIRequest?.cancel()
         activeAIRequest = nil
         stopState = .paused
@@ -201,7 +234,10 @@ public final class AgentTaskOrchestrator {
         }
         if let event = coordinator.cancelTask(requestID: activeRequestID) {
             onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+            activeTraceContinuation?.yield(event)
         }
+        activeTraceContinuation?.finish()
+        activeTraceContinuation = nil
         activeAIRequest?.cancel()
         activeAIRequest = nil
         stopState = .cancelled
@@ -216,7 +252,10 @@ public final class AgentTaskOrchestrator {
         }
         if let event = coordinator.takeOverTask(requestID: activeRequestID) {
             onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+            activeTraceContinuation?.yield(event)
         }
+        activeTraceContinuation?.finish()
+        activeTraceContinuation = nil
         activeAIRequest?.cancel()
         activeAIRequest = nil
         stopState = .takenOver
@@ -250,7 +289,8 @@ public final class AgentTaskOrchestrator {
         var lines = [
             "自主执行目标：\(goal)",
             "请根据已有观察决定第 \(stepIndex) 步。",
-            "如果目标已经完成，commands 返回空数组并给出结论。",
+            "如果目标已经完成，commands 返回空数组，message 只写给用户的最终答复。",
+            "最终答复必须直接回答原始目标，默认使用 1 至 3 个短句；不要重复命令、执行步骤、完整日志或思考过程，只保留结论和必要的后续建议。",
             "如果还需要行动，只返回下一步最小必要命令。"
         ]
         if observations.isEmpty == false {
@@ -304,8 +344,8 @@ public final class AgentTaskOrchestrator {
             .compactMap { $0.metadata?["terminalOutputSummary"] }
             .map { AgentProtocolRedaction.redact($0) }
             .filter { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
-        if structured.isEmpty == false {
-            return structured.joined(separator: "\n")
+        if let latestStructured = structured.last {
+            return latestStructured
         }
         let messages = events.map { AgentProtocolRedaction.redact($0.message) }
         guard messages.isEmpty == false else {
@@ -404,5 +444,14 @@ public final class AgentTaskOrchestrator {
         stopReason: AgentTaskRunStopReason? = nil
     ) -> AgentTaskRunResult {
         AgentTaskRunResult(goal: goal, state: state, summary: summary, steps: steps, stopReason: stopReason)
+    }
+
+    private static func isTerminalTraceState(_ state: AgentTraceState) -> Bool {
+        switch state {
+        case .completed, .failed, .cancelled, .paused, .takenOver:
+            return true
+        case .queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput:
+            return false
+        }
     }
 }

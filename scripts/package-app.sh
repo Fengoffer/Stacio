@@ -5,7 +5,7 @@ SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="${STACIO_PACKAGE_ROOT_OVERRIDE:-$SCRIPT_ROOT_DIR}"
 APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"
-VERSION="${STACIO_VERSION:-0.13.3-Beta}"
+VERSION="${STACIO_VERSION:-0.13.3}"
 BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
 OUTPUT_DIR="${STACIO_OUTPUT_DIR:-$ROOT_DIR/dist}"
 CODESIGN_IDENTITY="${STACIO_CODESIGN_IDENTITY:--}"
@@ -34,6 +34,10 @@ FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 ADAPTERS_DIR="$CONTENTS_DIR/Adapters"
 HELPERS_DIR="$CONTENTS_DIR/Helpers"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+SWIFTTERM_RESOURCE_BUNDLE_NAME="SwiftTerm_SwiftTerm.bundle"
+SWIFTTERM_RESOURCE_BUNDLE_OUTPUT="$RESOURCES_DIR/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+SWIFTTERM_CHECKOUT_PATH="${STACIO_SWIFTTERM_CHECKOUT_PATH:-$ROOT_DIR/.build/checkouts/SwiftTerm}"
+SWIFTTERM_RESOURCE_PATCHER="$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh"
 PLIST_PATH="$CONTENTS_DIR/Info.plist"
 APP_ICON_SOURCE="$ROOT_DIR/logo/icon.icns"
 APP_ICON_OUTPUT="$RESOURCES_DIR/Stacio.icns"
@@ -41,6 +45,10 @@ ABOUT_RESOURCES_SOURCE="$ROOT_DIR/Stacio/Resources/About"
 ABOUT_RESOURCES_OUTPUT="$RESOURCES_DIR/About"
 GITHUB_ICON_SOURCE="$ROOT_DIR/Stacio/Resources/github.svg"
 GITHUB_ICON_OUTPUT="$RESOURCES_DIR/github.svg"
+GITEE_ICON_SOURCE="$ROOT_DIR/Stacio/Resources/gitee.svg"
+GITEE_ICON_OUTPUT="$RESOURCES_DIR/gitee.svg"
+SESSION_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/SessionIcons"
+SESSION_ICONS_OUTPUT="$RESOURCES_DIR/SessionIcons"
 MONACO_VS_SOURCE="${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}"
 MONACO_OUTPUT="$RESOURCES_DIR/MonacoEditor/vs"
 VNC_ADAPTER_PRODUCT="StacioVNCAdapter"
@@ -109,6 +117,8 @@ source_snapshot() {
     "$ROOT_DIR/StacioCore/uniffi-bindgen-swift.rs" \
     "$APP_ICON_SOURCE" \
     "$GITHUB_ICON_SOURCE" \
+    "$GITEE_ICON_SOURCE" \
+    "$SESSION_ICONS_SOURCE" \
     "$ABOUT_RESOURCES_SOURCE" \
     "$MONACO_VS_SOURCE" \
     "$ROOT_DIR/scripts/package-app.sh"
@@ -332,6 +342,10 @@ fi
 
 if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
   wait_for_source_quiescence
+  if [[ ! -f "$SWIFTTERM_CHECKOUT_PATH/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift" ]]; then
+    swift package resolve --package-path "$ROOT_DIR"
+  fi
+  "$SWIFTTERM_RESOURCE_PATCHER" "$SWIFTTERM_CHECKOUT_PATH"
   cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
   swift build -c release --product "$APP_NAME" --package-path "$ROOT_DIR"
   swift build -c release --product "$CLI_PRODUCT" --package-path "$ROOT_DIR"
@@ -342,6 +356,7 @@ SWIFT_BIN_PATH="${STACIO_SWIFT_BIN_PATH:-$(swift build -c release --show-bin-pat
 EXECUTABLE_SOURCE="$SWIFT_BIN_PATH/$APP_NAME"
 CLI_SOURCE="${STACIO_CLI_PATH:-$SWIFT_BIN_PATH/$CLI_PRODUCT}"
 VNC_ADAPTER_SOURCE="${STACIO_VNC_ADAPTER_PATH:-$SWIFT_BIN_PATH/$VNC_ADAPTER_PRODUCT}"
+SWIFTTERM_RESOURCE_BUNDLE_SOURCE="${STACIO_SWIFTTERM_RESOURCE_BUNDLE_PATH:-$SWIFT_BIN_PATH/$SWIFTTERM_RESOURCE_BUNDLE_NAME}"
 CORE_DYLIB_SOURCE="${STACIO_CORE_DYLIB_PATH:-$ROOT_DIR/StacioCore/target/release/libstacio_core.dylib}"
 CORE_LOAD_PATH="${STACIO_CORE_LOAD_PATH:-$ROOT_DIR/StacioCore/target/debug/deps/libstacio_core.dylib}"
 SPARKLE_FRAMEWORK_SOURCE="${STACIO_SPARKLE_FRAMEWORK_PATH:-$SWIFT_BIN_PATH/Sparkle.framework}"
@@ -366,6 +381,11 @@ if [[ ! -x "$VNC_ADAPTER_SOURCE" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" ]]; then
+  echo "SwiftTerm shader resource not found: $SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" >&2
+  exit 1
+fi
+
 if [[ ! -d "$SPARKLE_FRAMEWORK_SOURCE" ]]; then
   echo "Sparkle.framework not found: $SPARKLE_FRAMEWORK_SOURCE" >&2
   echo "Run 'swift build -c release --product $APP_NAME' or set STACIO_SPARKLE_FRAMEWORK_PATH." >&2
@@ -382,13 +402,40 @@ required_sparkle_components=(
   "$SPARKLE_SOURCE_VERSION_DIR/Updater.app/Contents/MacOS/Updater"
   "$SPARKLE_SOURCE_VERSION_DIR/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
   "$SPARKLE_SOURCE_VERSION_DIR/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+  "$SPARKLE_SOURCE_VERSION_DIR/Resources/Info.plist"
 )
 for sparkle_component in "${required_sparkle_components[@]}"; do
   if [[ ! -x "$sparkle_component" ]]; then
+    if [[ "$sparkle_component" == *.plist && -f "$sparkle_component" ]]; then
+      continue
+    fi
     echo "Required Sparkle component missing: $sparkle_component" >&2
     exit 1
   fi
 done
+
+SPARKLE_RESOLVED_VERSION="$(python3 - "$ROOT_DIR/Package.resolved" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+for pin in payload.get("pins", []):
+    if pin.get("identity") == "sparkle":
+        version = pin.get("state", {}).get("version")
+        if version:
+            print(version)
+            break
+else:
+    raise SystemExit("Package.resolved does not contain a Sparkle version pin.")
+PY
+)"
+SPARKLE_FRAMEWORK_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SPARKLE_SOURCE_VERSION_DIR/Resources/Info.plist" 2>/dev/null || true)"
+if [[ -z "$SPARKLE_FRAMEWORK_VERSION" || "$SPARKLE_FRAMEWORK_VERSION" != "$SPARKLE_RESOLVED_VERSION" ]]; then
+  echo "Sparkle.framework version ${SPARKLE_FRAMEWORK_VERSION:-<missing>} does not match Package.resolved $SPARKLE_RESOLVED_VERSION." >&2
+  exit 1
+fi
 
 if [[ ! -f "$MONACO_VS_SOURCE/loader.js" ]]; then
   echo "Monaco Editor resources not found: $MONACO_VS_SOURCE" >&2
@@ -426,11 +473,6 @@ if [[ "${STACIO_SKIP_ARTIFACT_FRESHNESS:-0}" != "1" ]]; then
     "$ROOT_DIR/StacioCore/migrations" \
     "$ROOT_DIR/StacioCore/src" \
     "$ROOT_DIR/StacioCore/uniffi-bindgen-swift.rs"
-  check_prebuilt_artifact_freshness \
-    "Sparkle.framework" \
-    "$SPARKLE_FRAMEWORK_SOURCE/Sparkle" \
-    "$ROOT_DIR/Package.swift" \
-    "$ROOT_DIR/Package.resolved"
 fi
 
 rm -rf "$APP_DIR"
@@ -440,12 +482,19 @@ cp "$EXECUTABLE_SOURCE" "$MACOS_DIR/$APP_NAME"
 cp "$CLI_SOURCE" "$HELPERS_DIR/$CLI_HELPER_NAME"
 cp "$CORE_DYLIB_SOURCE" "$FRAMEWORKS_DIR/libstacio_core.dylib"
 cp "$VNC_ADAPTER_SOURCE" "$ADAPTERS_DIR/vnc"
+cp -R "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE" "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
+chmod -R u+w "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
+/usr/bin/xattr -cr "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
 cp -R "$SPARKLE_FRAMEWORK_SOURCE" "$FRAMEWORKS_DIR/Sparkle.framework"
 if [[ -d "$ABOUT_RESOURCES_SOURCE" ]]; then
   mkdir -p "$ABOUT_RESOURCES_OUTPUT"
   cp -R "$ABOUT_RESOURCES_SOURCE/." "$ABOUT_RESOURCES_OUTPUT/"
 fi
 cp "$GITHUB_ICON_SOURCE" "$GITHUB_ICON_OUTPUT"
+cp "$GITEE_ICON_SOURCE" "$GITEE_ICON_OUTPUT"
+mkdir -p "$SESSION_ICONS_OUTPUT"
+cp -R "$SESSION_ICONS_SOURCE/." "$SESSION_ICONS_OUTPUT/"
+/usr/bin/xattr -cr "$SESSION_ICONS_OUTPUT"
 mkdir -p "$(dirname "$MONACO_OUTPUT")"
 cp -R "$MONACO_VS_SOURCE" "$MONACO_OUTPUT"
 chmod 755 "$MACOS_DIR/$APP_NAME" "$HELPERS_DIR/$CLI_HELPER_NAME" "$FRAMEWORKS_DIR/libstacio_core.dylib" "$ADAPTERS_DIR/vnc"

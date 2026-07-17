@@ -21,6 +21,7 @@ internal struct AIProviderSummary: Equatable {
     let enabledModelCount: Int
     let totalModelCount: Int
     let isDefault: Bool
+    let isRecommended: Bool
 }
 
 internal struct AIProviderModelPresentation: Equatable {
@@ -90,12 +91,13 @@ final class AIProviderManagementViewController: NSViewController,
     private let mutationCoordinator: AIProviderMutationCoordinating
     private let modelCatalogLoader: AIModelCatalogLoading
     private let connectionTester: AIAssistantConnectionTesting
+    private let urlOpener: StacioURLOpening
     private let backgroundExecutor: AIProviderTaskExecutor
     private let mainExecutor: AIProviderTaskExecutor
     private let now: () -> Date
 
-    internal private(set) var currentEnvelope: AIProviderSettingsEnvelope = .rulesOnly
-    internal private(set) var selectedProviderID = BuiltInAIProvider.stacioRulesID
+    internal private(set) var currentEnvelope: AIProviderSettingsEnvelope = .defaultConfiguration
+    internal private(set) var selectedProviderID = BuiltInAIProvider.mozheAPIID
     private var catalogStates: [UUID: AIProviderCatalogUIState] = [:]
     private var catalogRequestTokens: [UUID: UUID] = [:]
     private var connectionStates: [UUID: AIProviderConnectionUIState] = [:]
@@ -120,11 +122,14 @@ final class AIProviderManagementViewController: NSViewController,
 
     private let providerNameLabel = NSTextField(labelWithString: "")
     private let providerStatusLabel = NSTextField(labelWithString: "")
+    private let visitWebsiteButton = NSButton()
     private let testConnectionButton = NSButton()
     private let refreshModelsButton = NSButton()
     private let displayNameField = NSTextField()
     private let baseURLField = NSTextField()
     private let apiKeyField = NSSecureTextField()
+    private let revealedAPIKeyField = NSTextField()
+    private let toggleAPIKeyVisibilityButton = NSButton()
     private let removeAPIKeyButton = NSButton()
     private let advancedDisclosureButton = NSButton()
     private let advancedStack = NSStackView()
@@ -150,12 +155,14 @@ final class AIProviderManagementViewController: NSViewController,
     private var manualContextBudgetRow: NSView?
     private var catalogReasoningEffortsRow: NSView?
     private var manualReasoningEffortsRow: NSView?
+    private var isAPIKeyRevealed = false
 
     init(
         settingsStore: AIProviderSettingsStoring,
         mutationCoordinator: AIProviderMutationCoordinating,
         modelCatalogLoader: AIModelCatalogLoading,
         connectionTester: AIAssistantConnectionTesting,
+        urlOpener: StacioURLOpening? = nil,
         backgroundExecutor: @escaping AIProviderTaskExecutor = { operation in
             let box = UncheckedAIProviderTaskBox(operation)
             DispatchQueue.global(qos: .userInitiated).async {
@@ -178,6 +185,7 @@ final class AIProviderManagementViewController: NSViewController,
         self.mutationCoordinator = mutationCoordinator
         self.modelCatalogLoader = modelCatalogLoader
         self.connectionTester = connectionTester
+        self.urlOpener = urlOpener ?? WorkspaceURLOpener()
         self.backgroundExecutor = backgroundExecutor
         self.mainExecutor = mainExecutor
         self.now = now
@@ -234,11 +242,18 @@ final class AIProviderManagementViewController: NSViewController,
         do {
             try reloadFromStore(selecting: nil)
         } catch {
-            currentEnvelope = .rulesOnly
-            selectedProviderID = BuiltInAIProvider.stacioRulesID
+            currentEnvelope = .defaultConfiguration
+            selectedProviderID = preferredProviderID()
             settingsLoadErrorMessage = actionableMessage(for: error, apiKey: nil)
+            providerTableView.reloadData()
+            syncProviderTableSelection()
             renderSelectedProvider()
         }
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        concealAPIKey()
     }
 
     func reloadFromStore(selecting requestedProviderID: UUID?) throws {
@@ -255,9 +270,7 @@ final class AIProviderManagementViewController: NSViewController,
             settingsLoadErrorMessage = nil
             reconcileSelectionAfterReload(requestedProviderID)
 
-            if selectedProviderID != BuiltInAIProvider.stacioRulesID {
-                _ = draft(for: selectedProviderID)
-            }
+            _ = draft(for: selectedProviderID)
 
             providerTableView.reloadData()
             syncProviderTableSelection()
@@ -278,9 +291,7 @@ final class AIProviderManagementViewController: NSViewController,
             selectedModelID = nil
         }
         selectedProviderID = id
-        if id != BuiltInAIProvider.stacioRulesID {
-            _ = draft(for: id)
-        }
+        _ = draft(for: id)
         syncProviderTableSelection()
         renderSelectedProvider()
     }
@@ -312,6 +323,40 @@ final class AIProviderManagementViewController: NSViewController,
         visibleProviderIDs.map(providerSummary(for:))
     }
 
+    var visitWebsiteButtonVisibleForTesting: Bool {
+        visitWebsiteButton.isHidden == false
+    }
+
+    func recommendedBadgeVisibleForTesting(providerID: UUID) -> Bool {
+        guard let row = visibleProviderIDs.firstIndex(of: providerID),
+              let cell = providerTableView.view(
+                  atColumn: 0,
+                  row: row,
+                  makeIfNecessary: true
+              )
+        else {
+            return false
+        }
+        let identifier = "Stacio.Settings.aiProviders.recommended.\(providerID.uuidString)"
+        return containsView(withAccessibilityIdentifier: identifier, in: cell)
+    }
+
+    func openSelectedProviderWebsiteForTesting() {
+        openProviderWebsite()
+    }
+
+    private func containsView(
+        withAccessibilityIdentifier identifier: String,
+        in root: NSView
+    ) -> Bool {
+        if root.accessibilityIdentifier() == identifier {
+            return true
+        }
+        return root.subviews.contains {
+            containsView(withAccessibilityIdentifier: identifier, in: $0)
+        }
+    }
+
     func setProviderSearchForTesting(_ query: String) {
         providerSearchField.stringValue = query
         applyProviderSearch(query)
@@ -336,6 +381,14 @@ final class AIProviderManagementViewController: NSViewController,
 
     func removeAPIKeyForTesting() {
         removeAPIKey()
+    }
+
+    var isAPIKeyRevealedForTesting: Bool {
+        isAPIKeyRevealed
+    }
+
+    func toggleAPIKeyVisibilityForTesting() {
+        toggleAPIKeyVisibility()
     }
 
     func commitNetworkSettingsForTesting(
@@ -431,24 +484,24 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private var visibleProviderIDs: [UUID] {
-        let allIDs = [BuiltInAIProvider.stacioRulesID] + currentEnvelope.aiProviders.map(\.id)
+        let providerIDs = currentEnvelope.aiProviders
+            .map(\.id)
+            .filter { $0 != BuiltInAIProvider.stacioRulesID }
+        let allIDs = providerIDs.contains(BuiltInAIProvider.mozheAPIID)
+            ? [BuiltInAIProvider.mozheAPIID] + providerIDs.filter { $0 != BuiltInAIProvider.mozheAPIID }
+            : providerIDs
         let query = normalizedSearchQuery(providerSearchQuery)
         guard query.isEmpty == false else { return allIDs }
         return allIDs.filter { id in
-            if id == BuiltInAIProvider.stacioRulesID {
-                return "stacio rules 内置规则".localizedCaseInsensitiveContains(query)
-            }
             guard let provider = providerForDisplay(id: id) else { return false }
-            return provider.displayName.localizedCaseInsensitiveContains(query)
-                || provider.baseURL.localizedCaseInsensitiveContains(query)
+            return displayName(for: provider).localizedCaseInsensitiveContains(query)
+                || displayedBaseURL(for: provider).localizedCaseInsensitiveContains(query)
                 || provider.profile.displayName.localizedCaseInsensitiveContains(query)
         }
     }
 
     private var visibleModels: [AIProviderModelConfiguration] {
-        guard selectedProviderID != BuiltInAIProvider.stacioRulesID,
-              let provider = providerForDisplay(id: selectedProviderID)
-        else {
+        guard let provider = providerForDisplay(id: selectedProviderID) else {
             return []
         }
         let query = normalizedSearchQuery(modelSearchQuery)
@@ -546,6 +599,16 @@ final class AIProviderManagementViewController: NSViewController,
         providerStatusLabel.setAccessibilityIdentifier("Stacio.Settings.aiProviders.status")
 
         configureCommandButton(
+            visitWebsiteButton,
+            title: "访问官网",
+            symbolName: "arrow.up.right.square",
+            toolTip: "在浏览器中访问 mozheAPI",
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.visitWebsite",
+            action: #selector(visitWebsitePressed(_:))
+        )
+        visitWebsiteButton.isHidden = true
+
+        configureCommandButton(
             testConnectionButton,
             title: "测试连接",
             symbolName: "bolt.horizontal.circle",
@@ -580,6 +643,22 @@ final class AIProviderManagementViewController: NSViewController,
             accessibilityIdentifier: "Stacio.Settings.aiProviders.apiKey",
             action: #selector(apiKeyCommitted(_:))
         )
+        configureTextField(
+            revealedAPIKeyField,
+            placeholder: "API Key",
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.apiKey.revealed",
+            action: #selector(apiKeyCommitted(_:))
+        )
+        revealedAPIKeyField.isEditable = false
+        revealedAPIKeyField.isSelectable = true
+        revealedAPIKeyField.isHidden = true
+        configureIconButton(
+            toggleAPIKeyVisibilityButton,
+            symbolName: "eye",
+            toolTip: "显示 API Key",
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
+            action: #selector(toggleAPIKeyVisibilityPressed(_:))
+        )
         configureIconButton(
             removeAPIKeyButton,
             symbolName: "key.slash",
@@ -594,11 +673,15 @@ final class AIProviderManagementViewController: NSViewController,
             accessibilityDescription: nil
         )
         advancedDisclosureButton.imagePosition = .imageLeading
+        advancedDisclosureButton.alignment = .left
         advancedDisclosureButton.isBordered = false
         advancedDisclosureButton.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
         advancedDisclosureButton.target = self
         advancedDisclosureButton.action = #selector(toggleAdvancedSettings(_:))
         advancedDisclosureButton.translatesAutoresizingMaskIntoConstraints = false
+        advancedDisclosureButton.setAccessibilityIdentifier(
+            "Stacio.Settings.aiProviders.advancedDisclosure"
+        )
         advancedDisclosureButton.setAccessibilityLabel("展开高级设置")
 
         compatibilityProtocolPopup.addItems(withTitles: ["Chat Completions", "Responses"])
@@ -772,10 +855,11 @@ final class AIProviderManagementViewController: NSViewController,
         titleStack.spacing = 3
         titleStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let actionStack = NSStackView(views: [testConnectionButton, refreshModelsButton])
+        let actionStack = NSStackView(views: [visitWebsiteButton, testConnectionButton, refreshModelsButton])
         actionStack.orientation = .horizontal
         actionStack.alignment = .centerY
         actionStack.spacing = 8
+        actionStack.detachesHiddenViews = true
         actionStack.translatesAutoresizingMaskIntoConstraints = false
 
         let header = NSView()
@@ -846,30 +930,62 @@ final class AIProviderManagementViewController: NSViewController,
     private func makeDetailContent() -> NSStackView {
         let basicTitle = makeSectionTitle("基础设置")
         basicTitle.setAccessibilityIdentifier("Stacio.Settings.aiProviders.basicSection")
-        let apiKeyControls = NSStackView(views: [apiKeyField, removeAPIKeyButton])
+        let apiKeyControls = NSStackView(
+            views: [
+                apiKeyField,
+                revealedAPIKeyField,
+                toggleAPIKeyVisibilityButton,
+                removeAPIKeyButton
+            ]
+        )
         apiKeyControls.orientation = .horizontal
         apiKeyControls.alignment = .centerY
+        apiKeyControls.distribution = .fill
         apiKeyControls.spacing = 6
+        apiKeyControls.detachesHiddenViews = true
         apiKeyControls.translatesAutoresizingMaskIntoConstraints = false
+        apiKeyField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        revealedAPIKeyField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        toggleAPIKeyVisibilityButton.setContentHuggingPriority(.required, for: .horizontal)
+        removeAPIKeyButton.setContentHuggingPriority(.required, for: .horizontal)
 
         advancedStack.orientation = .vertical
         advancedStack.alignment = .width
         advancedStack.spacing = 8
         advancedStack.translatesAutoresizingMaskIntoConstraints = false
-        advancedStack.addArrangedSubview(makeFormRow(label: "协议", control: compatibilityProtocolPopup))
-        advancedStack.addArrangedSubview(
-            makeFormRow(
-                label: "重试次数",
-                control: makeNumericControl(field: retryCountField, stepper: retryCountStepper)
-            )
+        let compatibilityProtocolRow = makeFormRow(
+            label: "协议",
+            control: compatibilityProtocolPopup,
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.compatibilityProtocol"
         )
-        advancedStack.addArrangedSubview(
-            makeFormRow(
-                label: "请求超时",
-                control: makeNumericControl(field: requestTimeoutField, stepper: requestTimeoutStepper)
-            )
+        let retryCountRow = makeFormRow(
+            label: "重试次数",
+            control: makeNumericControl(field: retryCountField, stepper: retryCountStepper),
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.retryCount"
         )
-        advancedStack.addArrangedSubview(makeFormRow(label: "User-Agent", control: userAgentField))
+        let requestTimeoutRow = makeFormRow(
+            label: "请求超时",
+            control: makeNumericControl(field: requestTimeoutField, stepper: requestTimeoutStepper),
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.requestTimeout"
+        )
+        let userAgentRow = makeFormRow(
+            label: "User-Agent",
+            control: userAgentField,
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.userAgent"
+        )
+        let advancedRows = [
+            compatibilityProtocolRow,
+            retryCountRow,
+            requestTimeoutRow,
+            userAgentRow
+        ]
+        advancedRows.forEach(advancedStack.addArrangedSubview)
+        advancedRows.forEach { row in
+            NSLayoutConstraint.activate([
+                row.leadingAnchor.constraint(equalTo: advancedStack.leadingAnchor),
+                row.trailingAnchor.constraint(equalTo: advancedStack.trailingAnchor)
+            ])
+        }
         advancedStack.isHidden = true
 
         let modelTitle = makeSectionTitle("模型")
@@ -965,10 +1081,25 @@ final class AIProviderManagementViewController: NSViewController,
         content.spacing = 10
         content.detachesHiddenViews = true
         content.translatesAutoresizingMaskIntoConstraints = false
+        let displayNameRow = makeFormRow(
+            label: "名称",
+            control: displayNameField,
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.displayName"
+        )
+        let baseURLRow = makeFormRow(
+            label: "Base URL",
+            control: baseURLField,
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.baseURL"
+        )
+        let apiKeyRow = makeFormRow(
+            label: "API Key",
+            control: apiKeyControls,
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.apiKey"
+        )
         content.addArrangedSubview(basicTitle)
-        content.addArrangedSubview(makeFormRow(label: "名称", control: displayNameField))
-        content.addArrangedSubview(makeFormRow(label: "Base URL", control: baseURLField))
-        content.addArrangedSubview(makeFormRow(label: "API Key", control: apiKeyControls))
+        content.addArrangedSubview(displayNameRow)
+        content.addArrangedSubview(baseURLRow)
+        content.addArrangedSubview(apiKeyRow)
         content.addArrangedSubview(advancedDisclosureButton)
         content.addArrangedSubview(advancedStack)
         content.addArrangedSubview(makeSeparator())
@@ -977,6 +1108,20 @@ final class AIProviderManagementViewController: NSViewController,
         content.addArrangedSubview(modelScroll)
         content.addArrangedSubview(manualAddRow)
         content.addArrangedSubview(modelCapabilityStack)
+        let leftAlignedViews: [NSView] = [
+            basicTitle,
+            displayNameRow,
+            baseURLRow,
+            apiKeyRow,
+            advancedDisclosureButton,
+            advancedStack
+        ]
+        leftAlignedViews.forEach { child in
+            NSLayoutConstraint.activate([
+                child.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                child.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            ])
+        }
         NSLayoutConstraint.activate([
             modelCapabilityStack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             modelCapabilityStack.trailingAnchor.constraint(equalTo: content.trailingAnchor)
@@ -984,21 +1129,33 @@ final class AIProviderManagementViewController: NSViewController,
         return content
     }
 
-    private func makeFormRow(label title: String, control: NSView) -> NSView {
+    private func makeFormRow(
+        label title: String,
+        control: NSView,
+        accessibilityIdentifier: String? = nil
+    ) -> NSView {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 12)
         label.textColor = StacioDesignSystem.theme.secondaryTextColor
-        label.alignment = .right
+        label.alignment = .left
         label.translatesAutoresizingMaskIntoConstraints = false
         label.widthAnchor.constraint(equalToConstant: 82).isActive = true
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
         control.translatesAutoresizingMaskIntoConstraints = false
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let row = NSStackView(views: [label, control])
         row.orientation = .horizontal
         row.alignment = .centerY
+        row.distribution = .fill
         row.spacing = 10
         row.translatesAutoresizingMaskIntoConstraints = false
         row.heightAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
+        if let accessibilityIdentifier {
+            row.setAccessibilityIdentifier(accessibilityIdentifier)
+            label.setAccessibilityIdentifier("\(accessibilityIdentifier).label")
+        }
         return row
     }
 
@@ -1007,9 +1164,13 @@ final class AIProviderManagementViewController: NSViewController,
         let stack = NSStackView(views: [field, stepper, spacer])
         stack.orientation = .horizontal
         stack.alignment = .centerY
+        stack.distribution = .fill
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
         field.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        field.setContentHuggingPriority(.required, for: .horizontal)
+        stepper.setContentHuggingPriority(.required, for: .horizontal)
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return stack
     }
 
@@ -1023,9 +1184,13 @@ final class AIProviderManagementViewController: NSViewController,
         let stack = NSStackView(views: [manualContextBudgetField, unit, spacer])
         stack.orientation = .horizontal
         stack.alignment = .centerY
+        stack.distribution = .fill
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
         manualContextBudgetField.widthAnchor.constraint(equalToConstant: 108).isActive = true
+        manualContextBudgetField.setContentHuggingPriority(.required, for: .horizontal)
+        unit.setContentHuggingPriority(.required, for: .horizontal)
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return stack
     }
 
@@ -1033,6 +1198,7 @@ final class AIProviderManagementViewController: NSViewController,
         let field = NSTextField(labelWithString: title)
         field.font = .systemFont(ofSize: 13, weight: .semibold)
         field.textColor = StacioDesignSystem.theme.primaryTextColor
+        field.alignment = .left
         field.translatesAutoresizingMaskIntoConstraints = false
         return field
     }
@@ -1180,6 +1346,16 @@ final class AIProviderManagementViewController: NSViewController,
         name.lineBreakMode = .byTruncatingTail
         name.maximumNumberOfLines = 1
         name.translatesAutoresizingMaskIntoConstraints = false
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let titleRow = NSStackView(views: [name])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 6
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        if summary.isRecommended {
+            titleRow.addArrangedSubview(makeRecommendedBadge(providerID: summary.id))
+        }
 
         let metadata = NSTextField(
             labelWithString: "\(summary.statusText) · \(summary.enabledModelCount)/\(summary.totalModelCount) 个模型"
@@ -1200,22 +1376,56 @@ final class AIProviderManagementViewController: NSViewController,
         star.isHidden = summary.isDefault == false
         star.translatesAutoresizingMaskIntoConstraints = false
 
-        cell.addSubview(name)
+        cell.addSubview(titleRow)
         cell.addSubview(metadata)
         cell.addSubview(star)
         NSLayoutConstraint.activate([
-            name.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-            name.trailingAnchor.constraint(lessThanOrEqualTo: star.leadingAnchor, constant: -6),
-            name.topAnchor.constraint(equalTo: cell.topAnchor, constant: 6),
-            metadata.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+            titleRow.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: star.leadingAnchor, constant: -6),
+            titleRow.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+            metadata.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
             metadata.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -8),
-            metadata.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 3),
+            metadata.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 2),
             star.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
-            star.centerYAnchor.constraint(equalTo: name.centerYAnchor),
+            star.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor),
             star.widthAnchor.constraint(equalToConstant: 13),
             star.heightAnchor.constraint(equalToConstant: 13)
         ])
         return cell
+    }
+
+    private func makeRecommendedBadge(providerID: UUID) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 5
+        container.layer?.cornerCurve = .continuous
+        container.layer?.borderWidth = 1
+        StacioDesignSystem.setLayerBackgroundColor(
+            container,
+            color: StacioDesignSystem.theme.accentColor.withAlphaComponent(0.12)
+        )
+        StacioDesignSystem.setLayerBorderColor(
+            container,
+            color: StacioDesignSystem.theme.accentColor.withAlphaComponent(0.32)
+        )
+        container.setAccessibilityIdentifier(
+            "Stacio.Settings.aiProviders.recommended.\(providerID.uuidString)"
+        )
+        container.setAccessibilityLabel("推荐供应商")
+
+        let label = NSTextField(labelWithString: "推荐")
+        label.font = .systemFont(ofSize: 9.5, weight: .semibold)
+        label.textColor = StacioDesignSystem.theme.accentColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 2),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -2)
+        ])
+        return container
     }
 
     private func makeModelCell(
@@ -1223,7 +1433,7 @@ final class AIProviderManagementViewController: NSViewController,
         column: String,
         row: Int
     ) -> NSView {
-        let isReadOnly = selectedProviderID == BuiltInAIProvider.stacioRulesID
+        let isReadOnly = providerForDisplay(id: selectedProviderID) == nil
         let selection = AIModelSelection(providerID: selectedProviderID, modelID: model.id)
         switch column {
         case "enabled":
@@ -1316,6 +1526,7 @@ final class AIProviderManagementViewController: NSViewController,
             return
         }
         apiKeyField.stringValue = ""
+        updateAPIKeyActionAvailability(editable: providerForDisplay(id: selectedProviderID) != nil)
     }
 
     func controlTextDidChange(_ notification: Notification) {
@@ -1331,10 +1542,18 @@ final class AIProviderManagementViewController: NSViewController,
         if field === manualContextBudgetField {
             return
         }
-        guard selectedProviderID != BuiltInAIProvider.stacioRulesID,
-              var draft = draft(for: selectedProviderID)
-        else {
+        guard var draft = draft(for: selectedProviderID) else {
             return
+        }
+        if selectedProviderID == BuiltInAIProvider.mozheAPIID {
+            if field === displayNameField {
+                field.stringValue = BuiltInAIProvider.mozheAPIDisplayName
+                return
+            }
+            if field === baseURLField {
+                field.stringValue = BuiltInAIProvider.mozheAPIBaseURL
+                return
+            }
         }
         if field === displayNameField {
             draft.provider.displayName = field.stringValue
@@ -1343,6 +1562,7 @@ final class AIProviderManagementViewController: NSViewController,
             invalidateRequestsForRequestSensitiveTyping(providerID: selectedProviderID)
         } else if field === apiKeyField {
             invalidateRequestsForRequestSensitiveTyping(providerID: selectedProviderID)
+            updateAPIKeyActionAvailability(editable: draft.provider.id == selectedProviderID)
         } else if field === userAgentField {
             draft.provider.userAgent = field.stringValue
             invalidateRequestsForRequestSensitiveTyping(providerID: selectedProviderID)
@@ -1400,7 +1620,7 @@ final class AIProviderManagementViewController: NSViewController,
         syncModelTableSelection()
         renderSelectedModelCapabilities(
             provider: providerForDisplay(id: selectedProviderID),
-            editable: selectedProviderID != BuiltInAIProvider.stacioRulesID
+            editable: providerForDisplay(id: selectedProviderID) != nil
         )
     }
 
@@ -1409,7 +1629,8 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     @objc private func removeProviderPressed(_ sender: NSButton) {
-        guard selectedProviderID != BuiltInAIProvider.stacioRulesID,
+        guard selectedProviderID != BuiltInAIProvider.mozheAPIID,
+              selectedProviderID != BuiltInAIProvider.stacioRulesID,
               let provider = providerForDisplay(id: selectedProviderID)
         else {
             return
@@ -1471,6 +1692,11 @@ final class AIProviderManagementViewController: NSViewController,
 
     @objc private func removeAPIKeyPressed(_ sender: NSButton) {
         removeAPIKey()
+    }
+
+    @objc private func toggleAPIKeyVisibilityPressed(_ sender: NSButton) {
+        endPendingTextEditing()
+        toggleAPIKeyVisibility()
     }
 
     @objc private func toggleAdvancedSettings(_ sender: NSButton) {
@@ -1544,14 +1770,37 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     @objc private func refreshModelsPressed(_ sender: NSButton) {
+        endPendingTextEditing()
         refreshSelectedProviderModels()
     }
 
+    @objc private func visitWebsitePressed(_ sender: NSButton) {
+        openProviderWebsite()
+    }
+
     @objc private func testConnectionPressed(_ sender: NSButton) {
+        endPendingTextEditing()
         testSelectedProviderConnection()
     }
 
+    private func endPendingTextEditing() {
+        _ = view.window?.makeFirstResponder(nil)
+    }
+
+    private func openProviderWebsite() {
+        guard selectedProviderID == BuiltInAIProvider.mozheAPIID,
+              let url = URL(string: BuiltInAIProvider.mozheAPIWebsiteURL)
+        else {
+            return
+        }
+        urlOpener.open(url)
+    }
+
     private func commitDisplayName(_ rawDisplayName: String) {
+        guard selectedProviderID != BuiltInAIProvider.mozheAPIID else {
+            renderSelectedProvider()
+            return
+        }
         guard selectedProviderID != BuiltInAIProvider.stacioRulesID,
               var draft = draft(for: selectedProviderID)
         else {
@@ -1568,6 +1817,10 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func commitBaseURL(_ rawBaseURL: String) {
+        guard selectedProviderID != BuiltInAIProvider.mozheAPIID else {
+            renderSelectedProvider()
+            return
+        }
         guard selectedProviderID != BuiltInAIProvider.stacioRulesID,
               var draft = draft(for: selectedProviderID)
         else {
@@ -1594,9 +1847,91 @@ final class AIProviderManagementViewController: NSViewController,
             renderSelectedProvider()
             return
         }
+        do {
+            if try mutationCoordinator.readAPIKey(for: selectedProviderID) == apiKey {
+                renderSelectedProvider()
+                return
+            }
+        } catch {
+            // The transaction below remains the authoritative write path.
+        }
         clearVerificationAndCatalogTimestamps(in: &draft.provider)
         draft.hasStoredAPIKey = true
         save(draft: draft, apiKeyUpdate: .replace(apiKey), impact: .catalogAndConnection)
+    }
+
+    private func pendingAPIKeyInput() -> String? {
+        let value = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.isEmpty == false, value != Self.maskedAPIKeyPlaceholder else {
+            return nil
+        }
+        return value
+    }
+
+    @discardableResult
+    private func persistPendingAPIKeyIfNeeded() -> Bool {
+        guard let apiKey = pendingAPIKeyInput() else {
+            return true
+        }
+        commitAPIKey(apiKey)
+        return configurationMutationErrorMessage == nil
+            && (editDrafts[selectedProviderID]?.hasStoredAPIKey ?? false)
+    }
+
+    private func toggleAPIKeyVisibility() {
+        if isAPIKeyRevealed {
+            concealAPIKey()
+            return
+        }
+
+        guard persistPendingAPIKeyIfNeeded() else {
+            return
+        }
+        let apiKey: String?
+        do {
+            apiKey = try mutationCoordinator.readAPIKey(for: selectedProviderID)
+        } catch {
+            configurationMutationErrorMessage = actionableMessage(for: error, apiKey: nil)
+            renderSelectedProvider()
+            return
+        }
+        guard let apiKey, apiKey.isEmpty == false else {
+            updateAPIKeyActionAvailability(editable: providerForDisplay(id: selectedProviderID) != nil)
+            return
+        }
+
+        revealedAPIKeyField.stringValue = apiKey
+        apiKeyField.isHidden = true
+        revealedAPIKeyField.isHidden = false
+        isAPIKeyRevealed = true
+        updateAPIKeyVisibilityButtonAppearance()
+    }
+
+    private func concealAPIKey() {
+        isAPIKeyRevealed = false
+        revealedAPIKeyField.stringValue = ""
+        revealedAPIKeyField.isHidden = true
+        apiKeyField.isHidden = false
+        updateAPIKeyVisibilityButtonAppearance()
+    }
+
+    private func updateAPIKeyVisibilityButtonAppearance() {
+        let symbolName = isAPIKeyRevealed ? "eye.slash" : "eye"
+        let label = isAPIKeyRevealed ? "隐藏 API Key" : "显示 API Key"
+        toggleAPIKeyVisibilityButton.image = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: nil
+        )
+        toggleAPIKeyVisibilityButton.toolTip = label
+        toggleAPIKeyVisibilityButton.setAccessibilityLabel(label)
+    }
+
+    private func updateAPIKeyActionAvailability(editable: Bool) {
+        let hasStoredAPIKey = editDrafts[selectedProviderID]?.hasStoredAPIKey ?? false
+        let hasPendingAPIKey = pendingAPIKeyInput() != nil
+        toggleAPIKeyVisibilityButton.isEnabled = editable
+            && (hasStoredAPIKey || hasPendingAPIKey || isAPIKeyRevealed)
+        removeAPIKeyButton.isEnabled = editable && hasStoredAPIKey
     }
 
     private func removeAPIKey() {
@@ -1835,7 +2170,11 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func performDeleteProvider(id deletedID: UUID) {
-        guard deletedID != BuiltInAIProvider.stacioRulesID else { return }
+        guard deletedID != BuiltInAIProvider.mozheAPIID,
+              deletedID != BuiltInAIProvider.stacioRulesID
+        else {
+            return
+        }
         let deletedProviderWasSelected = selectedProviderID == deletedID
         configurationMutationErrorMessage = nil
         invalidateRequests(for: deletedID, catalog: true, connection: true)
@@ -1848,7 +2187,7 @@ final class AIProviderManagementViewController: NSViewController,
             if deletedProviderWasSelected || providerExists(selectedProviderID) == false {
                 selectedProviderID = providerExists(envelope.defaultAIProviderID)
                     ? envelope.defaultAIProviderID
-                    : BuiltInAIProvider.stacioRulesID
+                    : preferredProviderID()
             }
             providerTableView.reloadData()
             syncProviderTableSelection()
@@ -1921,6 +2260,9 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func refreshSelectedProviderModels() {
+        guard persistPendingAPIKeyIfNeeded() else {
+            return
+        }
         let providerID = selectedProviderID
         guard providerID != BuiltInAIProvider.stacioRulesID,
               isCatalogLoading(providerID) == false,
@@ -2013,6 +2355,9 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func testSelectedProviderConnection() {
+        guard persistPendingAPIKeyIfNeeded() else {
+            return
+        }
         let providerID = selectedProviderID
         guard providerID != BuiltInAIProvider.stacioRulesID,
               isConnectionTesting(providerID) == false,
@@ -2102,23 +2447,31 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func renderSelectedProvider() {
-        let isRules = selectedProviderID == BuiltInAIProvider.stacioRulesID
-        let provider = isRules ? nil : providerForDisplay(id: selectedProviderID)
+        let provider = providerForDisplay(id: selectedProviderID)
+        let isMozheAPI = selectedProviderID == BuiltInAIProvider.mozheAPIID && provider != nil
         reconcileSelectedModel()
+        concealAPIKey()
 
-        providerNameLabel.stringValue = provider?.displayName ?? "Stacio Rules"
-        updateProviderStatus(provider: provider, isRules: isRules)
+        providerNameLabel.stringValue = provider.map(displayName(for:)) ?? "供应商不可用"
+        updateProviderStatus(provider: provider)
 
-        displayNameField.stringValue = provider?.displayName ?? "Stacio Rules"
-        baseURLField.stringValue = provider?.baseURL ?? ""
+        displayNameField.stringValue = provider.map(displayName(for:)) ?? ""
+        baseURLField.stringValue = provider.map(displayedBaseURL(for:)) ?? ""
         if let draft = editDrafts[selectedProviderID], draft.hasStoredAPIKey {
             apiKeyField.stringValue = Self.maskedAPIKeyPlaceholder
         } else {
             apiKeyField.stringValue = ""
         }
 
-        let editable = isRules == false && provider != nil
-        [displayNameField, baseURLField, apiKeyField, userAgentField, retryCountField, requestTimeoutField].forEach {
+        let editable = provider != nil
+        let identityEditable = editable && isMozheAPI == false
+        displayNameField.isEditable = identityEditable
+        displayNameField.isSelectable = identityEditable
+        displayNameField.isEnabled = editable
+        baseURLField.isEditable = identityEditable
+        baseURLField.isSelectable = editable
+        baseURLField.isEnabled = editable
+        [apiKeyField, userAgentField, retryCountField, requestTimeoutField].forEach {
             $0.isEditable = editable
             $0.isSelectable = editable
             $0.isEnabled = editable
@@ -2126,8 +2479,9 @@ final class AIProviderManagementViewController: NSViewController,
         compatibilityProtocolPopup.isEnabled = editable
         retryCountStepper.isEnabled = editable
         requestTimeoutStepper.isEnabled = editable
-        removeAPIKeyButton.isEnabled = editable && (editDrafts[selectedProviderID]?.hasStoredAPIKey ?? false)
-        removeProviderButton.isEnabled = editable
+        updateAPIKeyActionAvailability(editable: editable)
+        removeProviderButton.isEnabled = editable && isMozheAPI == false
+        visitWebsiteButton.isHidden = isMozheAPI == false
         updateAsyncActionAvailability(provider: provider, editable: editable)
         modelSearchField.isEnabled = editable
         manualModelField.isEnabled = editable
@@ -2147,7 +2501,7 @@ final class AIProviderManagementViewController: NSViewController,
             userAgentField.stringValue = ""
         }
 
-        updateCatalogStatus(providerID: selectedProviderID, isRules: isRules)
+        updateCatalogStatus(providerID: selectedProviderID)
         modelTableView.reloadData()
         syncModelTableSelection()
         renderSelectedModelCapabilities(provider: provider, editable: editable)
@@ -2253,8 +2607,7 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func updateProviderStatus(
-        provider: AIProviderConfiguration?,
-        isRules: Bool
+        provider: AIProviderConfiguration?
     ) {
         if let settingsLoadErrorMessage {
             providerStatusLabel.stringValue = settingsLoadErrorMessage
@@ -2264,13 +2617,6 @@ final class AIProviderManagementViewController: NSViewController,
         if let configurationMutationErrorMessage {
             providerStatusLabel.stringValue = configurationMutationErrorMessage
             providerStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
-            return
-        }
-        if isRules {
-            providerStatusLabel.stringValue = currentEnvelope.defaultAIProviderID == BuiltInAIProvider.stacioRulesID
-                ? "内置规则 · 默认"
-                : "内置规则"
-            providerStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
             return
         }
         guard let provider else {
@@ -2294,12 +2640,7 @@ final class AIProviderManagementViewController: NSViewController,
         }
     }
 
-    private func updateCatalogStatus(providerID: UUID, isRules: Bool) {
-        guard isRules == false else {
-            catalogStatusLabel.stringValue = "内置规则无需模型目录"
-            catalogStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
-            return
-        }
+    private func updateCatalogStatus(providerID: UUID) {
         switch catalogStates[providerID] ?? .idle {
         case .idle:
             if let lastSync = providerForDisplay(id: providerID)?.lastModelSyncAt {
@@ -2354,18 +2695,25 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func providerExists(_ id: UUID) -> Bool {
-        id == BuiltInAIProvider.stacioRulesID
-            || currentEnvelope.aiProviders.contains(where: { $0.id == id })
+        id != BuiltInAIProvider.stacioRulesID
+            && currentEnvelope.aiProviders.contains(where: { $0.id == id })
     }
 
     private func reconcileSelectionAfterReload(_ requestedProviderID: UUID?) {
         if let requestedProviderID, providerExists(requestedProviderID) {
             selectedProviderID = requestedProviderID
         } else if providerExists(selectedProviderID) == false {
-            selectedProviderID = providerExists(currentEnvelope.defaultAIProviderID)
-                ? currentEnvelope.defaultAIProviderID
-                : BuiltInAIProvider.stacioRulesID
+            selectedProviderID = preferredProviderID()
         }
+    }
+
+    private func preferredProviderID() -> UUID {
+        if providerExists(BuiltInAIProvider.mozheAPIID) {
+            return BuiltInAIProvider.mozheAPIID
+        }
+        return currentEnvelope.aiProviders
+            .first(where: { $0.id != BuiltInAIProvider.stacioRulesID })?
+            .id ?? BuiltInAIProvider.mozheAPIID
     }
 
     private func providerForDisplay(id: UUID) -> AIProviderConfiguration? {
@@ -2398,16 +2746,6 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func providerSummary(for id: UUID) -> AIProviderSummary {
-        if id == BuiltInAIProvider.stacioRulesID {
-            return AIProviderSummary(
-                id: id,
-                displayName: "Stacio Rules",
-                statusText: "内置规则",
-                enabledModelCount: 0,
-                totalModelCount: 0,
-                isDefault: currentEnvelope.defaultAIProviderID == id
-            )
-        }
         guard let provider = providerForDisplay(id: id) else {
             return AIProviderSummary(
                 id: id,
@@ -2415,17 +2753,31 @@ final class AIProviderManagementViewController: NSViewController,
                 statusText: "不可用",
                 enabledModelCount: 0,
                 totalModelCount: 0,
-                isDefault: false
+                isDefault: false,
+                isRecommended: false
             )
         }
         return AIProviderSummary(
             id: id,
-            displayName: provider.displayName,
+            displayName: displayName(for: provider),
             statusText: providerStatusText(provider),
             enabledModelCount: provider.models.filter(\.isEnabled).count,
             totalModelCount: provider.models.count,
-            isDefault: currentEnvelope.defaultAIProviderID == id
+            isDefault: currentEnvelope.defaultAIProviderID == id,
+            isRecommended: id == BuiltInAIProvider.mozheAPIID
         )
+    }
+
+    private func displayName(for provider: AIProviderConfiguration) -> String {
+        provider.id == BuiltInAIProvider.mozheAPIID
+            ? BuiltInAIProvider.mozheAPIDisplayName
+            : provider.displayName
+    }
+
+    private func displayedBaseURL(for provider: AIProviderConfiguration) -> String {
+        provider.id == BuiltInAIProvider.mozheAPIID
+            ? BuiltInAIProvider.mozheAPIBaseURL
+            : provider.baseURL
     }
 
     private func providerStatusText(_ provider: AIProviderConfiguration) -> String {
@@ -2442,9 +2794,7 @@ final class AIProviderManagementViewController: NSViewController,
     }
 
     private func providerStatusColor(for id: UUID) -> NSColor {
-        guard id != BuiltInAIProvider.stacioRulesID,
-              let provider = providerForDisplay(id: id)
-        else {
+        guard let provider = providerForDisplay(id: id) else {
             return StacioDesignSystem.theme.secondaryTextColor
         }
         return providerStatusColor(provider)

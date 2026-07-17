@@ -1,5 +1,6 @@
 import AppKit
 import StacioCoreBindings
+import SwiftTerm
 import XCTest
 @testable import StacioApp
 
@@ -49,6 +50,32 @@ final class WorkspaceLocalShellTests: XCTestCase {
 
         XCTAssertTrue(workspace.activateTerminal(runtimeID: firstRuntimeID, bringAppToFront: false))
         XCTAssertEqual((workspace.currentTerminalPane as? TerminalPaneViewController)?.runtimeID, firstRuntimeID)
+    }
+
+    func testActivateTerminalResolvesPreReconnectRuntimeIDToCurrentPane() throws {
+        let reconnecter = RecordingWorkspaceRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_after_reconnect", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_before_reconnect", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            connectionKind: .ssh
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        try pane.reconnectTerminal()
+        _ = try workspace.openLocalShell()
+
+        XCTAssertTrue(workspace.activateTerminal(runtimeID: "term_before_reconnect", bringAppToFront: false))
+        XCTAssertIdentical(workspace.currentTerminalPane, pane)
+        XCTAssertEqual(pane.runtimeID, "term_after_reconnect")
     }
 
     func testWorkspaceUsesDocumentContentOnlyLayout() throws {
@@ -380,6 +407,72 @@ final class WorkspaceLocalShellTests: XCTestCase {
 
         XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "ssh-default")
         XCTAssertEqual(workspace.tabImageAccessibilityDescriptionForTesting(index: 0), "SSH")
+    }
+
+    func testManualSessionIconWinsInDefaultTabIconMode() throws {
+        let suiteName = "StacioWorkspaceManualDefaultIconTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AppSettingsStore(defaults: defaults)
+        store.update { $0.sessionTabIconMode = .defaultIcon }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: store
+        )
+        workspace.loadView()
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_manual_default", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            connectionKind: .ssh,
+            manualIconID: "ubuntu"
+        )
+
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "ubuntu")
+        XCTAssertEqual(workspace.tabImageAccessibilityDescriptionForTesting(index: 0), "Ubuntu")
+    }
+
+    func testManualSessionIconWinsInOperatingSystemTabIconMode() throws {
+        let suiteName = "StacioWorkspaceManualOSIconTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AppSettingsStore(defaults: defaults)
+        store.update { $0.sessionTabIconMode = .operatingSystem }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            remoteOSProbe: { _ in
+                RemoteOperatingSystemInfo(
+                    id: "centos",
+                    idLike: ["rhel"],
+                    name: "CentOS",
+                    prettyName: "CentOS 9",
+                    version: "9",
+                    versionId: "9",
+                    kernelName: "Linux",
+                    kernelRelease: "",
+                    architecture: "x86_64"
+                )
+            },
+            settingsStore: store
+        )
+        workspace.loadView()
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_manual_os", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            connectionKind: .ssh,
+            liveSessionContext: liveContext(host: "example.com"),
+            manualIconID: "aliyun"
+        )
+
+        XCTAssertTrue(waitUntil { workspace.tabIconIdentifierForTesting(index: 0) == "aliyun" })
+        XCTAssertEqual(workspace.tabImageAccessibilityDescriptionForTesting(index: 0), "阿里云")
     }
 
     func testSSHRemoteShellSwitchesToDetectedOperatingSystemTabIcon() throws {
@@ -747,6 +840,9 @@ final class WorkspaceLocalShellTests: XCTestCase {
     }
 
     func testDeviceDashboardIsHiddenForSplitAndMultiExecWorkspaces() throws {
+        let reconnecter = RecordingWorkspaceRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_ssh_split", status: "running", diagnostic: "running")
+        )
         let workspace = WorkspaceViewController(
             autoStartTerminalProcesses: false,
             remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
@@ -762,6 +858,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         workspace.openRemoteShell(
             status: LiveShellStatus(runtimeId: "term_ssh", status: "running", diagnostic: "running"),
             title: "生产 SSH",
+            reconnecter: reconnecter,
             connectionKind: .ssh,
             liveSessionContext: liveContext(host: "prod.example.com")
         )
@@ -1263,6 +1360,10 @@ final class WorkspaceLocalShellTests: XCTestCase {
     }
 
     func testClosingFTPFilesSessionDisconnectsRuntimeScopedTransfers() throws {
+        let localFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-ftp-close-\(UUID().uuidString).txt")
+        try Data("upload".utf8).write(to: localFile)
+        defer { try? FileManager.default.removeItem(at: localFile) }
         let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [
             RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
         ])
@@ -1285,6 +1386,9 @@ final class WorkspaceLocalShellTests: XCTestCase {
             bridge: bridge,
             ftpTransferScheduler: scheduler
         )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        pane.filesViewControllerForTesting.performDropLocalFilesForTesting([localFile.path])
+        XCTAssertEqual(scheduler.scheduledRuntimeIDs, [runtimeID])
         workspace.closeCurrentTerminal()
 
         XCTAssertEqual(scheduler.disconnectedRuntimeIDs, [runtimeID])
@@ -2120,7 +2224,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         )
 
         workspace.loadView()
-        try workspace.openLocalShell()
+        let localRuntimeID = try workspace.openLocalShell()
         workspace.openRemoteShell(
             status: LiveShellStatus(runtimeId: "term_prod", status: "running", diagnostic: "running"),
             title: "生产 API",
@@ -2142,7 +2246,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         let targets = workspace.multiExecTargets()
         let sentCount = workspace.broadcastInput("uptime\n", to: ["term_prod", ""])
 
-        XCTAssertEqual(targets.map(\.id), ["term_prod", "term_serial"])
+        XCTAssertEqual(targets.map(\.id), [localRuntimeID, "term_prod", "term_serial", "term_telnet"])
         XCTAssertEqual(sentCount, 1)
         XCTAssertEqual(sink.userInputEvents, [
             TerminalInputEvent(runtimeID: "term_prod", bytes: Array("uptime\n".utf8))
@@ -2316,7 +2420,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertThrowsError(try workspace.startMultiExecSession(targetIDs: ["term_telnet"])) { error in
             XCTAssertEqual(
                 (error as? LocalizedError)?.errorDescription,
-                "多执行需要至少两个已连接的 SSH 或串口终端。"
+                "多执行需要至少两个可用终端。"
             )
         }
         XCTAssertFalse(workspace.isMultiExecSessionActiveForTesting)
@@ -2437,6 +2541,36 @@ final class WorkspaceLocalShellTests: XCTestCase {
             TerminalInputEvent(runtimeID: "term_serial", bytes: Array("pwd\n".utf8)),
             TerminalInputEvent(runtimeID: "term_ssh", bytes: Array("pwd\n".utf8))
         ])
+    }
+
+    func testRemoteMultiExecInputAlsoBroadcastsToLocalTerminal() throws {
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let localLauncher = RecordingWorkspaceLocalTerminalLauncher()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { sink },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            localTerminalProcessLauncherFactory: { localLauncher }
+        )
+        workspace.loadView()
+        let localRuntimeID = try workspace.openLocalShell()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "生产 SSH",
+            connectionKind: .ssh
+        )
+        try workspace.startMultiExecSession(targetIDs: [localRuntimeID, "term_remote"])
+        let remotePane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_remote"))
+
+        remotePane.send(source: remotePane.terminalView, data: ArraySlice(Array("uptime\n".utf8)))
+
+        XCTAssertEqual(sink.userInputEvents, [
+            TerminalInputEvent(runtimeID: "term_remote", bytes: Array("uptime\n".utf8))
+        ])
+        XCTAssertEqual(localLauncher.sentInputs, [Array("uptime\n".utf8)])
     }
 
     func testMultiExecSessionKeepsSynchronizingAfterRemoteRuntimeReattaches() throws {
@@ -2581,6 +2715,31 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual(sink.closedRuntimeIDs, [])
     }
 
+    func testClosingMultiExecSelectsRestoredPinnedTerminalInsteadOfLastTab() throws {
+        let presenter = RecordingWorkspaceTabOperationsPresenter()
+        presenter.renameResponses = ["固定终端"]
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            autoStartTerminalProcesses: false,
+            tabOperationsPresenter: presenter
+        )
+        workspace.loadView()
+        let firstRuntimeID = try workspace.openLocalShell()
+        let secondRuntimeID = try workspace.openLocalShell()
+        try workspace.performTabContextActionForTesting(.rename, index: 1)
+        try workspace.performTabContextActionForTesting(.pin, index: 1)
+        try workspace.startMultiExecSession(targetIDs: [firstRuntimeID, secondRuntimeID])
+
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["固定终端", "本地"])
+        XCTAssertEqual(workspace.selectedTabLabelForTesting, "固定终端")
+        XCTAssertEqual(
+            (workspace.currentTerminalPane as? TerminalPaneViewController)?.runtimeID,
+            secondRuntimeID
+        )
+    }
+
     func testCloseCurrentTerminalInMultiExecClosesSelectedPane() throws {
         let sink = RecordingWorkspaceRemoteTerminalEventSink()
         let bridge = RecordingWorkspaceRemoteTerminalBridge()
@@ -2627,7 +2786,155 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual(workspace.openTerminalPaneCount, 2)
         XCTAssertEqual(workspace.tabLabelsForTesting, ["本地 x2"])
         XCTAssertTrue(workspace.currentTerminalPane is TerminalPaneViewController)
-        XCTAssertEqual(workspace.currentSplitPaneMinimumThicknessesForTesting, [0, 0])
+        let minimumThicknesses = workspace.currentSplitPaneMinimumThicknessesForTesting
+        XCTAssertEqual(minimumThicknesses.count, 2)
+        XCTAssertGreaterThan(minimumThicknesses[0], 0)
+        XCTAssertEqual(minimumThicknesses[0], minimumThicknesses[1], accuracy: 0.5)
+    }
+
+    func testSplittingRemoteTerminalCreatesRemotePaneWithoutStartingMultiExec() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        let reconnecter = RecordingWorkspaceRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_remote_split_2", status: "running", diagnostic: "running")
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote_split_1", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            connectionKind: .ssh
+        )
+
+        try workspace.splitCurrentTerminal()
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+        XCTAssertEqual(workspace.currentSplitPaneRuntimeIDsForTesting, ["term_remote_split_1", "term_remote_split_2"])
+        XCTAssertFalse(workspace.isMultiExecSessionActiveForTesting)
+    }
+
+    func testClosingDirectLocalSplitRestoresIndependentTabsAfterSplitRename() throws {
+        let presenter = RecordingWorkspaceTabOperationsPresenter()
+        presenter.renameResponses = ["临时分屏"]
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { sink },
+            autoStartTerminalProcesses: false,
+            tabOperationsPresenter: presenter
+        )
+        workspace.loadView()
+        let firstRuntimeID = try workspace.openLocalShell()
+
+        try workspace.splitCurrentTerminal()
+        let secondRuntimeID = try XCTUnwrap(
+            (workspace.currentTerminalPane as? TerminalPaneViewController)?.runtimeID
+        )
+        XCTAssertEqual(workspace.currentSplitTargetIDs(), [firstRuntimeID, secondRuntimeID])
+        try workspace.performTabContextActionForTesting(.rename, index: 0)
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["本地", "本地"])
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+        XCTAssertEqual(workspace.currentSplitTargetIDs(), [])
+        XCTAssertEqual(sink.closedRuntimeIDs, [])
+
+        try workspace.performTabContextActionForTesting(.closeTab, index: 1)
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertEqual(sink.closedRuntimeIDs, [secondRuntimeID])
+    }
+
+    func testClosingDirectRemoteSplitRestoresOriginalTabStateAndDuplicateCapability() throws {
+        let presenter = RecordingWorkspaceTabOperationsPresenter()
+        presenter.renameResponses = ["生产主机", "临时分屏"]
+        presenter.colorResponses = [NSColor(srgbRed: 1, green: 0.58, blue: 0, alpha: 1)]
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let bridge = RecordingWorkspaceRemoteTerminalBridge()
+        let reconnecter = RecordingWorkspaceRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_remote_split_2", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false,
+            tabOperationsPresenter: presenter
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote_split_1", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            connectionKind: .ssh,
+            manualIconID: "ubuntu"
+        )
+        try workspace.performTabContextActionForTesting(.rename, index: 0)
+        try workspace.performTabContextActionForTesting(.setColor, index: 0)
+        try workspace.performTabContextActionForTesting(.pin, index: 0)
+
+        try workspace.splitCurrentTerminal()
+        try workspace.performTabContextActionForTesting(.rename, index: 0)
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["生产主机", "deploy@example.com"])
+        XCTAssertEqual(workspace.pinnedTabLabelsForTesting, ["生产主机"])
+        XCTAssertEqual(workspace.tabColorHexForTesting(index: 0), "#FF9400")
+        XCTAssertNil(workspace.tabColorHexForTesting(index: 1))
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "ubuntu")
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 1), "ubuntu")
+        XCTAssertEqual(bridge.closedRuntimeIDs, [])
+        XCTAssertEqual(sink.closedRuntimeIDs, [])
+
+        try workspace.performTabContextActionForTesting(.duplicate, index: 1)
+
+        XCTAssertEqual(reconnecter.reconnectTitles, ["deploy@example.com", "deploy@example.com"])
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["生产主机", "deploy@example.com", "deploy@example.com"])
+    }
+
+    func testClosingPendingDirectRemoteSplitDiscardsLateConnectedRuntime() throws {
+        let bridge = RecordingWorkspaceRemoteTerminalBridge()
+        let reconnecter = DelayedBackgroundWorkspaceReconnecter(
+            status: LiveShellStatus(runtimeId: "term_remote_split_late", status: "running", diagnostic: "running"),
+            delay: 0.05
+        )
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote_split_source", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            connectionKind: .ssh
+        )
+
+        try workspace.splitCurrentTerminal()
+        workspace.closeCurrentTerminal()
+
+        XCTAssertTrue(waitUntil {
+            bridge.closedRuntimeIDs.contains("term_remote_split_late")
+        })
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+    }
+
+    func testSplittingLocalTerminalsUsesExistingLocalPanes() throws {
+        let workspace = WorkspaceViewController(shellPathProvider: { "/bin/zsh" }, autoStartTerminalProcesses: false)
+        workspace.loadView()
+        try workspace.openLocalShell()
+        try workspace.openLocalShell()
+        let ids = workspace.splitTargets().map(\.id)
+
+        try workspace.splitExistingTerminals(targetIDs: ids, layout: .vertical)
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+        XCTAssertEqual(workspace.currentSplitPaneRuntimeIDsForTesting, ids)
+        XCTAssertFalse(workspace.isMultiExecSessionActiveForTesting)
     }
 
     func testSplitLayoutModesApplyToAllPanesWithoutCappingPaneCount() throws {
@@ -3228,6 +3535,29 @@ private final class RecordingWorkspaceRemoteTerminalEventSink: TerminalEventSink
     }
 }
 
+private final class RecordingWorkspaceLocalTerminalLauncher: LocalTerminalProcessLaunching {
+    private(set) var sentInputs: [[UInt8]] = []
+
+    func isRunning(_ terminalView: LocalProcessTerminalView) -> Bool {
+        false
+    }
+
+    func startProcess(
+        in terminalView: LocalProcessTerminalView,
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    ) {}
+
+    func terminate(_ terminalView: LocalProcessTerminalView) {}
+
+    func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView) {
+        sentInputs.append(bytes)
+    }
+}
+
 private final class RecordingWorkspaceRemoteTerminalBridge: RemoteTerminalBridging {
     private(set) var closedRuntimeIDs: [String] = []
     var pollError: Error?
@@ -3270,6 +3600,7 @@ private final class RecordingWorkspaceRemoteTerminalBridge: RemoteTerminalBridgi
 private final class RecordingWorkspaceRemoteTerminalReconnecter: RemoteTerminalReconnecting {
     private let status: LiveShellStatus
     private(set) var liveSessionContext: TunnelLiveSessionContext?
+    private(set) var reconnectTitles: [String] = []
 
     init(status: LiveShellStatus, liveSessionContext: TunnelLiveSessionContext? = nil) {
         self.status = status
@@ -3277,7 +3608,8 @@ private final class RecordingWorkspaceRemoteTerminalReconnecter: RemoteTerminalR
     }
 
     func reconnectRemoteTerminal(title: String) throws -> LiveShellStatus {
-        status
+        reconnectTitles.append(title)
+        return status
     }
 }
 
@@ -3443,6 +3775,17 @@ private final class RecordingWorkspaceSCPTransferScheduler: SCPTransferSchedulin
 
 private final class RecordingWorkspaceFTPTransferScheduler: FTPTransferScheduling {
     private(set) var disconnectedRuntimeIDs: [String] = []
+    private(set) var scheduledRuntimeIDs: [String] = []
+
+    func scheduleLiveFTPTransfer(
+        runtimeID: String,
+        config: FtpConnectionConfig,
+        secret: FtpAuthSecret,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduledRuntimeIDs.append(runtimeID)
+    }
 
     func scheduleLiveFTPTransfer(
         config: FtpConnectionConfig,
@@ -3584,6 +3927,14 @@ private extension WorkspaceViewController {
 
     var tabLabelsForTesting: [String] {
         workspaceTabControllerForTesting?.tabViewItems.map(\.label) ?? []
+    }
+
+    var selectedTabLabelForTesting: String? {
+        guard let tabController = workspaceTabControllerForTesting,
+              tabController.selectedTabViewItemIndex >= 0,
+              tabController.selectedTabViewItemIndex < tabController.tabViewItems.count
+        else { return nil }
+        return tabController.tabViewItems[tabController.selectedTabViewItemIndex].label
     }
 }
 

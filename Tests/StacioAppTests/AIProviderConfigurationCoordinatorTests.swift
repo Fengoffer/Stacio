@@ -21,7 +21,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         let result = try coordinator.saveProvider(created, apiKeyUpdate: .replace("created-secret"))
 
         XCTAssertEqual(result, settingsStore.envelope)
-        XCTAssertEqual(result.aiProviders.map(\.id), [existing.id, created.id])
+        XCTAssertEqual(
+            result.aiProviders.map(\.id),
+            [existing.id, created.id, BuiltInAIProvider.mozheAPIID]
+        )
         XCTAssertEqual(result.aiProviders[1].models.map(\.id), ["created-model"])
         XCTAssertEqual(result.aiProviders[1].maxRetryCount, 0)
         XCTAssertEqual(result.aiProviders[1].requestTimeoutSeconds, 120)
@@ -52,7 +55,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         let result = try coordinator.saveProvider(edited, apiKeyUpdate: .replace("new-secret"))
 
         XCTAssertEqual(result, settingsStore.envelope)
-        XCTAssertEqual(result.aiProviders.map(\.id), [first.id, original.id, third.id])
+        XCTAssertEqual(
+            result.aiProviders.map(\.id),
+            [first.id, original.id, third.id, BuiltInAIProvider.mozheAPIID]
+        )
         XCTAssertEqual(result.aiProviders[0], first)
         XCTAssertEqual(result.aiProviders[1], AIProviderSettingsNormalizer.normalized(
             .init(aiProviders: [edited], defaultAIProviderID: edited.id)
@@ -152,12 +158,34 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         let result = try coordinator.deleteProvider(id: deleted.id)
 
         XCTAssertEqual(result, settingsStore.envelope)
-        XCTAssertEqual(result.aiProviders, [first, third])
+        XCTAssertEqual(result.aiProviders, [first, third, BuiltInAIProvider.defaultConfiguration])
         XCTAssertEqual(result.defaultAIProviderID, first.id)
         XCTAssertNil(keyStore.key(for: deleted.id))
         XCTAssertEqual(keyStore.key(for: third.id), "third-secret")
         XCTAssertEqual(keyStore.legacyKey, "legacy-secret")
         XCTAssertEqual(recorder.events, ["settings.load", "key.read", "key.delete", "settings.save"])
+    }
+
+    func testDeleteMozheAPIReturnsNormalizedSettingsWithoutTouchingScopedKey() throws {
+        let recorder = CoordinatorCallRecorder()
+        let settingsStore = ThrowingAIProviderSettingsStore(
+            envelope: .rulesOnly,
+            recorder: recorder
+        )
+        let keyStore = ThrowingAIApiKeyStore(
+            keys: [BuiltInAIProvider.mozheAPIID: "mozhe-secret"],
+            recorder: recorder
+        )
+        let coordinator = makeCoordinator(settingsStore: settingsStore, keyStore: keyStore)
+
+        let result = try coordinator.deleteProvider(id: BuiltInAIProvider.mozheAPIID)
+
+        XCTAssertEqual(result, .defaultConfiguration)
+        XCTAssertEqual(settingsStore.envelope, .rulesOnly)
+        XCTAssertEqual(settingsStore.saveCallCount, 0)
+        XCTAssertEqual(keyStore.key(for: BuiltInAIProvider.mozheAPIID), "mozhe-secret")
+        XCTAssertEqual(keyStore.totalCallCount, 0)
+        XCTAssertEqual(recorder.events, ["settings.load"])
     }
 
     func testEditSettingsFailureRestoresOldScopedKey() throws {
@@ -364,7 +392,7 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         let result = try coordinator.setDefaultProvider(id: second.id)
 
         XCTAssertEqual(result, settingsStore.envelope)
-        XCTAssertEqual(result.aiProviders, [first, second])
+        XCTAssertEqual(result.aiProviders, [first, second, BuiltInAIProvider.defaultConfiguration])
         XCTAssertEqual(result.defaultAIProviderID, second.id)
         XCTAssertEqual(keyStore.key(for: first.id), "first-secret")
         XCTAssertEqual(keyStore.key(for: second.id), "second-secret")
@@ -384,7 +412,7 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         let result = try coordinator.setDefaultProvider(id: providerID(999))
 
         XCTAssertEqual(result.defaultAIProviderID, first.id)
-        XCTAssertEqual(result.aiProviders, [first, second])
+        XCTAssertEqual(result.aiProviders, [first, second, BuiltInAIProvider.defaultConfiguration])
         XCTAssertEqual(result, settingsStore.envelope)
         XCTAssertEqual(keyStore.totalCallCount, 0)
     }
@@ -404,7 +432,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
 
         let result = try coordinator.deleteProvider(id: deletedDefault.id)
 
-        XCTAssertEqual(result.aiProviders, [firstFallback, secondFallback])
+        XCTAssertEqual(
+            result.aiProviders,
+            [firstFallback, secondFallback, BuiltInAIProvider.defaultConfiguration]
+        )
         XCTAssertEqual(result.defaultAIProviderID, firstFallback.id)
         XCTAssertEqual(result, settingsStore.envelope)
     }
@@ -464,7 +495,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         XCTAssertEqual(keyStore.key(for: provider.id), "legacy-secret")
         XCTAssertEqual(keyStore.legacyKey, "legacy-secret")
         XCTAssertNil(settingsStore.envelope.legacyKeyMigrationProviderID)
-        XCTAssertEqual(settingsStore.envelope.aiProviders, [provider])
+        XCTAssertEqual(
+            settingsStore.envelope.aiProviders,
+            [provider, BuiltInAIProvider.defaultConfiguration]
+        )
         XCTAssertEqual(
             recorder.events,
             ["settings.load", "key.read", "key.legacy-read", "key.save", "settings.save"]
@@ -650,7 +684,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         XCTAssertEqual(secondLoadEntered.wait(timeout: .now() + 1), .success)
         XCTAssertEqual(results.successCount, 2)
         XCTAssertTrue(results.errors.isEmpty)
-        XCTAssertEqual(settingsStore.envelope.aiProviders.map(\.id), [firstProvider.id, secondProvider.id])
+        XCTAssertEqual(
+            settingsStore.envelope.aiProviders.map(\.id),
+            [firstProvider.id, BuiltInAIProvider.mozheAPIID, secondProvider.id]
+        )
         XCTAssertEqual(keyStore.key(for: firstProvider.id), "first-secret")
         XCTAssertEqual(keyStore.key(for: secondProvider.id), "second-secret")
     }
@@ -675,7 +712,7 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
             }
         }
         settingsStore.onSave = { envelope, _ in
-            if envelope.aiProviders.map(\.id) == [firstProvider.id] {
+            if envelope.aiProviders.map(\.id) == [firstProvider.id, BuiltInAIProvider.mozheAPIID] {
                 firstSettingsSaved.signal()
             }
         }
@@ -716,7 +753,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         XCTAssertEqual(group.wait(timeout: .now() + 3), .success)
         XCTAssertEqual(results.successCount, 2)
         XCTAssertTrue(results.errors.isEmpty)
-        XCTAssertEqual(settingsStore.envelope.aiProviders.map(\.id), [firstProvider.id, secondProvider.id])
+        XCTAssertEqual(
+            settingsStore.envelope.aiProviders.map(\.id),
+            [firstProvider.id, BuiltInAIProvider.mozheAPIID, secondProvider.id]
+        )
         XCTAssertEqual(keyStore.key(for: firstProvider.id), "first-secret")
         XCTAssertEqual(keyStore.key(for: secondProvider.id), "second-secret")
     }
@@ -744,7 +784,10 @@ final class AIProviderConfigurationCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(completed.wait(timeout: .now() + 1), .success)
-        XCTAssertEqual(try resultBox.outerResult?.get().aiProviders, [provider])
+        XCTAssertEqual(
+            try resultBox.outerResult?.get().aiProviders,
+            [provider, BuiltInAIProvider.defaultConfiguration]
+        )
         XCTAssertEqual(try resultBox.nestedResult?.get(), "new-secret")
     }
 }

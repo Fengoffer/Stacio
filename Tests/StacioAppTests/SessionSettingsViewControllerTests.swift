@@ -5,6 +5,44 @@ import StacioCoreBindings
 
 @MainActor
 final class SessionSettingsViewControllerTests: XCTestCase {
+    func testSSHSettingsShowsSessionIconRow() {
+        let controller = makeController()
+
+        controller.loadView()
+
+        XCTAssertFalse(controller.sessionIconRowIsHiddenForTesting)
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.SessionSettings.sessionIcon"))
+        XCTAssertNil(controller.selectedSessionIconIDForTesting)
+    }
+
+    func testSettingsLoadsAndPersistsManualIconWithoutDroppingAutomation() throws {
+        let controller = SessionSettingsViewController(
+            existingSession: makeExistingSSHSession(),
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            existingSerialConfigJSON: #"{"sessionIconID":"ubuntu","startupCommand":"pwd"}"#
+        )
+        controller.loadView()
+
+        XCTAssertEqual(controller.selectedSessionIconIDForTesting, "ubuntu")
+        controller.selectSessionIconForTesting("aliyun")
+        let draft = try XCTUnwrap(controller.draft())
+        let config = try XCTUnwrap(draft.configJson)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(config.utf8)) as? [String: Any])
+
+        XCTAssertEqual(object["sessionIconID"] as? String, "aliyun")
+        XCTAssertEqual(object["startupCommand"] as? String, "pwd")
+    }
+
+    func testNonSSHProtocolHidesSessionIconRow() {
+        let controller = makeController()
+        controller.loadView()
+
+        controller.selectProtocolForTesting(.vnc)
+
+        XCTAssertTrue(controller.sessionIconRowIsHiddenForTesting)
+    }
+
     func testProtocolSelectorOnlyShowsSaveableProtocolsAndUsesSCPInsteadOfSFTP() {
         let controller = makeController()
 
@@ -138,13 +176,22 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         let automation = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.SessionSettings.automation")
         )
+        let sessionIcon = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.SessionSettings.sessionIcon")
+        )
         let gridFrame = grid.convert(grid.bounds, to: controller.view)
+        let sessionIconFrame = sessionIcon.convert(sessionIcon.bounds, to: controller.view)
         let automationFrame = automation.convert(automation.bounds, to: controller.view)
 
         XCTAssertLessThanOrEqual(
-            gridFrame.minY - automationFrame.maxY,
-            40,
-            "The form should not stretch a blank area between the last row and automation controls."
+            gridFrame.minY - sessionIconFrame.maxY,
+            24,
+            "The form should keep the session icon row close to the last connection field."
+        )
+        XCTAssertLessThanOrEqual(
+            sessionIconFrame.minY - automationFrame.maxY,
+            24,
+            "The session icon row should stay close to automation controls."
         )
     }
 

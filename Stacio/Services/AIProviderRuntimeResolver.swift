@@ -1,8 +1,8 @@
 import Foundation
 
 public enum ResolvedAIRuntimeTarget: Equatable {
-    case stacioRules
     case external(provider: AIProviderConfiguration, modelID: String)
+    case unconfigured(provider: AIProviderConfiguration)
 }
 
 public enum AIProviderRuntimeResolver {
@@ -12,10 +12,8 @@ public enum AIProviderRuntimeResolver {
     ) -> ResolvedAIRuntimeTarget {
         let normalizedEnvelope = AIProviderSettingsNormalizer.normalized(envelope)
 
-        if let requestedSelection {
-            if requestedSelection.providerID == BuiltInAIProvider.stacioRulesID {
-                return .stacioRules
-            }
+        if let requestedSelection,
+           requestedSelection.providerID != BuiltInAIProvider.stacioRulesID {
             if let requestedTarget = externalTarget(
                 selection: requestedSelection,
                 providers: normalizedEnvelope.aiProviders
@@ -24,34 +22,19 @@ public enum AIProviderRuntimeResolver {
             }
         }
 
-        guard normalizedEnvelope.defaultAIProviderID != BuiltInAIProvider.stacioRulesID else {
-            return .stacioRules
-        }
-
-        if let provider = normalizedEnvelope.aiProviders.first(where: {
+        guard let provider = normalizedEnvelope.aiProviders.first(where: {
             $0.id == normalizedEnvelope.defaultAIProviderID
-        }),
-           let defaultModelID = provider.defaultModelID,
+        }) else {
+            return .unconfigured(provider: BuiltInAIProvider.defaultConfiguration)
+        }
+        if let defaultModelID = provider.defaultModelID,
            let target = externalTarget(
                selection: AIModelSelection(providerID: provider.id, modelID: defaultModelID),
                providers: normalizedEnvelope.aiProviders
            ) {
             return target
         }
-
-        for provider in normalizedEnvelope.aiProviders
-        where provider.id != normalizedEnvelope.defaultAIProviderID {
-            guard let defaultModelID = provider.defaultModelID,
-                  let target = externalTarget(
-                      selection: AIModelSelection(providerID: provider.id, modelID: defaultModelID),
-                      providers: normalizedEnvelope.aiProviders
-                  )
-            else {
-                continue
-            }
-            return target
-        }
-        return .stacioRules
+        return .unconfigured(provider: provider)
     }
 
     private static func externalTarget(

@@ -3,6 +3,22 @@ import Foundation
 import XCTest
 
 final class AIProviderSettingsTests: XCTestCase {
+    func testDefaultConfigurationUsesCanonicalUnconfiguredMozheAPIProvider() {
+        let envelope = AIProviderSettingsEnvelope.defaultConfiguration
+
+        XCTAssertEqual(envelope.defaultAIProviderID, BuiltInAIProvider.mozheAPIID)
+        XCTAssertEqual(envelope.aiProviders, [BuiltInAIProvider.defaultConfiguration])
+        XCTAssertEqual(BuiltInAIProvider.defaultConfiguration.displayName, "mozheAPI")
+        XCTAssertEqual(BuiltInAIProvider.defaultConfiguration.baseURL, "https://openai.mozhevip.top")
+        XCTAssertEqual(
+            BuiltInAIProvider.mozheAPIWebsiteURL,
+            "https://openai.mozhevip.top/register?aff=79LZW99ZKN8S"
+        )
+        XCTAssertEqual(BuiltInAIProvider.defaultConfiguration.profile, .openAICompatible)
+        XCTAssertTrue(BuiltInAIProvider.defaultConfiguration.models.isEmpty)
+        XCTAssertNil(BuiltInAIProvider.defaultConfiguration.defaultModelID)
+    }
+
     func testNormalizationFallsBackAfterDefaultModelIsDisabled() {
         let provider = makeProvider(
             id: providerID(1),
@@ -78,11 +94,14 @@ final class AIProviderSettingsTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(result.aiProviders.map(\.id), [invalidDefault.id, firstEligible.id, secondEligible.id])
+        XCTAssertEqual(
+            result.aiProviders.map(\.id),
+            [invalidDefault.id, firstEligible.id, secondEligible.id, BuiltInAIProvider.mozheAPIID]
+        )
         XCTAssertEqual(result.defaultAIProviderID, firstEligible.id)
     }
 
-    func testNormalizationFallsBackToRulesWhenNoProviderIsEligible() {
+    func testNormalizationFallsBackToMozheAPIWhenNoProviderIsEligible() {
         var provider = makeProvider(
             id: providerID(1),
             models: [enabledModel("model")],
@@ -94,10 +113,10 @@ final class AIProviderSettingsTests: XCTestCase {
             .init(aiProviders: [provider], defaultAIProviderID: provider.id)
         )
 
-        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.stacioRulesID)
+        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.mozheAPIID)
     }
 
-    func testNormalizationKeepsRulesAsExplicitDefaultWhenExternalProviderIsEligible() {
+    func testNormalizationMigratesRulesDefaultToMozheAPIWhenExternalProviderIsEligible() {
         let provider = makeProvider(
             id: providerID(1),
             models: [enabledModel("model")],
@@ -111,7 +130,54 @@ final class AIProviderSettingsTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.stacioRulesID)
+        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.mozheAPIID)
+    }
+
+    func testNormalizationKeepsUnconfiguredMozheAPIAsExplicitDefault() {
+        let external = makeProvider(
+            id: providerID(1),
+            models: [enabledModel("model")],
+            defaultModelID: "model"
+        )
+
+        let result = AIProviderSettingsNormalizer.normalized(
+            .init(
+                aiProviders: [external],
+                defaultAIProviderID: BuiltInAIProvider.mozheAPIID
+            )
+        )
+
+        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.mozheAPIID)
+        XCTAssertEqual(result.aiProviders.last, BuiltInAIProvider.defaultConfiguration)
+    }
+
+    func testNormalizationCanonicalizesMozheAPIAndDropsLegacyRulesResidue() {
+        var tamperedMozheAPI = BuiltInAIProvider.defaultConfiguration
+        tamperedMozheAPI.profile = .portDeskRules
+        tamperedMozheAPI.displayName = "Changed"
+        tamperedMozheAPI.baseURL = "https://changed.example/v1"
+        var rulesIDProvider = makeProvider(
+            id: BuiltInAIProvider.stacioRulesID,
+            models: [enabledModel("rules-id")],
+            defaultModelID: "rules-id"
+        )
+        rulesIDProvider.profile = .openAICompatible
+        var rulesProfileProvider = makeProvider(
+            id: providerID(9),
+            models: [enabledModel("rules-profile")],
+            defaultModelID: "rules-profile"
+        )
+        rulesProfileProvider.profile = .portDeskRules
+
+        let result = AIProviderSettingsNormalizer.normalized(
+            .init(
+                aiProviders: [tamperedMozheAPI, BuiltInAIProvider.defaultConfiguration, rulesIDProvider, rulesProfileProvider],
+                defaultAIProviderID: BuiltInAIProvider.stacioRulesID
+            )
+        )
+
+        XCTAssertEqual(result.aiProviders, [BuiltInAIProvider.defaultConfiguration])
+        XCTAssertEqual(result.defaultAIProviderID, BuiltInAIProvider.mozheAPIID)
     }
 
     func testNormalizationDropsEmptyAndDuplicateModelsPreservingFirstOccurrenceAndOrder() {

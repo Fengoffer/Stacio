@@ -1230,7 +1230,10 @@ final class TerminalThemeImportTests: XCTestCase {
             )
         )
 
-        let resourceBundle = root.appendingPathComponent("SwiftTerm_SwiftTerm.bundle", isDirectory: true)
+        let resourceBundle = root
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("SwiftTerm_SwiftTerm.bundle", isDirectory: true)
         try FileManager.default.createDirectory(at: resourceBundle, withIntermediateDirectories: true)
         try "shader".write(
             to: resourceBundle.appendingPathComponent("Shaders.metal"),

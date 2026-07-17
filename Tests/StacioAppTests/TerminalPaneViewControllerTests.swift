@@ -6,6 +6,65 @@ import XCTest
 
 @MainActor
 final class TerminalPaneViewControllerTests: XCTestCase {
+    func testCompletedAgentTraceOverlayAutoDismissesAndRunningOverlayRemainsVisible() {
+        let completedOverlay = TerminalAgentTraceOverlayView(
+            frame: .zero,
+            completedAutoDismissInterval: 0.02
+        )
+        completedOverlay.render([
+            TerminalTraceEvent(
+                requestID: "req-completed",
+                state: .completed,
+                message: "命令已完成",
+                redactedCommand: "uptime",
+                metadata: nil
+            )
+        ])
+
+        let deadline = Date().addingTimeInterval(0.2)
+        while completedOverlay.isHidden == false, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(completedOverlay.isHidden)
+
+        let runningOverlay = TerminalAgentTraceOverlayView(
+            frame: .zero,
+            completedAutoDismissInterval: 0.02
+        )
+        runningOverlay.render([
+            TerminalTraceEvent(
+                requestID: "req-running",
+                state: .running,
+                message: "命令执行中",
+                redactedCommand: "uptime",
+                metadata: nil
+            )
+        ])
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertFalse(runningOverlay.isHidden)
+    }
+
+    func testAgentTraceOverlayShowsHoverCloseButtonAndClosesImmediately() {
+        let overlay = TerminalAgentTraceOverlayView(frame: .zero)
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-completed",
+                state: .completed,
+                message: "命令已完成",
+                redactedCommand: "uptime",
+                metadata: nil
+            )
+        ])
+
+        XCTAssertFalse(overlay.closeButtonVisibleForTesting)
+        overlay.setPointerInsideForTesting(true)
+        XCTAssertTrue(overlay.closeButtonVisibleForTesting)
+        overlay.triggerCloseForTesting()
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertFalse(overlay.closeButtonVisibleForTesting)
+    }
+
     func testTerminalPaneLoadsSwiftTermView() {
         let sink = RecordingTerminalEventSink()
         let controller = TerminalPaneViewController(
@@ -26,6 +85,68 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         let terminalView = StacioLocalTerminalView(frame: .zero)
 
         XCTAssertFalse(terminalView.mouseDownCanMoveWindow)
+    }
+
+    func testProgrammaticLocalTerminalInputBypassesUserInputHook() {
+        let terminalView = StacioLocalTerminalView(frame: .zero)
+        var userInputHookCalls = 0
+        terminalView.onUserInput = { _ in
+            userInputHookCalls += 1
+            return true
+        }
+
+        SwiftTermLocalTerminalProcessLauncher().sendInput(
+            Array("uptime\n".utf8),
+            to: terminalView
+        )
+
+        XCTAssertEqual(userInputHookCalls, 0)
+    }
+
+    func testTerminalAgentTraceOverlayShowsControlsInOwningTerminalAndRelaysActions() {
+        let overlay = TerminalAgentTraceOverlayView(frame: .zero)
+        var received: (requestID: String, action: TerminalAgentTaskControlAction)?
+        overlay.onControlAction = { requestID, action in
+            received = (requestID, action)
+        }
+
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-terminal-control",
+                state: .running,
+                message: "命令已在终端执行",
+                redactedCommand: "tail -f /var/log/messages"
+            )
+        ])
+
+        XCTAssertEqual(overlay.visibleControlTitlesForTesting, [
+            L10n.AI.pauseTask,
+            L10n.AI.cancelTask,
+            L10n.AI.takeOverTask
+        ])
+        overlay.triggerControlForTesting(.takeOver)
+        XCTAssertEqual(received?.requestID, "req-terminal-control")
+        XCTAssertEqual(received?.action, .takeOver)
+
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-terminal-control",
+                state: .waitingForOutput,
+                message: "等待输出",
+                redactedCommand: "tail -f /var/log/messages"
+            )
+        ])
+        XCTAssertTrue(overlay.visibleControlTitlesForTesting.contains(L10n.AI.confirmTaskComplete))
+
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-terminal-control",
+                state: .completed,
+                message: "任务完成",
+                redactedCommand: "tail -f /var/log/messages"
+            )
+        ])
+        XCTAssertEqual(overlay.visibleControlTitlesForTesting, [])
     }
 
     func testLocalTerminalEnablesCommandClickImplicitLinks() {
@@ -121,7 +242,7 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(request, TerminalAIContextRequest(runtimeID: "term_local", selectedText: "permission denied"))
     }
 
-    func testAgentTraceRemainsDataOnlyAndDoesNotCreateTerminalOverlay() {
+    func testAgentTraceRendersTerminalOverlayWithoutWritingInput() throws {
         let launcher = RecordingLocalTerminalLauncher()
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
@@ -141,11 +262,20 @@ final class TerminalPaneViewControllerTests: XCTestCase {
 
         XCTAssertEqual(launcher.sentInput, [])
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("Codex 正在执行 uptime"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayVisibleForTesting)
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("执行中"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("Codex 正在执行 uptime"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("uptime"))
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        let overlay = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay")
+                as? TerminalAgentTraceOverlayView
+        )
+        XCTAssertEqual(overlay.fixedSizeForTesting, NSSize(width: 520, height: 132))
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-1"))
     }
 
-    func testAgentTraceDoesNotAddViewsAboveTerminal() throws {
+    func testAgentTraceOverlaySharesTerminalContainerWithoutReplacingTerminal() throws {
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
             shellPath: "/bin/zsh",
@@ -162,7 +292,12 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         )
 
         XCTAssertTrue(controller.terminalView.superview === controller.view)
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        let overlay = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay")
+                as? TerminalAgentTraceOverlayView
+        )
+        XCTAssertTrue(overlay.superview === controller.view)
+        XCTAssertNil(overlay.hitTest(NSPoint(x: 1, y: 1)))
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-hit-test"))
     }
 
@@ -188,7 +323,7 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(launcher.sentInput, [])
     }
 
-    func testAgentTraceDoesNotRenderBoundedStateAndRiskOverlay() {
+    func testAgentTraceOverlayShowsOnlyRecentEvents() {
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
             shellPath: "/bin/zsh",
@@ -207,10 +342,11 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         }
 
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("running"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("AI 步骤 7"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("AI 步骤 0"))
     }
 
-    func testAgentTraceDoesNotRenderRequestTimelineProgressInTerminalPane() {
+    func testAgentTraceOverlaySynchronizesRequestTimelineProgress() {
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
             shellPath: "/bin/zsh",
@@ -235,10 +371,11 @@ final class TerminalPaneViewControllerTests: XCTestCase {
 
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("等待确认"))
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("命令已在终端执行"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("等待确认"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("命令已在终端执行"))
     }
 
-    func testAgentTraceBackgroundMetadataStaysInDataLayerOnly() {
+    func testAgentTraceOverlayShowsBackgroundProgressWithoutInternalRuntimeMetadata() {
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
             shellPath: "/bin/zsh",
@@ -259,10 +396,12 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         )
 
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("已创建独立执行终端"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("已创建独立执行终端"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("agent_bg_1"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("backgroundTask"))
     }
 
-    func testAgentTraceExecutionPolicyMetadataStaysInDataLayerOnly() {
+    func testAgentTraceOverlayKeepsExecutionPolicyMetadataInDataLayer() {
         let controller = TerminalPaneViewController(
             runtimeID: "term_local",
             shellPath: "/bin/zsh",
@@ -286,7 +425,9 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         )
 
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("已按全局策略自动放行"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("已按全局策略自动放行"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("production"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("readOnlyAuto"))
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-policy"))
     }
 

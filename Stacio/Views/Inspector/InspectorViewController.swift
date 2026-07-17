@@ -112,6 +112,7 @@ public final class InspectorViewController: NSViewController {
     private let tunnelEndpointContextBuilder: TunnelLiveSessionContextBuilding?
     private let databasePathProvider: () throws -> String
     private let settingsStore: AppSettingsStore
+    private let transferCompletionNotificationPresenter: TransferCompletionNotificationPresenting
     private let transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)?
     private let multiExecAuditStore: MultiExecAuditListing?
     private let agentAuditStore: AgentActionAuditListing?
@@ -164,6 +165,7 @@ public final class InspectorViewController: NSViewController {
         tunnelEndpointContextBuilder: TunnelLiveSessionContextBuilding? = nil,
         databasePathProvider: @escaping () throws -> String = { try StacioPaths().databaseURL.path },
         settingsStore: AppSettingsStore = .shared,
+        transferCompletionNotificationPresenter: TransferCompletionNotificationPresenting? = nil,
         transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)? = nil
     ) {
         self.transferHistoryStore = transferHistoryStore
@@ -192,6 +194,8 @@ public final class InspectorViewController: NSViewController {
         self.tunnelEndpointContextBuilder = tunnelEndpointContextBuilder
         self.databasePathProvider = databasePathProvider
         self.settingsStore = settingsStore
+        self.transferCompletionNotificationPresenter = transferCompletionNotificationPresenter
+            ?? NoopTransferCompletionNotificationPresenter()
         self.transferQueueCoordinatorFactory = transferQueueCoordinatorFactory
         super.init(nibName: nil, bundle: nil)
     }
@@ -662,6 +666,7 @@ public final class InspectorViewController: NSViewController {
     @discardableResult
     public func disconnectFilesBindingIfNeeded(runtimeID: String) -> Bool {
         guard remoteFilesBinding?.runtimeID == runtimeID else {
+            _ = transferQueueCoordinator?.disconnectTransfers(runtimeID: runtimeID)
             return true
         }
         guard filesViewController?.closeEmbeddedEditorIfNeeded() != false else {
@@ -687,12 +692,24 @@ public final class InspectorViewController: NSViewController {
         return true
     }
 
+    public func dismissTransferNotifications(runtimeID: String) {
+        if let transferQueueCoordinator {
+            transferQueueCoordinator.dismissTransferNotifications(runtimeID: runtimeID)
+        } else {
+            transferCompletionNotificationPresenter.dismiss(runtimeID: runtimeID)
+        }
+    }
+
     public func reattachFilesBindingIfNeeded(
         oldRuntimeID: String,
         runtimeID: String,
         context: TunnelLiveSessionContext?,
         remotePath: String
     ) {
+        transferQueueCoordinator?.reattachTransfers(
+            oldRuntimeID: oldRuntimeID,
+            runtimeID: runtimeID
+        )
         guard let binding = remoteFilesBinding,
               binding.runtimeID == oldRuntimeID
         else {
@@ -1268,6 +1285,7 @@ public final class InspectorViewController: NSViewController {
         if let transferHistoryStore {
             let coordinator = TransferQueueCoordinator(
                 historyStore: transferHistoryStore,
+                completionNotificationPresenter: transferCompletionNotificationPresenter,
                 queueViewController: transferQueue
             )
             try? coordinator.restoreHistory()
@@ -1278,12 +1296,16 @@ public final class InspectorViewController: NSViewController {
             let paths = try StacioPaths()
             let coordinator = TransferQueueCoordinator(
                 historyStore: CoreBridgeSCPTransferHistoryStore(databasePath: paths.databaseURL.path),
+                completionNotificationPresenter: transferCompletionNotificationPresenter,
                 queueViewController: transferQueue
             )
             try? coordinator.restoreHistory()
             return coordinator
         } catch {
-            return TransferQueueCoordinator(queueViewController: transferQueue)
+            return TransferQueueCoordinator(
+                completionNotificationPresenter: transferCompletionNotificationPresenter,
+                queueViewController: transferQueue
+            )
         }
     }
 

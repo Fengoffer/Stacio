@@ -1,5 +1,8 @@
 // swift-tools-version: 5.10
+import Foundation
 import PackageDescription
+
+let stacioCoreLibraryDirectory = ProcessInfo.processInfo.environment["STACIO_CORE_LIBRARY_DIR"] ?? "StacioCore/target/debug"
 
 let package = Package(
     name: "Stacio",
@@ -32,7 +35,7 @@ let package = Package(
             dependencies: ["stacio_coreFFI"],
             path: "Stacio/Bridge/Generated/Sources",
             linkerSettings: [
-                .unsafeFlags(["-L", "StacioCore/target/debug", "-lstacio_core"])
+                .unsafeFlags(["-L", stacioCoreLibraryDirectory, "-lstacio_core"])
             ]
         ),
         .systemLibrary(
@@ -54,7 +57,9 @@ let package = Package(
             ],
             resources: [
                 .process("Resources/About"),
-                .process("Resources/github.svg")
+                .process("Resources/github.svg"),
+                .process("Resources/gitee.svg"),
+                .process("Resources/SessionIcons")
             ]
         ),
         .executableTarget(

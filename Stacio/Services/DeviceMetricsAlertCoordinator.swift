@@ -114,7 +114,8 @@ public final class StacioUserNotificationDeviceMetricsAlertNotifier: DeviceMetri
             identifier: payload.identifier,
             title: payload.title,
             body: payload.body,
-            runtimeID: payload.runtimeID
+            runtimeID: payload.runtimeID,
+            retentionPolicy: .replaceableAutomatic
         ))
     }
 }

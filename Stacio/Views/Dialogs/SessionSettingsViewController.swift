@@ -445,7 +445,12 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     private let proxyJumpCredentialIDField = NSTextField()
     private let proxyJumpPrivateKeyPathField = NSTextField()
     private let proxyJumpHintLabel = NSTextField(labelWithString: L10n.SessionSettings.proxyJumpHint)
+    private let sessionIconView = NSView()
+    private let sessionIconImageView = NSImageView()
+    private let sessionIconNameLabel = NSTextField(labelWithString: "默认")
+    private let sessionIconChooseButton = NSButton(title: "选择…", target: nil, action: nil)
     private var serialAdvancedHeightConstraint: NSLayoutConstraint?
+    private var sessionIconHeightConstraint: NSLayoutConstraint?
     private var serialAdvancedLabels: [NSTextField] = []
     private let saveButton = NSButton(title: L10n.Common.save, target: nil, action: nil)
     private let cancelButton = NSButton(title: L10n.Common.cancel, target: nil, action: nil)
@@ -468,6 +473,8 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         connectTimeoutMs: nil
     )
     private var existingProxyJumpSelection: SSHProxyJumpSelection = .disabled
+    private var selectedSessionIconID: String?
+    private var sessionIconPickerWindow: NSWindow?
 
     var onSave: ((SessionDraft) -> Void)?
     var onCancel: (() -> Void)?
@@ -482,6 +489,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     ) {
         self.existingSession = existingSession
         self.existingSerialConfigJSON = existingSerialConfigJSON
+        selectedSessionIconID = SessionIconConfigCodec.iconID(from: existingSerialConfigJSON)
         sshForm = SessionSidebarSessionForm(
             existingSession: existingSession,
             selectedFolderID: selectedFolderID,
@@ -547,6 +555,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         sshForm.view.translatesAutoresizingMaskIntoConstraints = false
         sshForm.bind(saveButton: saveButton)
         configureSerialAdvancedView()
+        configureSessionIconView()
         applyExistingSerialAdvancedConfigIfNeeded()
         initialSerialAdvancedSelection = currentSerialAdvancedSelection()
         configureAutomationView()
@@ -568,6 +577,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         let detailContainer = NSView()
         detailContainer.translatesAutoresizingMaskIntoConstraints = false
         detailContainer.addSubview(sshForm.view)
+        detailContainer.addSubview(sessionIconView)
         detailContainer.addSubview(serialAdvancedView)
         detailContainer.addSubview(automationView)
         detailContainer.addSubview(startupActionsView)
@@ -584,6 +594,8 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         detailScrollView.setAccessibilityIdentifier("Stacio.SessionSettings.detailScrollView")
         let serialAdvancedHeightConstraint = serialAdvancedView.heightAnchor.constraint(equalToConstant: 0)
         self.serialAdvancedHeightConstraint = serialAdvancedHeightConstraint
+        let sessionIconHeightConstraint = sessionIconView.heightAnchor.constraint(equalToConstant: 36)
+        self.sessionIconHeightConstraint = sessionIconHeightConstraint
 
         saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
@@ -650,8 +662,13 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             sshForm.view.trailingAnchor.constraint(lessThanOrEqualTo: detailContainer.trailingAnchor),
             sshForm.view.bottomAnchor.constraint(lessThanOrEqualTo: detailContainer.bottomAnchor),
 
+            sessionIconView.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor),
+            sessionIconView.trailingAnchor.constraint(lessThanOrEqualTo: detailContainer.trailingAnchor),
+            sessionIconView.topAnchor.constraint(equalTo: sshForm.view.bottomAnchor, constant: 12),
+            sessionIconHeightConstraint,
+
             serialAdvancedView.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor),
-            serialAdvancedView.topAnchor.constraint(equalTo: sshForm.view.bottomAnchor, constant: 14),
+            serialAdvancedView.topAnchor.constraint(equalTo: sessionIconView.bottomAnchor, constant: 12),
             serialAdvancedView.trailingAnchor.constraint(lessThanOrEqualTo: detailContainer.trailingAnchor),
             serialAdvancedView.bottomAnchor.constraint(lessThanOrEqualTo: automationView.topAnchor, constant: -10),
             serialAdvancedHeightConstraint,
@@ -723,11 +740,14 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             privateKeyPath: draft.privateKeyPath,
             credentialId: draft.credentialId,
             tags: draft.tags,
-            configJson: try configJSON(
-                for: selectedProtocol,
-                host: serialConnectionFields?.devicePath ?? draft.host,
-                port: serialConnectionFields?.baudRate ?? draft.port,
-                baseConfigJSON: draft.configJson
+            configJson: try SessionIconConfigCodec.updatingIconID(
+                selectedProtocol == .ssh ? selectedSessionIconID : nil,
+                in: configJSON(
+                    for: selectedProtocol,
+                    host: serialConnectionFields?.devicePath ?? draft.host,
+                    port: serialConnectionFields?.baudRate ?? draft.port,
+                    baseConfigJSON: draft.configJson
+                )
             )
         )
     }
@@ -1275,6 +1295,87 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         onCancel?()
     }
 
+    private func configureSessionIconView() {
+        sessionIconView.translatesAutoresizingMaskIntoConstraints = false
+        sessionIconView.setAccessibilityIdentifier("Stacio.SessionSettings.sessionIcon")
+
+        let titleLabel = NSTextField(labelWithString: "会话图标")
+        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        titleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        sessionIconImageView.imageScaling = .scaleProportionallyUpOrDown
+        sessionIconImageView.translatesAutoresizingMaskIntoConstraints = false
+
+        sessionIconNameLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        sessionIconNameLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        sessionIconNameLabel.lineBreakMode = .byTruncatingTail
+        sessionIconNameLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        sessionIconChooseButton.target = self
+        sessionIconChooseButton.action = #selector(chooseSessionIcon(_:))
+        sessionIconChooseButton.bezelStyle = .rounded
+        sessionIconChooseButton.translatesAutoresizingMaskIntoConstraints = false
+        sessionIconChooseButton.setAccessibilityIdentifier("Stacio.SessionSettings.sessionIconChoose")
+
+        sessionIconView.addSubview(titleLabel)
+        sessionIconView.addSubview(sessionIconImageView)
+        sessionIconView.addSubview(sessionIconNameLabel)
+        sessionIconView.addSubview(sessionIconChooseButton)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: sessionIconView.leadingAnchor),
+            titleLabel.centerYAnchor.constraint(equalTo: sessionIconView.centerYAnchor),
+            titleLabel.widthAnchor.constraint(equalToConstant: 76),
+            sessionIconImageView.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 12),
+            sessionIconImageView.centerYAnchor.constraint(equalTo: sessionIconView.centerYAnchor),
+            sessionIconImageView.widthAnchor.constraint(equalToConstant: 24),
+            sessionIconImageView.heightAnchor.constraint(equalToConstant: 24),
+            sessionIconNameLabel.leadingAnchor.constraint(equalTo: sessionIconImageView.trailingAnchor, constant: 8),
+            sessionIconNameLabel.centerYAnchor.constraint(equalTo: sessionIconView.centerYAnchor),
+            sessionIconChooseButton.leadingAnchor.constraint(greaterThanOrEqualTo: sessionIconNameLabel.trailingAnchor, constant: 10),
+            sessionIconChooseButton.trailingAnchor.constraint(equalTo: sessionIconView.trailingAnchor),
+            sessionIconChooseButton.centerYAnchor.constraint(equalTo: sessionIconView.centerYAnchor),
+            sessionIconChooseButton.widthAnchor.constraint(equalToConstant: 76)
+        ])
+        updateSessionIconPreview()
+    }
+
+    @objc private func chooseSessionIcon(_ sender: NSButton) {
+        guard let parentWindow = view.window else { return }
+        let picker = SessionIconPickerViewController(selectedIconID: selectedSessionIconID)
+        let pickerWindow = NSWindow(contentViewController: picker)
+        pickerWindow.title = "选择会话图标"
+        pickerWindow.styleMask = [.titled, .closable, .resizable]
+        pickerWindow.setContentSize(NSSize(width: 560, height: 460))
+        pickerWindow.minSize = NSSize(width: 480, height: 400)
+        sessionIconPickerWindow = pickerWindow
+
+        picker.onConfirm = { [weak self, weak parentWindow, weak pickerWindow] iconID in
+            guard let self, let parentWindow, let pickerWindow else { return }
+            selectedSessionIconID = iconID
+            updateSessionIconPreview()
+            parentWindow.endSheet(pickerWindow)
+            sessionIconPickerWindow = nil
+        }
+        picker.onCancel = { [weak self, weak parentWindow, weak pickerWindow] in
+            guard let parentWindow, let pickerWindow else { return }
+            parentWindow.endSheet(pickerWindow)
+            self?.sessionIconPickerWindow = nil
+        }
+        parentWindow.beginSheet(pickerWindow)
+    }
+
+    private func updateSessionIconPreview() {
+        if let definition = SessionIconCatalog.definition(id: selectedSessionIconID),
+           let image = SessionIconCatalog.image(for: definition.id, size: NSSize(width: 24, height: 24)) {
+            sessionIconImageView.image = image
+            sessionIconNameLabel.stringValue = definition.displayName
+        } else {
+            sessionIconImageView.image = SessionTabIconDescriptor.sshDefault.image(size: NSSize(width: 24, height: 24))
+            sessionIconNameLabel.stringValue = "默认"
+        }
+    }
+
     private func refreshProtocolState() {
         sshForm.view.isHidden = !selectedProtocol.isAvailableForSaving
         serialAdvancedView.isHidden = selectedProtocol != .serial
@@ -1285,6 +1386,9 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             : L10n.SessionSettings.unsupportedProtocol(selectedProtocol.label)
         automationView.isHidden = !selectedProtocol.isAvailableForSaving
         proxyJumpView.isHidden = selectedProtocol != .ssh && selectedProtocol != .scp
+        let showsSessionIcon = selectedProtocol == .ssh
+        sessionIconView.isHidden = !showsSessionIcon
+        sessionIconHeightConstraint?.constant = showsSessionIcon ? 36 : 0
 
         if selectedProtocol.isAvailableForSaving {
             saveButton.isEnabled = sshForm.isValidForSaving
@@ -1743,6 +1847,19 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
 
     var sshFormIsHiddenForTesting: Bool {
         sshForm.view.isHidden
+    }
+
+    var sessionIconRowIsHiddenForTesting: Bool {
+        sessionIconView.isHidden
+    }
+
+    var selectedSessionIconIDForTesting: String? {
+        selectedSessionIconID
+    }
+
+    func selectSessionIconForTesting(_ iconID: String?) {
+        selectedSessionIconID = SessionIconCatalog.definition(id: iconID)?.id
+        updateSessionIconPreview()
     }
 
     var unsupportedMessageForTesting: String {

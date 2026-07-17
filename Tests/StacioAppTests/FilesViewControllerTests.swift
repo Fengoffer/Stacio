@@ -1571,7 +1571,163 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.visibleTextSnapshot.contains("Remote Edit"))
     }
 
-    func testFilesPanelKeepsShowingSameRunningTransferWhenAnotherTaskStarts() throws {
+    func testFilesPanelKeepsTransferRowsAndActionsWhenShowingOrdinaryStatus() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        var actions: [(TransferQueueAction, String)] = []
+        controller.onTransferStatusAction = { actions.append(($0, $1)) }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_release",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_backup",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+
+        controller.setRemoteEditSyncStatus(
+            message: "Remote Edit：本地副本已加入上传队列",
+            progressValue: 100
+        )
+
+        let transferLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
+        )
+        let secondTransferLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1") as? NSTextField
+        )
+        let supplementalLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.2") as? NSTextField
+        )
+        let pause = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferPrimaryAction") as? NSButton
+        )
+        let secondStop = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferSecondaryAction.1") as? NSButton
+        )
+        XCTAssertTrue(transferLabel.stringValue.contains("上传 release.tar"))
+        XCTAssertTrue(secondTransferLabel.stringValue.contains("下载 backup.tar"))
+        XCTAssertEqual(supplementalLabel.stringValue, "Remote Edit：本地副本已加入上传队列")
+
+        pause.performClick(nil as Any?)
+        secondStop.performClick(nil as Any?)
+
+        XCTAssertEqual(actions.map(\.0), [.pause, .stop])
+        XCTAssertEqual(actions.map(\.1), ["upload_release", "download_backup"])
+    }
+
+    func testFilesPanelUpdatesAndClearsOrdinaryStatusWithoutRemovingTransferRows() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "download_backup",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+        controller.setRemoteEditSyncStatus(message: "正在刷新目录", progressValue: 10)
+
+        controller.setRemoteEditSyncStatus(message: "目录刷新完成", progressValue: 100)
+
+        let updatedStatus = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1") as? NSTextField
+        )
+        XCTAssertEqual(updatedStatus.stringValue, "目录刷新完成")
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.2"))
+
+        controller.setRemoteEditSyncStatus(message: "   ", progressValue: nil)
+
+        let transferLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
+        )
+        XCTAssertTrue(transferLabel.stringValue.contains("下载 backup.tar"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1"))
+    }
+
+    func testFilesPanelRefreshesTransferSnapshotAndClearsStaleOrdinaryStatus() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_release",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_backup",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+        controller.setRemoteEditSyncStatus(message: "正在跟随终端目录", progressValue: 20)
+
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_release",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 75,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_backup",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+
+        let firstTransfer = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
+        )
+        let secondTransfer = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1") as? NSTextField
+        )
+        XCTAssertTrue(firstTransfer.stringValue.contains("75%"))
+        XCTAssertTrue(secondTransfer.stringValue.contains("下载 backup.tar"))
+        XCTAssertTrue(secondTransfer.stringValue.contains("50%"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.2"))
+        XCTAssertFalse(controller.visibleTextSnapshot.contains("正在跟随终端目录"))
+    }
+
+    func testFilesPanelShowsEveryRunningTransferWhenAnotherTaskStarts() throws {
         let controller = FilesViewController()
         controller.loadView()
 
@@ -1620,17 +1776,220 @@ final class FilesViewControllerTests: XCTestCase {
             )
         )
 
-        let progress = try XCTUnwrap(
+        let firstProgress = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.Files.transferProgress") as? NSProgressIndicator
         )
+        let firstLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
+        )
+        let secondProgress = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferProgress.1") as? NSProgressIndicator
+        )
+        let secondLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1") as? NSTextField
+        )
+
+        XCTAssertEqual(firstProgress.doubleValue, 80, accuracy: 0.1)
+        XCTAssertEqual(secondProgress.doubleValue, 50, accuracy: 0.1)
+        XCTAssertTrue(firstLabel.stringValue.contains("上传 release"))
+        XCTAssertTrue(firstLabel.stringValue.contains("80%"))
+        XCTAssertTrue(secondLabel.stringValue.contains("下载 swap.img"))
+        XCTAssertTrue(secondLabel.stringValue.contains("50%"))
+        XCTAssertTrue(controller.visibleTextSnapshot.contains("上传 release"))
+        XCTAssertTrue(controller.visibleTextSnapshot.contains("下载 swap.img"))
+    }
+
+    func testFilesPanelMultiTransferRowsDispatchActionsToTheirOwnJobs() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        var actions: [(TransferQueueAction, String)] = []
+        controller.onTransferStatusAction = { actions.append(($0, $1)) }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_release",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_backup",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+
+        let firstPause = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferPrimaryAction") as? NSButton
+        )
+        let secondStop = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferSecondaryAction.1") as? NSButton
+        )
+        firstPause.performClick(nil as Any?)
+        secondStop.performClick(nil as Any?)
+
+        XCTAssertEqual(actions.map(\.0), [.pause, .stop])
+        XCTAssertEqual(actions.map(\.1), ["upload_release", "download_backup"])
+    }
+
+    func testFilesPanelKeepsResumingTransferVisibleAndControllable() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_resume",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "resuming",
+                diagnostic: nil
+            )
+        ]))
+
         let label = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
         )
+        let pause = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferPrimaryAction") as? NSButton
+        )
+        let stop = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferSecondaryAction") as? NSButton
+        )
+        XCTAssertTrue(label.stringValue.contains("续传中"))
+        XCTAssertEqual(pause.accessibilityLabel(), "暂停")
+        XCTAssertEqual(stop.accessibilityLabel(), "停止")
+    }
 
-        XCTAssertEqual(progress.doubleValue, 80, accuracy: 0.1)
-        XCTAssertTrue(label.stringValue.contains("上传 release"))
-        XCTAssertTrue(label.stringValue.contains("80%"))
-        XCTAssertFalse(label.stringValue.contains("下载 swap.img"))
+    func testFilesPanelMakesLongTransferListScrollableWithoutDroppingRows() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        let rows = (0 ..< 5).map { index in
+            TransferQueueSnapshot.Row(
+                jobID: "job_\(index)",
+                direction: .upload,
+                sourcePath: "/Users/alice/file-\(index).tar",
+                destinationPath: "/srv/file-\(index).tar",
+                bytesDone: UInt64(index * 10),
+                bytesTotal: 100,
+                rawStatus: index < 2 ? "running" : "queued",
+                diagnostic: nil
+            )
+        }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: rows))
+
+        let scrollView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatusList") as? NSScrollView
+        )
+        XCTAssertTrue(scrollView.hasVerticalScroller)
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatusRow.4"))
+        XCTAssertTrue(controller.visibleTextSnapshot.contains("file-0.tar"))
+        XCTAssertTrue(controller.visibleTextSnapshot.contains("file-4.tar"))
+    }
+
+    func testFilesPanelKeepsTransferListScrollPositionDuringProgressRefresh() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 360, height: 420)
+        let rows = (0 ..< 6).map { index in
+            TransferQueueSnapshot.Row(
+                jobID: "job_\(index)",
+                direction: .upload,
+                sourcePath: "/Users/alice/file-\(index).tar",
+                destinationPath: "/srv/file-\(index).tar",
+                bytesDone: UInt64(index * 10),
+                bytesTotal: 100,
+                rawStatus: index < 2 ? "running" : "queued",
+                diagnostic: nil
+            )
+        }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: rows))
+        controller.view.layoutSubtreeIfNeeded()
+        let scrollView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatusList") as? NSScrollView
+        )
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: 40))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        let scrolledY = scrollView.contentView.bounds.origin.y
+        XCTAssertGreaterThan(scrolledY, 0)
+
+        let refreshedRows = rows.map { row in
+            TransferQueueSnapshot.Row(
+                jobID: row.jobID,
+                direction: row.direction,
+                sourcePath: row.sourcePath,
+                destinationPath: row.destinationPath,
+                bytesDone: min(row.bytesDone + 5, row.bytesTotal),
+                bytesTotal: row.bytesTotal,
+                rawStatus: row.rawStatus,
+                diagnostic: row.diagnostic
+            )
+        }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: refreshedRows))
+        controller.view.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, scrolledY, accuracy: 1)
+    }
+
+    func testFilesPanelReindexesReusedTransferRowsAfterFirstTaskDisappears() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        let initialRows = ["job_a", "job_b"].map { jobID in
+            TransferQueueSnapshot.Row(
+                jobID: jobID,
+                direction: .upload,
+                sourcePath: "/Users/alice/\(jobID).tar",
+                destinationPath: "/srv/\(jobID).tar",
+                bytesDone: 10,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: initialRows))
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [initialRows[1]]))
+
+        let firstLabel = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus") as? NSTextField
+        )
+        XCTAssertTrue(firstLabel.stringValue.contains("job_b.tar"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatus.1"))
+    }
+
+    func testFilesPanelShrinksTransferListBeforeCollapsingRemoteFileTable() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 360, height: 260)
+        let rows = (0 ..< 5).map { index in
+            TransferQueueSnapshot.Row(
+                jobID: "job_compact_\(index)",
+                direction: .download,
+                sourcePath: "/srv/file-\(index).tar",
+                destinationPath: "/Users/alice/file-\(index).tar",
+                bytesDone: 10,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: rows))
+        controller.view.layoutSubtreeIfNeeded()
+
+        let transferScrollView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferStatusList") as? NSScrollView
+        )
+        let remoteScrollView = try XCTUnwrap(controller.tableView.enclosingScrollView)
+        XCTAssertGreaterThanOrEqual(remoteScrollView.frame.height, 43)
+        XCTAssertTrue(transferScrollView.hasVerticalScroller)
     }
 
     func testInspectorFilesCoordinatorUsesEmbeddedStacioEditorOpener() {

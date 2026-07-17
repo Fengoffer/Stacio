@@ -4,6 +4,392 @@ import StacioCoreBindings
 
 @MainActor
 final class TransferQueueCoordinatorTests: XCTestCase {
+    func testCoordinatorDefaultsToTwoConcurrentTransfers() {
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(queueViewController: queue)
+
+        XCTAssertEqual(coordinator.maxConcurrentTransfersForTesting, 2)
+    }
+
+    func testCompletedSCPTransferPresentsPersistentNotification() throws {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let bridge = RecordingSCPTransferBridge(progress: [
+            ScpTransferProgress(
+                jobId: "job_notify_completed",
+                bytesDone: 128,
+                bytesTotal: 128,
+                status: "completed"
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let completedAt = Date(timeIntervalSince1970: 1_721_111_111)
+        var monotonicTimes: [TimeInterval] = [10, 14]
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            nowProvider: { completedAt },
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
+        )
+        let job = ScpTransferJob(
+            id: "job_notify_completed",
+            direction: .upload,
+            sourcePath: "/local/release.tar",
+            destinationPath: "/srv/release.tar",
+            bytesTotal: 128
+        )
+
+        _ = try coordinator.runLiveTransfer(
+            config: SshConnectionConfig(
+                host: "notify.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+
+        XCTAssertEqual(presenter.payloads, [
+            TransferCompletionNotificationPayload(
+                jobID: job.id,
+                runtimeID: "notify.example.com",
+                status: .completed,
+                title: "文件传输完成",
+                body: "上传“release.tar”已完成。",
+                itemName: "release.tar",
+                byteCount: 128,
+                completedAt: completedAt,
+                duration: 4,
+                averageBytesPerSecond: 32
+            )
+        ])
+    }
+
+    func testCompletedFolderUploadNotificationUsesFinalRecursiveSizeAndAverageRate() throws {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let bridge = RecordingSCPTransferBridge(progress: [
+            ScpTransferProgress(
+                jobId: "job_notify_folder",
+                bytesDone: 4_096,
+                bytesTotal: 4_096,
+                status: "completed"
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        var monotonicTimes: [TimeInterval] = [20, 24]
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            nowProvider: { Date(timeIntervalSince1970: 1_721_222_222) },
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
+        )
+        let job = ScpTransferJob(
+            id: "job_notify_folder",
+            direction: .upload,
+            sourcePath: "/local/release-assets",
+            destinationPath: "/srv/release-assets",
+            bytesTotal: 0
+        )
+
+        _ = try coordinator.runLiveTransfer(
+            config: SshConnectionConfig(
+                host: "notify.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+
+        let payload = try XCTUnwrap(presenter.payloads.first)
+        XCTAssertEqual(payload.itemName, "release-assets")
+        XCTAssertEqual(payload.byteCount, 4_096)
+        XCTAssertEqual(payload.duration, 4)
+        XCTAssertEqual(payload.averageBytesPerSecond, 1_024)
+    }
+
+    func testCompletedFTPNotificationUsesActualBytesWhenQueuedFileSizeChanged() throws {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let ftpBridge = RecordingFTPTransferBridge(progress: [
+            ScpTransferProgress(
+                jobId: "job_notify_ftp_size_changed",
+                bytesDone: 150,
+                bytesTotal: 100,
+                status: "completed"
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        var monotonicTimes: [TimeInterval] = [10, 14]
+        let coordinator = TransferQueueCoordinator(
+            ftpBridge: ftpBridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
+        )
+        let job = ScpTransferJob(
+            id: "job_notify_ftp_size_changed",
+            direction: .upload,
+            sourcePath: "/local/release.tar",
+            destinationPath: "/srv/release.tar",
+            bytesTotal: 100
+        )
+
+        _ = try coordinator.runLiveFTPTransfer(
+            config: FtpConnectionConfig(
+                host: "ftp.example.com",
+                port: 21,
+                username: "deploy",
+                connectTimeoutMs: 10_000
+            ),
+            secret: .password(value: "secret"),
+            job: job
+        )
+
+        let payload = try XCTUnwrap(presenter.payloads.first)
+        XCTAssertEqual(payload.byteCount, 150)
+        XCTAssertEqual(payload.duration, 4)
+        XCTAssertEqual(payload.averageBytesPerSecond, 37.5)
+    }
+
+    func testCompletedFolderNotificationDoesNotLetEstimateOverrideFinalEngineSize() async throws {
+        let job = ScpTransferJob(
+            id: "job_notify_folder_estimate",
+            direction: .upload,
+            sourcePath: "/local/release-assets",
+            destinationPath: "/srv/release-assets",
+            bytesTotal: 0
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 4_096,
+                    bytesTotal: 4_096,
+                    status: "completed"
+                )
+            ]
+        ])
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        var monotonicTimes: [TimeInterval] = [20, 24]
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime_one",
+            config: SshConnectionConfig(
+                host: "notify.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+        coordinator.updateScheduledTransferEstimatedByteTotal(jobID: job.id, bytesTotal: 8_192)
+
+        bridge.release(jobID: job.id)
+
+        let didPresent = await eventually { presenter.payloads.count == 1 }
+        XCTAssertTrue(didPresent)
+        let payload = try XCTUnwrap(presenter.payloads.first)
+        XCTAssertEqual(payload.byteCount, 4_096)
+        XCTAssertEqual(payload.duration, 4)
+        XCTAssertEqual(payload.averageBytesPerSecond, 1_024)
+    }
+
+    func testPolledTerminalProgressCapturesCompletionTimeBeforeBridgeReturns() async throws {
+        let job = ScpTransferJob(
+            id: "job_notify_polled_terminal",
+            direction: .download,
+            sourcePath: "/srv/release.tar",
+            destinationPath: "/local/release.tar",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ]
+        ])
+        bridge.progressBatchesByJobID[job.id] = [[
+            ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: 100,
+                bytesTotal: 100,
+                status: "completed"
+            )
+        ]]
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let observedCompletionDate = Date(timeIntervalSince1970: 1_721_111_111)
+        var currentDate = observedCompletionDate
+        var monotonicTimes: [TimeInterval] = [10, 14]
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            nowProvider: { currentDate },
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime_one",
+            config: SshConnectionConfig(
+                host: "notify.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+        coordinator.pollScheduledTransferProgressForTesting()
+        let didObserveCompletion = await eventually {
+            queue.tableView.statusText(row: 0) == "已完成"
+        }
+        XCTAssertTrue(didObserveCompletion)
+
+        currentDate = Date(timeIntervalSince1970: 1_721_111_999)
+        bridge.release(jobID: job.id)
+
+        let didPresent = await eventually { presenter.payloads.count == 1 }
+        XCTAssertTrue(didPresent)
+        let payload = try XCTUnwrap(presenter.payloads.first)
+        XCTAssertEqual(payload.completedAt, observedCompletionDate)
+        XCTAssertEqual(payload.duration, 4)
+    }
+
+    func testFailedSCPTransferPresentsPersistentNotification() {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let bridge = RecordingSCPTransferBridge(error: SshRuntimeError.Timeout)
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue
+        )
+        let job = ScpTransferJob(
+            id: "job_notify_failed",
+            direction: .download,
+            sourcePath: "/srv/release.tar",
+            destinationPath: "/local/release.tar",
+            bytesTotal: 128
+        )
+
+        XCTAssertThrowsError(try coordinator.runLiveTransfer(
+            config: SshConnectionConfig(
+                host: "notify.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        ))
+
+        XCTAssertEqual(presenter.payloads.count, 1)
+        XCTAssertEqual(presenter.payloads[0].jobID, job.id)
+        XCTAssertEqual(presenter.payloads[0].runtimeID, "notify.example.com")
+        XCTAssertEqual(presenter.payloads[0].status, .failed)
+        XCTAssertEqual(presenter.payloads[0].title, "文件传输失败")
+        XCTAssertTrue(presenter.payloads[0].body.contains("下载“release.tar”失败"))
+        XCTAssertTrue(presenter.payloads[0].body.contains("连接超时"))
+    }
+
+    func testClosingRuntimeDismissesTransferNotificationsEvenWithoutQueuedJobs() {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            completionNotificationPresenter: presenter,
+            queueViewController: queue
+        )
+
+        XCTAssertEqual(coordinator.disconnectTransfers(runtimeID: "term_closed"), [])
+
+        XCTAssertEqual(presenter.dismissedRuntimeIDs, ["term_closed"])
+    }
+
+    func testClosingReattachedRuntimeDismissesPreReconnectTransferNotification() throws {
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let bridge = RecordingSCPTransferBridge(progress: [
+            ScpTransferProgress(
+                jobId: "job_notify_reattached",
+                bytesDone: 128,
+                bytesTotal: 128,
+                status: "completed"
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue
+        )
+        let job = ScpTransferJob(
+            id: "job_notify_reattached",
+            direction: .upload,
+            sourcePath: "/local/release.tar",
+            destinationPath: "/srv/release.tar",
+            bytesTotal: 128
+        )
+        _ = try coordinator.runLiveTransfer(
+            config: SshConnectionConfig(
+                host: "old-runtime.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+
+        coordinator.reattachTransfers(
+            oldRuntimeID: "old-runtime.example.com",
+            runtimeID: "term_reconnected"
+        )
+        XCTAssertEqual(coordinator.disconnectTransfers(runtimeID: "term_reconnected"), [job.id])
+
+        XCTAssertEqual(
+            presenter.dismissedRuntimeIDs,
+            ["term_reconnected", "old-runtime.example.com"]
+        )
+    }
+
     func testCoordinatorPublishesEstimatedByteTotalForQueuedUnknownSizeUpload() {
         let bridge = BlockingSCPTransferBridge(completionsByJobID: [
             "job_unknown_size_upload": [
@@ -497,6 +883,65 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertFalse(queue.visibleTextSnapshot.localizedCaseInsensitiveContains("SFTP"))
     }
 
+    func testCoordinatorWaitsForPausedFTPWorkerBeforeStartingResume() async {
+        let ftpBridge = DelayedFTPTransferBridge(
+            delay: 0.2,
+            progress: [
+                ScpTransferProgress(
+                    jobId: "ftp_pause_resume_serial",
+                    bytesDone: 64,
+                    bytesTotal: 64,
+                    status: "completed"
+                )
+            ]
+        )
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            ftpBridge: ftpBridge,
+            queueViewController: queue
+        )
+        let job = ScpTransferJob(
+            id: "ftp_pause_resume_serial",
+            direction: .upload,
+            sourcePath: "/Users/alice/readme.txt",
+            destinationPath: "/pub/readme.txt",
+            bytesTotal: 64
+        )
+        var completionStatuses: [String] = []
+        coordinator.scheduleLiveFTPTransfer(
+            runtimeID: "ftp_runtime",
+            config: FtpConnectionConfig(
+                host: "ftp.example.com",
+                port: 21,
+                username: "deploy",
+                connectTimeoutMs: 10_000
+            ),
+            secret: .password(value: "ftp-secret"),
+            job: job,
+            completion: { completionStatuses.append($0.status) }
+        )
+        let started = await eventually { ftpBridge.events == ["run:\(job.id)"] }
+        XCTAssertTrue(started)
+
+        XCTAssertTrue(coordinator.pauseTransfer(jobID: job.id))
+        XCTAssertTrue(coordinator.resumeTransfer(jobID: job.id))
+        let overlappedBeforeOriginalRunFinished = await eventually(timeout: 0.1) {
+            ftpBridge.events.count > 1
+        }
+        XCTAssertFalse(overlappedBeforeOriginalRunFinished)
+
+        let restarted = await eventually(timeout: 0.5) {
+            ftpBridge.events == ["run:\(job.id)", "run:\(job.id)"]
+        }
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(completionStatuses, [])
+        let completed = await eventually(timeout: 0.5) {
+            completionStatuses == ["completed"]
+        }
+        XCTAssertTrue(completed)
+    }
+
     func testCoordinatorMarksFailedStateWhenLiveTransferFails() {
         let bridge = RecordingSCPTransferBridge(error: SshRuntimeError.InvalidConfig)
         let queue = TransferQueueViewController()
@@ -741,7 +1186,11 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         ])
         let queue = TransferQueueViewController()
         queue.loadView()
-        let coordinator = TransferQueueCoordinator(bridge: bridge, queueViewController: queue)
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            queueViewController: queue,
+            maxConcurrentTransfers: 1
+        )
         let config = SshConnectionConfig(
             host: "example.com",
             port: 22,
@@ -838,6 +1287,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             queueViewController: queue,
             maxConcurrentTransfers: 2
         )
+        var snapshots: [TransferQueueSnapshot] = []
+        coordinator.onSnapshotChanged = { snapshots.append($0) }
         let config = SshConnectionConfig(
             host: "example.com",
             port: 22,
@@ -862,6 +1313,10 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
         XCTAssertEqual(queue.tableView.statusText(row: 1), "传输中")
         XCTAssertEqual(queue.tableView.statusText(row: 2), "排队中")
+        XCTAssertTrue(snapshots.contains { snapshot in
+            snapshot.rows.map(\.jobID) == [firstJob.id, secondJob.id, thirdJob.id]
+                && snapshot.rows.map(\.rawStatus) == ["running", "running", "queued"]
+        })
 
         bridge.release(jobID: firstJob.id)
 
@@ -883,6 +1338,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorCancelsRunningBackgroundTransferAndIgnoresLateCompletion() async {
+        var completionStatuses: [String] = []
         let job = ScpTransferJob(
             id: "job_background_cancel",
             direction: .upload,
@@ -920,7 +1376,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             config: config,
             secret: .agent,
             expectedFingerprintSHA256: "SHA256:test",
-            job: job
+            job: job,
+            completion: { completionStatuses.append($0.status) }
         )
 
         let started = await eventually { bridge.startedJobIDs == [job.id] }
@@ -939,6 +1396,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             "progress:job_background_cancel:running:0",
             "progress:job_background_cancel:canceled:0"
         ])
+        XCTAssertEqual(completionStatuses, [])
     }
 
     func testCoordinatorStopsProgressPollingWhenLastRunningSCPTransferIsCanceled() async {
@@ -989,6 +1447,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorPausesRunningSCPTransferAndResumesSameQueuedTask() async {
+        var completionStatuses: [String] = []
         let job = ScpTransferJob(
             id: "job_background_pause_resume",
             direction: .upload,
@@ -1017,12 +1476,16 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             ]
         ]
         let history = RecordingTransferHistoryStore()
+        let presenter = RecordingTransferCompletionNotificationPresenter()
         let queue = TransferQueueViewController()
         queue.loadView()
+        var monotonicTimes: [TimeInterval] = [10, 14, 20, 26]
         let coordinator = TransferQueueCoordinator(
             bridge: bridge,
             historyStore: history,
-            queueViewController: queue
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            monotonicTimeProvider: { monotonicTimes.removeFirst() }
         )
         var snapshots: [TransferQueueSnapshot] = []
         coordinator.onSnapshotChanged = { snapshots.append($0) }
@@ -1038,7 +1501,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             config: config,
             secret: .agent,
             expectedFingerprintSHA256: "SHA256:test",
-            job: job
+            job: job,
+            completion: { completionStatuses.append($0.status) }
         )
         let started = await eventually { bridge.startedJobIDs == [job.id] }
         XCTAssertTrue(started)
@@ -1055,22 +1519,30 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertTrue(queue.tableView.progressText(row: 0)?.hasPrefix("40%") == true)
         XCTAssertEqual(snapshots.last?.rows.first?.rawStatus, "paused")
 
-        bridge.release(jobID: job.id)
-        let originalRunFinished = await eventually { bridge.finishedJobIDs == [job.id] }
-        XCTAssertTrue(originalRunFinished)
+        XCTAssertTrue(coordinator.resumeTransfer(jobID: job.id))
+        let overlappedBeforeOriginalRunFinished = await eventually(timeout: 0.05) {
+            bridge.startedJobIDs.count > 1
+        }
+        XCTAssertFalse(overlappedBeforeOriginalRunFinished)
         XCTAssertEqual(queue.tableView.statusText(row: 0), "已暂停")
 
-        XCTAssertTrue(coordinator.resumeTransfer(jobID: job.id))
+        bridge.release(jobID: job.id)
 
         let restarted = await eventually { bridge.startedJobIDs == [job.id, job.id] }
         XCTAssertTrue(restarted)
+        XCTAssertEqual(bridge.finishedJobIDs, [job.id])
+        XCTAssertEqual(completionStatuses, [])
         XCTAssertEqual(queue.tableView.statusText(row: 0), "续传中")
+        XCTAssertEqual(snapshots.last?.rows.first?.rawStatus, "resuming")
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.requestedOffset), [0, 40])
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.forceRestart), [false, false])
 
         bridge.release(jobID: job.id)
         let completed = await eventually { queue.tableView.statusText(row: 0) == "已完成" }
         XCTAssertTrue(completed)
+        XCTAssertEqual(completionStatuses, ["completed"])
+        XCTAssertEqual(presenter.payloads.first?.duration, 10)
+        XCTAssertEqual(presenter.payloads.first?.averageBytesPerSecond, 10)
         XCTAssertEqual(history.events.filter { $0.contains(":paused:40") }, [
             "progress:job_background_pause_resume:paused:40"
         ])
@@ -1147,6 +1619,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorStopsRunningTransferAndRetriesStoppedTask() async {
+        var completionStatuses: [String] = []
         let job = ScpTransferJob(
             id: "job_background_stop_retry",
             direction: .download,
@@ -1194,7 +1667,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             config: config,
             secret: .agent,
             expectedFingerprintSHA256: "SHA256:test",
-            job: job
+            job: job,
+            completion: { completionStatuses.append($0.status) }
         )
         let started = await eventually { bridge.startedJobIDs == [job.id] }
         XCTAssertTrue(started)
@@ -1210,15 +1684,18 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertEqual(queue.tableView.statusText(row: 0), "已停止")
         XCTAssertTrue(queue.tableView.progressText(row: 0)?.hasPrefix("30%") == true)
 
-        bridge.release(jobID: job.id)
-        let originalRunFinished = await eventually { bridge.finishedJobIDs == [job.id] }
-        XCTAssertTrue(originalRunFinished)
+        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: job.id))
+        let overlappedBeforeOriginalRunFinished = await eventually(timeout: 0.05) {
+            bridge.startedJobIDs.count > 1
+        }
+        XCTAssertFalse(overlappedBeforeOriginalRunFinished)
         XCTAssertEqual(queue.tableView.statusText(row: 0), "已停止")
 
-        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: job.id))
-
+        bridge.release(jobID: job.id)
         let restarted = await eventually { bridge.startedJobIDs == [job.id, job.id] }
         XCTAssertTrue(restarted)
+        XCTAssertEqual(bridge.finishedJobIDs, [job.id])
+        XCTAssertEqual(completionStatuses, [])
         XCTAssertEqual(queue.tableView.statusText(row: 0), "续传中")
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.requestedOffset), [0, 30])
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.forceRestart), [false, false])
@@ -1226,6 +1703,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         bridge.release(jobID: job.id)
         let completed = await eventually { queue.tableView.statusText(row: 0) == "已完成" }
         XCTAssertTrue(completed)
+        XCTAssertEqual(completionStatuses, ["completed"])
         XCTAssertEqual(history.events.filter { $0.contains(":stopped:30") }, [
             "progress:job_background_stop_retry:stopped:30"
         ])
@@ -1296,6 +1774,106 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshots.last?.rows.first?.bytesDone, 30)
 
         bridge.release(jobID: job.id)
+    }
+
+    func testCoordinatorKeepsFailedTransferInSnapshotWhileAnotherRunsAndAllowsRetry() async {
+        let failedJob = ScpTransferJob(
+            id: "ftp_failed_while_scp_runs",
+            direction: .upload,
+            sourcePath: "/local/failed.tar",
+            destinationPath: "/srv/failed.tar",
+            bytesTotal: 100
+        )
+        let runningJob = ScpTransferJob(
+            id: "scp_running_after_ftp_failure",
+            direction: .download,
+            sourcePath: "/srv/running.tar",
+            destinationPath: "/local/running.tar",
+            bytesTotal: 200
+        )
+        let scpBridge = BlockingSCPTransferBridge(completionsByJobID: [
+            runningJob.id: [
+                ScpTransferProgress(
+                    jobId: runningJob.id,
+                    bytesDone: 200,
+                    bytesTotal: 200,
+                    status: "completed"
+                )
+            ]
+        ])
+        let ftpBridge = RecordingSequenceFTPTransferBridge(results: [
+            .failure(SshRuntimeError.Transport(message: "temporary upload failure")),
+            .success([
+                ScpTransferProgress(
+                    jobId: failedJob.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ])
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: scpBridge,
+            ftpBridge: ftpBridge,
+            queueViewController: queue,
+            maxConcurrentTransfers: 2
+        )
+        var snapshots: [TransferQueueSnapshot] = []
+        coordinator.onSnapshotChanged = { snapshots.append($0) }
+        var failedJobCompletionStatuses: [String] = []
+
+        coordinator.scheduleLiveFTPTransfer(
+            config: FtpConnectionConfig(
+                host: "ftp.example.com",
+                port: 21,
+                username: "deploy",
+                connectTimeoutMs: 10_000
+            ),
+            secret: .password(value: "ftp-secret"),
+            job: failedJob,
+            completion: { failedJobCompletionStatuses.append($0.status) }
+        )
+        coordinator.scheduleLiveTransfer(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: runningJob
+        )
+
+        let failedAndRunningAreVisible = await eventually {
+            snapshots.last?.rows.map(\.jobID) == [failedJob.id, runningJob.id]
+                && snapshots.last?.rows.map(\.rawStatus) == ["failed", "running"]
+        }
+        XCTAssertTrue(failedAndRunningAreVisible)
+        XCTAssertEqual(failedJobCompletionStatuses, ["failed"])
+
+        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: failedJob.id))
+        let retryCompleted = await eventually {
+            failedJobCompletionStatuses == ["failed", "completed"]
+        }
+        XCTAssertTrue(retryCompleted)
+        XCTAssertTrue(snapshots.contains { snapshot in
+            snapshot.rows.map(\.jobID) == [failedJob.id, runningJob.id]
+                && snapshot.rows.map(\.rawStatus) == ["running", "running"]
+        })
+        XCTAssertEqual(ftpBridge.events, [
+            "run:\(failedJob.id)",
+            "run:\(failedJob.id)"
+        ])
+
+        scpBridge.release(jobID: runningJob.id)
+        let runningJobCompleted = await eventually {
+            scpBridge.finishedJobIDs == [runningJob.id]
+        }
+        XCTAssertTrue(runningJobCompleted)
     }
 
     func testCoordinatorPollsLiveTransferProgressWhileBackgroundTransferRuns() async {
@@ -1394,11 +1972,13 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             ]
         ]
         let history = RecordingTransferHistoryStore()
+        let presenter = RecordingTransferCompletionNotificationPresenter()
         let queue = TransferQueueViewController()
         queue.loadView()
         let coordinator = TransferQueueCoordinator(
             bridge: bridge,
             historyStore: history,
+            completionNotificationPresenter: presenter,
             queueViewController: queue
         )
         let config = SshConnectionConfig(
@@ -1428,6 +2008,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         let finished = await eventually { bridge.finishedJobIDs == [job.id] }
         XCTAssertTrue(finished)
         XCTAssertEqual(queue.tableView.statusText(row: 0), "已完成")
+        XCTAssertEqual(presenter.payloads.map(\.jobID), [job.id])
         XCTAssertFalse(history.events.contains("progress:job_progress_polled_completion:failed:100:传输失败"))
     }
 
@@ -1755,6 +2336,196 @@ final class TransferQueueCoordinatorTests: XCTestCase {
 
         bridge.release(jobID: targetJob.id)
         bridge.release(jobID: otherJob.id)
+    }
+
+    func testCoordinatorDisconnectKeepsRemovedWorkerInConcurrencyLimitUntilItFinishes() async {
+        let firstJob = ScpTransferJob(
+            id: "job_disconnect_draining_first",
+            direction: .upload,
+            sourcePath: "/local/first.tar",
+            destinationPath: "/srv/first.tar",
+            bytesTotal: 100
+        )
+        let secondJob = ScpTransferJob(
+            id: "job_disconnect_draining_second",
+            direction: .upload,
+            sourcePath: "/local/second.tar",
+            destinationPath: "/srv/second.tar",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            firstJob.id: [
+                ScpTransferProgress(jobId: firstJob.id, bytesDone: 100, bytesTotal: 100, status: "completed")
+            ],
+            secondJob.id: [
+                ScpTransferProgress(jobId: secondJob.id, bytesDone: 100, bytesTotal: 100, status: "completed")
+            ]
+        ])
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue,
+            maxConcurrentTransfers: 1
+        )
+        let config = SshConnectionConfig(
+            host: "example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+        var firstCompletionStatuses: [String] = []
+
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-disconnect-first",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: firstJob,
+            completion: { firstCompletionStatuses.append($0.status) }
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-disconnect-second",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: secondJob
+        )
+        let firstStarted = await eventually { bridge.startedJobIDs == [firstJob.id] }
+        XCTAssertTrue(firstStarted)
+
+        XCTAssertEqual(coordinator.disconnectTransfers(runtimeID: "runtime-disconnect-first"), [firstJob.id])
+        XCTAssertEqual(coordinator.disconnectTransfers(runtimeID: "runtime-disconnect-first"), [])
+        XCTAssertEqual(bridge.cancelledJobIDs, [firstJob.id])
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [secondJob.id])
+        let overlappedBeforeFirstFinished = await eventually(timeout: 0.05) {
+            bridge.startedJobIDs.count > 1
+        }
+        XCTAssertFalse(overlappedBeforeFirstFinished)
+
+        bridge.release(jobID: firstJob.id)
+        let secondStarted = await eventually {
+            bridge.finishedJobIDs.contains(firstJob.id)
+                && bridge.startedJobIDs == [firstJob.id, secondJob.id]
+        }
+        XCTAssertTrue(secondStarted)
+        XCTAssertEqual(firstCompletionStatuses, [])
+        XCTAssertFalse(presenter.payloads.contains { $0.jobID == firstJob.id })
+
+        bridge.release(jobID: secondJob.id)
+        let secondCompleted = await eventually {
+            queue.tableView.statusText(row: 0) == "已完成"
+        }
+        XCTAssertTrue(secondCompleted)
+    }
+
+    func testCoordinatorCancelsRunningTransferThroughReattachedRuntimeID() async {
+        let job = ScpTransferJob(
+            id: "job_runtime_reattached",
+            direction: .upload,
+            sourcePath: "/local/reattached.tar",
+            destinationPath: "/srv/reattached.tar",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ]
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            queueViewController: queue
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-old",
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+        let didStart = await eventually {
+            bridge.startedJobIDs == [job.id]
+        }
+        XCTAssertTrue(didStart)
+
+        coordinator.reattachTransfers(oldRuntimeID: "runtime-old", runtimeID: "runtime-new")
+        XCTAssertEqual(coordinator.disconnectTransfers(runtimeID: "runtime-new"), [job.id])
+
+        XCTAssertEqual(bridge.cancelledJobIDs, [job.id])
+        XCTAssertEqual(queue.snapshotForTesting.rows, [])
+        bridge.release(jobID: job.id)
+    }
+
+    func testReattachedTransferCompletionUsesCurrentRuntimeIDForNotification() async {
+        let job = ScpTransferJob(
+            id: "job_runtime_notification_reattached",
+            direction: .download,
+            sourcePath: "/srv/reattached.tar",
+            destinationPath: "/local/reattached.tar",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ]
+        ])
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-before-reconnect",
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+        let didStart = await eventually {
+            bridge.startedJobIDs == [job.id]
+        }
+        XCTAssertTrue(didStart)
+
+        coordinator.reattachTransfers(
+            oldRuntimeID: "runtime-before-reconnect",
+            runtimeID: "runtime-after-reconnect"
+        )
+        bridge.release(jobID: job.id)
+        let didPresent = await eventually {
+            presenter.payloads.count == 1
+        }
+        XCTAssertTrue(didPresent)
+        XCTAssertEqual(presenter.payloads.first?.runtimeID, "runtime-after-reconnect")
     }
 
     func testCoordinatorIgnoresDuplicateScheduleForRunningJobID() async {
@@ -2188,6 +2959,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorRetriesFailedScheduledSCPTransferFromQueueActionWithoutExposingSecret() async {
+        var completionStatuses: [String] = []
         let job = ScpTransferJob(
             id: "job_retry_scheduled_scp",
             direction: .upload,
@@ -2224,13 +2996,15 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             config: config,
             secret: .password(value: "top-secret-password"),
             expectedFingerprintSHA256: "SHA256:test",
-            job: job
+            job: job,
+            completion: { completionStatuses.append($0.status) }
         )
 
         let failed = await eventually {
             queue.tableView.statusText(row: 0) == "失败"
         }
         XCTAssertTrue(failed)
+        XCTAssertEqual(completionStatuses, ["failed"])
         queue.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         XCTAssertTrue(queue.selectedTransferDetailTextForTesting.contains("认证失败 [已隐藏凭据] [已隐藏路径]"))
 
@@ -2241,6 +3015,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             queue.tableView.statusText(row: 0) == "已完成"
         }
         XCTAssertTrue(completed)
+        XCTAssertEqual(completionStatuses, ["failed", "completed"])
         XCTAssertEqual(bridge.events, ["run:job_retry_scheduled_scp", "run:job_retry_scheduled_scp"])
         XCTAssertFalse(bridge.debugDescription.contains("top-secret-password"))
         XCTAssertFalse(queue.visibleTextSnapshot.contains("top-secret-password"))
@@ -2248,6 +3023,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorRetriesFailedScheduledFTPTransferFromQueueActionWithoutExposingSecret() async {
+        var completionStatuses: [String] = []
         let job = ScpTransferJob(
             id: "job_retry_scheduled_ftp",
             direction: .download,
@@ -2282,13 +3058,15 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         coordinator.scheduleLiveFTPTransfer(
             config: config,
             secret: .password(value: "ftp-secret"),
-            job: job
+            job: job,
+            completion: { completionStatuses.append($0.status) }
         )
 
         let failed = await eventually {
             queue.tableView.statusText(row: 0) == "失败"
         }
         XCTAssertTrue(failed)
+        XCTAssertEqual(completionStatuses, ["failed"])
 
         queue.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         queue.performTransferActionForTesting(at: 0)
@@ -2297,6 +3075,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             queue.tableView.statusText(row: 0) == "已完成"
         }
         XCTAssertTrue(completed)
+        XCTAssertEqual(completionStatuses, ["failed", "completed"])
         XCTAssertEqual(ftpBridge.events, ["run:job_retry_scheduled_ftp", "run:job_retry_scheduled_ftp"])
         XCTAssertFalse(ftpBridge.debugDescription.contains("ftp-secret"))
         XCTAssertFalse(queue.visibleTextSnapshot.localizedCaseInsensitiveContains("SFTP"))
@@ -2742,6 +3521,84 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertFalse(queue.visibleTextSnapshot.contains("/local/completed.tar"))
         XCTAssertFalse(queue.visibleTextSnapshot.contains("/srv/failed.tar"))
     }
+
+    func testCoordinatorClearFinishedKeepsRemovedWorkerInConcurrencyLimitUntilItFinishes() async {
+        let firstJob = ScpTransferJob(
+            id: "job_clear_draining_first",
+            direction: .download,
+            sourcePath: "/srv/first.tar",
+            destinationPath: "/local/first.tar",
+            bytesTotal: 100
+        )
+        let secondJob = ScpTransferJob(
+            id: "job_clear_draining_second",
+            direction: .download,
+            sourcePath: "/srv/second.tar",
+            destinationPath: "/local/second.tar",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            firstJob.id: [
+                ScpTransferProgress(jobId: firstJob.id, bytesDone: 100, bytesTotal: 100, status: "completed")
+            ],
+            secondJob.id: [
+                ScpTransferProgress(jobId: secondJob.id, bytesDone: 100, bytesTotal: 100, status: "completed")
+            ]
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            queueViewController: queue,
+            maxConcurrentTransfers: 1
+        )
+        let config = SshConnectionConfig(
+            host: "example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-clear-first",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: firstJob
+        )
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-clear-second",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: secondJob
+        )
+        let firstStarted = await eventually { bridge.startedJobIDs == [firstJob.id] }
+        XCTAssertTrue(firstStarted)
+
+        XCTAssertTrue(coordinator.stopTransfer(jobID: firstJob.id))
+        XCTAssertEqual(coordinator.clearFinishedTransfers(), 1)
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [secondJob.id])
+        XCTAssertEqual(queue.snapshotForTesting.rows.first?.rawStatus, "queued")
+        let overlappedBeforeFirstFinished = await eventually(timeout: 0.05) {
+            bridge.startedJobIDs.count > 1
+        }
+        XCTAssertFalse(overlappedBeforeFirstFinished)
+
+        bridge.release(jobID: firstJob.id)
+        let secondStarted = await eventually {
+            bridge.finishedJobIDs.contains(firstJob.id)
+                && bridge.startedJobIDs == [firstJob.id, secondJob.id]
+        }
+        XCTAssertTrue(secondStarted)
+
+        bridge.release(jobID: secondJob.id)
+        let secondCompleted = await eventually {
+            queue.tableView.statusText(row: 0) == "已完成"
+        }
+        XCTAssertTrue(secondCompleted)
+    }
 }
 
 private func eventually(
@@ -3110,6 +3967,30 @@ private final class SlowProgressSCPTransferBridge: SCPTransferBridging {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+}
+
+@MainActor
+private final class RecordingTransferCompletionNotificationPresenter: TransferCompletionNotificationPresenting {
+    private(set) var payloads: [TransferCompletionNotificationPayload] = []
+    private(set) var dismissedJobIDs: [String] = []
+    private(set) var dismissedRuntimeIDs: [String] = []
+    private(set) var dismissAllCount = 0
+
+    func present(_ payload: TransferCompletionNotificationPayload) {
+        payloads.append(payload)
+    }
+
+    func dismiss(jobID: String) {
+        dismissedJobIDs.append(jobID)
+    }
+
+    func dismiss(runtimeID: String) {
+        dismissedRuntimeIDs.append(runtimeID)
+    }
+
+    func dismissAll() {
+        dismissAllCount += 1
     }
 }
 

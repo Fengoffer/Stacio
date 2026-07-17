@@ -12,6 +12,11 @@ public protocol AgentBridgeRequestHandling {
         _ request: AgentBridgeRequest,
         emit: @escaping @MainActor (AgentTraceEvent) -> Void
     ) throws
+    func handleAgentBridgeRequest(
+        _ request: AgentBridgeRequest,
+        emit: @escaping @MainActor (AgentTraceEvent) -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) throws
 }
 
 @MainActor
@@ -22,6 +27,15 @@ public extension AgentBridgeRequestHandling {
     ) throws {
         let events = try handleAgentBridgeRequest(request)
         events.forEach(emit)
+    }
+
+    func handleAgentBridgeRequest(
+        _ request: AgentBridgeRequest,
+        emit: @escaping @MainActor (AgentTraceEvent) -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) throws {
+        try handleAgentBridgeRequest(request, emit: emit)
+        completion()
     }
 }
 
@@ -85,9 +99,14 @@ public final class AgentBridgeServer {
     @MainActor
     public func handleRequestForTesting(_ request: AgentBridgeRequest) throws -> [String] {
         var lines: [String] = []
-        Self.streamResponse(for: request, handler: handler) { line in
-            lines.append(String(decoding: line.dropLastNewline(), as: UTF8.self))
-        }
+        Self.streamResponse(
+            for: request,
+            handler: handler,
+            writeLine: { line in
+                lines.append(String(decoding: line.dropLastNewline(), as: UTF8.self))
+            },
+            completion: {}
+        )
         return lines
     }
 
@@ -101,10 +120,20 @@ public final class AgentBridgeServer {
                 }
                 let data = Self.readAll(from: clientFD)
                 Task { @MainActor in
-                    Self.streamResponse(for: data, handler: handler) { line in
-                        Self.writeAll(line, to: clientFD)
+                    var didFinish = false
+                    let finish: @MainActor () -> Void = {
+                        guard didFinish == false else { return }
+                        didFinish = true
+                        close(clientFD)
                     }
-                    close(clientFD)
+                    Self.streamResponse(
+                        for: data,
+                        handler: handler,
+                        writeLine: { line in
+                            Self.writeAll(line, to: clientFD)
+                        },
+                        completion: finish
+                    )
                 }
             }
         }
@@ -153,14 +182,21 @@ public final class AgentBridgeServer {
     private static func streamResponse(
         for data: Data,
         handler: AgentBridgeRequestHandling,
-        writeLine: @escaping @MainActor (Data) -> Void
+        writeLine: @escaping @MainActor (Data) -> Void,
+        completion: @escaping @MainActor () -> Void
     ) {
         do {
             let trimmed = data.firstIndex(of: 0x0A).map { Data(data[..<$0]) } ?? data
             let request = try JSONDecoder().decode(AgentBridgeRequest.self, from: trimmed)
-            streamResponse(for: request, handler: handler, writeLine: writeLine)
+            streamResponse(
+                for: request,
+                handler: handler,
+                writeLine: writeLine,
+                completion: completion
+            )
         } catch {
             writeLine(encodedLine(for: failedEvent(requestID: "unknown", error: error)))
+            completion()
         }
     }
 
@@ -168,14 +204,20 @@ public final class AgentBridgeServer {
     private static func streamResponse(
         for request: AgentBridgeRequest,
         handler: AgentBridgeRequestHandling,
-        writeLine: @escaping @MainActor (Data) -> Void
+        writeLine: @escaping @MainActor (Data) -> Void,
+        completion: @escaping @MainActor () -> Void
     ) {
         do {
-            try handler.handleAgentBridgeRequest(request) { event in
-                writeLine(encodedLine(for: event))
-            }
+            try handler.handleAgentBridgeRequest(
+                request,
+                emit: { event in
+                    writeLine(encodedLine(for: event))
+                },
+                completion: completion
+            )
         } catch {
             writeLine(encodedLine(for: failedEvent(requestID: request.id, error: error)))
+            completion()
         }
     }
 
@@ -286,6 +328,54 @@ extension AgentExecutionCoordinator: AgentBridgeRequestHandling {
                 )
             ]
             events.forEach(emit)
+        }
+    }
+
+    public func handleAgentBridgeRequest(
+        _ request: AgentBridgeRequest,
+        emit: @escaping @MainActor (AgentTraceEvent) -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) throws {
+        guard case .runCommand(let commandRequest) = request.action else {
+            try handleAgentBridgeRequest(request, emit: emit)
+            completion()
+            return
+        }
+
+        var didFinish = false
+        let finishOnce: @MainActor () -> Void = {
+            guard didFinish == false else { return }
+            didFinish = true
+            completion()
+        }
+        let events = try runCommand(request) { event in
+            emit(event)
+            if Self.shouldCloseBridgeFollowStream(for: event.state) {
+                self.discardBridgeFollowStream(requestID: request.id)
+                finishOnce()
+            }
+        }
+
+        let continuesAsBackgroundTask = commandRequest.follow
+            && events.last?.metadata?["executionMode"] == "backgroundTask"
+            && events.last.map { Self.shouldCloseBridgeFollowStream(for: $0.state) } != true
+        guard continuesAsBackgroundTask, didFinish == false else {
+            finishOnce()
+            return
+        }
+        registerBridgeFollowStream(
+            requestID: request.id,
+            emit: emit,
+            completion: finishOnce
+        )
+    }
+
+    private static func shouldCloseBridgeFollowStream(for state: AgentTraceState) -> Bool {
+        switch state {
+        case .completed, .failed, .cancelled, .paused, .takenOver:
+            return true
+        case .queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput:
+            return false
         }
     }
 }

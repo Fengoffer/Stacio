@@ -109,7 +109,7 @@ enum L10n {
     enum Settings {
         static let title = "设置"
         static let terminal = "终端"
-        static let terminalDescription = "终端显示、输入和交互偏好。"
+        static let terminalDescription = "会话侧边栏、终端显示、输入和交互偏好。"
         static let terminalTheme = "终端主题"
         static let terminalThemeDescription = "终端配色、主题库、导入主题和预览。"
         static let aiAndAgent = "AI 与执行"
@@ -141,6 +141,10 @@ enum L10n {
         static let sessionTabIconDefault = "默认"
         static let sessionTabIconOperatingSystem = "操作系统"
         static let sessionTabIconModeHelp = "默认使用 Stacio 的连接类型图标；操作系统模式会在 SSH 连接成功后自动识别远端系统并切换为对应图标。"
+        static let sessionSidebarGroupTitle = "会话侧边栏"
+        static let sessionSidebarGroupDescription = "控制会话列表中的自动分组和快捷入口。"
+        static let sessionSidebarShowRecentSessions = "显示“最近使用”分组"
+        static let sessionSidebarShowRecentSessionsHelp = "在会话侧边栏顶部显示最近打开的最多 5 个会话；这些只是快捷入口，不会复制、移动或删除原会话。"
         static let terminalHighlightTheme = "高亮主题"
         static let terminalCloseConfirmation = "关闭终端前确认"
         static let terminalSelectionAutoCopy = "选中自动复制"
@@ -306,7 +310,7 @@ enum L10n {
         static let aiIncludeRecentTerminalTranscript = "附带最近终端输出"
         static let aiContextCharacterLimit = "上下文字符上限"
         static let aiContextHelp = "关闭后 AI 只收到当前终端标题、目录和你的问题。模型的上下文容量和推理强度请在模型管理中查看或配置。"
-        static let aiExecutionHelp = "可见终端会把命令写入当前终端；后台任务会为 SSH 会话创建独立执行 runtime，不会遮挡终端，并把过程同步到终端 trace。自动执行仍会遵守全局与会话审批策略。"
+        static let aiExecutionHelp = "AI 命令会直接写入当前终端标签页，沿用现有 SSH 或本地终端会话，并把执行过程同步到终端。自动执行仍会遵守全局与会话审批策略。"
         static let confirmationPolicy = "命令确认"
         static let executionMode = "执行方式"
         static let filesDirectoryFollowDefault = "默认开启目录跟随"
@@ -504,8 +508,8 @@ enum L10n {
         static let title = "多执行"
         static let message = "选择要广播输入的终端。"
         static let noTargets = "当前没有可执行的终端。"
-        static let interactiveMessage = "选择要加入多执行分屏的 SSH 或串口终端。"
-        static let requiresMultipleTargets = "多执行需要至少两个已连接的 SSH 或串口终端。"
+        static let interactiveMessage = "选择要加入多执行分屏的可用终端。"
+        static let requiresMultipleTargets = "多执行需要至少两个可用终端。"
         static let pauseTerminal = "暂停此终端同步"
         static let resumeTerminal = "恢复此终端同步"
         static let execute = "执行"
@@ -528,10 +532,13 @@ enum L10n {
 
     enum Sidebar {
         static let sessions = "会话"
+        static let recentSessions = "最近使用"
         static let favorites = "收藏"
         static let search = "搜索会话、主机或标签"
         static let importSessions = "导入"
         static let newGroup = "新建分组"
+        static let expandAllGroups = "展开所有分组"
+        static let collapseAllGroups = "折叠所有分组"
         static let renameGroup = "重命名分组"
         static let deleteGroup = "删除分组"
         static let exportGroupSessions = "导出分组会话"
@@ -970,6 +977,16 @@ enum L10n {
         static let connectionTimedOut = "连接超时"
         static let hostKeyChanged = "主机密钥已变更"
         static let unknownHostKey = "未知主机密钥"
+        static let completedNotificationTitle = "文件传输完成"
+        static let failedNotificationTitle = "文件传输失败"
+        static let notificationListTitle = "文件传输通知"
+        static let notificationItemUnit = "项记录"
+        static let notificationSize = "大小"
+        static let notificationCompletedAt = "完成时间"
+        static let notificationDuration = "用时"
+        static let notificationAverageSpeed = "平均速率"
+        static let completed = "已完成"
+        static let failed = "失败"
         static let detailTitle = "任务详情"
         static let detailEmpty = "选择传输任务查看详情"
         static let detailJobID = "任务 ID"
@@ -982,6 +999,16 @@ enum L10n {
         static let detailLog = "传输日志"
         static let detailLogEmpty = "暂无传输日志"
         static let remainingPrefix = "剩余"
+
+        static func completedNotificationBody(direction: String, fileName: String) -> String {
+            "\(direction)“\(fileName)”已完成。"
+        }
+
+        static func failedNotificationBody(direction: String, fileName: String, diagnostic: String?) -> String {
+            let summary = "\(direction)“\(fileName)”失败。"
+            guard let diagnostic, diagnostic.isEmpty == false else { return summary }
+            return "\(summary) \(diagnostic)"
+        }
 
         static func status(_ rawStatus: String) -> String {
             switch rawStatus {

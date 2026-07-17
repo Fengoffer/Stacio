@@ -5,7 +5,7 @@ import XCTest
 
 @MainActor
 final class AIProviderManagementViewControllerTests: XCTestCase {
-    func testSelectingProviderShowsOnlyItsFieldsAndModelsWhileRulesAndSummariesStayAccurate() {
+    func testSelectingProviderShowsOnlyItsFieldsAndModelsWhileMozheRecommendationStaysAccurate() {
         let fixture = makeFixture(defaultProviderID: providerBID)
         let controller = fixture.controller
         controller.loadView()
@@ -15,19 +15,95 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.selectedProviderID, providerBID)
         XCTAssertEqual(textField("Stacio.Settings.aiProviders.baseURL", in: controller.view)?.stringValue, "https://b.example/v1")
         XCTAssertEqual(controller.visibleModelIDsForTesting, ["b-default", "b-disabled"])
-        XCTAssertEqual(controller.visibleProviderIDsForTesting, [BuiltInAIProvider.stacioRulesID, providerAID, providerBID])
+        XCTAssertEqual(
+            controller.visibleProviderIDsForTesting,
+            [BuiltInAIProvider.mozheAPIID, providerAID, providerBID]
+        )
+        XCTAssertFalse(controller.visibleProviderIDsForTesting.contains(BuiltInAIProvider.stacioRulesID))
 
         let summaries = controller.providerSummariesForTesting
-        XCTAssertEqual(summaries.first?.id, BuiltInAIProvider.stacioRulesID)
-        XCTAssertEqual(summaries.first?.displayName, "Stacio Rules")
-        XCTAssertEqual(summaries.first?.statusText, "内置规则")
+        XCTAssertEqual(summaries.first?.id, BuiltInAIProvider.mozheAPIID)
+        XCTAssertEqual(summaries.first?.displayName, BuiltInAIProvider.mozheAPIDisplayName)
         XCTAssertEqual(summaries.first?.enabledModelCount, 0)
         XCTAssertEqual(summaries.first?.totalModelCount, 0)
         XCTAssertFalse(summaries.first?.isDefault ?? true)
+        XCTAssertTrue(summaries.first?.isRecommended ?? false)
+        XCTAssertTrue(controller.recommendedBadgeVisibleForTesting(providerID: BuiltInAIProvider.mozheAPIID))
+        XCTAssertFalse(controller.recommendedBadgeVisibleForTesting(providerID: providerAID))
         XCTAssertEqual(summaries.first(where: { $0.id == providerBID })?.enabledModelCount, 1)
         XCTAssertEqual(summaries.first(where: { $0.id == providerBID })?.totalModelCount, 2)
         XCTAssertTrue(summaries.first(where: { $0.id == providerBID })?.isDefault ?? false)
         XCTAssertFalse(summaries.first(where: { $0.id == providerBID })?.statusText.isEmpty ?? true)
+    }
+
+    func testMozheIdentityAndBaseURLAreReadOnlyWhileURLRemainsSelectable() throws {
+        let fixture = makeFixture(defaultProviderID: providerAID)
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
+
+        let nameField = try XCTUnwrap(
+            textField("Stacio.Settings.aiProviders.displayName", in: controller.view)
+        )
+        let baseURLField = try XCTUnwrap(
+            textField("Stacio.Settings.aiProviders.baseURL", in: controller.view)
+        )
+
+        XCTAssertEqual(nameField.stringValue, BuiltInAIProvider.mozheAPIDisplayName)
+        XCTAssertFalse(nameField.isEditable)
+        XCTAssertFalse(nameField.isSelectable)
+        XCTAssertTrue(nameField.isEnabled)
+        XCTAssertEqual(baseURLField.stringValue, BuiltInAIProvider.mozheAPIBaseURL)
+        XCTAssertFalse(baseURLField.isEditable)
+        XCTAssertTrue(baseURLField.isSelectable)
+        XCTAssertTrue(baseURLField.isEnabled)
+        XCTAssertFalse((view("Stacio.Settings.aiProviders.remove", in: controller.view) as? NSButton)?.isEnabled ?? true)
+
+        nameField.stringValue = "Renamed mozhe"
+        controller.controlTextDidChange(
+            Notification(name: NSControl.textDidChangeNotification, object: nameField)
+        )
+        baseURLField.stringValue = "https://redirect.example/v1"
+        controller.controlTextDidChange(
+            Notification(name: NSControl.textDidChangeNotification, object: baseURLField)
+        )
+        controller.commitDisplayNameForTesting("Renamed mozhe")
+        controller.commitBaseURLForTesting("https://redirect.example/v1")
+
+        XCTAssertEqual(nameField.stringValue, BuiltInAIProvider.mozheAPIDisplayName)
+        XCTAssertEqual(baseURLField.stringValue, BuiltInAIProvider.mozheAPIBaseURL)
+        XCTAssertTrue(fixture.coordinator.saveCalls.isEmpty)
+        let managedProvider = try XCTUnwrap(
+            controller.currentEnvelope.aiProviders.first { $0.id == BuiltInAIProvider.mozheAPIID }
+        )
+        XCTAssertEqual(managedProvider.displayName, BuiltInAIProvider.mozheAPIDisplayName)
+        XCTAssertEqual(managedProvider.baseURL, BuiltInAIProvider.mozheAPIBaseURL)
+    }
+
+    func testMozheWebsiteButtonOpensExactURLOnceAndIsHiddenForOtherProviders() throws {
+        let fixture = makeFixture(defaultProviderID: providerAID)
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
+
+        XCTAssertTrue(controller.visitWebsiteButtonVisibleForTesting)
+        let visitButton = try XCTUnwrap(
+            view("Stacio.Settings.aiProviders.visitWebsite", in: controller.view) as? NSButton
+        )
+        XCTAssertEqual(visitButton.title, "访问官网")
+        XCTAssertNotNil(visitButton.image)
+        visitButton.performClick(nil)
+
+        XCTAssertEqual(
+            fixture.urlOpener.openedURLs.map(\.absoluteString),
+            [BuiltInAIProvider.mozheAPIWebsiteURL]
+        )
+
+        controller.selectProvider(id: providerAID)
+
+        XCTAssertFalse(controller.visitWebsiteButtonVisibleForTesting)
+        controller.openSelectedProviderWebsiteForTesting()
+        XCTAssertEqual(fixture.urlOpener.openedURLs.count, 1)
     }
 
     func testProviderAndModelSearchPreserveUUIDSelectionAndProviderDraft() {
@@ -255,9 +331,9 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
 
     func testSetDefaultProviderUsesSelectedProviderIDWithoutSavingOtherProviders() {
         let fixture = makeFixture(defaultProviderID: providerAID)
-        let originalProviders = fixture.store.envelope.aiProviders
         let controller = fixture.controller
         controller.loadView()
+        let originalProviders = controller.currentEnvelope.aiProviders
         controller.selectProvider(id: providerBID)
 
         controller.setDefaultProviderForTesting()
@@ -268,21 +344,22 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.providerSummariesForTesting.first(where: { $0.id == providerBID })?.isDefault ?? false)
     }
 
-    func testDefaultProviderFailureIsVisibleWhileRulesAreSelected() {
+    func testDefaultProviderFailureIsVisibleWhileMozheIsSelected() {
         let fixture = makeFixture(defaultProviderID: providerAID)
         let originalEnvelope = fixture.store.envelope
         let controller = fixture.controller
         controller.loadView()
-        controller.selectProvider(id: BuiltInAIProvider.stacioRulesID)
+        let originalControllerEnvelope = controller.currentEnvelope
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
         fixture.coordinator.defaultFailure = TestFailure.message(
             "default mutation failed Authorization: Bearer unrelated-token token=other-secret"
         )
 
         controller.setDefaultProviderForTesting()
 
-        XCTAssertEqual(fixture.coordinator.defaultProviderIDs, [BuiltInAIProvider.stacioRulesID])
+        XCTAssertEqual(fixture.coordinator.defaultProviderIDs, [BuiltInAIProvider.mozheAPIID])
         XCTAssertEqual(fixture.store.envelope, originalEnvelope)
-        XCTAssertEqual(controller.currentEnvelope, originalEnvelope)
+        XCTAssertEqual(controller.currentEnvelope, originalControllerEnvelope)
         let status = textField("Stacio.Settings.aiProviders.status", in: controller.view)?.stringValue
         XCTAssertTrue(status?.contains("default mutation failed") ?? false)
         assertNoProviderManagerSecrets(status)
@@ -321,6 +398,106 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
 
         XCTAssertTrue(fixture.coordinator.saveCalls.isEmpty)
         XCTAssertEqual(fixture.coordinator.keys[providerAID], "old-secret")
+    }
+
+    func testRefreshingModelsPersistsPendingAPIKeyBeforeReadingKeychain() throws {
+        let fixture = makeFixture(defaultProviderID: providerAID)
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
+        fixture.catalog.result = .success(["new-model"])
+        let apiKeyField = try XCTUnwrap(
+            textField("Stacio.Settings.aiProviders.apiKey", in: controller.view)
+        )
+        let revealButton = try XCTUnwrap(
+            view(
+                "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
+                in: controller.view
+            ) as? NSButton
+        )
+        apiKeyField.stringValue = "newly-typed-secret"
+        controller.controlTextDidChange(
+            Notification(name: NSControl.textDidChangeNotification, object: apiKeyField)
+        )
+
+        controller.refreshModelsForTesting()
+
+        XCTAssertEqual(
+            fixture.coordinator.keys[BuiltInAIProvider.mozheAPIID],
+            "newly-typed-secret"
+        )
+        XCTAssertEqual(
+            fixture.coordinator.saveCalls.first?.apiKeyUpdate,
+            .replace("newly-typed-secret")
+        )
+        XCTAssertEqual(
+            apiKeyField.stringValue,
+            AIProviderManagementViewController.maskedAPIKeyPlaceholder
+        )
+        XCTAssertTrue(revealButton.isEnabled)
+        XCTAssertEqual(fixture.background.pendingCount, 1)
+
+        fixture.background.runNext()
+
+        XCTAssertEqual(fixture.catalog.calls.first?.apiKey, "newly-typed-secret")
+        XCTAssertEqual(
+            fixture.catalog.calls.first?.provider.id,
+            BuiltInAIProvider.mozheAPIID
+        )
+        XCTAssertEqual(
+            controller.catalogStateForTesting(providerID: BuiltInAIProvider.mozheAPIID),
+            .loaded
+        )
+    }
+
+    func testStoredAPIKeyIsHiddenByDefaultAndCanBeTemporarilyRevealed() throws {
+        let fixture = makeFixture(
+            defaultProviderID: providerAID,
+            keys: [providerAID: "stored-secret"]
+        )
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProvider(id: providerAID)
+        let secureField = try XCTUnwrap(
+            textField("Stacio.Settings.aiProviders.apiKey", in: controller.view)
+        )
+        let revealButton = try XCTUnwrap(
+            view(
+                "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
+                in: controller.view
+            ) as? NSButton
+        )
+
+        XCTAssertFalse(controller.isAPIKeyRevealedForTesting)
+        XCTAssertEqual(
+            secureField.stringValue,
+            AIProviderManagementViewController.maskedAPIKeyPlaceholder
+        )
+        XCTAssertTrue(revealButton.isEnabled)
+        XCTAssertEqual(revealButton.toolTip, "显示 API Key")
+
+        controller.toggleAPIKeyVisibilityForTesting()
+
+        let revealedField = try XCTUnwrap(
+            textField("Stacio.Settings.aiProviders.apiKey.revealed", in: controller.view)
+        )
+        XCTAssertTrue(controller.isAPIKeyRevealedForTesting)
+        XCTAssertTrue(secureField.isHidden)
+        XCTAssertFalse(revealedField.isHidden)
+        XCTAssertEqual(revealedField.stringValue, "stored-secret")
+        XCTAssertEqual(revealButton.toolTip, "隐藏 API Key")
+
+        controller.toggleAPIKeyVisibilityForTesting()
+
+        XCTAssertFalse(controller.isAPIKeyRevealedForTesting)
+        XCTAssertFalse(secureField.isHidden)
+        XCTAssertTrue(revealedField.isHidden)
+        XCTAssertEqual(revealedField.stringValue, "")
+        XCTAssertEqual(
+            secureField.stringValue,
+            AIProviderManagementViewController.maskedAPIKeyPlaceholder
+        )
+        XCTAssertEqual(revealButton.toolTip, "显示 API Key")
     }
 
     func testReplacingAndExplicitlyRemovingAPIKeyUseScopedUpdatesAndClearTimestamps() {
@@ -446,16 +623,18 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.selectedProviderID, providerAID)
     }
 
-    func testRulesCannotBeDeleted() {
+    func testMozheCannotBeDeleted() {
         let fixture = makeFixture(defaultProviderID: providerAID)
         let controller = fixture.controller
         controller.loadView()
-        controller.selectProvider(id: BuiltInAIProvider.stacioRulesID)
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
 
         controller.deleteSelectedProviderForTesting()
 
         XCTAssertTrue(fixture.coordinator.deletedProviderIDs.isEmpty)
-        XCTAssertEqual(controller.selectedProviderID, BuiltInAIProvider.stacioRulesID)
+        XCTAssertEqual(controller.selectedProviderID, BuiltInAIProvider.mozheAPIID)
+        XCTAssertTrue(controller.visibleProviderIDsForTesting.contains(BuiltInAIProvider.mozheAPIID))
+        XCTAssertFalse(controller.visibleProviderIDsForTesting.contains(BuiltInAIProvider.stacioRulesID))
         XCTAssertEqual(fixture.store.envelope.aiProviders.count, 2)
     }
 
@@ -569,10 +748,10 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
 
     func testReloadFailureInvalidatesRuntimeStateDiscardsDraftAndRejectsInflightResults() {
         let fixture = makeFixture(defaultProviderID: providerAID)
-        let originalEnvelope = fixture.store.envelope
         let originalProvider = fixture.store.provider(id: providerAID)
         let controller = fixture.controller
         controller.loadView()
+        let originalControllerEnvelope = controller.currentEnvelope
         controller.selectProvider(id: providerAID)
         fixture.catalog.result = .success(["must-not-merge-after-reload-failure"])
         fixture.connection.result = .success(.init(message: "must-not-verify-after-reload-failure"))
@@ -587,7 +766,7 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.reloadFromStore(selecting: providerAID))
 
-        XCTAssertEqual(controller.currentEnvelope, originalEnvelope)
+        XCTAssertEqual(controller.currentEnvelope, originalControllerEnvelope)
         XCTAssertEqual(textField("Stacio.Settings.aiProviders.displayName", in: controller.view)?.stringValue, "Alpha Provider")
         XCTAssertTrue(textField("Stacio.Settings.aiProviders.status", in: controller.view)?.stringValue.contains("reload failed") ?? false)
         XCTAssertEqual(controller.catalogStateForTesting(providerID: providerAID), .idle)
@@ -1008,6 +1187,7 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         for identifier in [
             "Stacio.Settings.aiProviders.testConnection",
             "Stacio.Settings.aiProviders.refreshModels",
+            "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
             "Stacio.Settings.aiProviders.removeAPIKey",
             "Stacio.Settings.aiProviders.modelCapabilities",
             "Stacio.Settings.aiProviders.modelCapabilities.model",
@@ -1023,6 +1203,83 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
             let frame = control.convert(control.bounds, to: controller.view)
             XCTAssertGreaterThanOrEqual(frame.minX, controller.view.bounds.minX)
             XCTAssertLessThanOrEqual(frame.maxX, controller.view.bounds.maxX + 0.5)
+        }
+    }
+
+    func testBasicAndAdvancedFormRowsStayLeftAlignedAcrossWindowWidths() throws {
+        let fixture = makeFixture(defaultProviderID: providerAID)
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProvider(id: BuiltInAIProvider.mozheAPIID)
+        let advancedDisclosure = try XCTUnwrap(
+            view(
+                "Stacio.Settings.aiProviders.advancedDisclosure",
+                in: controller.view
+            ) as? NSButton
+        )
+        advancedDisclosure.performClick(nil)
+
+        let content = try XCTUnwrap(
+            view("Stacio.Settings.aiProviders.detailContent", in: controller.view)
+        )
+        let basicTitle = try XCTUnwrap(
+            view("Stacio.Settings.aiProviders.basicSection", in: controller.view) as? NSTextField
+        )
+        let rowIdentifiers = [
+            "Stacio.Settings.aiProviders.form.displayName",
+            "Stacio.Settings.aiProviders.form.baseURL",
+            "Stacio.Settings.aiProviders.form.apiKey",
+            "Stacio.Settings.aiProviders.form.compatibilityProtocol",
+            "Stacio.Settings.aiProviders.form.retryCount",
+            "Stacio.Settings.aiProviders.form.requestTimeout",
+            "Stacio.Settings.aiProviders.form.userAgent"
+        ]
+
+        XCTAssertEqual(basicTitle.alignment, .left)
+        XCTAssertEqual(advancedDisclosure.alignment, .left)
+
+        var expectedControlMinX: CGFloat?
+        for width in [700.0, 1_100.0] {
+            controller.view.frame = NSRect(x: 0, y: 0, width: width, height: 760)
+            controller.view.needsLayout = true
+            controller.view.layoutSubtreeIfNeeded()
+
+            let contentBounds = content.bounds
+            for identifier in rowIdentifiers {
+                let row = try XCTUnwrap(
+                    view(identifier, in: controller.view) as? NSStackView,
+                    identifier
+                )
+                let label = try XCTUnwrap(
+                    view("\(identifier).label", in: controller.view) as? NSTextField,
+                    "\(identifier).label"
+                )
+                let control = try XCTUnwrap(row.arrangedSubviews.last, identifier)
+                let rowFrame = row.convert(row.bounds, to: content)
+                let labelFrame = label.convert(label.bounds, to: content)
+                let controlFrame = control.convert(control.bounds, to: content)
+
+                XCTAssertEqual(rowFrame.minX, contentBounds.minX, accuracy: 0.5, identifier)
+                XCTAssertEqual(rowFrame.maxX, contentBounds.maxX, accuracy: 0.5, identifier)
+                XCTAssertEqual(labelFrame.minX, contentBounds.minX - 2, accuracy: 0.5, identifier)
+                XCTAssertEqual(label.alignment, .left, identifier)
+                if let expectedControlMinX {
+                    XCTAssertEqual(
+                        controlFrame.minX,
+                        expectedControlMinX,
+                        accuracy: 0.5,
+                        identifier
+                    )
+                } else {
+                    expectedControlMinX = controlFrame.minX
+                }
+                XCTAssertGreaterThan(controlFrame.minX, labelFrame.maxX, identifier)
+                XCTAssertLessThanOrEqual(
+                    controlFrame.maxX,
+                    contentBounds.maxX + 0.5,
+                    identifier
+                )
+            }
         }
     }
 
@@ -1238,8 +1495,10 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
             "Stacio.Settings.aiProviders.add",
             "Stacio.Settings.aiProviders.remove",
             "Stacio.Settings.aiProviders.more",
+            "Stacio.Settings.aiProviders.visitWebsite",
             "Stacio.Settings.aiProviders.testConnection",
             "Stacio.Settings.aiProviders.refreshModels",
+            "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
             "Stacio.Settings.aiProviders.removeAPIKey"
         ] {
             XCTAssertNotNil(view(identifier, in: controller.view), identifier)
@@ -1249,6 +1508,7 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
             "Stacio.Settings.aiProviders.add",
             "Stacio.Settings.aiProviders.remove",
             "Stacio.Settings.aiProviders.more",
+            "Stacio.Settings.aiProviders.toggleAPIKeyVisibility",
             "Stacio.Settings.aiProviders.removeAPIKey"
         ] {
             guard let button = view(identifier, in: controller.view) as? NSButton else {
@@ -1261,7 +1521,7 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         }
     }
 
-    func testInitialSettingsLoadFailureRemainsVisibleInsteadOfLookingRulesOnly() {
+    func testInitialSettingsLoadFailureKeepsMozheSelectedAndShowsTheError() {
         let fixture = makeFixture(defaultProviderID: providerAID)
         fixture.store.loadFailure = TestFailure.message("provider settings are corrupt")
         let controller = fixture.controller
@@ -1271,7 +1531,11 @@ final class AIProviderManagementViewControllerTests: XCTestCase {
         let status = textField("Stacio.Settings.aiProviders.status", in: controller.view)?.stringValue
         XCTAssertTrue(status?.contains("provider settings are corrupt") ?? false)
         XCTAssertTrue(status?.contains("请检查") ?? false)
-        XCTAssertNotEqual(status, "内置规则 · 默认")
+        XCTAssertEqual(controller.selectedProviderID, BuiltInAIProvider.mozheAPIID)
+        XCTAssertEqual(
+            textField("Stacio.Settings.aiProviders.displayName", in: controller.view)?.stringValue,
+            BuiltInAIProvider.mozheAPIDisplayName
+        )
     }
 
     func testAddButtonInvokesTaskEightCallback() {
@@ -1294,8 +1558,10 @@ private let providerBID = UUID(uuidString: "20000000-0000-0000-0000-000000000002
 private func makeFixture(
     defaultProviderID: UUID,
     keys: [UUID: String] = [:],
-    now: Date = Date(timeIntervalSince1970: 1_000)
+    now: Date = Date(timeIntervalSince1970: 1_000),
+    urlOpener: RecordingProviderURLOpener? = nil
 ) -> ProviderManagerFixture {
+    let urlOpener = urlOpener ?? RecordingProviderURLOpener()
     let envelope = AIProviderSettingsEnvelope(
         aiProviders: [
             provider(
@@ -1331,6 +1597,7 @@ private func makeFixture(
         mutationCoordinator: coordinator,
         modelCatalogLoader: catalog,
         connectionTester: connection,
+        urlOpener: urlOpener,
         backgroundExecutor: background.execute,
         mainExecutor: { operation in operation() },
         now: { now }
@@ -1341,7 +1608,8 @@ private func makeFixture(
         coordinator: coordinator,
         catalog: catalog,
         connection: connection,
-        background: background
+        background: background,
+        urlOpener: urlOpener
     )
 }
 
@@ -1352,6 +1620,15 @@ private struct ProviderManagerFixture {
     let catalog: ProviderManagerCatalogLoader
     let connection: ProviderManagerConnectionTester
     let background: ManualProviderExecutor
+    let urlOpener: RecordingProviderURLOpener
+}
+
+private final class RecordingProviderURLOpener: StacioURLOpening {
+    private(set) var openedURLs: [URL] = []
+
+    func open(_ url: URL) {
+        openedURLs.append(url)
+    }
 }
 
 private func provider(

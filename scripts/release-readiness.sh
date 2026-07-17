@@ -8,6 +8,8 @@ RUN_PACKAGE="${STACIO_RELEASE_SKIP_PACKAGE:-0}"
 REQUESTED_REQUIRE_DEVELOPER_ID="${STACIO_RELEASE_REQUIRE_DEVELOPER_ID:-0}"
 REQUESTED_REQUIRE_NOTARY="${STACIO_RELEASE_REQUIRE_NOTARY:-0}"
 LOCAL_SMOKE="${STACIO_RELEASE_LOCAL_SMOKE:-0}"
+EXPECTED_CHANNEL="${STACIO_RELEASE_EXPECTED_CHANNEL:-stable}"
+DISTRIBUTION_MODE="${STACIO_RELEASE_DISTRIBUTION_MODE:-developer-id}"
 REQUIRE_DEVELOPER_ID="$REQUESTED_REQUIRE_DEVELOPER_ID"
 REQUIRE_NOTARY="$REQUESTED_REQUIRE_NOTARY"
 SOURCE_ROOT="${STACIO_RELEASE_SOURCE_ROOT:-$ROOT_DIR}"
@@ -15,8 +17,13 @@ RELEASE_LOCK_DIR="${STACIO_RELEASE_LOCK_DIR:-$(dirname "$APP_DIR")/.release-read
 RELEASE_LOCK_ACQUIRED=0
 REMOTE_TEMP_DIR=""
 if [[ "$LOCAL_SMOKE" != "1" ]]; then
-  REQUIRE_DEVELOPER_ID=1
-  REQUIRE_NOTARY=1
+  if [[ "$DISTRIBUTION_MODE" == "developer-id" ]]; then
+    REQUIRE_DEVELOPER_ID=1
+    REQUIRE_NOTARY=1
+  elif [[ "$DISTRIBUTION_MODE" == "adhoc" ]]; then
+    REQUIRE_DEVELOPER_ID=0
+    REQUIRE_NOTARY=0
+  fi
 fi
 
 failures=0
@@ -60,6 +67,63 @@ require_tool() {
 
 plist_value() {
   /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
+}
+
+compare_bundle_trees() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+source_root, packaged_root = sys.argv[1:3]
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest(root):
+    entries = {}
+
+    def visit(directory, relative_directory=""):
+        with os.scandir(directory) as iterator:
+            children = sorted(iterator, key=lambda entry: entry.name)
+        for entry in children:
+            relative_path = os.path.join(relative_directory, entry.name)
+            metadata = entry.stat(follow_symlinks=False)
+            permissions = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                entries[relative_path] = ("symlink", permissions, os.readlink(entry.path))
+            elif stat.S_ISDIR(metadata.st_mode):
+                entries[relative_path] = ("directory", permissions)
+                visit(entry.path, relative_path)
+            elif stat.S_ISREG(metadata.st_mode):
+                entries[relative_path] = ("file", permissions, metadata.st_size, sha256(entry.path))
+            else:
+                entries[relative_path] = ("special", permissions, stat.S_IFMT(metadata.st_mode))
+
+    visit(root)
+    return entries
+
+
+source = manifest(source_root)
+packaged = manifest(packaged_root)
+for path in sorted(source.keys() | packaged.keys()):
+    if path not in source:
+        print(f"unexpected in DMG: {path}")
+        raise SystemExit(1)
+    if path not in packaged:
+        print(f"missing from DMG: {path}")
+        raise SystemExit(1)
+    if source[path] != packaged[path]:
+        print(f"content or metadata differs: {path}")
+        raise SystemExit(1)
+PY
 }
 
 cleanup_release_lock() {
@@ -176,6 +240,25 @@ check_app_bundle() {
   [[ "$package_type" == "APPL" ]] && pass "CFBundlePackageType=APPL" || fail "unexpected CFBundlePackageType: ${package_type:-<empty>}"
   [[ "$min_system" == "14.0" ]] && pass "LSMinimumSystemVersion=14.0" || warn "unexpected LSMinimumSystemVersion: ${min_system:-<empty>}"
   [[ -n "${short_version//[[:space:]]/}" ]] && pass "CFBundleShortVersionString=$short_version" || fail "CFBundleShortVersionString must not be empty"
+  case "$EXPECTED_CHANNEL" in
+    stable)
+      if [[ "$short_version" == *Beta* || "$short_version" == *beta* ]]; then
+        fail "stable release version must not contain Beta: ${short_version:-<empty>}"
+      else
+        pass "stable release version has no Beta suffix"
+      fi
+      ;;
+    beta)
+      if [[ "$short_version" == *Beta* || "$short_version" == *beta* ]]; then
+        pass "beta release version contains Beta"
+      else
+        fail "beta release version must contain Beta: ${short_version:-<empty>}"
+      fi
+      ;;
+    *)
+      fail "STACIO_RELEASE_EXPECTED_CHANNEL must be stable or beta: $EXPECTED_CHANNEL"
+      ;;
+  esac
   [[ "$build_number" =~ ^[1-9][0-9]*$ ]] && pass "CFBundleVersion=$build_number" || fail "CFBundleVersion must be a positive integer: ${build_number:-<empty>}"
   if [[ -n "${STACIO_RELEASE_PREVIOUS_BUILD_NUMBER:-}" ]]; then
     if [[ ! "$STACIO_RELEASE_PREVIOUS_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
@@ -195,6 +278,28 @@ check_product_ops_configuration() {
   local label="${2:-}"
   local plist="$app_path/Contents/Info.plist"
   [[ -f "$plist" ]] || return
+
+  local update_channel beta_updates_enabled
+  update_channel="$(plist_value "$plist" StacioProductOpsUpdateChannel)"
+  beta_updates_enabled="$(plist_value "$plist" StacioProductOpsBetaUpdatesEnabled)"
+  case "$EXPECTED_CHANNEL" in
+    stable)
+      [[ "$update_channel" == "stable" ]] \
+        && pass "${label}formal release update channel is stable" \
+        || fail "${label}formal stable release requires update channel stable: ${update_channel:-<empty>}"
+      [[ "$beta_updates_enabled" == "false" ]] \
+        && pass "${label}formal stable release disables Beta updates" \
+        || fail "${label}formal stable release requires StacioProductOpsBetaUpdatesEnabled=false"
+      ;;
+    beta)
+      [[ "$update_channel" == "beta" ]] \
+        && pass "${label}formal release update channel is beta" \
+        || fail "${label}formal beta release requires update channel beta: ${update_channel:-<empty>}"
+      [[ "$beta_updates_enabled" == "true" ]] \
+        && pass "${label}formal beta release enables Beta updates" \
+        || fail "${label}formal beta release requires StacioProductOpsBetaUpdatesEnabled=true"
+      ;;
+  esac
 
   if [[ "$LOCAL_SMOKE" == "1" ]]; then
     skip "${label}Product Ops configuration completeness by explicit local-smoke mode"
@@ -226,9 +331,8 @@ check_product_ops_configuration() {
     fi
   done
 
-  local api_base_url update_channel stable_appcast_url beta_appcast_url
+  local api_base_url stable_appcast_url beta_appcast_url
   api_base_url="$(plist_value "$plist" StacioProductOpsAPIBaseURL)"
-  update_channel="$(plist_value "$plist" StacioProductOpsUpdateChannel)"
   stable_appcast_url="$(plist_value "$plist" SUFeedURL)"
   beta_appcast_url="$(plist_value "$plist" StacioSparkleBetaAppcastURL)"
   [[ "$api_base_url" == https://* ]] \
@@ -764,8 +868,8 @@ check_signing() {
   local gatekeeper_status
   gatekeeper_status="$(spctl --status 2>&1 || true)"
   if grep -Fqi "assessments disabled" <<<"$gatekeeper_status"; then
-    if [[ "$LOCAL_SMOKE" == "1" ]]; then
-      skip "Gatekeeper assessments are disabled; local-smoke mode cannot prove distribution acceptance"
+    if [[ "$LOCAL_SMOKE" == "1" || "$DISTRIBUTION_MODE" == "adhoc" ]]; then
+      skip "Gatekeeper distribution acceptance is not required for this release mode"
     else
       fail "Gatekeeper assessments are disabled; distribution acceptance cannot be verified"
     fi
@@ -777,8 +881,8 @@ check_signing() {
   if spctl -a -vv "$APP_DIR" >"$spctl_output_file" 2>&1; then
     spctl_output="$(cat "$spctl_output_file" 2>/dev/null || true)"
     if grep -Fqi "override=security disabled" <<<"$spctl_output"; then
-      if [[ "$LOCAL_SMOKE" == "1" ]]; then
-        skip "Gatekeeper returned a security-disabled override"
+      if [[ "$LOCAL_SMOKE" == "1" || "$DISTRIBUTION_MODE" == "adhoc" ]]; then
+        skip "Gatekeeper returned a security-disabled override for a mode that does not require distribution acceptance"
       else
         fail "Gatekeeper assessments are disabled; distribution acceptance cannot be verified"
       fi
@@ -790,7 +894,7 @@ check_signing() {
     if [[ "$REQUIRE_DEVELOPER_ID" == "1" ]]; then
       fail "spctl assessment rejected app: ${spctl_output//$'\n'/ }"
     else
-      skip "spctl assessment not accepted for local test app: ${spctl_output//$'\n'/ }"
+      skip "spctl assessment not required for this release mode: ${spctl_output//$'\n'/ }"
     fi
   fi
   rm -f "$spctl_output_file"
@@ -825,7 +929,7 @@ check_dmg() {
       pass "DMG root contains Stacio.app"
       local diff_output
       diff_output="$(mktemp)"
-      if diff -qr "$APP_DIR" "$mounted_app" >"$diff_output" 2>&1; then
+      if compare_bundle_trees "$APP_DIR" "$mounted_app" >"$diff_output" 2>&1; then
         pass "DMG Stacio.app matches release app bundle"
       else
         fail "DMG Stacio.app does not match release app bundle: $(head -n 1 "$diff_output" 2>/dev/null || true)"
@@ -1016,7 +1120,9 @@ check_notary_readiness() {
     return
   fi
 
-  if notary_configured; then
+  if [[ "$DISTRIBUTION_MODE" == "adhoc" && "$LOCAL_SMOKE" != "1" ]]; then
+    skip "notarization and staple validation are not available in ad-hoc distribution mode"
+  elif notary_configured; then
     pass "notary credentials are configured"
     skip "notarization ticket validation not required in local-smoke mode; set STACIO_RELEASE_REQUIRE_NOTARY=1 to opt in"
   else
@@ -1027,7 +1133,12 @@ check_notary_readiness() {
 printf 'Stacio release readiness\n'
 printf 'Repository: %s\n' "$ROOT_DIR"
 printf 'App: %s\n' "$APP_DIR"
-printf 'DMG: %s\n\n' "$DMG_PATH"
+printf 'DMG: %s\n' "$DMG_PATH"
+printf 'Distribution mode: %s\n\n' "$DISTRIBUTION_MODE"
+
+if [[ "$DISTRIBUTION_MODE" == "adhoc" && "$LOCAL_SMOKE" != "1" ]]; then
+  warn "ad-hoc distribution will require users to bypass normal macOS Gatekeeper trust prompts"
+fi
 
 require_tool plutil
 require_tool codesign
@@ -1047,6 +1158,9 @@ fi
 
 if [[ "$LOCAL_SMOKE" != "0" && "$LOCAL_SMOKE" != "1" ]]; then
   fail "STACIO_RELEASE_LOCAL_SMOKE must be 0 or 1"
+fi
+if [[ "$DISTRIBUTION_MODE" != "developer-id" && "$DISTRIBUTION_MODE" != "adhoc" ]]; then
+  fail "STACIO_RELEASE_DISTRIBUTION_MODE must be developer-id or adhoc"
 fi
 if [[ "$RUN_PACKAGE" != "0" && "$RUN_PACKAGE" != "1" ]]; then
   fail "STACIO_RELEASE_SKIP_PACKAGE must be 0 or 1"

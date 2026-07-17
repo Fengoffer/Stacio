@@ -1394,6 +1394,48 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(store.snapshot().sessionTabIconMode, .operatingSystem)
     }
 
+    func testSettingsPersistsRecentSessionsVisibilityPreference() throws {
+        let suiteName = "StacioRecentSessionsVisibilitySettingsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AppSettingsStore(defaults: defaults)
+        let controller = AppSettingsWindowController(settingsStore: store)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let group = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Settings.group.sessionSidebar")
+        )
+        let recentSwitch = try XCTUnwrap(
+            content.firstSubview(
+                withIdentifier: "Stacio.Settings.sessionSidebarShowRecentSessions.switch"
+            ) as? NSSwitch
+        )
+        let title = try XCTUnwrap(
+            content.firstSubview(
+                withIdentifier: "Stacio.Settings.preferenceTitle.sessionSidebarShowRecentSessions"
+            ) as? NSTextField
+        )
+        let help = try XCTUnwrap(
+            content.firstSubview(
+                withIdentifier: "Stacio.Settings.preferenceHelp.sessionSidebarShowRecentSessions"
+            ) as? NSTextField
+        )
+
+        XCTAssertFalse(group.isHidden)
+        XCTAssertEqual(recentSwitch.state, .on)
+        XCTAssertEqual(title.stringValue, "显示“最近使用”分组")
+        XCTAssertTrue(help.stringValue.contains("最多 5 个会话"))
+
+        recentSwitch.state = .off
+        recentSwitch.sendAction(recentSwitch.action, to: recentSwitch.target)
+
+        XCTAssertFalse(store.snapshot().sessionSidebarShowRecentSessions)
+        XCTAssertFalse(AppSettingsStore(defaults: defaults).snapshot().sessionSidebarShowRecentSessions)
+    }
+
     func testTerminalSettingsPreviewUsesSelectedFontFamily() throws {
         let suiteName = "StacioTerminalPreviewFontSettingsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1803,11 +1845,8 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             controlIdentifier: "Stacio.Settings.agentConfirmationPolicy",
             in: content
         )
-        try assertSettingsFormPair(
-            labelIdentifier: "Stacio.Settings.formLabel.executionMode",
-            controlIdentifier: "Stacio.Settings.agentExecutionMode",
-            in: content
-        )
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.formLabel.executionMode"))
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode"))
 
         try selectSettingsSection("files", in: content)
         try assertSettingsFormPair(
@@ -1901,9 +1940,7 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         let confirmationControl = try XCTUnwrap(
             content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl
         )
-        let executionModeControl = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode") as? NSSegmentedControl
-        )
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode"))
         let autoRunButton = try XCTUnwrap(
             content.firstSubview(withIdentifier: "Stacio.Settings.aiAutoRunProposedCommands") as? NSButton
         )
@@ -1928,8 +1965,6 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         try selectAISettingsTab("执行与权限", in: content)
         confirmationControl.selectedSegment = 1
         confirmationControl.sendAction(confirmationControl.action, to: confirmationControl.target)
-        executionModeControl.selectedSegment = 0
-        executionModeControl.sendAction(executionModeControl.action, to: executionModeControl.target)
         autoRunButton.state = .off
         autoRunButton.sendAction(autoRunButton.action, to: autoRunButton.target)
         allowPatternsField.stringValue = "systemctl status\njournalctl"
@@ -1992,7 +2027,7 @@ final class AppSettingsWindowControllerTests: XCTestCase {
 
         let envelope = try store.loadAIProviderSettings()
         let snapshot = store.snapshot()
-        XCTAssertEqual(envelope.aiProviders, [provider])
+        XCTAssertEqual(envelope.aiProviders, [provider, BuiltInAIProvider.defaultConfiguration])
         XCTAssertEqual(envelope.defaultAIProviderID, providerID)
         XCTAssertEqual(snapshot.aiProviderSettings, envelope)
         XCTAssertEqual(snapshot.aiReasoningEffort, .high)
@@ -2152,9 +2187,9 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(bridgeSocket.stringValue.contains("agent-bridge.sock"))
         XCTAssertTrue(bridgeHint.stringValue.contains("stacio agent sessions"))
         XCTAssertTrue(bridgeHint.stringValue.contains("stacio 仍作为兼容命令保留"))
-        XCTAssertTrue(executionHelp.stringValue.contains("独立执行 runtime"))
-        XCTAssertTrue(executionHelp.stringValue.contains("不会遮挡终端"))
-        XCTAssertTrue(executionHelp.stringValue.contains("终端 trace"))
+        XCTAssertTrue(executionHelp.stringValue.contains("当前终端标签页"))
+        XCTAssertTrue(executionHelp.stringValue.contains("现有 SSH 或本地终端会话"))
+        XCTAssertFalse(executionHelp.stringValue.contains("独立执行 runtime"))
         XCTAssertTrue(commandPatternHelp.stringValue.contains("禁止模式优先"))
         XCTAssertTrue(commandPatternHelp.stringValue.contains("从命令开头匹配"))
         XCTAssertTrue(commandPatternHelp.stringValue.contains("sudo"))
@@ -2162,17 +2197,13 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         let confirmationControl = try XCTUnwrap(
             content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl
         )
-        let executionModeControl = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode") as? NSSegmentedControl
-        )
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode"))
 
         confirmationControl.selectedSegment = 3
         confirmationControl.sendAction(confirmationControl.action, to: confirmationControl.target)
-        executionModeControl.selectedSegment = 1
-        executionModeControl.sendAction(executionModeControl.action, to: executionModeControl.target)
 
         XCTAssertEqual(store.snapshot().agentConfirmationPolicy, .requireEveryCommand)
-        XCTAssertEqual(store.snapshot().agentExecutionMode, .backgroundTask)
+        XCTAssertEqual(store.snapshot().agentExecutionMode, .visibleTerminal)
     }
 
     func testAIAndSecuritySettingsShowApprovalRiskMatrix() throws {

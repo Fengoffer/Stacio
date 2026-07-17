@@ -70,12 +70,232 @@ final class AgentTaskOrchestratorTests: XCTestCase {
         XCTAssertEqual(execution.commands, ["uptime"])
         XCTAssertEqual(provider.requests.count, 2)
         XCTAssertTrue(provider.requests[1].question.contains("load average: 0.08"))
+        XCTAssertTrue(provider.requests[1].question.contains("默认使用 1 至 3 个短句"))
+        XCTAssertTrue(provider.requests[1].question.contains("不要重复命令、执行步骤、完整日志或思考过程"))
         XCTAssertEqual(result.state, .completed)
         XCTAssertEqual(result.steps.count, 1)
         XCTAssertEqual(result.steps.first?.state, .completed)
         XCTAssertTrue(updates.contains { $0.kind == .thinking })
+        XCTAssertEqual(
+            updates.filter { $0.message == "负载正常，任务完成。" }.map(\.kind),
+            [.completed]
+        )
         XCTAssertTrue(updates.contains { $0.kind == .trace && $0.traceEvent?.state == .running })
         XCTAssertTrue(updates.contains { $0.kind == .completed })
+    }
+
+    func testAutonomousRunsUseDistinctRequestIDNamespaces() async throws {
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "执行第一轮。",
+                commandProposals: [
+                    AgentCommandProposal(command: "uptime", explanation: "查看负载。", risk: .readOnly)
+                ]
+            ),
+            AIAssistantResponse(message: "第一轮完成。", commandProposals: []),
+            AIAssistantResponse(
+                message: "执行第二轮。",
+                commandProposals: [
+                    AgentCommandProposal(command: "uptime", explanation: "再次查看负载。", risk: .readOnly)
+                ]
+            ),
+            AIAssistantResponse(message: "第二轮完成。", commandProposals: [])
+        ])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .completed,
+                    message: "本次命令已完成：load average: 0.08",
+                    redactedCommand: "uptime",
+                    metadata: ["terminalOutputSummary": "load average: 0.08"]
+                )
+            ]
+        ])
+        let coordinator = AIAssistantCoordinator(provider: provider, executionCoordinator: execution)
+        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator)
+        let context = AITerminalContext(
+            runtimeID: "term_1",
+            title: "dev@example.com",
+            currentDirectory: "/srv/app",
+            recentTranscript: ""
+        )
+
+        let firstResult = try await orchestrator.run(goal: "第一轮检查", context: context)
+        let secondResult = try await orchestrator.run(goal: "第二轮检查", context: context)
+
+        XCTAssertEqual(firstResult.state, .completed)
+        XCTAssertEqual(secondResult.state, .completed)
+        XCTAssertEqual(execution.requests.count, 2)
+        let requestIDs = execution.requests.map(\.id)
+        XCTAssertNotEqual(requestIDs[0], requestIDs[1])
+        XCTAssertTrue(requestIDs.allSatisfy { $0.hasPrefix("agent-step-") })
+        XCTAssertTrue(requestIDs.allSatisfy { $0.hasSuffix("-1") })
+    }
+
+    func testAutonomousLoopRefreshesMappedTerminalHistoryBeforeNextModelDecision() async throws {
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "先查看负载。",
+                commandProposals: [
+                    AgentCommandProposal(command: "uptime", explanation: "查看负载。", risk: .readOnly)
+                ]
+            ),
+            AIAssistantResponse(message: "结合历史输出和本步结果，系统正常。", commandProposals: [])
+        ])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .completed,
+                    message: "本次命令已完成：load average: 0.08",
+                    redactedCommand: "uptime",
+                    metadata: ["terminalOutputSummary": "load average: 0.08"]
+                )
+            ]
+        ])
+        let coordinator = AIAssistantCoordinator(provider: provider, executionCoordinator: execution)
+        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator)
+        let initialContext = AITerminalContext(
+            runtimeID: "term_1",
+            title: "dev@example.com",
+            currentDirectory: "/srv/app",
+            recentTranscript: "old prompt"
+        )
+        var currentTranscript = "old prompt"
+
+        let result = try await orchestrator.run(
+            goal: "结合终端历史检查服务器",
+            context: initialContext,
+            contextProvider: {
+                AITerminalContext(
+                    runtimeID: "term_1",
+                    title: "dev@example.com",
+                    currentDirectory: "/srv/app",
+                    recentTranscript: currentTranscript
+                )
+            },
+            onUpdate: { update in
+                if update.traceEvent?.state == .completed {
+                    currentTranscript = "old prompt\nload average: 0.08\nroot@host:~#"
+                }
+            }
+        )
+
+        XCTAssertEqual(result.state, .completed)
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertTrue(provider.requests[1].context.recentTranscript.contains("root@host:~#"))
+        XCTAssertTrue(provider.requests[1].question.contains("load average: 0.08"))
+    }
+
+    func testAutonomousLoopUsesOnlyLatestCumulativeTerminalOutputForObservation() async throws {
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "检查输出。",
+                commandProposals: [AgentCommandProposal(command: "printf test", explanation: "执行检查。", risk: .readOnly)]
+            ),
+            AIAssistantResponse(message: "检查完成。", commandProposals: [])
+        ])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            "printf test": [
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .waitingForOutput,
+                    message: "输出更新",
+                    redactedCommand: "printf test",
+                    metadata: ["terminalOutputSummary": "line 1"]
+                ),
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .completed,
+                    message: "已完成",
+                    redactedCommand: "printf test",
+                    metadata: ["terminalOutputSummary": "line 1\nline 2"]
+                )
+            ]
+        ])
+        let coordinator = AIAssistantCoordinator(provider: provider, executionCoordinator: execution)
+        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator)
+
+        _ = try await orchestrator.run(
+            goal: "检查输出",
+            context: AITerminalContext(
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                currentDirectory: nil,
+                recentTranscript: ""
+            )
+        )
+
+        let nextQuestion = provider.requests[1].question
+        XCTAssertTrue(nextQuestion.contains("观察：line 1 line 2"))
+        XCTAssertFalse(nextQuestion.contains("观察：line 1 line 1 line 2"))
+    }
+
+    func testAutonomousLoopWaitsForAsynchronousBackgroundCompletion() async throws {
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "先读取系统负载。",
+                commandProposals: [
+                    AgentCommandProposal(command: "uptime", explanation: "查看负载。", risk: .readOnly)
+                ]
+            ),
+            AIAssistantResponse(message: "负载正常，任务完成。", commandProposals: [])
+        ])
+        let execution = DelayedBackgroundAgentCommandExecutor()
+        let coordinator = AIAssistantCoordinator(provider: provider, executionCoordinator: execution)
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: coordinator,
+            limits: AgentTaskLoopLimits(maxSteps: 3, maxDuration: 60)
+        )
+
+        let result = try await orchestrator.run(
+            goal: "检查服务器负载",
+            context: AITerminalContext(
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                currentDirectory: "/srv/app",
+                recentTranscript: ""
+            )
+        )
+
+        XCTAssertEqual(result.state, .completed)
+        XCTAssertEqual(result.steps.first?.state, .completed)
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertTrue(provider.requests[1].question.contains("load average: 0.04"))
+    }
+
+    func testCancellingAsynchronousBackgroundStepReleasesCompletionWait() async throws {
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "开始检查。",
+                commandProposals: [
+                    AgentCommandProposal(command: "uptime", explanation: "查看负载。", risk: .readOnly)
+                ]
+            )
+        ])
+        let execution = DelayedBackgroundAgentCommandExecutor(emitCompletion: false)
+        let coordinator = AIAssistantCoordinator(provider: provider, executionCoordinator: execution)
+        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator)
+
+        let result = try await orchestrator.run(
+            goal: "检查服务器负载",
+            context: AITerminalContext(
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                currentDirectory: "/srv/app",
+                recentTranscript: ""
+            ),
+            onUpdate: { update in
+                if update.traceEvent?.state == .running {
+                    orchestrator.cancel()
+                }
+            }
+        )
+
+        XCTAssertEqual(result.state, .cancelled)
+        XCTAssertEqual(result.steps.first?.state, .cancelled)
+        XCTAssertEqual(execution.cancelledRequestIDs, execution.requestIDs)
     }
 
     func testInitialResponseOnlyRunsFirstCommandAndNextCommandComesFromObservedOutputRequest() async throws {
@@ -280,14 +500,6 @@ final class AgentTaskOrchestratorTests: XCTestCase {
             coordinator: coordinator,
             limits: AgentTaskLoopLimits(maxSteps: 4, maxDuration: 60)
         )
-        execution.pauseEvents["agent-step-1"] = AgentTraceEvent(
-            requestID: "agent-step-1",
-            state: .paused,
-            message: "AI 后续自动动作已暂停；当前命令仍以目标终端输出为准。",
-            redactedCommand: "tail -f /var/log/messages",
-            metadata: ["control": "pause"]
-        )
-
         let result = try await orchestrator.run(
             goal: "持续观察日志",
             context: AITerminalContext(
@@ -303,7 +515,7 @@ final class AgentTaskOrchestratorTests: XCTestCase {
             }
         )
 
-        XCTAssertEqual(execution.pausedRequestIDs, ["agent-step-1"])
+        XCTAssertEqual(execution.pausedRequestIDs, execution.requests.map(\.id))
         XCTAssertEqual(execution.commands, ["tail -f /var/log/messages"])
         XCTAssertEqual(result.state, .paused)
         XCTAssertEqual(provider.requests.count, 1)
@@ -401,6 +613,63 @@ final class AgentTaskOrchestratorTests: XCTestCase {
         XCTAssertEqual(plan.steps.map(\.command), ["uptime", "df -h"])
         XCTAssertEqual(plan.steps.map(\.intent), ["判断是否 CPU 压力。", "判断是否 IO 或空间问题。"])
         XCTAssertTrue(provider.requests.first?.question.contains("先产出一个多步计划") == true)
+    }
+}
+
+@MainActor
+private final class DelayedBackgroundAgentCommandExecutor: AgentCommandStreamingExecuting, AgentTaskControlling {
+    private let emitCompletion: Bool
+    private(set) var requestIDs: [String] = []
+    private(set) var cancelledRequestIDs: [String] = []
+
+    init(emitCompletion: Bool = true) {
+        self.emitCompletion = emitCompletion
+    }
+
+    func runCommand(_ request: AgentBridgeRequest) throws -> [AgentTraceEvent] {
+        try runCommand(request, emit: { _ in })
+    }
+
+    func runCommand(
+        _ request: AgentBridgeRequest,
+        emit: @escaping (AgentTraceEvent) -> Void
+    ) throws -> [AgentTraceEvent] {
+        requestIDs.append(request.id)
+        let running = AgentTraceEvent(
+            requestID: request.id,
+            state: .running,
+            message: "独立任务已启动，输出将同步显示",
+            redactedCommand: "uptime",
+            metadata: ["executionMode": "backgroundTask"]
+        )
+        emit(running)
+        if emitCompletion {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                emit(AgentTraceEvent(
+                    requestID: request.id,
+                    state: .completed,
+                    message: "AI 独立任务已完成：load average: 0.04",
+                    redactedCommand: "uptime",
+                    metadata: [
+                        "executionMode": "backgroundTask",
+                        "terminalOutputSummary": "load average: 0.04"
+                    ]
+                ))
+            }
+        }
+        return [running]
+    }
+
+    func cancelTask(requestID: String) -> AgentTraceEvent? {
+        cancelledRequestIDs.append(requestID)
+        return AgentTraceEvent(
+            requestID: requestID,
+            state: .cancelled,
+            message: "AI 独立任务已取消。",
+            redactedCommand: "uptime",
+            metadata: ["executionMode": "backgroundTask"]
+        )
     }
 }
 

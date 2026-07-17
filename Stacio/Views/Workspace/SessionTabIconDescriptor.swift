@@ -7,19 +7,22 @@ public struct SessionTabIconDescriptor: Equatable {
     public let shortLabel: String
     public let backgroundColor: NSColor
     public let foregroundColor: NSColor
+    private let resourceIconID: String?
 
     public init(
         identifier: String,
         accessibilityLabel: String,
         shortLabel: String,
         backgroundColor: NSColor,
-        foregroundColor: NSColor = .white
+        foregroundColor: NSColor = .white,
+        resourceIconID: String? = nil
     ) {
         self.identifier = identifier
         self.accessibilityLabel = accessibilityLabel
         self.shortLabel = shortLabel
         self.backgroundColor = backgroundColor
         self.foregroundColor = foregroundColor
+        self.resourceIconID = resourceIconID
     }
 
     public static let sshDefault = SessionTabIconDescriptor(
@@ -28,6 +31,17 @@ public struct SessionTabIconDescriptor: Equatable {
         shortLabel: ">_",
         backgroundColor: NSColor(calibratedRed: 0.18, green: 0.22, blue: 0.29, alpha: 1)
     )
+
+    public static func catalogIcon(id: String, accessibilityLabel: String? = nil) -> SessionTabIconDescriptor? {
+        guard let definition = SessionIconCatalog.definition(id: id) else { return nil }
+        return SessionTabIconDescriptor(
+            identifier: definition.id,
+            accessibilityLabel: accessibilityLabel ?? definition.displayName,
+            shortLabel: "",
+            backgroundColor: .clear,
+            resourceIconID: definition.id
+        )
+    }
 
     public static func graphicsProtocol(_ protocolName: String) -> SessionTabIconDescriptor {
         let normalized = protocolName.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -62,6 +76,11 @@ public struct SessionTabIconDescriptor: Equatable {
     }
 
     public func image(size: NSSize = NSSize(width: 18, height: 18)) -> NSImage {
+        if let resourceIconID,
+           let image = SessionIconCatalog.image(for: resourceIconID, size: size) {
+            image.accessibilityDescription = accessibilityLabel
+            return image
+        }
         let image = NSImage(size: size)
         image.isTemplate = false
         image.accessibilityDescription = accessibilityLabel

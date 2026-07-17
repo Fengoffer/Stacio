@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-pub const DEFAULT_SCP_TRANSFER_CHUNK_SIZE_BYTES: usize = 128 * 1024;
-pub const DEFAULT_SCP_TRANSFER_CHANNEL_WINDOW_SIZE_BYTES: u32 = 2 * 1024 * 1024;
-pub const DEFAULT_SCP_TRANSFER_CHANNEL_PACKET_SIZE_BYTES: u32 = 128 * 1024;
+pub const DEFAULT_SCP_TRANSFER_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_SCP_TRANSFER_CHANNEL_WINDOW_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_SCP_TRANSFER_CHANNEL_PACKET_SIZE_BYTES: u32 = 32 * 1024;
+pub const DEFAULT_SCP_TRANSFER_PROGRESS_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_SCP_TRANSFER_OPERATION_TIMEOUT_MS: u32 = 30_000;
 pub const DEFAULT_SCP_TRANSFER_MAX_RETRY_ATTEMPTS: u8 = 3;
 pub const DEFAULT_SCP_TRANSFER_COMPRESSION: &str = "none";
@@ -24,6 +25,7 @@ pub struct ScpTransferTuning {
     pub chunk_size_bytes: usize,
     pub channel_window_size_bytes: u32,
     pub channel_packet_size_bytes: u32,
+    pub progress_interval_bytes: u64,
     pub operation_timeout_ms: u32,
     pub max_retry_attempts: u8,
     pub compression: &'static str,
@@ -35,6 +37,7 @@ impl Default for ScpTransferTuning {
             chunk_size_bytes: DEFAULT_SCP_TRANSFER_CHUNK_SIZE_BYTES,
             channel_window_size_bytes: DEFAULT_SCP_TRANSFER_CHANNEL_WINDOW_SIZE_BYTES,
             channel_packet_size_bytes: DEFAULT_SCP_TRANSFER_CHANNEL_PACKET_SIZE_BYTES,
+            progress_interval_bytes: DEFAULT_SCP_TRANSFER_PROGRESS_INTERVAL_BYTES,
             operation_timeout_ms: DEFAULT_SCP_TRANSFER_OPERATION_TIMEOUT_MS,
             max_retry_attempts: DEFAULT_SCP_TRANSFER_MAX_RETRY_ATTEMPTS,
             compression: DEFAULT_SCP_TRANSFER_COMPRESSION,
@@ -264,12 +267,15 @@ impl Libssh2ScpEngine {
                 .session()
                 .scp_recv(Path::new(&remote_path))
                 .map_err(map_scp_error)?;
-            Self::tune_receive_window(&mut remote_channel, &self.tuning)?;
+            let mut remote_reader = TunedScpChannelReader::new(
+                &mut remote_channel,
+                self.tuning.channel_window_size_bytes,
+            )?;
             if offset > stat.size() {
                 return Ok(Vec::new());
             }
             let mut sink = std::io::sink();
-            let mut skipped_reader = std::io::Read::by_ref(&mut remote_channel).take(offset);
+            let mut skipped_reader = std::io::Read::by_ref(&mut remote_reader).take(offset);
             let skipped = Self::copy_with_cancellation_and_tuning(
                 &mut skipped_reader,
                 &mut sink,
@@ -281,7 +287,7 @@ impl Libssh2ScpEngine {
             let remaining = stat.size().saturating_sub(offset);
             let target_len = length.unwrap_or(remaining).min(remaining);
             let mut bytes = Vec::with_capacity(target_len.min(usize::MAX as u64) as usize);
-            let mut target_reader = remote_channel.take(target_len);
+            let mut target_reader = remote_reader.take(target_len);
             let read = Self::copy_with_cancellation_and_tuning(
                 &mut target_reader,
                 &mut bytes,
@@ -455,14 +461,17 @@ impl Libssh2ScpEngine {
                     .session()
                     .scp_recv(Path::new(&remote_path))
                     .map_err(map_scp_error)?;
-                Self::tune_receive_window(&mut remote_channel, &self.tuning)?;
+                let mut remote_reader = TunedScpChannelReader::new(
+                    &mut remote_channel,
+                    self.tuning.channel_window_size_bytes,
+                )?;
                 let reported_total = if progress_total == 0 {
                     progress_base.saturating_add(stat.size())
                 } else {
                     progress_total
                 };
                 let bytes_read = Self::copy_with_cancellation_and_tuning(
-                    &mut remote_channel,
+                    &mut remote_reader,
                     &mut local_writer,
                     || is_live_scp_transfer_cancelled(&job.id),
                     |bytes_done| {
@@ -890,24 +899,6 @@ impl Libssh2ScpEngine {
             .map_err(|_| "FILES_REMOTE_COMMAND_FAILED".to_string())
     }
 
-    fn tune_receive_window(
-        channel: &mut ssh2::Channel,
-        tuning: &ScpTransferTuning,
-    ) -> Result<(), String> {
-        let window = channel.read_window();
-        if window.remaining < tuning.channel_window_size_bytes {
-            let adjust = tuning
-                .channel_window_size_bytes
-                .saturating_sub(window.remaining) as u64;
-            if adjust > 0 {
-                channel
-                    .adjust_receive_window(adjust, true)
-                    .map_err(map_scp_error)?;
-            }
-        }
-        Ok(())
-    }
-
     fn local_path_for_remote_child(
         local_root: &str,
         remote_root: &str,
@@ -1017,6 +1008,7 @@ impl Libssh2ScpEngine {
     {
         let mut buffer = vec![0_u8; tuning.chunk_size_bytes];
         let mut bytes_copied = 0_u64;
+        let mut last_reported_bytes = 0_u64;
         loop {
             if should_cancel() {
                 return Err("FILES_TRANSFER_CANCELED".to_string());
@@ -1024,12 +1016,18 @@ impl Libssh2ScpEngine {
 
             let bytes_read = read_chunk_with_retry(reader, &mut buffer, tuning)?;
             if bytes_read == 0 {
+                if bytes_copied != last_reported_bytes {
+                    did_copy(bytes_copied);
+                }
                 return Ok(bytes_copied);
             }
 
             write_all_with_retry(writer, &buffer[..bytes_read], tuning)?;
             bytes_copied += bytes_read as u64;
-            did_copy(bytes_copied);
+            if bytes_copied.saturating_sub(last_reported_bytes) >= tuning.progress_interval_bytes {
+                did_copy(bytes_copied);
+                last_reported_bytes = bytes_copied;
+            }
         }
     }
 
@@ -1074,6 +1072,48 @@ impl Libssh2ScpEngine {
             .seek(SeekFrom::Start(offset))
             .map_err(|_| "FILES_TRANSFER_INTERRUPTED".to_string())?;
         Self::copy_with_cancellation_and_tuning(reader, writer, should_cancel, did_copy, tuning)
+    }
+}
+
+struct TunedScpChannelReader<'channel> {
+    channel: &'channel mut ssh2::Channel,
+    target_window_size_bytes: u32,
+}
+
+impl<'channel> TunedScpChannelReader<'channel> {
+    fn new(
+        channel: &'channel mut ssh2::Channel,
+        target_window_size_bytes: u32,
+    ) -> Result<Self, String> {
+        let mut reader = Self {
+            channel,
+            target_window_size_bytes,
+        };
+        reader.replenish_receive_window()?;
+        Ok(reader)
+    }
+
+    fn replenish_receive_window(&mut self) -> Result<(), String> {
+        let remaining = self.channel.read_window().remaining;
+        let replenish_threshold = self.target_window_size_bytes / 2;
+        if remaining >= replenish_threshold {
+            return Ok(());
+        }
+        let adjust = self.target_window_size_bytes.saturating_sub(remaining) as u64;
+        if adjust == 0 {
+            return Ok(());
+        }
+        self.channel
+            .adjust_receive_window(adjust, true)
+            .map(|_| ())
+            .map_err(map_scp_error)
+    }
+}
+
+impl Read for TunedScpChannelReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.replenish_receive_window().map_err(io::Error::other)?;
+        self.channel.read(buffer)
     }
 }
 
@@ -1298,13 +1338,8 @@ fn local_resume_offset(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(_) => return Err("FILES_LOCAL_WRITE_FAILED".to_string()),
     };
-    let requested = if resume_options.requested_offset > 0 {
-        resume_options.requested_offset.min(partial_size)
-    } else {
-        partial_size
-    };
-    if requested > 0 && requested < remote_identity.source_size {
-        Ok(requested)
+    if partial_size > 0 && partial_size < remote_identity.source_size {
+        Ok(partial_size)
     } else {
         Ok(0)
     }
@@ -1753,7 +1788,7 @@ mod libssh2_scp_tests {
 
     #[test]
     fn copy_with_cancellation_stops_between_chunks() {
-        let payload = vec![42_u8; 384 * 1024];
+        let payload = vec![42_u8; 3 * 1024 * 1024];
         let mut reader = std::io::Cursor::new(payload);
         let mut writer = Vec::new();
         let mut checks = 0;
@@ -1770,12 +1805,12 @@ mod libssh2_scp_tests {
         .expect_err("canceled copy");
 
         assert_eq!(error, "FILES_TRANSFER_CANCELED");
-        assert_eq!(writer.len(), 256 * 1024);
+        assert_eq!(writer.len(), 2 * 1024 * 1024);
     }
 
     #[test]
-    fn copy_with_cancellation_reports_progress_after_each_chunk() {
-        let payload = vec![42_u8; 130 * 1024];
+    fn copy_with_cancellation_coalesces_progress_and_reports_final_bytes() {
+        let payload = vec![42_u8; 5 * 1024 * 1024 + 128 * 1024];
         let mut reader = std::io::Cursor::new(payload);
         let mut writer = Vec::new();
         let mut progress = Vec::new();
@@ -1788,17 +1823,21 @@ mod libssh2_scp_tests {
         )
         .expect("copy");
 
-        assert_eq!(copied, 130 * 1024);
-        assert_eq!(progress, vec![128 * 1024, 130 * 1024]);
+        assert_eq!(copied, 5 * 1024 * 1024 + 128 * 1024);
+        assert_eq!(
+            progress,
+            vec![4 * 1024 * 1024, 5 * 1024 * 1024 + 128 * 1024]
+        );
     }
 
     #[test]
     fn default_transfer_tuning_uses_large_binary_scp_settings() {
         let tuning = super::ScpTransferTuning::default();
 
-        assert_eq!(tuning.chunk_size_bytes, 128 * 1024);
-        assert_eq!(tuning.channel_window_size_bytes, 2 * 1024 * 1024);
-        assert_eq!(tuning.channel_packet_size_bytes, 128 * 1024);
+        assert_eq!(tuning.chunk_size_bytes, 1024 * 1024);
+        assert_eq!(tuning.channel_window_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(tuning.channel_packet_size_bytes, 32 * 1024);
+        assert_eq!(tuning.progress_interval_bytes, 4 * 1024 * 1024);
         assert_eq!(tuning.operation_timeout_ms, 30_000);
         assert_eq!(tuning.max_retry_attempts, 3);
         assert_eq!(tuning.compression, "none");
@@ -1992,6 +2031,33 @@ mod libssh2_scp_tests {
 
         assert_eq!(offset, 0);
         assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn local_resume_offset_uses_verified_partial_file_size_when_ui_progress_lags() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let local_path = temp.path().join("build.zip");
+        let metadata_path = super::local_resume_metadata_path(&local_path);
+        let remote_identity = super::ScpResumeMetadata {
+            source_size: 100,
+            source_mtime_unix: 1_700_000_000,
+        };
+        std::fs::write(&local_path, vec![7_u8; 64]).expect("write partial");
+        super::write_local_resume_metadata(&metadata_path, &remote_identity)
+            .expect("write sidecar");
+
+        let offset = super::local_resume_offset(
+            &local_path,
+            &metadata_path,
+            Some(&remote_identity),
+            &ScpResumeOptions {
+                requested_offset: 40,
+                force_restart: false,
+            },
+        )
+        .expect("resume offset");
+
+        assert_eq!(offset, 64);
     }
 
     struct FlakyReader {

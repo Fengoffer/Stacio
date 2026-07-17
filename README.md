@@ -4,7 +4,7 @@ Stacio 是一款面向 macOS 的本地优先远程运维工作台，适合开发
 
 应用由 AppKit 工作台和 Rust Core 组成。远程连接、会话存储、传输、诊断和可审计自动化都尽量由应用自身负责，而不是把核心体验降级成零散 shell 命令包装。
 
-![Stacio 工作台](docs/assets/screenshots/stacio-workbench.png)
+![Stacio 工作台](assets/screenshots/stacio-workbench.png)
 
 ## 亮点
 
@@ -15,7 +15,7 @@ Stacio 是一款面向 macOS 的本地优先远程运维工作台，适合开发
 - Swift / AppKit 前端加 Rust Core，仓库包含桥接、会话、传输、文件、诊断、AI、终端体验和打包相关测试。
 - AI 助手可读取可见终端上下文，提出排查建议，生成可执行命令卡片，并保留执行审计。
 
-![Stacio 会话设置](docs/assets/screenshots/stacio-session-settings.png)
+![Stacio 会话设置](assets/screenshots/stacio-session-settings.png)
 
 ## 功能说明
 

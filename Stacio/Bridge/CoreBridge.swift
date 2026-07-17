@@ -206,6 +206,14 @@ public enum CoreBridge {
         try StacioCoreBindings.listSessionFolders(databasePath: databasePath)
     }
 
+    public static func listSessionSidebarOrder(databasePath: String) throws -> [SessionSidebarOrderItem] {
+        try StacioCoreBindings.listSessionSidebarOrder(databasePath: databasePath)
+    }
+
+    public static func loadSessionSidebarSnapshot(databasePath: String) throws -> SessionSidebarSnapshot {
+        try StacioCoreBindings.loadSessionSidebarSnapshot(databasePath: databasePath)
+    }
+
     public static func saveCredentialRecord(
         databasePath: String,
         draft: CredentialDraft
@@ -261,6 +269,22 @@ public enum CoreBridge {
             databasePath: databasePath,
             id: id,
             targetFolderId: targetFolderID
+        )
+    }
+
+    public static func placeSessionSidebarItem(
+        databasePath: String,
+        kind: String,
+        id: String,
+        targetFolderID: String?,
+        targetIndex: UInt32
+    ) throws {
+        _ = try StacioCoreBindings.placeSessionSidebarItem(
+            databasePath: databasePath,
+            kind: kind,
+            id: id,
+            targetParentId: targetFolderID,
+            targetIndex: targetIndex
         )
     }
 

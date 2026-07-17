@@ -363,6 +363,11 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         target: nil,
         action: nil
     )
+    private let sessionSidebarShowRecentSessionsButton = NSButton(
+        checkboxWithTitle: L10n.Settings.sessionSidebarShowRecentSessions,
+        target: nil,
+        action: nil
+    )
     private let importTerminalThemeButton = NSButton(title: L10n.Settings.importTerminalTheme, target: nil, action: nil)
     private let terminalHighlightThemePopup = NSPopUpButton()
     private let customTerminalThemeLabel = NSTextField(labelWithString: "")
@@ -565,12 +570,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             L10n.Settings.allowReadOnly,
             L10n.Settings.requireEveryCommand
         ],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let executionModeControl = NSSegmentedControl(
-        labels: [L10n.Settings.visibleTerminal, L10n.Settings.backgroundTask],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -937,6 +936,19 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         configureTerminalControls()
         let stack = makePaneStack(section: .terminal)
         stack.addArrangedSubview(makeSettingsGroup(
+            title: L10n.Settings.sessionSidebarGroupTitle,
+            detail: L10n.Settings.sessionSidebarGroupDescription,
+            identifier: "Stacio.Settings.group.sessionSidebar",
+            content: [
+                makeSettingsPreferenceToggleRow(
+                    title: L10n.Settings.sessionSidebarShowRecentSessions,
+                    detail: L10n.Settings.sessionSidebarShowRecentSessionsHelp,
+                    button: sessionSidebarShowRecentSessionsButton,
+                    identifier: "sessionSidebarShowRecentSessions"
+                )
+            ]
+        ))
+        stack.addArrangedSubview(makeSettingsGroup(
             title: L10n.Settings.terminalGeneralGroupTitle,
             detail: L10n.Settings.terminalGeneralGroupDescription,
             identifier: "Stacio.Settings.group.terminalGeneral",
@@ -1190,7 +1202,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         let stack = makePlainAIStack()
         let executionForm = makeForm(rows: [
             (L10n.Settings.confirmationPolicy, confirmationControl),
-            (L10n.Settings.executionMode, executionModeControl),
             (L10n.Settings.agentCommandAllowPatterns, agentCommandAllowPatternsField),
             (L10n.Settings.agentCommandDenyPatterns, agentCommandDenyPatternsField)
         ])
@@ -3106,6 +3117,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         fontSizeField.stringValue = "\(Int(snapshot.terminalFontSize))"
         themeControl.selectedSegment = segment(for: snapshot.terminalTheme)
         sessionTabIconModeControl.selectedSegment = segment(for: snapshot.sessionTabIconMode)
+        sessionSidebarShowRecentSessionsButton.state = snapshot.sessionSidebarShowRecentSessions ? .on : .off
         terminalHighlightThemePopup.selectItem(withTitle: title(forBuiltInThemeID: snapshot.terminalBuiltInThemeID))
         terminalHighlightLevelControl.selectedSegment = segment(for: snapshot.terminalHighlightLevel)
         terminalRichHighlightingButton.state = snapshot.terminalRichHighlightingEnabled ? .on : .off
@@ -3182,6 +3194,12 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         sessionTabIconModeControl.action = #selector(sessionTabIconModeChanged(_:))
         sessionTabIconModeControl.setAccessibilityIdentifier("Stacio.Settings.sessionTabIconMode")
         StacioDesignSystem.styleSegmentedControl(sessionTabIconModeControl)
+
+        configureTerminalCheckbox(
+            sessionSidebarShowRecentSessionsButton,
+            action: #selector(sessionSidebarShowRecentSessionsChanged(_:)),
+            identifier: "Stacio.Settings.sessionSidebarShowRecentSessions"
+        )
 
         terminalCursorStyleControl.target = self
         terminalCursorStyleControl.action = #selector(terminalCursorStyleChanged(_:))
@@ -3309,6 +3327,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             themeControl.heightAnchor.constraint(equalToConstant: 32),
             sessionTabIconModeControl.widthAnchor.constraint(equalToConstant: AppSettingsLayout.mediumSegmentedWidth),
             sessionTabIconModeControl.heightAnchor.constraint(equalToConstant: 32),
+            sessionSidebarShowRecentSessionsButton.heightAnchor.constraint(equalToConstant: 28),
             terminalCursorStyleControl.widthAnchor.constraint(equalToConstant: AppSettingsLayout.mediumSegmentedWidth),
             terminalCursorStyleControl.heightAnchor.constraint(equalToConstant: 32),
             terminalCursorBlinkButton.heightAnchor.constraint(equalToConstant: 28),
@@ -3440,7 +3459,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         aiIncludeRecentTerminalTranscriptButton.state = snapshot.aiIncludeRecentTerminalTranscript ? .on : .off
         aiContextCharacterLimitField.stringValue = "\(snapshot.aiContextCharacterLimit)"
         confirmationControl.selectedSegment = segment(for: snapshot.agentConfirmationPolicy)
-        executionModeControl.selectedSegment = segment(for: snapshot.agentExecutionMode)
         agentCommandAllowPatternsField.stringValue = snapshot.agentCommandAllowPatterns
         agentCommandDenyPatternsField.stringValue = snapshot.agentCommandDenyPatterns
         aiAutoRunProposedCommandsButton.state = snapshot.aiAutoRunProposedCommands ? .on : .off
@@ -3568,11 +3586,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         confirmationControl.setAccessibilityIdentifier("Stacio.Settings.agentConfirmationPolicy")
         StacioDesignSystem.styleSegmentedControl(confirmationControl)
 
-        executionModeControl.target = self
-        executionModeControl.action = #selector(executionModeChanged(_:))
-        executionModeControl.setAccessibilityIdentifier("Stacio.Settings.agentExecutionMode")
-        StacioDesignSystem.styleSegmentedControl(executionModeControl)
-
         configureCommandPatternField(
             agentCommandAllowPatternsField,
             identifier: "Stacio.Settings.agentCommandAllowPatterns",
@@ -3638,8 +3651,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             aiConnectionStatusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: AppSettingsLayout.fieldWidth),
             confirmationControl.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
             confirmationControl.heightAnchor.constraint(equalToConstant: 32),
-            executionModeControl.widthAnchor.constraint(equalToConstant: AppSettingsLayout.mediumSegmentedWidth),
-            executionModeControl.heightAnchor.constraint(equalToConstant: 32),
             agentCommandAllowPatternsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
             agentCommandAllowPatternsField.heightAnchor.constraint(equalToConstant: 56),
             agentCommandDenyPatternsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
@@ -4071,6 +4082,12 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     @objc private func sessionTabIconModeChanged(_ sender: NSSegmentedControl) {
         settingsStore.update { settings in
             settings.sessionTabIconMode = sessionTabIconMode(for: sender.selectedSegment)
+        }
+    }
+
+    @objc private func sessionSidebarShowRecentSessionsChanged(_ sender: NSButton) {
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = sender.state == .on
         }
     }
 
@@ -4579,13 +4596,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         securityConfirmationControl.selectedSegment = sender.selectedSegment
         refreshAISummary()
         refreshSecuritySummary()
-    }
-
-    @objc private func executionModeChanged(_ sender: NSSegmentedControl) {
-        settingsStore.update { settings in
-            settings.agentExecutionMode = executionMode(for: sender.selectedSegment)
-        }
-        refreshAISummary()
     }
 
     @objc private func aiAutoRunProposedCommandsChanged(_ sender: NSButton) {
@@ -5125,19 +5135,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         default:
             return .requireEveryCommand
         }
-    }
-
-    private func segment(for mode: AgentExecutionModePreference) -> Int {
-        switch mode {
-        case .visibleTerminal:
-            return 0
-        case .backgroundTask:
-            return 1
-        }
-    }
-
-    private func executionMode(for segment: Int) -> AgentExecutionModePreference {
-        segment == 1 ? .backgroundTask : .visibleTerminal
     }
 
     private func segment(for effort: AIReasoningEffortPreference) -> Int {

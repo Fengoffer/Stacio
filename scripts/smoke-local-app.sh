@@ -15,6 +15,7 @@ SPARKLE_FRAMEWORK="$FRAMEWORKS_DIR/Sparkle.framework"
 CLI_HELPER="$HELPERS_DIR/stacio"
 MONACO_LOADER="$RESOURCES_DIR/MonacoEditor/vs/loader.js"
 ABOUT_WECHAT_ICON="$RESOURCES_DIR/About/wechat-official-account.svg"
+SWIFTTERM_SHADER="$RESOURCES_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
 RDP_ADAPTER="$ADAPTERS_DIR/rdp"
 RDP_VIEWER="$ADAPTERS_DIR/rdp-viewer"
 RDP_VIEWER_APP="$ADAPTERS_DIR/StacioRDPViewer.app"
@@ -90,6 +91,7 @@ require_path executable "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc/Contents
 require_path executable "$CLI_HELPER" "Stacio CLI helper"
 require_path file "$MONACO_LOADER" "Monaco Editor loader"
 require_path file "$ABOUT_WECHAT_ICON" "About WeChat official account icon"
+require_path file "$SWIFTTERM_SHADER" "SwiftTerm Metal shader"
 if [[ -e "$RDP_ADAPTER" || -e "$RDP_VIEWER" || -e "$RDP_VIEWER_APP" ]]; then
   fail "removed RDP assets should not be packaged under Contents/Adapters"
 else

@@ -542,6 +542,7 @@ private func previewSession(
         port: port,
         username: "deploy",
         privateKeyPath: nil,
+        configJson: nil,
         conflict: conflict
     )
 }

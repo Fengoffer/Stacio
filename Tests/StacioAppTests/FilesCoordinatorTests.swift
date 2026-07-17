@@ -2890,6 +2890,7 @@ final class FilesCoordinatorTests: XCTestCase {
         let coordinator = FilesCoordinator(
             bridge: RecordingRemoteFilesBridge(),
             filesViewController: files,
+            liveSessionRuntimeIDProvider: { "ftp-pane-runtime" },
             ftpSessionContextProvider: {
                 FTPLiveSessionContext(
                     config: FtpConnectionConfig(
@@ -2919,6 +2920,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(ftpScheduler.jobs.first?.sourcePath, "/Users/alice/build.zip")
         XCTAssertEqual(ftpScheduler.jobs.first?.destinationPath, "/pub/build.zip")
         XCTAssertEqual(ftpScheduler.jobs.first?.bytesTotal, 2_048)
+        XCTAssertEqual(ftpScheduler.runtimeIDs, ["ftp-pane-runtime"])
         XCTAssertEqual(ftpScheduler.configs.map(\.host), ["ftp.example.com"])
         XCTAssertFalse(String(describing: ftpScheduler).contains("ftp-secret"))
     }
@@ -4648,12 +4650,29 @@ private final class RecordingRemoteEditOpener: RemoteEditOpening {
 }
 
 private final class RecordingFTPTransferScheduler: FTPTransferScheduling, CustomStringConvertible {
+    var runtimeIDs: [String] = []
     var configs: [FtpConnectionConfig] = []
     var jobs: [ScpTransferJob] = []
     var estimatedByteTotals: [String: UInt64] = [:]
     private var completionHandlers: [String: (ScpTransferProgress) -> Void] = [:]
     var description: String {
         jobs.map(\.id).joined(separator: " ")
+    }
+
+    func scheduleLiveFTPTransfer(
+        runtimeID: String,
+        config: FtpConnectionConfig,
+        secret: FtpAuthSecret,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        runtimeIDs.append(runtimeID)
+        scheduleLiveFTPTransfer(
+            config: config,
+            secret: secret,
+            job: job,
+            completion: completion
+        )
     }
 
     func scheduleLiveFTPTransfer(

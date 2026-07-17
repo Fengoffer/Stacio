@@ -560,6 +560,11 @@ impl Libssh2Transport {
         self.endpoint(config)?;
         let auth_request = self.auth_request(config, secret)?;
         let stream = connect_tcp(&self.endpoint(config)?, self.timeout_ms(config))?;
+        if binary_transfer {
+            stream
+                .set_nodelay(true)
+                .map_err(|error| Self::map_error(&error.to_string()))?;
+        }
         let mut session = self.create_session()?;
         if binary_transfer {
             configure_binary_transfer_session(&session)?;

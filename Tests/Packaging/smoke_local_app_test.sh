@@ -62,6 +62,7 @@ make_fake_app() {
     "$frameworks_dir" \
     "$adapters_dir" \
     "$resources_dir/About" \
+    "$resources_dir/SwiftTerm_SwiftTerm.bundle" \
     "$resources_dir/MonacoEditor/vs" \
     "$contents_dir/_CodeSignature"
 
@@ -109,6 +110,7 @@ PLIST
   printf '#!/usr/bin/env bash\nexit 0\n' >"$frameworks_dir/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
   printf 'fake monaco loader\n' >"$resources_dir/MonacoEditor/vs/loader.js"
   printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' >"$resources_dir/About/wechat-official-account.svg"
+  printf 'fake SwiftTerm shader\n' >"$resources_dir/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
   chmod +x \
     "$macos_dir/Stacio" \
     "$contents_dir/Helpers/stacio" \
@@ -130,7 +132,35 @@ grep -Fq "PASS LSMinimumSystemVersion=14.0" "$TMP_DIR/valid.out"
 grep -Fq "PASS NSQuitAlwaysKeepsWindows=false" "$TMP_DIR/valid.out"
 grep -Fq "PASS Stacio VNC adapter" "$TMP_DIR/valid.out"
 grep -Fq "PASS Sparkle Installer XPC" "$TMP_DIR/valid.out"
+grep -Fq "PASS SwiftTerm Metal shader" "$TMP_DIR/valid.out"
 grep -Fq "Summary: 0 failure(s), 0 warning(s)" "$TMP_DIR/valid.out"
+
+MISSING_SWIFTTERM_SHADER_APP="$TMP_DIR/missing-swiftterm-shader/Stacio.app"
+make_fake_app "$MISSING_SWIFTTERM_SHADER_APP" "14.0"
+rm "$MISSING_SWIFTTERM_SHADER_APP/Contents/Resources/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
+
+if PATH="$FAKE_BIN_DIR:$PATH" \
+  "$ROOT_DIR/scripts/smoke-local-app.sh" "$MISSING_SWIFTTERM_SHADER_APP" >"$TMP_DIR/missing-swiftterm-shader.out" 2>&1; then
+  echo "expected missing SwiftTerm shader to fail" >&2
+  exit 1
+fi
+
+grep -Fq "SwiftTerm Metal shader missing" "$TMP_DIR/missing-swiftterm-shader.out"
+
+INVALID_ROOT_SWIFTTERM_LOCATION_APP="$TMP_DIR/invalid-root-swiftterm-location/Stacio.app"
+make_fake_app "$INVALID_ROOT_SWIFTTERM_LOCATION_APP" "14.0"
+mkdir -p "$INVALID_ROOT_SWIFTTERM_LOCATION_APP/SwiftTerm_SwiftTerm.bundle"
+mv \
+  "$INVALID_ROOT_SWIFTTERM_LOCATION_APP/Contents/Resources/SwiftTerm_SwiftTerm.bundle/Shaders.metal" \
+  "$INVALID_ROOT_SWIFTTERM_LOCATION_APP/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
+
+if PATH="$FAKE_BIN_DIR:$PATH" \
+  "$ROOT_DIR/scripts/smoke-local-app.sh" "$INVALID_ROOT_SWIFTTERM_LOCATION_APP" >"$TMP_DIR/invalid-root-swiftterm-location.out" 2>&1; then
+  echo "expected root SwiftTerm resource location to fail" >&2
+  exit 1
+fi
+
+grep -Fq "SwiftTerm Metal shader missing" "$TMP_DIR/invalid-root-swiftterm-location.out"
 
 MISSING_VNC_ADAPTER_APP="$TMP_DIR/missing-vnc-adapter/Stacio.app"
 make_fake_app "$MISSING_VNC_ADAPTER_APP" "14.0"

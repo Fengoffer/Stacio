@@ -67,6 +67,39 @@ final class SessionBridgeTests: XCTestCase {
         XCTAssertFalse(String(describing: sessions).contains("secret"))
     }
 
+    func testSidebarSnapshotIsAvailableThroughCoreBridgeWithoutExposingSessionConfig() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Ubuntu",
+                protocol: "ssh",
+                host: "ubuntu.example.com",
+                port: 22,
+                username: "root",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: #"{"sessionIconID":"ubuntu","startupCommand":"export TOKEN=hidden"}"#
+            )
+        )
+
+        let snapshot = try CoreBridge.loadSessionSidebarSnapshot(databasePath: tempURL.path)
+
+        XCTAssertEqual(snapshot.sessions, [session])
+        XCTAssertEqual(snapshot.orderItems.map(\.id), [session.id])
+        XCTAssertEqual(
+            snapshot.manualIconAssignments,
+            [SessionIconAssignment(sessionId: session.id, iconId: "ubuntu")]
+        )
+        XCTAssertFalse(String(describing: snapshot).contains("TOKEN"))
+        XCTAssertFalse(String(describing: snapshot).contains("startupCommand"))
+    }
+
     func testImportApplyPersistsSessionsReportsAndExposesAllSessionList() throws {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -274,7 +307,7 @@ final class SessionBridgeTests: XCTestCase {
                 privateKeyPath: "~/.ssh/prod",
                 credentialId: nil,
                 tags: ["prod"],
-                configJson: nil
+                configJson: #"{"sessionIconID":"ubuntu"}"#
             )
         )
         let opened = try CoreBridge.markSessionRecordOpened(
@@ -293,9 +326,35 @@ final class SessionBridgeTests: XCTestCase {
             targetFolderID: nil
         )
         let exportJSON = try CoreBridge.exportSessionsJSON(databasePath: tempURL.path)
+        let duplicateConfigJSON = try CoreBridge.getSessionConfigJSON(
+            databasePath: tempURL.path,
+            id: duplicate.id
+        )
         let exportData = try XCTUnwrap(exportJSON.data(using: .utf8))
         let exportObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: exportData) as? [String: Any]
+        )
+        let importURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: importURL) }
+        let importPreview = try CoreBridge.previewStacioJSONImport(
+            exportJSON,
+            existingSessionNames: []
+        )
+        _ = try CoreBridge.applySessionImport(
+            databasePath: importURL.path,
+            sourceType: "stacio_json",
+            sourceName: "sessions.json",
+            preview: importPreview
+        )
+        let importedSession = try XCTUnwrap(
+            CoreBridge.listAllSessionRecords(databasePath: importURL.path)
+                .first { $0.name == "API Server" }
+        )
+        let importedConfigJSON = try CoreBridge.getSessionConfigJSON(
+            databasePath: importURL.path,
+            id: importedSession.id
         )
         let allSessions = try CoreBridge.listAllSessionRecords(databasePath: tempURL.path)
 
@@ -308,6 +367,9 @@ final class SessionBridgeTests: XCTestCase {
         XCTAssertEqual(allSessions.count, 2)
         XCTAssertEqual(exportObject["format"] as? String, "stacio.sessions.v1")
         XCTAssertTrue(exportJSON.contains("API Server"))
+        XCTAssertEqual(SessionIconConfigCodec.iconID(from: duplicateConfigJSON), "ubuntu")
+        XCTAssertTrue(exportJSON.contains(#"\"sessionIconID\":\"ubuntu\""#))
+        XCTAssertEqual(SessionIconConfigCodec.iconID(from: importedConfigJSON), "ubuntu")
         XCTAssertTrue(exportJSON.contains("API Server 副本"))
         XCTAssertTrue(exportJSON.contains("~/.ssh/prod"))
         XCTAssertFalse(exportJSON.localizedCaseInsensitiveContains("password"))
@@ -460,5 +522,92 @@ final class SessionBridgeTests: XCTestCase {
         XCTAssertEqual(opened.id, session.id)
         XCTAssertNotNil(opened.lastOpenedAt)
         XCTAssertEqual(listed[0].lastOpenedAt, opened.lastOpenedAt)
+    }
+
+    func testMixedSidebarOrderPersistsAcrossCoreBridgeCallsAndRename() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let first = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "First",
+                protocol: "ssh",
+                host: "first.example.com",
+                port: 22,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let folder = try CoreBridge.createSessionFolder(
+            databasePath: tempURL.path,
+            parentID: nil,
+            name: "Production"
+        )
+        let second = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Second",
+                protocol: "ssh",
+                host: "second.example.com",
+                port: 22,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+
+        try CoreBridge.placeSessionSidebarItem(
+            databasePath: tempURL.path,
+            kind: "folder",
+            id: folder.id,
+            targetFolderID: nil,
+            targetIndex: 0
+        )
+        try CoreBridge.placeSessionSidebarItem(
+            databasePath: tempURL.path,
+            kind: "session",
+            id: second.id,
+            targetFolderID: folder.id,
+            targetIndex: 0
+        )
+        _ = try CoreBridge.updateSessionRecord(
+            databasePath: tempURL.path,
+            id: first.id,
+            update: SessionUpdate(
+                name: "Zulu",
+                protocol: nil,
+                folderId: nil,
+                host: nil,
+                port: nil,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: nil,
+                configJson: nil
+            )
+        )
+
+        let firstRead = try CoreBridge.listSessionSidebarOrder(databasePath: tempURL.path)
+        let secondRead = try CoreBridge.listSessionSidebarOrder(databasePath: tempURL.path)
+
+        XCTAssertEqual(firstRead, secondRead)
+        XCTAssertEqual(
+            firstRead.filter { $0.parentId == nil }.map(\.id),
+            [folder.id, first.id]
+        )
+        XCTAssertEqual(
+            firstRead.filter { $0.parentId == folder.id }.map(\.id),
+            [second.id]
+        )
     }
 }

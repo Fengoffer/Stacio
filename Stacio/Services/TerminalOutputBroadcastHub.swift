@@ -3,6 +3,7 @@ import Foundation
 public enum TerminalBroadcastEventKind: Equatable {
     case output
     case userInput
+    case commandFinished
 }
 public struct TerminalBroadcastEvent: Equatable {
     public let runtimeID: String
@@ -65,8 +66,13 @@ public final class TerminalOutputBroadcastHub {
     }
 
     @MainActor
+    public func publishCommandFinished(runtimeID: String) {
+        publish(TerminalBroadcastEvent(runtimeID: runtimeID, kind: .commandFinished, bytes: []))
+    }
+
+    @MainActor
     private func publish(_ event: TerminalBroadcastEvent) {
-        guard event.bytes.isEmpty == false,
+        guard (event.kind == .commandFinished || event.bytes.isEmpty == false),
               let handlers = handlersByRuntimeID[event.runtimeID]
         else {
             return

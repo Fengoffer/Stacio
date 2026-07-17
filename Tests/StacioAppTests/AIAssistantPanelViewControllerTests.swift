@@ -372,6 +372,23 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.localAgentStatusTextForTesting.contains("Codex 原生会话已启动"))
     }
 
+    func testSurfaceModeSegmentsFillFirstVisibleLayoutAfterPanelStartsAtZeroWidth() {
+        let panel = makeAssistantPanel()
+
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 360, height: 720)
+        panel.view.needsLayout = true
+        panel.view.layoutSubtreeIfNeeded()
+
+        let controlWidth = panel.surfaceModeControlWidthForTesting
+        let segmentWidths = panel.surfaceModeSegmentWidthsForTesting
+        XCTAssertGreaterThan(controlWidth, 0)
+        XCTAssertEqual(segmentWidths.count, 2)
+        XCTAssertEqual(segmentWidths.reduce(0, +), controlWidth, accuracy: 1)
+        XCTAssertEqual(segmentWidths[0], segmentWidths[1], accuracy: 1)
+        XCTAssertTrue(segmentWidths.allSatisfy { $0 > 0 })
+    }
+
     func testLocalAgentSelectorUsesPopupAndMarksMissingTools() throws {
         let panel = makeAssistantPanel(
             localAgentToolResolver: StaticLocalAgentToolResolver(paths: [
@@ -1602,7 +1619,14 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let historyStore = RecordingAIConversationHistoryStore()
         historyStore.listedItems = [
             makeHistoryRecord(runtimeID: "term_1", role: .user, content: "旧问题：看磁盘"),
-            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "旧回复：建议 df -h"),
+            makeHistoryRecord(runtimeID: "term_1", role: .step, content: "思考：建议先执行 df -h"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ df -h\nFilesystem 42%",
+                requestID: "agent-step-history-1"
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "旧结论：磁盘占用正常"),
             makeHistoryRecord(runtimeID: "term_other", role: .assistant, content: "其他会话回复")
         ]
         let panel = makeAssistantPanel(
@@ -1613,9 +1637,303 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.loadView()
 
         XCTAssertTrue(panel.transcriptTextForTesting.contains("旧问题：看磁盘"))
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("旧回复：建议 df -h"))
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("旧结论：磁盘占用正常"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("Filesystem 42%"))
+        XCTAssertFalse(panel.transcriptTextForTesting.contains("Filesystem 42%"))
+        XCTAssertEqual(panel.collapsedProcessEntryCountForTesting, 2)
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+        XCTAssertTrue(panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true)
+        panel.expandAllProcessEntriesForTesting()
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("思考：建议先执行 df -h"))
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("Filesystem 42%"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("其他会话回复"))
         XCTAssertTrue(historyStore.listedRuntimeIDs.contains("term_1"))
+    }
+
+    func testAssistantPanelFoldsLegacyPreliminaryAssistantReplyIntoProcessHistory() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看 CPU"),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "我先读取 CPU 状态。"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ top -l 1\nCPU idle 98%",
+                requestID: "agent-step-legacy-1"
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "CPU 当前负载很低，运行正常。")
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+
+        panel.loadView()
+
+        XCTAssertEqual(panel.assistantConclusionTextsForTesting, ["CPU 当前负载很低，运行正常。"])
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+        XCTAssertGreaterThan(panel.collapsedThinkingEntryCountForTesting, 0)
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("我先读取 CPU 状态。"))
+    }
+
+    func testAssistantHistoryOmitsTrailingTerminalTraceWithoutAssistantConclusion() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "删除测试文件"),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "已删除 /root/test.txt 文件。"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · 雨云\n$ free -h\nexternal local Agent output"
+            )
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+
+        panel.loadView()
+
+        XCTAssertTrue(panel.assistantTranscriptTextForTesting.contains("已删除 /root/test.txt 文件。"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("free -h"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external local Agent output"))
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryOmitsExternalCLIProcessBeforeAssistantConclusion() throws {
+        let externalRequestID = "7C0E8D7B-9270-4728-87B0-5C3E41E74954"
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看内存"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ free -h\nexternal local Agent output",
+                requestID: externalRequestID
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "内存状态正常。")
+        ]
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-external-history",
+                requestID: externalRequestID,
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "free -h",
+                actorKind: AgentActorKind.externalCLI.rawValue,
+                actorName: "codex"
+            )
+        ]
+        let panel = makeAssistantPanel(
+            taskLister: taskStore,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+
+        XCTAssertTrue(panel.assistantTranscriptTextForTesting.contains("内存状态正常。"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("free -h"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external local Agent output"))
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryOmitsTerminalWithoutRequestIDButKeepsBuiltInPlanAndStep() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看负载"),
+            makeHistoryRecord(runtimeID: "term_1", role: .plan, content: "计划：先查看系统负载"),
+            makeHistoryRecord(runtimeID: "term_1", role: .step, content: "正在分析终端状态"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ uptime\nexternal terminal history"
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "系统负载正常。")
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+
+        panel.loadView()
+
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("计划：先查看系统负载"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("正在分析终端状态"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external terminal history"))
+        XCTAssertEqual(panel.collapsedProcessEntryCountForTesting, 2)
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+    }
+
+    func testAssistantHistoryScopesRequestOwnershipToRuntime() throws {
+        let sharedRequestID = "6F6CF0E6-A0D0-4D5A-93A2-F59813115C75"
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看内存"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ free -h\nexternal current-runtime output",
+                requestID: sharedRequestID
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "内存状态正常。")
+        ]
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-built-in-other-runtime",
+                requestID: sharedRequestID,
+                runtimeID: "term_other",
+                title: "other@example.com",
+                command: "free -h"
+            ),
+            makeAgentTaskSessionRecord(
+                id: "task-external-current-runtime",
+                requestID: sharedRequestID,
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "free -h",
+                actorKind: AgentActorKind.externalCLI.rawValue,
+                actorName: "codex"
+            )
+        ]
+        let panel = makeAssistantPanel(
+            taskLister: taskStore,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external current-runtime output"))
+        XCTAssertEqual(panel.assistantConclusionTextsForTesting, ["内存状态正常。"])
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryDoesNotTrustAgentStepPrefixOwnedOnlyByOtherRuntimes() throws {
+        let sharedRequestID = "agent-step-shared-runtime-1"
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看进程"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ ps aux\ncross-runtime agent output",
+                requestID: sharedRequestID
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "进程状态正常。")
+        ]
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-built-in-other-runtime-agent-step",
+                requestID: sharedRequestID,
+                runtimeID: "term_other_built_in",
+                title: "built-in@example.com",
+                command: "ps aux"
+            ),
+            makeAgentTaskSessionRecord(
+                id: "task-external-other-runtime-agent-step",
+                requestID: sharedRequestID,
+                runtimeID: "term_other_external",
+                title: "external@example.com",
+                command: "ps aux",
+                actorKind: AgentActorKind.externalCLI.rawValue,
+                actorName: "codex"
+            )
+        ]
+        let panel = makeAssistantPanel(
+            taskLister: taskStore,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("cross-runtime agent output"))
+        XCTAssertEqual(panel.assistantConclusionTextsForTesting, ["进程状态正常。"])
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryTreatsMixedActorsForSameRuntimeRequestAsAmbiguous() throws {
+        let requestID = "E5FBC182-7B61-4FD5-B4A6-93F46F747C3D"
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看磁盘"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ df -h\nambiguous actor output",
+                requestID: requestID
+            ),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "磁盘状态正常。")
+        ]
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-built-in-ambiguous",
+                requestID: requestID,
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "df -h"
+            ),
+            makeAgentTaskSessionRecord(
+                id: "task-external-ambiguous",
+                requestID: requestID,
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "df -h",
+                actorKind: AgentActorKind.externalCLI.rawValue,
+                actorName: "codex"
+            )
+        ]
+        let panel = makeAssistantPanel(
+            taskLister: taskStore,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("ambiguous actor output"))
+        XCTAssertEqual(panel.assistantConclusionTextsForTesting, ["磁盘状态正常。"])
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryKeepsOnlyLastOfThreeIdenticalConclusionsInUserTurn() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "查看 CPU"),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "CPU 负载正常。"),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "CPU 负载正常。"),
+            makeHistoryRecord(runtimeID: "term_1", role: .assistant, content: "CPU 负载正常。")
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+
+        panel.loadView()
+
+        XCTAssertEqual(panel.assistantConclusionTextsForTesting, ["CPU 负载正常。"])
+        XCTAssertEqual(panel.processGroupCountForTesting, 0)
+    }
+
+    func testAssistantHistoryKeepsOwnedBuiltInProcessWithoutConclusion() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(runtimeID: "term_1", role: .user, content: "观察日志"),
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .terminal,
+                content: "终端 · dev@example.com\n$ tail -f /var/log/messages\n仍在运行",
+                requestID: "req-owned-process"
+            )
+        ]
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-owned-process",
+                requestID: "req-owned-process",
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "tail -f /var/log/messages"
+            )
+        ]
+        let panel = makeAssistantPanel(
+            taskLister: taskStore,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("tail -f /var/log/messages"))
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
     }
 
     func testAssistantPanelPersistsMessagesCommandCardStateAndExecutionSummary() throws {
@@ -1703,15 +2021,16 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertFalse(panel.transcriptTextForTesting.contains("自动执行：df -h"))
     }
 
-    func testAssistantContextShowsRulesOrModelModeFromSettings() throws {
-        let settingsStore = makeSettingsStore(autoRunProposedCommands: false)
+    func testAssistantContextShowsUnconfiguredOrModelModeFromSettings() throws {
+        let settingsStore = makeUnconfiguredSettingsStore(autoRunProposedCommands: false)
         let panel = makeAssistantPanel(settingsStore: settingsStore)
 
         panel.loadView()
         panel.refreshForCurrentContext()
 
-        XCTAssertTrue(panel.contextTextForTesting.contains(L10n.AI.rulesMode))
-        XCTAssertTrue(panel.contextTextForTesting.contains("Stacio 规则"))
+        XCTAssertTrue(panel.contextTextForTesting.contains(L10n.AI.modelMode))
+        XCTAssertTrue(panel.contextTextForTesting.contains("mozheAPI · 未配置模型"))
+        XCTAssertFalse(panel.contextTextForTesting.contains("Stacio 规则"))
 
         let provider = makeModelProvider(
             id: UUID(uuidString: "70000000-0000-0000-0000-000000000001")!,
@@ -1727,11 +2046,33 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.contextTextForTesting.contains("qwen-plus"))
     }
 
+    func testAssistantUnconfiguredProviderDisablesAskAndRejectsSubmissionWithoutRequest() {
+        let provider = RecordingAIAssistantProvider(
+            response: AIAssistantResponse(message: "不应发送", proposedCommand: nil)
+        )
+        let store = makeUnconfiguredSettingsStore(autoRunProposedCommands: false)
+        let panel = makeAssistantPanel(provider: provider, settingsStore: store)
+
+        panel.loadView()
+
+        XCTAssertEqual(panel.composerModelTitleForTesting, "mozheAPI · 未配置模型")
+        XCTAssertEqual(panel.composerModelPickerModelTitlesForTesting, ["跟随全局默认"])
+        XCTAssertTrue(panel.composerModelPickerReasoningTitlesForTesting.isEmpty)
+
+        panel.setQuestionForTesting("检查磁盘")
+
+        XCTAssertFalse(panel.askButtonEnabledForTesting)
+        panel.submitQuestionFromFieldForTesting()
+        XCTAssertTrue(provider.requests.isEmpty)
+        XCTAssertEqual(panel.questionTextForTesting, "检查磁盘")
+        XCTAssertEqual(panel.messageTextForTesting, "请先在设置中配置供应商模型")
+    }
+
     func testAssistantPanelHeaderShowsChatChromeWithoutDuplicateContextUsage() throws {
-        let store = makeSettingsStore(autoRunProposedCommands: false)
-        store.update { settings in
-            settings.aiContextCharacterLimit = 100
-        }
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 100
+        )
         let panel = makeAssistantPanel(
             settingsStore: store,
             recentTranscript: String(repeating: "x", count: 40)
@@ -1798,7 +2139,11 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.view.layoutSubtreeIfNeeded()
 
         XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.userBubble"))
-        XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.assistantBubble"))
+        let assistantBubble = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.assistantBubble")
+        )
+        let assistantContent = try XCTUnwrap(assistantBubble.subviews.first)
+        XCTAssertEqual(assistantContent.frame.width, assistantBubble.bounds.width, accuracy: 1)
         XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.statusBubble"))
         XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.traceBubble"))
         let userText = try XCTUnwrap(
@@ -1842,7 +2187,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.performAskForTesting()
 
         XCTAssertEqual(panel.questionTextForTesting, "")
-        XCTAssertFalse(panel.askButtonEnabledForTesting)
+        XCTAssertTrue(panel.askButtonEnabledForTesting)
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前 AI 请求")
         XCTAssertEqual(panel.statusTextForTesting, L10n.AI.thinking)
         XCTAssertTrue(panel.transcriptTextForTesting.contains("系统为什么卡"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("你："))
@@ -1903,7 +2249,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertFalse(panel.transcriptTextForTesting.contains("执行："))
         XCTAssertTrue(panel.taskControlTextForTesting.contains("命令已交给目标终端"))
         XCTAssertTrue(panel.taskControlTextForTesting.contains("必要时可以暂停、取消、接管或确认完成"))
-        XCTAssertFalse(panel.taskControlTextForTesting.contains("agent-step-1"))
+        XCTAssertFalse(panel.taskControlTextForTesting.contains("agent-step-"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("running"))
         XCTAssertEqual(panel.commandCardCountForTesting, 0)
     }
@@ -2023,7 +2369,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.transcriptTextForTesting.contains("第 2 步：根据真实负载输出继续看进程。"))
     }
 
-    func testAssistantAutoRunAppendsFinalResultWithStepOverview() throws {
+    func testAssistantAutoRunAppendsOnlyConciseFinalResult() throws {
         let provider = SequencedPanelAIAssistantProvider(responses: [
             AIAssistantResponse(
                 message: "先看负载。",
@@ -2054,10 +2400,71 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             panel.assistantTranscriptTextForTesting.contains("负载正常，不需要继续处理。")
         })
         let assistantTranscript = panel.assistantTranscriptTextForTesting
-        XCTAssertTrue(assistantTranscript.contains("任务完成"))
-        XCTAssertTrue(assistantTranscript.contains("关键步骤"))
-        XCTAssertTrue(assistantTranscript.contains("uptime"))
-        XCTAssertTrue(assistantTranscript.contains("load average: 0.05"))
+        XCTAssertEqual(
+            assistantTranscript.components(separatedBy: "负载正常，不需要继续处理。").count - 1,
+            1
+        )
+        XCTAssertEqual(panel.statusTextForTesting, "")
+        XCTAssertFalse(assistantTranscript.contains("任务完成"))
+        XCTAssertFalse(assistantTranscript.contains("关键步骤"))
+        XCTAssertFalse(assistantTranscript.contains("uptime"))
+        XCTAssertFalse(assistantTranscript.contains("load average: 0.05"))
+    }
+
+    func testAssistantStreamingFinalResultReplacesProcessDraftAndAppearsOnce() {
+        let conclusion = "CPU 当前使用率很低，系统运行正常。"
+        let historyStore = RecordingAIConversationHistoryStore()
+        let provider = SequencedStreamingPanelAIAssistantProvider(
+            responses: [
+                (
+                    partials: ["先查看 CPU。"],
+                    response: AIAssistantResponse(
+                        message: "先查看 CPU。",
+                        commandProposals: [
+                            AgentCommandProposal(command: "top -bn1 | head -n 20", explanation: "查看 CPU。", risk: .readOnly)
+                        ]
+                    )
+                ),
+                (
+                    partials: ["CPU 当前使用率很低，", "系统运行正常。"],
+                    response: AIAssistantResponse(message: conclusion, commandProposals: [])
+                )
+            ]
+        )
+        let execution = RecordingAgentCommandExecutor(eventsByCommand: [
+            "top -bn1 | head -n 20": [
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .completed,
+                    message: "本次命令已完成：98.9% idle",
+                    redactedCommand: "top -bn1 | head -n 20",
+                    metadata: ["terminalOutputSummary": "98.9% idle"]
+                )
+            ]
+        ])
+        let panel = makeAssistantPanel(
+            provider: provider,
+            executionCoordinator: execution,
+            conversationHistoryStore: historyStore
+        )
+
+        panel.loadView()
+        panel.setQuestionForTesting("查看 CPU")
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains(conclusion) })
+        XCTAssertEqual(
+            panel.assistantTranscriptTextForTesting.components(separatedBy: conclusion).count - 1,
+            1
+        )
+        XCTAssertEqual(
+            historyStore.appendedItems.filter { $0.role == .assistant }.map(\.content),
+            [conclusion]
+        )
+        XCTAssertTrue(historyStore.appendedItems.contains {
+            $0.role == .step && $0.content == "先查看 CPU。"
+        })
+        XCTAssertEqual(panel.statusTextForTesting, "")
     }
 
     func testAssistantAutoRunStopsWhenFirstStepFailsAndDoesNotAskForNextStep() throws {
@@ -2097,9 +2504,9 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertEqual(execution.commands, ["df -h"])
         XCTAssertEqual(provider.requests.count, 1)
         XCTAssertFalse(execution.commands.contains("uptime"))
-        XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("任务失败"))
-        XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("关键步骤"))
-        XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("df -h"))
+        XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("执行失败：Permission denied"))
+        XCTAssertFalse(panel.systemTranscriptTextForTesting.contains("关键步骤"))
+        XCTAssertFalse(panel.systemTranscriptTextForTesting.contains("df -h"))
         XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("Permission denied"))
     }
 
@@ -2141,9 +2548,10 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let taskStore = RecordingAgentTaskStore()
         taskStore.nextRequestID = "req-streaming-terminal"
         let panel = makeAssistantPanel(
-            provider: RecordingAIAssistantProvider(
-                response: AIAssistantResponse(message: "结论会在执行后显示。", proposedCommand: "uptime")
-            ),
+            provider: SequencedPanelAIAssistantProvider(responses: [
+                AIAssistantResponse(message: "结论会在执行后显示。", proposedCommand: "uptime"),
+                AIAssistantResponse(message: "本次执行结果：load average: 0.67", commandProposals: [])
+            ]),
             executionCoordinator: execution,
             taskRecorder: taskStore
         )
@@ -2153,14 +2561,25 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.performAskForTesting()
 
         XCTAssertTrue(waitUntil {
-            panel.transcriptTextForTesting.contains("终端 · dev@example.com")
-                && panel.transcriptTextForTesting.contains("$ uptime")
-                && panel.transcriptTextForTesting.contains("load average: 0.67")
+            panel.rawTranscriptTextForTesting.contains("终端 · dev@example.com")
+                && panel.rawTranscriptTextForTesting.contains("$ uptime")
+                && panel.rawTranscriptTextForTesting.contains("load average: 0.67")
                 && panel.transcriptTextForTesting.contains("本次执行结果：load average: 0.67")
+                && panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true
         })
-        XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.terminalBubble"))
+        XCTAssertGreaterThan(panel.collapsedProcessEntryCountForTesting, 0)
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+        XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.processGroup"))
+        XCTAssertTrue(panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true)
+        XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.systemBubble"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("虚拟终端输出："))
-        XCTAssertEqual(execution.streamingRequestIDs, ["agent-step-1"])
+        XCTAssertFalse(panel.systemTranscriptTextForTesting.contains("本次执行结果：load average: 0.67"))
+        XCTAssertEqual(
+            panel.assistantTranscriptTextForTesting.components(separatedBy: "本次执行结果：load average: 0.67").count - 1,
+            1
+        )
+        XCTAssertEqual(execution.streamingRequestIDs, execution.requests.map(\.id))
+        XCTAssertTrue(execution.streamingRequestIDs.allSatisfy { $0.hasPrefix("agent-step-") })
     }
 
     func testAssistantAutoRunShowsProcessBeforeConclusionAndCollapsesWhenFinished() throws {
@@ -2192,9 +2611,10 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             )
         ])
         let panel = makeAssistantPanel(
-            provider: RecordingAIAssistantProvider(
-                response: AIAssistantResponse(message: "结论：负载正常。", proposedCommand: "uptime")
-            ),
+            provider: SequencedPanelAIAssistantProvider(responses: [
+                AIAssistantResponse(message: "先读取负载。", proposedCommand: "uptime"),
+                AIAssistantResponse(message: "结论：负载正常。", commandProposals: [])
+            ]),
             executionCoordinator: execution
         )
 
@@ -2203,15 +2623,25 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.performAskForTesting()
 
         XCTAssertTrue(waitUntil {
-            panel.transcriptTextForTesting.contains("终端 · dev@example.com")
-                && panel.transcriptTextForTesting.contains("$ uptime")
-                && panel.transcriptTextForTesting.contains("load average: 0.01")
-                && panel.transcriptTextForTesting.contains("结论：负载正常。")
+            panel.transcriptTextForTesting.contains("结论：负载正常。")
+                && panel.collapsedProcessEntryCountForTesting > 0
+                && panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true
         })
         let transcript = panel.transcriptTextForTesting
         let processIndex = try XCTUnwrap(transcript.range(of: "终端 · dev@example.com")?.lowerBound)
-        let resultIndex = try XCTUnwrap(transcript.range(of: "结果：load average: 0.01")?.lowerBound)
+        let resultIndex = try XCTUnwrap(transcript.range(of: "结论：负载正常。")?.lowerBound)
         XCTAssertLessThan(processIndex, resultIndex)
+        XCTAssertFalse(transcript.contains("关键步骤概要"))
+        XCTAssertGreaterThan(panel.collapsedThinkingEntryCountForTesting, 0)
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+        XCTAssertTrue(panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true)
+        XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.processGroup"))
+        XCTAssertNotNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.processDisclosure"))
+        XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.systemBubble"))
+        panel.expandAllProcessEntriesForTesting()
+        XCTAssertEqual(panel.collapsedProcessEntryCountForTesting, 0)
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("$ uptime"))
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("load average: 0.01"))
         XCTAssertFalse(transcript.contains("已加入执行队列"))
         XCTAssertFalse(transcript.contains("已确认，准备写入终端"))
         XCTAssertFalse(transcript.contains("运行中 ·"))
@@ -2261,9 +2691,12 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         panel.runCommandCardForTesting(at: 0)
 
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("终端 · dev@example.com"))
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("$ uptime"))
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("load average: 0.42"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("终端 · dev@example.com"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("$ uptime"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("load average: 0.42"))
+        XCTAssertGreaterThan(panel.collapsedProcessEntryCountForTesting, 0)
+        XCTAssertEqual(panel.processGroupCountForTesting, 1)
+        XCTAssertTrue(panel.processGroupSummaryTextsForTesting.first?.hasPrefix("已处理 ") == true)
         XCTAssertFalse(panel.taskControlTextForTesting.contains("任务时间线"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("req-task"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("queued"))
@@ -2313,7 +2746,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.runCommandCardForTesting(at: 0)
 
         XCTAssertTrue(panel.transcriptTextForTesting.contains("终端 · dev@example.com"))
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("load average: 0.67"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("load average: 0.67"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("输出摘要："))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("后台任务"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("req-task-metadata-output"))
@@ -2364,8 +2797,9 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         panel.runCommandCardForTesting(at: 0)
 
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("phase 2"))
-        XCTAssertFalse(panel.transcriptTextForTesting.contains("phase 1"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("phase 2"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("phase 1"))
+        XCTAssertGreaterThan(panel.collapsedProcessEntryCountForTesting, 0)
         XCTAssertEqual(panel.taskControlTextForTesting, "")
     }
 
@@ -2399,7 +2833,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         panel.runCommandCardForTesting(at: 0)
 
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("load average: 0.42"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("load average: 0.42"))
         XCTAssertEqual(panel.taskControlTextForTesting, "")
         XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.taskWorkspace"))
         XCTAssertFalse(panel.taskPauseEnabledForTesting)
@@ -2472,7 +2906,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.statusTextForTesting.contains("load average: 0.08"))
         XCTAssertFalse(panel.statusTextForTesting.contains(L10n.AI.sentToTerminal))
         XCTAssertTrue(panel.transcriptTextForTesting.contains("终端 · dev@example.com"))
-        XCTAssertTrue(panel.transcriptTextForTesting.contains("load average: 0.08"))
+        XCTAssertTrue(panel.rawTranscriptTextForTesting.contains("load average: 0.08"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("agent_bg_7"))
         XCTAssertFalse(panel.taskControlTextForTesting.contains("后台任务"))
     }
@@ -2568,6 +3002,17 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 ]
             )
         ])
+        execution.confirmEvents["req-manual-confirm"] = AgentTraceEvent(
+            requestID: "req-manual-confirm",
+            state: .completed,
+            message: "已确认本步结束。",
+            redactedCommand: "tail -f /var/log/messages",
+            metadata: [
+                "executionMode": "visibleTerminal",
+                "completionConfidence": "userConfirmed",
+                "completionReason": "userConfirmed"
+            ]
+        )
         let panel = makeAssistantPanel(
             provider: RecordingAIAssistantProvider(
                 response: AIAssistantResponse(message: "持续查看日志", proposedCommand: "tail -f /var/log/messages")
@@ -2593,6 +3038,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertFalse(panel.taskPauseEnabledForTesting)
         XCTAssertFalse(panel.taskCancelEnabledForTesting)
         XCTAssertFalse(panel.taskTakeOverEnabledForTesting)
+        XCTAssertEqual(execution.confirmedRequestIDs.count, 1)
         XCTAssertEqual(execution.pausedRequestIDs, [])
         XCTAssertEqual(execution.cancelledRequestIDs, [])
         XCTAssertEqual(execution.takenOverRequestIDs, [])
@@ -2895,7 +3341,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         XCTAssertEqual(panel.questionTextForTesting, "")
         XCTAssertEqual(panel.statusTextForTesting, L10n.AI.thinking)
-        XCTAssertFalse(panel.askButtonEnabledForTesting)
+        XCTAssertTrue(panel.askButtonEnabledForTesting)
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前 AI 请求")
         XCTAssertTrue(panel.transcriptTextForTesting.contains("服务器无响应"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("你："))
 
@@ -2944,7 +3391,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                         subtitle: "ssh · /srv/app"
                     )
                 ]
-            }
+            },
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
         )
 
         panel.loadView()
@@ -2987,7 +3435,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                     return contexts[runtimeID]
                 }
                 return contexts["term_current"]
-            }
+            },
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
         )
 
         panel.loadView()
@@ -3319,6 +3768,34 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.taskHistoryTextForTesting.contains("completed"))
         XCTAssertTrue(panel.taskHistoryTextForTesting.contains("docker ps"))
         XCTAssertEqual(taskStore.listLimits, [24])
+    }
+
+    func testAssistantPanelExcludesExternalCLIFromRecentTaskHistory() throws {
+        let taskStore = RecordingAgentTaskStore()
+        taskStore.listedSessions = [
+            makeAgentTaskSessionRecord(
+                id: "task-external",
+                requestID: "req-external",
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "free -h",
+                actorKind: AgentActorKind.externalCLI.rawValue,
+                actorName: "codex"
+            ),
+            makeAgentTaskSessionRecord(
+                id: "task-built-in",
+                requestID: "req-built-in",
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                command: "docker ps"
+            )
+        ]
+        let panel = makeAssistantPanel(taskLister: taskStore)
+
+        panel.loadView()
+
+        XCTAssertTrue(panel.taskHistoryTextForTesting.contains("docker ps"))
+        XCTAssertFalse(panel.taskHistoryTextForTesting.contains("free -h"))
     }
 
     func testAssistantPanelHidesRecentTaskHistoryWhenNoTerminalContext() throws {
@@ -4056,10 +4533,10 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(waitUntil { panel.taskPauseEnabledForTesting })
         panel.performTaskPauseForTesting()
 
-        XCTAssertEqual(execution.pausedRequestIDs, ["agent-step-1"])
+        XCTAssertEqual(execution.pausedRequestIDs, execution.requests.map(\.id))
         XCTAssertTrue(panel.transcriptTextForTesting.contains("自主执行已暂停"))
         XCTAssertTrue(panel.taskControlTextForTesting.contains("AI 后续自动动作已暂停"))
-        XCTAssertFalse(panel.taskControlTextForTesting.contains("agent-step-1"))
+        XCTAssertFalse(panel.taskControlTextForTesting.contains("agent-step-"))
     }
 
     func testAssistantPlanConfirmStopsBeforeNextCommandWhenFirstStepNeedsManualCompletion() throws {
@@ -4141,8 +4618,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             ),
             AIAssistantResponse(message: "负载正常，完成。", commandProposals: [])
         ])
-        let execution = RecordingAgentCommandExecutor(eventsByRequestID: [
-            "agent-step-1": [
+        let execution = RecordingAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
                 AgentTraceEvent(
                     requestID: "agent-step-1",
                     state: .running,
@@ -4165,7 +4642,12 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 )
             ]
         ])
-        let panel = makeAssistantPanel(provider: provider, executionCoordinator: execution)
+        let taskStore = RecordingAgentTaskStore()
+        let panel = makeAssistantPanel(
+            provider: provider,
+            executionCoordinator: execution,
+            taskRecorder: taskStore
+        )
 
         panel.loadView()
         panel.toggleGoalModeForTesting()
@@ -4174,12 +4656,13 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         XCTAssertTrue(waitUntil {
             panel.transcriptTextForTesting.contains("我开始自主推进这个目标。")
-                && panel.transcriptTextForTesting.contains("load average: 0.05")
+                && panel.rawTranscriptTextForTesting.contains("load average: 0.05")
                 && panel.transcriptTextForTesting.contains("负载正常，完成。")
         })
         XCTAssertEqual(execution.requests.count, 1)
         XCTAssertTrue(provider.requests.last?.question.contains("load average: 0.05") == true)
         XCTAssertEqual(panel.commandCardCountForTesting, 0)
+        XCTAssertEqual(taskStore.records.last?.session.state, .completed)
     }
 
     func testAssistantGoalModeStepLimitWaitsForUserContinueAndPreservesHistory() throws {
@@ -4545,8 +5028,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 ]
             )
         ])
-        let execution = RecordingAgentCommandExecutor(eventsByRequestID: [
-            "agent-step-1": [
+        let execution = RecordingAgentCommandExecutor(eventsByCommand: [
+            "tail -f /var/log/messages": [
                 AgentTraceEvent(
                     requestID: "agent-step-1",
                     state: .running,
@@ -4574,7 +5057,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.performTaskPauseForTesting()
 
         XCTAssertTrue(waitUntil { panel.transcriptTextForTesting.contains("自主执行已暂停") })
-        XCTAssertEqual(execution.pausedRequestIDs, ["agent-step-1"])
+        XCTAssertEqual(execution.pausedRequestIDs, execution.requests.map(\.id))
         XCTAssertEqual(execution.requests.count, 1)
         XCTAssertEqual(provider.requests.count, 1)
         XCTAssertFalse(panel.taskPauseEnabledForTesting)
@@ -4601,8 +5084,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 0.12
             )
         ])
-        let execution = RecordingAgentCommandExecutor(eventsByRequestID: [
-            "agent-step-1": [
+        let execution = RecordingAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
                 AgentTraceEvent(
                     requestID: "agent-step-1",
                     state: .completed,
@@ -4624,7 +5107,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(waitUntil { provider.requests.count == 2 })
 
         panel.performTaskCancelForTesting()
-        XCTAssertEqual(execution.cancelledRequestIDs, ["agent-step-1"])
+        XCTAssertEqual(execution.cancelledRequestIDs, execution.requests.map(\.id))
         XCTAssertTrue(panel.statusTextForTesting.contains("自主执行已取消"))
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
@@ -4654,8 +5137,8 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 0.12
             )
         ])
-        let execution = RecordingAgentCommandExecutor(eventsByRequestID: [
-            "agent-step-1": [
+        let execution = RecordingAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
                 AgentTraceEvent(
                     requestID: "agent-step-1",
                     state: .completed,
@@ -4854,7 +5337,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(secondPanel.composerModelTitleForTesting.contains("Provider A"))
     }
 
-    func testAssistantComposerOffersRulesAndGlobalDefaultAfterExternalSelection() throws {
+    func testAssistantComposerOmitsRulesAndClearsLegacyRulesSelection() throws {
         let store = makeSettingsStore(autoRunProposedCommands: false)
         let providerA = makeModelProvider(
             id: UUID(uuidString: "7D000000-0000-0000-0000-000000000001")!,
@@ -4874,27 +5357,26 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 defaultAIProviderID: providerA.id
             )
         )
-        let selectionSession = AIModelSelectionSession()
+        let rules = AIModelSelection(providerID: BuiltInAIProvider.stacioRulesID, modelID: "")
+        let selectionSession = AIModelSelectionSession(selection: rules)
         let panel = makeAssistantPanel(
             settingsStore: store,
             modelSelectionSession: selectionSession
         )
 
         panel.loadView()
+        XCTAssertNil(selectionSession.snapshot())
+        XCTAssertTrue(panel.composerModelTitleForTesting.contains("Provider A"))
+
         let external = AIModelSelection(providerID: providerB.id, modelID: "b")
         panel.selectComposerModelForTesting(external)
 
         XCTAssertEqual(selectionSession.snapshot(), external)
         XCTAssertTrue(panel.composerModelPickerModelTitlesForTesting.contains("跟随全局默认"))
-        XCTAssertTrue(panel.composerModelPickerModelTitlesForTesting.contains(L10n.Settings.portDeskRules))
+        XCTAssertFalse(panel.composerModelPickerModelTitlesForTesting.contains(L10n.Settings.portDeskRules))
+        XCTAssertFalse(panel.composerModelMenuModelTitlesForTesting.contains(L10n.Settings.portDeskRules))
 
-        let rules = AIModelSelection(providerID: BuiltInAIProvider.stacioRulesID, modelID: "")
         panel.selectComposerModelForTesting(rules)
-
-        XCTAssertEqual(selectionSession.snapshot(), rules)
-        XCTAssertEqual(panel.composerModelTitleForTesting, L10n.Settings.portDeskRules)
-
-        panel.selectComposerModelForTesting(nil)
 
         XCTAssertNil(selectionSession.snapshot())
         XCTAssertTrue(panel.composerModelTitleForTesting.contains("Provider A"))
@@ -4977,7 +5459,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             panel.composerModelPickerModelTitlesForTesting,
-            ["跟随全局默认", L10n.Settings.portDeskRules, "gpt-5.5"]
+            ["跟随全局默认", "gpt-5.5"]
         )
         XCTAssertEqual(panel.composerModelPickerContextTextForTesting, "7%")
         XCTAssertLessThanOrEqual(panel.composerModelPickerPreferredSizeForTesting.height, 340)
@@ -5051,10 +5533,10 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
     }
 
     func testAssistantComposerShowsContextUsageRingFromCurrentContextBudget() throws {
-        let store = makeSettingsStore(autoRunProposedCommands: false)
-        store.update { settings in
-            settings.aiContextCharacterLimit = 100
-        }
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 100
+        )
         let panel = makeAssistantPanel(
             settingsStore: store,
             recentTranscript: String(repeating: "x", count: 40)
@@ -5067,9 +5549,11 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
     }
 
     func testAssistantComposerContextUsageReflectsCompressedTranscriptBudget() throws {
-        let store = makeSettingsStore(autoRunProposedCommands: false)
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 100
+        )
         store.update { settings in
-            settings.aiContextCharacterLimit = 100
             settings.aiIncludeRecentTerminalTranscript = true
         }
         let panel = makeAssistantPanel(
@@ -5127,6 +5611,26 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(panel.view.fittingSize.height, 460)
     }
 
+    func testAssistantTranscriptKeepsUnusedHeightBelowConversationContent() throws {
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(message: "CPU 负载正常。", proposedCommand: nil)
+            )
+        )
+
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 520, height: 900)
+        panel.setQuestionForTesting("检查 CPU")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains("CPU 负载正常") })
+        panel.view.layoutSubtreeIfNeeded()
+
+        let transcript = try XCTUnwrap(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript"))
+        let spacer = try XCTUnwrap(panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.bottomSpacer"))
+        XCTAssertGreaterThan(spacer.frame.height, 100)
+        XCTAssertGreaterThanOrEqual(spacer.frame.minY, transcript.frame.maxY - 1)
+    }
+
     func testAssistantMarkdownRendererStylesCodeBlocksAsMonospacedText() throws {
         let rendered = AIAssistantMarkdownRenderer.attributedString(
             from: """
@@ -5157,7 +5661,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(hasMonospacedCode)
     }
 
-    func testAssistantStopButtonCancelsStreamingQuestionAndLeavesSystemStatus() throws {
+    func testAssistantSendButtonBecomesStopDuringStreamingThenReturnsToSend() throws {
         let provider = HangingStreamingAIAssistantProvider()
         let panel = makeAssistantPanel(
             provider: provider,
@@ -5165,18 +5669,22 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         )
 
         panel.loadView()
+        XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.stop"))
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, L10n.AI.ask)
         panel.setQuestionForTesting("持续生成一段排查建议")
         panel.performAskForTesting()
 
         XCTAssertTrue(waitUntil { panel.generalStopEnabledForTesting && provider.started })
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前 AI 请求")
         XCTAssertTrue(panel.assistantTranscriptTextForTesting.contains("正在生成"))
 
-        panel.performGeneralStopForTesting()
+        panel.performAskForTesting()
 
         XCTAssertTrue(waitUntil { provider.cancelled })
         XCTAssertTrue(panel.systemTranscriptTextForTesting.contains("已停止"))
         XCTAssertFalse(panel.assistantTranscriptTextForTesting.contains("已停止"))
         XCTAssertFalse(panel.generalStopEnabledForTesting)
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, L10n.AI.ask)
     }
 
     func testAssistantShowsRunningTerminalTraceInTranscript() throws {
@@ -5193,14 +5701,15 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 "event": AgentTraceEvent(
                     requestID: "req-trace",
                     state: .running,
-                    message: "Codex 正在执行 uptime",
-                    redactedCommand: "uptime"
+                    message: "Stacio AI 正在执行 uptime",
+                    redactedCommand: "uptime",
+                    metadata: ["actorKind": AgentActorKind.builtInAI.rawValue]
                 )
             ]
         )
 
         XCTAssertTrue(waitUntil {
-            panel.statusTextForTesting.contains("Codex 正在执行 uptime")
+            panel.statusTextForTesting.contains("Stacio AI 正在执行 uptime")
                 && panel.transcriptTextForTesting.contains("终端 · dev@example.com")
                 && panel.transcriptTextForTesting.contains("$ uptime")
                 && panel.transcriptTextForTesting.contains("uptime")
@@ -5211,6 +5720,143 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.taskWorkspace"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("运行中 ·"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("执行："))
+    }
+
+    func testAssistantIgnoresExternalCLITraceFromCurrentTerminal() throws {
+        let panel = makeAssistantPanel()
+
+        panel.loadView()
+        TerminalAgentTraceNotification.post(
+            runtimeID: "term_1",
+            title: "dev@example.com",
+            event: AgentTraceEvent(
+                requestID: "req-local-agent",
+                state: .completed,
+                message: "本次命令已完成：external output",
+                redactedCommand: "free -h",
+                metadata: [
+                    "actorKind": AgentActorKind.externalCLI.rawValue,
+                    "terminalOutputSummary": "external output"
+                ]
+            )
+        )
+
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("free -h"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external output"))
+        XCTAssertEqual(panel.statusTextForTesting, "")
+    }
+
+    func testTerminalTaskControlNotificationUsesSameCoordinatorAndHidesSidebarControlBar() throws {
+        let execution = RecordingAgentCommandExecutor()
+        execution.cancelEvents["req-terminal-control"] = AgentTraceEvent(
+            requestID: "req-terminal-control",
+            state: .cancelled,
+            message: "已向可见终端发送中断；输出仍以目标终端为准。",
+            redactedCommand: "tail -f /var/log/messages",
+            metadata: ["executionMode": "visibleTerminal", "control": "cancel"]
+        )
+        let panel = makeAssistantPanel(executionCoordinator: execution)
+
+        panel.loadView()
+        NotificationCenter.default.post(
+            name: TerminalAgentTraceNotification.didAppend,
+            object: nil,
+            userInfo: [
+                TerminalAgentTraceNotification.runtimeIDKey: "term_1",
+                TerminalAgentTraceNotification.titleKey: "dev@example.com",
+                TerminalAgentTraceNotification.eventKey: AgentTraceEvent(
+                    requestID: "req-terminal-control",
+                    state: .running,
+                    message: "命令已在终端执行",
+                    redactedCommand: "tail -f /var/log/messages",
+                    metadata: [
+                        "executionMode": "visibleTerminal",
+                        "actorKind": AgentActorKind.builtInAI.rawValue
+                    ]
+                )
+            ]
+        )
+        NotificationCenter.default.post(
+            name: TerminalAgentTaskControlNotification.didRequest,
+            object: nil,
+            userInfo: [
+                TerminalAgentTaskControlNotification.runtimeIDKey: "term_1",
+                TerminalAgentTaskControlNotification.requestIDKey: "req-terminal-control",
+                TerminalAgentTaskControlNotification.actionKey: TerminalAgentTaskControlAction.cancel.rawValue
+            ]
+        )
+
+        XCTAssertEqual(execution.cancelledRequestIDs, ["req-terminal-control"])
+        XCTAssertTrue(panel.statusTextForTesting.contains("已向可见终端发送中断"))
+        let sidebarControl = panel.view.firstSubview(withIdentifier: "Stacio.AI.taskControl")
+        XCTAssertTrue(sidebarControl?.isHidden == true)
+    }
+
+    func testExternalCLITerminalControlExecutesWithoutUpdatingAssistantTranscript() throws {
+        let execution = RecordingAgentCommandExecutor()
+        execution.cancelEvents["req-external-control"] = AgentTraceEvent(
+            requestID: "req-external-control",
+            state: .cancelled,
+            message: "external task cancelled",
+            redactedCommand: "tail -f /var/log/messages",
+            metadata: ["actorKind": AgentActorKind.externalCLI.rawValue]
+        )
+        let panel = makeAssistantPanel(executionCoordinator: execution)
+
+        panel.loadView()
+        TerminalAgentTraceNotification.post(
+            runtimeID: "term_1",
+            title: "dev@example.com",
+            event: AgentTraceEvent(
+                requestID: "req-external-control",
+                state: .running,
+                message: "local Agent running",
+                redactedCommand: "tail -f /var/log/messages",
+                metadata: ["actorKind": AgentActorKind.externalCLI.rawValue]
+            )
+        )
+        NotificationCenter.default.post(
+            name: TerminalAgentTaskControlNotification.didRequest,
+            object: nil,
+            userInfo: [
+                TerminalAgentTaskControlNotification.runtimeIDKey: "term_1",
+                TerminalAgentTaskControlNotification.requestIDKey: "req-external-control",
+                TerminalAgentTaskControlNotification.actionKey: TerminalAgentTaskControlAction.cancel.rawValue
+            ]
+        )
+
+        XCTAssertEqual(execution.cancelledRequestIDs, ["req-external-control"])
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("tail -f /var/log/messages"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("external task cancelled"))
+        XCTAssertEqual(panel.statusTextForTesting, "")
+    }
+
+    func testNonSelectedTerminalControlExecutesWithoutUpdatingAssistantTranscript() throws {
+        let execution = RecordingAgentCommandExecutor()
+        execution.cancelEvents["req-other-terminal-control"] = AgentTraceEvent(
+            requestID: "req-other-terminal-control",
+            state: .cancelled,
+            message: "other terminal task cancelled",
+            redactedCommand: "tail -f /var/log/messages",
+            metadata: ["actorKind": AgentActorKind.externalCLI.rawValue]
+        )
+        let panel = makeAssistantPanel(executionCoordinator: execution)
+
+        panel.loadView()
+        NotificationCenter.default.post(
+            name: TerminalAgentTaskControlNotification.didRequest,
+            object: nil,
+            userInfo: [
+                TerminalAgentTaskControlNotification.runtimeIDKey: "term_other",
+                TerminalAgentTaskControlNotification.requestIDKey: "req-other-terminal-control",
+                TerminalAgentTaskControlNotification.actionKey: TerminalAgentTaskControlAction.cancel.rawValue
+            ]
+        )
+
+        XCTAssertEqual(execution.cancelledRequestIDs, ["req-other-terminal-control"])
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("tail -f /var/log/messages"))
+        XCTAssertFalse(panel.rawTranscriptTextForTesting.contains("other terminal task cancelled"))
+        XCTAssertEqual(panel.statusTextForTesting, "")
     }
 
     func testTaskCancelFallbackAppearsAsSystemNoticeNotAssistantReply() throws {
@@ -5270,17 +5916,19 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 redactedCommand: "uptime",
                 metadata: [
                     "executionMode": "backgroundTask",
+                    "actorKind": AgentActorKind.builtInAI.rawValue,
                     "taskRuntimeID": "agent_bg_1"
                 ]
             )
         )
 
         XCTAssertTrue(waitUntil {
-            panel.transcriptTextForTesting.contains("终端 · dev@example.com")
-                && panel.transcriptTextForTesting.contains("$ uptime")
-                && panel.transcriptTextForTesting.contains("load average: 0.01")
+            panel.rawTranscriptTextForTesting.contains("终端 · dev@example.com")
+                && panel.rawTranscriptTextForTesting.contains("$ uptime")
+                && panel.rawTranscriptTextForTesting.contains("load average: 0.01")
                 && panel.statusTextForTesting.contains("AI 独立任务已完成")
         })
+        XCTAssertGreaterThan(panel.collapsedProcessEntryCountForTesting, 0)
         XCTAssertFalse(panel.transcriptTextForTesting.contains("AI 独立任务已完成：load average: 0.01"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("完成：load average: 0.01"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("执行："))
@@ -5303,6 +5951,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 redactedCommand: "uptime",
                 metadata: [
                     "executionMode": "backgroundTask",
+                    "actorKind": AgentActorKind.builtInAI.rawValue,
                     "environment": "production",
                     "aiExecutionPolicy": "readOnlyAuto",
                     "policyDecision": "autoAllowed"
@@ -5331,6 +5980,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
                 redactedCommand: "uptime",
                 metadata: [
                     "executionMode": "backgroundTask",
+                    "actorKind": AgentActorKind.builtInAI.rawValue,
                     "environment": "production",
                     "aiExecutionPolicy": "readOnlyAuto",
                     "policyDecision": "autoAllowed"
@@ -5481,9 +6131,11 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let provider = RecordingAIAssistantProvider(
             response: AIAssistantResponse(message: "已分析", proposedCommand: nil)
         )
-        let store = makeSettingsStore(autoRunProposedCommands: true)
+        let store = makeSettingsStore(
+            autoRunProposedCommands: true,
+            modelContextCharacterLimit: 26
+        )
         store.update { settings in
-            settings.aiContextCharacterLimit = 26
             settings.aiIncludeRecentTerminalTranscript = true
         }
         let coordinator = AIAssistantCoordinator(
@@ -5525,9 +6177,11 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let provider = RecordingAIAssistantProvider(
             response: AIAssistantResponse(message: "已分析", proposedCommand: nil)
         )
-        let store = makeSettingsStore(autoRunProposedCommands: true)
+        let store = makeSettingsStore(
+            autoRunProposedCommands: true,
+            modelContextCharacterLimit: 260
+        )
         store.update { settings in
-            settings.aiContextCharacterLimit = 260
             settings.aiIncludeRecentTerminalTranscript = true
         }
         let coordinator = AIAssistantCoordinator(
@@ -5806,13 +6460,15 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         requestID: String,
         runtimeID: String,
         title: String,
-        command: String
+        command: String,
+        actorKind: String = AgentActorKind.builtInAI.rawValue,
+        actorName: String = "Stacio AI"
     ) -> AgentTaskSessionRecord {
         AgentTaskSessionRecord(
             id: id,
             requestId: requestID,
-            actorKind: "builtInAI",
-            actorName: "Stacio AI",
+            actorKind: actorKind,
+            actorName: actorName,
             targetRuntimeId: runtimeID,
             targetTitle: title,
             state: "completed",
@@ -5851,8 +6507,36 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         )
     }
 
-    private func makeSettingsStore(autoRunProposedCommands: Bool) -> AppSettingsStore {
+    private func makeSettingsStore(
+        autoRunProposedCommands: Bool,
+        modelContextCharacterLimit: Int = AIModelCapabilityConfiguration.defaultContextCharacterLimit
+    ) -> AppSettingsStore {
         let defaults = UserDefaults(suiteName: "StacioAIPanelSettings-\(UUID().uuidString)")!
+        let store = AppSettingsStore(defaults: defaults)
+        var provider = makeModelProvider(
+            id: UUID(),
+            name: "Test Provider",
+            modelIDs: ["test-model"],
+            defaultModelID: "test-model"
+        )
+        provider.models[0].capabilities = AIModelCapabilityConfiguration(
+            contextCharacterLimit: modelContextCharacterLimit,
+            contextCharacterLimitSource: .manual
+        )
+        try! store.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [provider],
+                defaultAIProviderID: provider.id
+            )
+        )
+        store.update { settings in
+            settings.aiAutoRunProposedCommands = autoRunProposedCommands
+        }
+        return store
+    }
+
+    private func makeUnconfiguredSettingsStore(autoRunProposedCommands: Bool) -> AppSettingsStore {
+        let defaults = UserDefaults(suiteName: "StacioAIUnconfiguredPanelSettings-\(UUID().uuidString)")!
         let store = AppSettingsStore(defaults: defaults)
         store.update { settings in
             settings.aiAutoRunProposedCommands = autoRunProposedCommands
@@ -5954,6 +6638,34 @@ private final class SequencedPanelAIAssistantProvider: AIAssistantProviding {
         requests.append(request)
         let index = min(requests.count - 1, responses.count - 1)
         return responses[index]
+    }
+}
+
+private final class SequencedStreamingPanelAIAssistantProvider: AIAssistantProviding, AIAssistantStreamingProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private let responses: [(partials: [String], response: AIAssistantResponse)]
+    private var requestCount = 0
+
+    init(responses: [(partials: [String], response: AIAssistantResponse)]) {
+        self.responses = responses
+    }
+
+    func respond(to request: AIAssistantRequest) throws -> AIAssistantResponse {
+        XCTFail("expected streaming path")
+        return responses[0].response
+    }
+
+    func respondStreaming(
+        to request: AIAssistantRequest,
+        onPartial: @escaping (String) -> Void
+    ) async throws -> AIAssistantResponse {
+        let item = lock.withLock { () -> (partials: [String], response: AIAssistantResponse) in
+            let index = min(requestCount, responses.count - 1)
+            requestCount += 1
+            return responses[index]
+        }
+        item.partials.forEach(onPartial)
+        return item.response
     }
 }
 
@@ -6357,9 +7069,11 @@ private final class RecordingAgentCommandExecutor: AgentCommandExecuting, AgentT
     private(set) var cancelledRequestIDs: [String] = []
     private(set) var pausedRequestIDs: [String] = []
     private(set) var takenOverRequestIDs: [String] = []
+    private(set) var confirmedRequestIDs: [String] = []
     var cancelEvents: [String: AgentTraceEvent] = [:]
     var pauseEvents: [String: AgentTraceEvent] = [:]
     var takeOverEvents: [String: AgentTraceEvent] = [:]
+    var confirmEvents: [String: AgentTraceEvent] = [:]
     private var originalEventRequestIDsByRequestID: [String: String] = [:]
     private let events: [AgentTraceEvent]
     private let eventsByRequestID: [String: [AgentTraceEvent]]
@@ -6413,6 +7127,15 @@ private final class RecordingAgentCommandExecutor: AgentCommandExecuting, AgentT
     func takeOverTask(requestID: String) -> AgentTraceEvent? {
         takenOverRequestIDs.append(requestID)
         return remapControlEvent(takeOverEvents[requestID] ?? originalEventRequestIDsByRequestID[requestID].flatMap { takeOverEvents[$0] }, requestID: requestID)
+    }
+
+    func confirmTaskComplete(requestID: String) -> AgentTraceEvent? {
+        confirmedRequestIDs.append(requestID)
+        return remapControlEvent(
+            confirmEvents[requestID]
+                ?? originalEventRequestIDsByRequestID[requestID].flatMap { confirmEvents[$0] },
+            requestID: requestID
+        )
     }
 
     private func remapControlEvent(_ event: AgentTraceEvent?, requestID: String) -> AgentTraceEvent? {

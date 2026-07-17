@@ -50,4 +50,11 @@ public enum AgentProtocolRedaction {
             }
             .joined(separator: " ")
     }
+
+    public static func redactPreservingLineBreaks(_ text: String) -> String {
+        text
+            .components(separatedBy: .newlines)
+            .map(redact)
+            .joined(separator: "\n")
+    }
 }

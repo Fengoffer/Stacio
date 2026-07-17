@@ -8,6 +8,14 @@ final class StacioPinnedSplitView: NSSplitView {
     var isPerformingLayoutPass: Bool { isPerformingLayoutForTesting }
     private var isAfterLayoutCallbackScheduled = false
 
+    override var fittingSize: NSSize {
+        bounds.size
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
     override func setPosition(_ position: CGFloat, ofDividerAt dividerIndex: Int) {
         beforeSetPosition?(self, position, dividerIndex)
         super.setPosition(position, ofDividerAt: dividerIndex)

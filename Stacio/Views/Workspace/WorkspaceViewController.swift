@@ -248,8 +248,11 @@ public final class WorkspaceViewController: NSViewController {
     private var tabWorkspaces: [NSTabViewItem: TerminalSplitWorkspace] = [:]
     private var tabMetadata: [NSTabViewItem: WorkspaceTabMetadata] = [:]
     private var tabDuplicateHandlers: [NSTabViewItem: (String) throws -> Void] = [:]
+    private var paneTabRestorations: [ObjectIdentifier: WorkspacePaneTabRestoration] = [:]
     private var detachedTabWindows: [NSWindowController] = []
     private var multiExecSession: MultiExecInteractiveSession?
+    private var terminalSelectionNotificationGeneration: UInt64 = 0
+    private var runtimeIDReattachments: [String: String] = [:]
     private var settingsObserver: NSObjectProtocol?
     private weak var lastCommandTerminalPane: NSViewController?
     private lazy var commandCompletionNotificationCoordinator = TerminalCommandCompletionNotificationCoordinator(
@@ -477,6 +480,26 @@ public final class WorkspaceViewController: NSViewController {
         liveSessionContext: TunnelLiveSessionContext? = nil,
         automationPolicy: SessionAutomationPolicy = .default
     ) {
+        openRemoteShell(
+            status: status,
+            title: title,
+            reconnecter: reconnecter,
+            connectionKind: connectionKind,
+            liveSessionContext: liveSessionContext,
+            automationPolicy: automationPolicy,
+            manualIconID: nil
+        )
+    }
+
+    public func openRemoteShell(
+        status: LiveShellStatus,
+        title: String,
+        reconnecter: RemoteTerminalReconnecting? = nil,
+        connectionKind: RemoteTerminalConnectionKind = .ssh,
+        liveSessionContext: TunnelLiveSessionContext? = nil,
+        automationPolicy: SessionAutomationPolicy = .default,
+        manualIconID: String?
+    ) {
         let terminalPane = RemoteTerminalPaneViewController(
             runtimeID: status.runtimeId,
             title: title,
@@ -499,7 +522,7 @@ public final class WorkspaceViewController: NSViewController {
         )
         let item = makeTerminalTab(label: title, firstPane: terminalPane, deviceDashboard: deviceDashboard)
         item.label = title
-        configureRemoteTabIcon(for: item, connectionKind: connectionKind)
+        configureRemoteTabIcon(for: item, connectionKind: connectionKind, manualIconID: manualIconID)
         if let reconnecter {
             tabDuplicateHandlers[item] = { [weak self, weak reconnecter] duplicateTitle in
                 guard let self, let reconnecter else {
@@ -509,7 +532,8 @@ public final class WorkspaceViewController: NSViewController {
                     title: duplicateTitle,
                     reconnecter: reconnecter,
                     connectionKind: connectionKind,
-                    automationPolicy: automationPolicy
+                    automationPolicy: automationPolicy,
+                    manualIconID: manualIconID
                 )
             }
         }
@@ -541,6 +565,25 @@ public final class WorkspaceViewController: NSViewController {
         liveSessionContext: TunnelLiveSessionContext?,
         automationPolicy: SessionAutomationPolicy
     ) -> RemoteTerminalPaneViewController {
+        openConnectingRemoteShell(
+            title: title,
+            reconnecter: reconnecter,
+            connectionKind: connectionKind,
+            liveSessionContext: liveSessionContext,
+            automationPolicy: automationPolicy,
+            manualIconID: nil
+        )
+    }
+
+    @discardableResult
+    public func openConnectingRemoteShell(
+        title: String,
+        reconnecter: RemoteTerminalReconnecting?,
+        connectionKind: RemoteTerminalConnectionKind,
+        liveSessionContext: TunnelLiveSessionContext?,
+        automationPolicy: SessionAutomationPolicy,
+        manualIconID: String?
+    ) -> RemoteTerminalPaneViewController {
         let terminalPane = RemoteTerminalPaneViewController(
             runtimeID: "pending_\(UUID().uuidString.lowercased())",
             title: title,
@@ -558,7 +601,7 @@ public final class WorkspaceViewController: NSViewController {
 
         let item = makeTerminalTab(label: title, firstPane: terminalPane)
         item.label = title
-        configureRemoteTabIcon(for: item, connectionKind: connectionKind)
+        configureRemoteTabIcon(for: item, connectionKind: connectionKind, manualIconID: manualIconID)
         if let reconnecter {
             tabDuplicateHandlers[item] = { [weak self, weak reconnecter] duplicateTitle in
                 guard let self, let reconnecter else {
@@ -568,7 +611,8 @@ public final class WorkspaceViewController: NSViewController {
                     title: duplicateTitle,
                     reconnecter: reconnecter,
                     connectionKind: connectionKind,
-                    automationPolicy: automationPolicy
+                    automationPolicy: automationPolicy,
+                    manualIconID: manualIconID
                 )
             }
         }
@@ -580,7 +624,8 @@ public final class WorkspaceViewController: NSViewController {
         title: String,
         reconnecter: RemoteTerminalReconnecting,
         connectionKind: RemoteTerminalConnectionKind,
-        automationPolicy: SessionAutomationPolicy
+        automationPolicy: SessionAutomationPolicy,
+        manualIconID: String?
     ) throws {
         guard let backgroundReconnecter = reconnecter as? RemoteTerminalBackgroundReconnecting else {
             let status = try reconnecter.reconnectRemoteTerminal(title: title)
@@ -590,7 +635,8 @@ public final class WorkspaceViewController: NSViewController {
                 reconnecter: reconnecter,
                 connectionKind: connectionKind,
                 liveSessionContext: reconnecter.liveSessionContext,
-                automationPolicy: automationPolicy
+                automationPolicy: automationPolicy,
+                manualIconID: manualIconID
             )
             return
         }
@@ -600,7 +646,8 @@ public final class WorkspaceViewController: NSViewController {
             reconnecter: reconnecter,
             connectionKind: connectionKind,
             liveSessionContext: reconnecter.liveSessionContext,
-            automationPolicy: automationPolicy
+            automationPolicy: automationPolicy,
+            manualIconID: manualIconID
         )
         backgroundReconnecter.reconnectRemoteTerminalInBackground(
             title: title,
@@ -869,14 +916,113 @@ public final class WorkspaceViewController: NSViewController {
 
     public func splitCurrentTerminal() throws {
         guard let selectedItem = selectedTabViewItem,
-              let workspace = tabWorkspaces[selectedItem]
+              let workspace = tabWorkspaces[selectedItem],
+              let sourcePane = workspace.selectedPane
         else {
             throw WorkspaceTerminalError.noCurrentTerminal
         }
 
-        let pane = makeLocalTerminalPane()
+        let pane: NSViewController
+        if let remote = sourcePane as? RemoteTerminalPaneViewController {
+            guard let reconnecter = remote.reconnecterForWorkspace else {
+                throw WorkspaceTabActionError.unsupportedDuplicate
+            }
+            let status: LiveShellStatus
+            if let background = reconnecter as? RemoteTerminalBackgroundReconnecting {
+                status = LiveShellStatus(runtimeId: "pending_\(UUID().uuidString.lowercased())", status: "connecting", diagnostic: "connecting")
+                let remotePane = RemoteTerminalPaneViewController(
+                    runtimeID: status.runtimeId,
+                    title: remote.terminalTitle,
+                    connectionKind: remote.connectionKind,
+                    liveSessionContext: reconnecter.liveSessionContext,
+                    eventSink: remoteTerminalEventSinkFactory(),
+                    bridge: remoteTerminalBridgeFactory(),
+                    reconnecter: reconnecter,
+                    settingsStore: settingsStore,
+                    automationPolicy: remote.automationPolicy,
+                    startsPollingAutomatically: startsRemoteTerminalPollingAutomatically
+                )
+                configureRemoteTerminalPane(remotePane)
+                remotePane.displayConnectionStarting()
+                installDirectSplitPane(
+                    remotePane,
+                    duplicating: sourcePane,
+                    in: workspace,
+                    tabItem: selectedItem
+                )
+                background.reconnectRemoteTerminalInBackground(title: remote.terminalTitle, automatically: false) { [remotePane] result in
+                    guard remotePane.lifecycleState != .closed else {
+                        if case let .success(connected) = result {
+                            remotePane.discardUnattachedRuntime(connected)
+                        }
+                        return
+                    }
+                    switch result {
+                    case let .success(connected):
+                        remotePane.attachConnectedRuntime(status: connected, liveSessionContext: reconnecter.liveSessionContext, automationPolicy: remote.automationPolicy)
+                    case let .failure(error):
+                        remotePane.displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
+                    }
+                }
+                return
+            }
+            status = try reconnecter.reconnectRemoteTerminal(title: remote.terminalTitle)
+            let remotePane = RemoteTerminalPaneViewController(
+                runtimeID: status.runtimeId,
+                title: remote.terminalTitle,
+                connectionKind: remote.connectionKind,
+                liveSessionContext: reconnecter.liveSessionContext,
+                eventSink: remoteTerminalEventSinkFactory(),
+                bridge: remoteTerminalBridgeFactory(),
+                reconnecter: reconnecter,
+                settingsStore: settingsStore,
+                automationPolicy: remote.automationPolicy,
+                startsPollingAutomatically: startsRemoteTerminalPollingAutomatically
+            )
+            configureRemoteTerminalPane(remotePane)
+            pane = remotePane
+        } else {
+            pane = makeLocalTerminalPane()
+        }
+        installDirectSplitPane(
+            pane,
+            duplicating: sourcePane,
+            in: workspace,
+            tabItem: selectedItem
+        )
+    }
+
+    private func installDirectSplitPane(
+        _ pane: NSViewController,
+        duplicating sourcePane: NSViewController,
+        in workspace: TerminalSplitWorkspace,
+        tabItem: NSTabViewItem
+    ) {
+        let sourceKey = ObjectIdentifier(sourcePane)
+        let sourceRestoration: WorkspacePaneTabRestoration
+        if let existing = paneTabRestorations[sourceKey] {
+            sourceRestoration = existing
+        } else {
+            sourceRestoration = WorkspacePaneTabRestoration(
+                label: workspace.baseLabel,
+                metadata: tabMetadata[tabItem] ?? WorkspaceTabMetadata(),
+                duplicateHandler: tabDuplicateHandlers[tabItem]
+            )
+            paneTabRestorations[sourceKey] = sourceRestoration
+        }
+
+        var duplicatedMetadata = sourceRestoration.metadata
+        duplicatedMetadata.color = nil
+        duplicatedMetadata.isPinned = false
+        paneTabRestorations[ObjectIdentifier(pane)] = WorkspacePaneTabRestoration(
+            label: title(for: pane),
+            metadata: duplicatedMetadata,
+            duplicateHandler: sourceRestoration.duplicateHandler
+        )
+
+        workspace.kind = .split
         workspace.addPane(pane)
-        updateLabel(for: selectedItem)
+        updateLabel(for: tabItem)
         currentTerminalPane = pane
         rememberCommandTerminalPane(pane)
         focusCurrentTerminalPane()
@@ -884,6 +1030,9 @@ public final class WorkspaceViewController: NSViewController {
 
     public func setCurrentTerminalSplitLayout(_ mode: TerminalSplitLayoutMode) {
         guard let workspace = currentSelectedWorkspace else { return }
+        if mode != .single, workspace.panes.count == 1 {
+            try? splitCurrentTerminal()
+        }
         workspace.setLayoutMode(mode)
         currentTerminalPane = workspace.selectedPane
         rememberCommandTerminalPane(currentTerminalPane)
@@ -983,6 +1132,7 @@ public final class WorkspaceViewController: NSViewController {
         tabWorkspaces.removeAll()
         tabMetadata.removeAll()
         tabDuplicateHandlers.removeAll()
+        paneTabRestorations.removeAll()
         lastCommandTerminalPane = nil
         for item in tabViewController.tabViewItems {
             tabViewController.removeTabViewItem(item)
@@ -997,8 +1147,12 @@ public final class WorkspaceViewController: NSViewController {
               let multiExecItem = tabViewController.tabViewItems.first(where: { isMultiExecTab($0) }),
               let multiExecWorkspace = tabWorkspaces[multiExecItem]
         else { return }
-        let panes = session.targetIDs.compactMap { remoteTerminalPane(for: $0) }
-        let reusablePanes = panes.filter { $0.lifecycleState == .running || $0.lifecycleState == .disconnected }
+        let panes = session.targetIDs.compactMap { runtimeID in
+            terminalCommandPanes().first { self.runtimeID(for: $0) == runtimeID }
+        }
+        let reusablePanes = panes.filter { pane in
+            (pane as? RemoteTerminalPaneViewController)?.lifecycleState != .closed
+        }
 
         endMultiExecSession()
         for pane in reusablePanes {
@@ -1007,15 +1161,14 @@ public final class WorkspaceViewController: NSViewController {
         closeMultiExecTabWithoutClosingPanes(multiExecItem)
 
         for pane in reusablePanes {
-            let item = makeTerminalTab(label: pane.terminalTitle, firstPane: pane)
-            item.label = pane.terminalTitle
+            let item = restoreTerminalTab(for: pane)
             select(item, currentPane: pane)
         }
         updateEmptyState(animated: true)
     }
 
     public func multiExecTargets() -> [MultiExecTarget] {
-        eligibleMultiExecPanes().map { pane in
+        terminalCommandPanes().map { pane in
             let title = title(for: pane)
             return MultiExecTarget(
                 id: runtimeID(for: pane),
@@ -1048,17 +1201,17 @@ public final class WorkspaceViewController: NSViewController {
     public func startMultiExecSession(targetIDs: [String]) throws {
         let selectedIDs = orderedUniqueIDs(targetIDs)
         let selectedSet = Set(selectedIDs)
-        let selectedPanes = eligibleMultiExecPanes()
-            .filter { selectedSet.contains($0.runtimeID) }
+        let selectedPanes = terminalCommandPanes()
+            .filter { selectedSet.contains(runtimeID(for: $0)) }
             .sorted { lhs, rhs in
-                selectedIDs.firstIndex(of: lhs.runtimeID) ?? .max < selectedIDs.firstIndex(of: rhs.runtimeID) ?? .max
+                selectedIDs.firstIndex(of: runtimeID(for: lhs)) ?? .max < selectedIDs.firstIndex(of: runtimeID(for: rhs)) ?? .max
             }
         guard selectedPanes.count >= 2 else {
             throw WorkspaceTerminalError.multiExecRequiresMultipleTargets
         }
 
         endMultiExecSession()
-        removePanesFromWorkspacesForMultiExec(selectedPanes)
+        removePanesFromWorkspaces(selectedPanes)
 
         let workspace = TerminalSplitWorkspace(
             baseLabel: L10n.MultiExec.title,
@@ -1069,7 +1222,8 @@ public final class WorkspaceViewController: NSViewController {
             identifierProvider: { [weak self] pane in
                 self?.runtimeID(for: pane) ?? ""
             },
-            isDeviceDashboardGloballyVisible: false
+            isDeviceDashboardGloballyVisible: false,
+            kind: .multiExec
         )
         for pane in selectedPanes.dropFirst() {
             workspace.addPane(pane)
@@ -1083,14 +1237,62 @@ public final class WorkspaceViewController: NSViewController {
         tabViewController.selectedTabViewItemIndex = tabViewController.tabViewItems.count - 1
         updateLabel(for: item)
 
-        multiExecSession = MultiExecInteractiveSession(targetIDs: selectedPanes.map(\.runtimeID), pausedIDs: [])
-        for pane in selectedPanes {
-            pane.setMultiExecModeEnabled(true)
-        }
+        multiExecSession = MultiExecInteractiveSession(targetIDs: selectedPanes.map { runtimeID(for: $0) }, pausedIDs: [])
+        for pane in selectedPanes { setMultiExecEnabled(pane, true) }
         currentTerminalPane = workspace.selectedPane
         rememberCommandTerminalPane(currentTerminalPane)
         updateEmptyState(animated: true)
         focusCurrentTerminalPane()
+    }
+
+    private func setMultiExecEnabled(_ pane: NSViewController, _ enabled: Bool) {
+        if let remote = pane as? RemoteTerminalPaneViewController { remote.setMultiExecModeEnabled(enabled) }
+    }
+
+    public func currentSplitTargetIDs() -> [String] {
+        guard let workspace = currentSelectedWorkspace, workspace.kind == .split else { return [] }
+        return workspace.panes.map { runtimeID(for: $0) }
+    }
+
+    public func splitExistingTerminals(targetIDs: [String], layout: TerminalSplitLayoutMode) throws {
+        let selectedIDs = orderedUniqueIDs(targetIDs)
+        let selectedSet = Set(selectedIDs)
+        let selectedPanes = terminalCommandPanes()
+            .filter { selectedSet.contains(runtimeID(for: $0)) }
+            .sorted { lhs, rhs in
+                selectedIDs.firstIndex(of: runtimeID(for: lhs)) ?? .max < selectedIDs.firstIndex(of: runtimeID(for: rhs)) ?? .max
+            }
+        guard selectedPanes.count >= 2 else {
+            throw WorkspaceTerminalError.multiExecRequiresMultipleTargets
+        }
+        removePanesFromWorkspaces(selectedPanes)
+        let workspace = TerminalSplitWorkspace(
+            baseLabel: "分屏",
+            firstPane: selectedPanes[0],
+            titleProvider: { [weak self] pane in self?.title(for: pane) ?? pane.title ?? "" },
+            identifierProvider: { [weak self] pane in self?.runtimeID(for: pane) ?? "" },
+            isDeviceDashboardGloballyVisible: false,
+            kind: .split
+        )
+        for pane in selectedPanes.dropFirst() { workspace.addPane(pane) }
+        workspace.setLayoutMode(layout)
+        let item = NSTabViewItem(viewController: workspace)
+        item.label = "分屏"
+        tabWorkspaces[item] = workspace
+        tabMetadata[item] = WorkspaceTabMetadata()
+        tabViewController.addTabViewItem(item)
+        tabViewController.selectedTabViewItemIndex = tabViewController.tabViewItems.count - 1
+        updateLabel(for: item)
+        currentTerminalPane = workspace.selectedPane
+        rememberCommandTerminalPane(currentTerminalPane)
+        updateEmptyState(animated: true)
+        focusCurrentTerminalPane()
+    }
+
+    public func splitTargets() -> [MultiExecTarget] {
+        terminalCommandPanes().map { pane in
+            MultiExecTarget(id: runtimeID(for: pane), label: title(for: pane), environment: environment(for: pane), enabled: true)
+        }
     }
 
     public func endMultiExecSession() {
@@ -1372,7 +1574,26 @@ public final class WorkspaceViewController: NSViewController {
             closeMultiExecSessionKeepingTerminals()
             return true
         }
+        if isSplitTab(item) {
+            return closeSplitTabKeepingTerminals(item)
+        }
         return closeTab(item, closePanes: true)
+    }
+
+    private func closeSplitTabKeepingTerminals(_ item: NSTabViewItem) -> Bool {
+        guard let workspace = tabWorkspaces[item] else { return false }
+        let panes = workspace.panes
+        for pane in panes { workspace.removePaneForTransfer(pane) }
+        tabWorkspaces.removeValue(forKey: item)
+        tabMetadata.removeValue(forKey: item)
+        tabDuplicateHandlers.removeValue(forKey: item)
+        tabViewController.removeTabViewItem(item)
+        for pane in panes {
+            let newItem = restoreTerminalTab(for: pane)
+            select(newItem, currentPane: pane)
+        }
+        updateEmptyState(animated: true)
+        return true
     }
 
     private func closeTabs(leftOf item: NSTabViewItem) {
@@ -1400,7 +1621,7 @@ public final class WorkspaceViewController: NSViewController {
     private func closeTabs(_ items: [NSTabViewItem]) {
         for item in items {
             let didClose: Bool
-            if isMultiExecTab(item) {
+            if isMultiExecTab(item) || isSplitTab(item) {
                 didClose = closeTab(item, closePanes: true)
             } else {
                 didClose = closeTab(item)
@@ -1459,7 +1680,11 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     private func isMultiExecWorkspace(_ workspace: TerminalSplitWorkspace) -> Bool {
-        workspace.baseLabel == L10n.MultiExec.title
+        workspace.kind == .multiExec
+    }
+
+    private func isSplitTab(_ item: NSTabViewItem) -> Bool {
+        tabWorkspaces[item]?.kind == .split
     }
 
     private func detachTab(_ item: NSTabViewItem) throws {
@@ -1650,6 +1875,7 @@ public final class WorkspaceViewController: NSViewController {
             autoStartProcess: autoStartTerminalProcesses
         )
         configureAIContextMenu(for: pane)
+        configureMultiExecInputHook(for: pane)
         configureCommandHistory(for: pane)
         pane.title = L10n.Workspace.local
         return pane
@@ -1706,7 +1932,8 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     private func select(_ item: NSTabViewItem, currentPane: NSViewController) {
-        tabViewController.selectedTabViewItemIndex = tabViewController.tabViewItems.count - 1
+        tabViewController.selectedTabViewItemIndex = tabViewController.tabViewItems.firstIndex(of: item)
+            ?? max(0, tabViewController.tabViewItems.count - 1)
         tabWorkspaces[item]?.selectPane(currentPane)
         currentTerminalPane = currentPane
         rememberCommandTerminalPane(currentPane)
@@ -1722,11 +1949,14 @@ public final class WorkspaceViewController: NSViewController {
         currentTerminalPane = currentSelectedWorkspace?.selectedPane
         rememberCommandTerminalPane(currentTerminalPane)
         notifyCurrentRemoteTerminalChangedIfNeeded(currentTerminalPane)
-        focusCurrentTerminalPane()
+        DispatchQueue.main.async { [weak self] in
+            self?.focusCurrentTerminalPaneOnce()
+        }
     }
 
     @discardableResult
     public func activateTerminal(runtimeID: String, bringAppToFront: Bool = true) -> Bool {
+        let runtimeID = resolvedRuntimeID(runtimeID)
         guard let match = tabWorkspaces.first(where: { _, workspace in
             workspace.panes.contains { pane in
                 pane is TerminalCommandHandling && self.runtimeID(for: pane) == runtimeID
@@ -1754,6 +1984,29 @@ public final class WorkspaceViewController: NSViewController {
         return true
     }
 
+    private func recordRuntimeReattachment(oldRuntimeID: String, newRuntimeID: String) {
+        guard oldRuntimeID != newRuntimeID else { return }
+        let aliases = runtimeIDReattachments.compactMap { alias, targetRuntimeID in
+            targetRuntimeID == oldRuntimeID ? alias : nil
+        }
+        runtimeIDReattachments[newRuntimeID] = nil
+        for alias in aliases {
+            runtimeIDReattachments[alias] = newRuntimeID
+        }
+        runtimeIDReattachments[oldRuntimeID] = newRuntimeID
+    }
+
+    private func resolvedRuntimeID(_ runtimeID: String) -> String {
+        var resolved = runtimeID
+        var visited = Set<String>()
+        while visited.insert(resolved).inserted,
+              let next = runtimeIDReattachments[resolved],
+              next.isEmpty == false {
+            resolved = next
+        }
+        return resolved
+    }
+
     private func isForegroundActiveTerminal(runtimeID: String) -> Bool {
         guard NSApp.isActive,
               let window = view.window,
@@ -1768,16 +2021,21 @@ public final class WorkspaceViewController: NSViewController {
 
     private func notifyCurrentRemoteTerminalChangedIfNeeded(_ pane: NSViewController?) {
         onCurrentTerminalChanged?()
+        terminalSelectionNotificationGeneration &+= 1
+        let generation = terminalSelectionNotificationGeneration
+        let remoteChanged = onCurrentRemoteTerminalChanged
         if pane is RemoteFilesPaneViewController {
             return
         }
-        guard let remote = pane as? RemoteTerminalPaneViewController,
-              remote.lifecycleState == .running
-        else {
-            onCurrentRemoteTerminalChanged?(nil)
-            return
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.terminalSelectionNotificationGeneration == generation
+            else { return }
+            let selectedRemote = (pane as? RemoteTerminalPaneViewController).flatMap { remote in
+                remote.lifecycleState == .running ? remote : nil
+            }
+            remoteChanged?(selectedRemote)
         }
-        onCurrentRemoteTerminalChanged?(remote)
     }
 
     private func syncCurrentTerminalPaneWithFirstResponder() {
@@ -1807,6 +2065,12 @@ public final class WorkspaceViewController: NSViewController {
         _ = currentSelectedWorkspace?.view
         _ = pane.view
         let focusView = terminal.keyboardFocusView
+        if attempt > 0,
+           let window = focusView.window,
+           shouldPreserveExternalFirstResponder(in: window, focusView: focusView)
+        {
+            return
+        }
         if focusView.acceptsFirstResponder,
            let window = focusView.window,
            window.firstResponder !== focusView {
@@ -1847,6 +2111,9 @@ public final class WorkspaceViewController: NSViewController {
             if window.firstResponder === focusView {
                 return
             }
+            guard self.shouldPreserveExternalFirstResponder(in: window, focusView: focusView) == false else {
+                return
+            }
             window.makeFirstResponder(focusView)
             if window.firstResponder !== focusView, attempt < 8 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
@@ -1856,21 +2123,46 @@ public final class WorkspaceViewController: NSViewController {
         }
     }
 
+    private func shouldPreserveExternalFirstResponder(in window: NSWindow, focusView: NSView) -> Bool {
+        guard let firstResponder = window.firstResponder as? NSView,
+              firstResponder !== focusView,
+              firstResponder !== window.contentView
+        else {
+            return false
+        }
+        if let workspaceView = currentSelectedWorkspace?.view,
+           firstResponder === workspaceView || firstResponder.isDescendant(of: workspaceView)
+        {
+            return false
+        }
+        return firstResponder.acceptsFirstResponder
+    }
+
+    private func focusCurrentTerminalPaneOnce() {
+        guard let pane = currentTerminalPane,
+              let terminal = pane as? TerminalCommandHandling,
+              let window = terminal.keyboardFocusView.window,
+              terminal.keyboardFocusView.acceptsFirstResponder,
+              window.firstResponder !== terminal.keyboardFocusView
+        else { return }
+        window.makeFirstResponder(terminal.keyboardFocusView)
+    }
+
     @discardableResult
     private func close(pane: NSViewController) -> Bool {
         if let remote = pane as? RemoteTerminalPaneViewController,
            onRemoteTerminalClosed?(remote) == false {
             return false
         }
-        if let remote = pane as? RemoteTerminalPaneViewController,
-           multiExecSession?.targetIDs.contains(remote.runtimeID) == true {
-            remote.setMultiExecModeEnabled(false)
-            multiExecSession?.targetIDs.removeAll { $0 == remote.runtimeID }
-            multiExecSession?.pausedIDs.remove(remote.runtimeID)
+        let paneRuntimeID = runtimeID(for: pane)
+        if multiExecSession?.targetIDs.contains(paneRuntimeID) == true {
+            setMultiExecEnabled(pane, false)
+            multiExecSession?.targetIDs.removeAll { $0 == paneRuntimeID }
+            multiExecSession?.pausedIDs.remove(paneRuntimeID)
             if (multiExecSession?.targetIDs.count ?? 0) == 1,
                let remainingID = multiExecSession?.targetIDs.first,
-               let remainingPane = remoteTerminalPane(for: remainingID) {
-                remainingPane.setMultiExecModeEnabled(false)
+               let remainingPane = terminalCommandPanes().first(where: { runtimeID(for: $0) == remainingID }) {
+                setMultiExecEnabled(remainingPane, false)
             }
             if (multiExecSession?.targetIDs.count ?? 0) < 2 {
                 endMultiExecSession()
@@ -1880,6 +2172,13 @@ public final class WorkspaceViewController: NSViewController {
         (pane as? GraphicsSessionPaneViewController)?.closeGraphicsRuntime()
         (pane as? RemoteFilesPaneViewController)?.closeRemoteFilesRuntime()
         (pane as? BrowserPaneViewController)?.closeBrowserPane()
+        paneTabRestorations.removeValue(forKey: ObjectIdentifier(pane))
+        let runtimeAliasesToRemove = runtimeIDReattachments.compactMap { alias, targetRuntimeID in
+            alias == paneRuntimeID || targetRuntimeID == paneRuntimeID ? alias : nil
+        }
+        for alias in runtimeAliasesToRemove {
+            runtimeIDReattachments[alias] = nil
+        }
         return true
     }
 
@@ -2143,12 +2442,24 @@ public final class WorkspaceViewController: NSViewController {
         }
     }
 
+    private func configureMultiExecInputHook(for pane: TerminalPaneViewController) {
+        pane.onUserInput = { [weak self] _, bytes in
+            guard let self, let session = self.multiExecSession,
+                  session.targetIDs.contains(pane.runtimeID) else { return false }
+            pane.sendInput(bytes)
+            for id in session.targetIDs where id != pane.runtimeID {
+                self.terminalPaneForRuntimeID(id)?.sendInput(bytes)
+            }
+            return true
+        }
+    }
+
     private func configureRemoteTerminalPane(_ pane: RemoteTerminalPaneViewController) {
         configureMultiExecInputHook(for: pane)
         configureAIContextMenu(for: pane)
         configureCommandHistory(for: pane)
         pane.onRequestClose = { [weak self] pane in
-            self?.closeTab(containing: pane)
+            self?.closePaneFromPaneHeader(pane)
         }
         pane.onRequestSaveOutput = { [weak self] pane in
             self?.saveTerminalOutput(containing: pane)
@@ -2175,6 +2486,10 @@ public final class WorkspaceViewController: NSViewController {
             }
         }
         pane.onRuntimeReattached = { [weak self] pane, oldRuntimeID, status, liveSessionContext in
+            self?.recordRuntimeReattachment(
+                oldRuntimeID: oldRuntimeID,
+                newRuntimeID: status.runtimeId
+            )
             self?.updateMultiExecSessionRuntimeID(
                 oldRuntimeID: oldRuntimeID,
                 newRuntimeID: status.runtimeId
@@ -2191,6 +2506,27 @@ public final class WorkspaceViewController: NSViewController {
                 liveSessionContext
             )
         }
+    }
+
+    private func closePaneFromPaneHeader(_ pane: NSViewController) {
+        guard let item = tabWorkspaces.first(where: { $0.value.containsPane(pane) })?.key,
+              let workspace = tabWorkspaces[item],
+              close(pane: pane)
+        else { return }
+        workspace.removePane(pane)
+        if workspace.panes.isEmpty {
+            tabWorkspaces.removeValue(forKey: item)
+            tabMetadata.removeValue(forKey: item)
+            tabDuplicateHandlers.removeValue(forKey: item)
+            tabViewController.removeTabViewItem(item)
+        } else {
+            updateLabel(for: item)
+        }
+        currentTerminalPane = currentSelectedWorkspace?.selectedPane
+        rememberCommandTerminalPane(currentTerminalPane)
+        notifyCurrentRemoteTerminalChangedIfNeeded(currentTerminalPane)
+        updateEmptyState(animated: true)
+        focusCurrentTerminalPane()
     }
 
     private func recordCommandHistory(runtimeID: String, command: String) {
@@ -2211,10 +2547,15 @@ public final class WorkspaceViewController: NSViewController {
         }
     }
 
-    private func configureRemoteTabIcon(for item: NSTabViewItem, connectionKind: RemoteTerminalConnectionKind) {
+    private func configureRemoteTabIcon(
+        for item: NSTabViewItem,
+        connectionKind: RemoteTerminalConnectionKind,
+        manualIconID: String? = nil
+    ) {
         guard connectionKind == .ssh else { return }
         var metadata = tabMetadata[item] ?? WorkspaceTabMetadata()
         metadata.defaultIcon = .sshDefault
+        metadata.manualIcon = manualIconID.flatMap { SessionTabIconDescriptor.catalogIcon(id: $0) }
         metadata.connectionKind = connectionKind
         tabMetadata[item] = metadata
         applyTabIcon(for: item)
@@ -2248,7 +2589,13 @@ public final class WorkspaceViewController: NSViewController {
                       let item = self.tabItem(containing: pane)
                 else { return }
 
-                let descriptor = SessionTabIconDescriptor.operatingSystem(info)
+                let fallbackDescriptor = SessionTabIconDescriptor.operatingSystem(info)
+                let descriptor = SessionIconCatalog.iconID(for: info).flatMap {
+                    SessionTabIconDescriptor.catalogIcon(
+                        id: $0,
+                        accessibilityLabel: fallbackDescriptor.accessibilityLabel
+                    )
+                } ?? fallbackDescriptor
                 var metadata = self.tabMetadata[item] ?? WorkspaceTabMetadata()
                 metadata.defaultIcon = metadata.defaultIcon ?? .sshDefault
                 metadata.connectionKind = metadata.connectionKind ?? pane.connectionKind
@@ -2278,12 +2625,25 @@ public final class WorkspaceViewController: NSViewController {
 
     private func resolvedTabIconDescriptor(for item: NSTabViewItem) -> SessionTabIconDescriptor? {
         guard let metadata = tabMetadata[item] else { return nil }
+        if let manualIcon = metadata.manualIcon {
+            return manualIcon
+        }
         switch settingsStore.snapshot().sessionTabIconMode {
         case .defaultIcon:
             return metadata.defaultIcon
         case .operatingSystem:
             return metadata.detectedOperatingSystemIcon ?? metadata.defaultIcon
         }
+    }
+
+    public func setManualSessionIcon(_ iconID: String?, runtimeID: String) {
+        guard let pane = terminalPaneForRuntimeID(runtimeID) as? NSViewController,
+              let item = tabItem(containing: pane)
+        else { return }
+        var metadata = tabMetadata[item] ?? WorkspaceTabMetadata()
+        metadata.manualIcon = iconID.flatMap { SessionTabIconDescriptor.catalogIcon(id: $0) }
+        tabMetadata[item] = metadata
+        applyTabIcon(for: item)
     }
 
     private func handleRemoteTerminalDirectoryChanged(
@@ -2323,7 +2683,7 @@ public final class WorkspaceViewController: NSViewController {
         }
 
         for targetID in session.targetIDs where targetID != source.runtimeID && !session.pausedIDs.contains(targetID) {
-            remoteTerminalPane(for: targetID)?.sendInput(bytes)
+            terminalPaneForRuntimeID(targetID)?.sendInput(bytes)
         }
         return true
     }
@@ -2377,18 +2737,31 @@ public final class WorkspaceViewController: NSViewController {
             else {
                 continue
             }
+            workspace.kind = .standard
             workspace.baseLabel = title(for: firstPane)
             updateLabel(for: item)
         }
     }
 
-    private func removePanesFromWorkspacesForMultiExec(_ selectedPanes: [RemoteTerminalPaneViewController]) {
+    private func removePanesFromWorkspaces(_ selectedPanes: [NSViewController]) {
         let selectedPaneSet = Set(selectedPanes.map(ObjectIdentifier.init))
         let selectedItem = selectedTabViewItem
 
         for item in Array(tabViewController.tabViewItems) {
             guard let workspace = tabWorkspaces[item] else { continue }
             let panesToMove = workspace.panes.filter { selectedPaneSet.contains(ObjectIdentifier($0)) }
+            if workspace.kind == .standard {
+                for pane in panesToMove {
+                    let key = ObjectIdentifier(pane)
+                    if paneTabRestorations[key] == nil {
+                        paneTabRestorations[key] = WorkspacePaneTabRestoration(
+                            label: workspace.baseLabel,
+                            metadata: tabMetadata[item] ?? WorkspaceTabMetadata(),
+                            duplicateHandler: tabDuplicateHandlers[item]
+                        )
+                    }
+                }
+            }
             for pane in panesToMove {
                 workspace.removePaneForTransfer(pane)
             }
@@ -2406,6 +2779,34 @@ public final class WorkspaceViewController: NSViewController {
            let selectedIndex = tabViewController.tabViewItems.firstIndex(of: selectedItem) {
             tabViewController.selectedTabViewItemIndex = selectedIndex
         }
+    }
+
+    private func removePanesFromWorkspacesForMultiExec(_ selectedPanes: [RemoteTerminalPaneViewController]) {
+        removePanesFromWorkspaces(selectedPanes)
+    }
+
+    private func restoreTerminalTab(for pane: NSViewController) -> NSTabViewItem {
+        let restoration = paneTabRestorations.removeValue(forKey: ObjectIdentifier(pane))
+        let label = restoration?.label ?? title(for: pane)
+        let item = makeTerminalTab(label: label, firstPane: pane)
+        item.label = label
+        guard let restoration else { return item }
+
+        tabMetadata[item] = restoration.metadata
+        if let color = restoration.metadata.color {
+            item.color = color
+        }
+        if let duplicateHandler = restoration.duplicateHandler {
+            tabDuplicateHandlers[item] = duplicateHandler
+        }
+        applyTabIcon(for: item)
+        if restoration.metadata.isPinned,
+           let index = tabViewController.tabViewItems.firstIndex(of: item),
+           index > pinnedInsertionIndex(excluding: item) {
+            tabViewController.removeTabViewItem(item)
+            tabViewController.insertTabViewItem(item, at: pinnedInsertionIndex(excluding: item))
+        }
+        return item
     }
 
     private func runtimeID(for pane: NSViewController) -> String {
@@ -2753,8 +3154,21 @@ private struct WorkspaceTabMetadata {
     var color: NSColor?
     var isPinned = false
     var defaultIcon: SessionTabIconDescriptor?
+    var manualIcon: SessionTabIconDescriptor?
     var detectedOperatingSystemIcon: SessionTabIconDescriptor?
     var connectionKind: RemoteTerminalConnectionKind?
+}
+
+private struct WorkspacePaneTabRestoration {
+    let label: String
+    let metadata: WorkspaceTabMetadata
+    let duplicateHandler: ((String) throws -> Void)?
+}
+
+private enum TerminalWorkspaceKind {
+    case standard
+    case split
+    case multiExec
 }
 
 private enum WorkspaceTabMenuEntry {
@@ -3292,6 +3706,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
             refreshPaneHeaders()
         }
     }
+    var kind: TerminalWorkspaceKind
     private(set) var panes: [NSViewController]
     private let titleProvider: (NSViewController) -> String
     private let identifierProvider: (NSViewController) -> String
@@ -3311,9 +3726,11 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
         deviceDashboard: NSViewController? = nil,
         titleProvider: @escaping (NSViewController) -> String,
         identifierProvider: @escaping (NSViewController) -> String,
-        isDeviceDashboardGloballyVisible: Bool = true
+        isDeviceDashboardGloballyVisible: Bool = true,
+        kind: TerminalWorkspaceKind = .standard
     ) {
         self.baseLabel = baseLabel
+        self.kind = kind
         self.panes = [firstPane]
         self.titleProvider = titleProvider
         self.identifierProvider = identifierProvider
@@ -3566,6 +3983,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
         detachPaneFromGrid(pane)
         let item = NSSplitViewItem(viewController: container)
         item.minimumThickness = 0
+        item.preferredThicknessFraction = 1.0 / CGFloat(max(panes.count, 1))
         splitViewController.addSplitViewItem(item)
     }
 
@@ -3646,7 +4064,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
     }
 
     private var shouldShowPaneHeaders: Bool {
-        panes.count > 1 || baseLabel == L10n.MultiExec.title
+        panes.count > 1 || kind == .multiExec
     }
 
     private func refreshPaneHeaders() {
@@ -3661,7 +4079,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
     }
 
     private var shouldShowDeviceDashboard: Bool {
-        isDeviceDashboardGloballyVisible && deviceDashboard != nil && panes.count == 1 && baseLabel != L10n.MultiExec.title
+        isDeviceDashboardGloballyVisible && deviceDashboard != nil && panes.count == 1 && kind != .multiExec
     }
 
     private func addDeviceDashboardIfNeeded(to container: NSView) {
@@ -3696,6 +4114,24 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
                 splitViewController.view.frame = bounds
             }
             applySinglePaneCollapseIfNeeded()
+            if splitViewController.splitViewItems.count > 1 {
+                let fraction = 1.0 / CGFloat(splitViewController.splitViewItems.count)
+                let splitView = splitViewController.splitView
+                let totalExtent = splitView.isVertical ? splitView.bounds.width : splitView.bounds.height
+                let dividerTotal = splitView.dividerThickness * CGFloat(splitViewController.splitViewItems.count - 1)
+                let equalExtent = max(0, (totalExtent - dividerTotal) * fraction)
+                for item in splitViewController.splitViewItems {
+                    item.preferredThicknessFraction = fraction
+                    if equalExtent > 0 {
+                        item.minimumThickness = equalExtent
+                        item.maximumThickness = equalExtent
+                    }
+                }
+            } else if let item = splitViewController.splitViewItems.first {
+                item.minimumThickness = 0
+                item.maximumThickness = 100_000
+                item.preferredThicknessFraction = 1
+            }
             splitViewController.portDeskRefreshPinnedSplitViewLayout()
             gridColumnCount = 0
             gridRowCount = 0
@@ -3741,6 +4177,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
             height: dashboardHeight
         )
     }
+
 
     private func layoutGridPanes(in bounds: NSRect) {
         let paneCount = panes.count

@@ -248,6 +248,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public private(set) var runtimeID: String
     public let terminalTitle: String
     public let connectionKind: RemoteTerminalConnectionKind
+    var reconnecterForWorkspace: RemoteTerminalReconnecting? { reconnecter }
     public private(set) var liveSessionContext: TunnelLiveSessionContext?
     public private(set) var automationPolicy: SessionAutomationPolicy
     public private(set) var currentRemoteDirectory: String = "~"
@@ -265,6 +266,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public var onMultiExecPresentationChanged: ((RemoteTerminalPaneViewController) -> Void)?
     public var onCommandSubmitted: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onCommandFinished: ((RemoteTerminalPaneViewController) -> Void)?
+    public private(set) var commandCompletionGeneration: UInt64 = 0
+    private var agentInteractionLocked = false
     public var onUploadDroppedFiles: ((String, [String]) -> Void)?
     public var canAcceptDroppedLocalFiles: Bool {
         connectionKind == .ssh && liveSessionContext != nil
@@ -285,6 +288,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
     private var commandSuggestionHistoryCommands: [String] = []
     private let commandHintOverlay = TerminalCommandHintOverlayView()
+    private let agentTraceOverlay = TerminalAgentTraceOverlayView(frame: .zero)
+    private let agentInteractionGlow = TerminalAgentInteractionGlowView(frame: .zero)
     private lazy var liveRemotePathCompletionProvider: RemoteTerminalPathCompletionProvider = {
         let provider = RemoteTerminalPathCompletionProvider(
             liveSessionContextProvider: { [weak self] in
@@ -330,6 +335,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private var immediateOutputDrainFollowUpBurstsRemaining = 0
     private var immediateOutputDrainFollowUpWorkItem: DispatchWorkItem?
     private var isPollingRemoteOutput = false
+    private var pendingTerminalResize: (runtimeID: String, cols: Int, rows: Int)?
+    private var isSendingTerminalResize = false
     private var automaticReconnectWorkItem: DispatchWorkItem?
     private var reconnectGeneration: UInt64 = 0
     private var didClose = false
@@ -453,15 +460,25 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         commandHintOverlay.onVisibilityChanged = { [weak self] visible in
             self?.setCommandHintOverlayVisible(visible)
         }
+        agentTraceOverlay.onControlAction = { [weak self] requestID, action in
+            guard let self else { return }
+            TerminalAgentTaskControlNotification.post(
+                runtimeID: self.runtimeID,
+                requestID: requestID,
+                action: action
+            )
+        }
 
         container.addSubview(terminalView)
         container.terminalFocusView = terminalView
         container.addSubview(lineInfoGutter)
+        container.addSubview(agentInteractionGlow, positioned: .above, relativeTo: terminalView)
         configureLifecycleBar()
         configureOutputProtectionBar()
         container.addSubview(lifecycleBar)
         container.addSubview(outputProtectionBar)
         container.addSubview(commandHintOverlay)
+        container.addSubview(agentTraceOverlay)
         terminalSearchController.install(in: container, overlaying: terminalView)
         let terminalBottomToContainer = terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         let terminalBottomToCommandHint = terminalView.bottomAnchor.constraint(
@@ -503,6 +520,10 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             terminalTrailingToContainer,
             terminalTopToContainer,
             terminalBottomToContainer,
+            agentInteractionGlow.leadingAnchor.constraint(equalTo: terminalView.leadingAnchor),
+            agentInteractionGlow.trailingAnchor.constraint(equalTo: terminalView.trailingAnchor),
+            agentInteractionGlow.topAnchor.constraint(equalTo: terminalView.topAnchor),
+            agentInteractionGlow.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
             lineInfoGutter.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             lineInfoGutter.topAnchor.constraint(equalTo: terminalView.topAnchor),
             lineInfoGutter.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
@@ -518,7 +539,11 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             commandHintBottom,
             commandHintOverlay.widthAnchor.constraint(
                 lessThanOrEqualToConstant: TerminalCommandHintOverlayLayout.submittedPreferredMaxWidth
-            )
+            ),
+            agentTraceOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            agentTraceOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
+            agentTraceOverlay.topAnchor.constraint(equalTo: lifecycleBar.bottomAnchor, constant: 6),
+            agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
         ])
         applyTerminalRuntimeSettings(settingsStore.snapshot())
 
@@ -544,10 +569,57 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
               outputPollTimer == nil
         else { return }
         let timer = Timer(timeInterval: Self.outputPollInterval, repeats: true) { [weak self] _ in
-            self?.pollRemoteOutputOnce()
+            self?.pollRemoteOutputInBackground()
         }
         RunLoop.main.add(timer, forMode: .common)
         outputPollTimer = timer
+    }
+
+    private func pollRemoteOutputInBackground() {
+        guard didClose == false,
+              lifecycleState == .running,
+              agentInteractionLocked == false,
+              isPollingRemoteOutput == false
+        else { return }
+        isPollingRemoteOutput = true
+        let polledRuntimeID = runtimeID
+        let bridge = bridge
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<(LiveShellStatus, TerminalOutputBatch), Error>
+            do {
+                result = .success((
+                    try bridge.pollLiveSSHShell(runtimeID: polledRuntimeID),
+                    try bridge.takeTerminalOutputBatch(runtimeID: polledRuntimeID)
+                ))
+            } catch {
+                result = .failure(error)
+            }
+            RunLoop.main.perform(inModes: [.common]) {
+                guard let self else { return }
+                self.isPollingRemoteOutput = false
+                guard self.didClose == false, self.runtimeID == polledRuntimeID else { return }
+                switch result {
+                case let .success((status, batch)):
+                    guard status.runtimeId == polledRuntimeID, batch.runtimeId == polledRuntimeID else { return }
+                    self.updateOutputProtectionStatus(
+                        protectionActive: batch.protectionActive,
+                        droppedByteCount: batch.droppedByteCount,
+                        bufferedByteCount: batch.bufferedByteCount
+                    )
+                    if !batch.bytes.isEmpty {
+                        self.feedRemoteOutput(Array(batch.bytes), applySemanticHighlighting: batch.protectionActive == false)
+                    }
+                    if status.status != "running" {
+                        self.stopOutputPolling()
+                        self.displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(status.diagnostic))
+                    }
+                case let .failure(error):
+                    guard Self.isTransientPollError(error) == false else { return }
+                    self.stopOutputPolling()
+                    self.displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
+                }
+            }
+        }
     }
 
     public override func viewWillDisappear() {
@@ -591,14 +663,17 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         )
         resetRemoteInputLineAnchor()
         let wasCollectingOSC7Sequence = osc7OutputBuffer.isEmpty == false
-        recordOSC7DirectoryFromOutput(visibleBytes)
+        var didFinishCommand = recordOSC7DirectoryFromOutput(visibleBytes)
         if wasCollectingOSC7Sequence == false,
            osc7OutputBuffer.isEmpty,
            Self.containsOSC7Start(in: visibleBytes) == false
         {
-            recordRemotePromptDirectoryFromOutput(visibleBytes)
+            didFinishCommand = recordRemotePromptDirectoryFromOutput(visibleBytes) || didFinishCommand
         }
         TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: runtimeID, bytes: visibleBytes)
+        if didFinishCommand {
+            TerminalOutputBroadcastHub.shared.publishCommandFinished(runtimeID: runtimeID)
+        }
         terminalSearchController.terminalContentDidChange()
         if filteredOutput.didRemoveEcho {
             finishSilentInputEchoRecovery(restoreTerminalEcho: false)
@@ -680,7 +755,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         )
         guard immediateOutputDrainScheduled == false else { return }
         immediateOutputDrainScheduled = true
-        DispatchQueue.main.async { [weak self] in
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in
             self?.performImmediateRemoteOutputDrain()
         }
     }
@@ -737,13 +812,36 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         sendInput(bytes, broadcastUserInput: true)
     }
 
+    public func sendAgentInput(_ bytes: [UInt8]) {
+        sendInput(bytes, broadcastUserInput: false)
+    }
+
     private func sendInput(_ bytes: [UInt8], broadcastUserInput: Bool) {
+        if agentInteractionLocked && broadcastUserInput { return }
         guard lifecycleState == .running else {
             handleStoppedSessionInput(bytes)
             return
         }
         expireSilentInputEchoFiltersIfNeeded()
         sendInputImmediately(bytes, broadcastUserInput: broadcastUserInput)
+    }
+
+    public func setAgentInteractionLocked(_ locked: Bool) {
+        agentInteractionLocked = locked
+        agentInteractionGlow.setActive(locked)
+    }
+
+    public func refreshAgentTerminalOutput() {
+        guard agentInteractionLocked else { return }
+        _ = pollRemoteOutputOnce()
+    }
+
+    public var agentInteractionGlowActiveForTesting: Bool {
+        agentInteractionGlow.isActiveForTesting
+    }
+
+    public var agentInteractionGlowPreservesTransparentCenterForTesting: Bool {
+        agentInteractionGlow.preservesTransparentCenterForTesting
     }
 
     private func sendInputImmediately(_ bytes: [UInt8], broadcastUserInput: Bool) {
@@ -1026,30 +1124,41 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         setLifecycle(.reconnecting, message: L10n.TerminalLifecycle.reconnecting)
         stopOutputPolling()
         resetSilentInputEchoRecoveryState()
-        _ = try? bridge.closeLiveSSHShell(runtimeID: oldRuntimeID)
+        reconnectGeneration &+= 1
+        let generation = reconnectGeneration
 
         if let backgroundReconnecter = reconnecter as? RemoteTerminalBackgroundReconnecting {
             let bridge = bridge
-            reconnectGeneration &+= 1
-            let generation = reconnectGeneration
-            backgroundReconnecter.reconnectRemoteTerminalInBackground(
-                title: terminalTitle,
-                automatically: trigger == .automatic
-            ) { [weak self] result in
-                guard let self,
-                      self.didClose == false,
-                      self.reconnectGeneration == generation
-                else {
-                    if case let .success(status) = result {
-                        _ = try? bridge.closeLiveSSHShell(runtimeID: status.runtimeId)
+            let title = terminalTitle
+            let automatically = trigger == .automatic
+            DispatchQueue.global(qos: .utility).async { [weak self, weak backgroundReconnecter] in
+                _ = try? bridge.closeLiveSSHShell(runtimeID: oldRuntimeID)
+                DispatchQueue.main.async {
+                    guard let self,
+                          let backgroundReconnecter,
+                          self.didClose == false,
+                          self.reconnectGeneration == generation
+                    else { return }
+                    backgroundReconnecter.reconnectRemoteTerminalInBackground(
+                        title: title,
+                        automatically: automatically
+                    ) { [weak self] result in
+                        guard let self,
+                              self.didClose == false,
+                              self.reconnectGeneration == generation
+                        else {
+                            if case let .success(status) = result {
+                                _ = try? bridge.closeLiveSSHShell(runtimeID: status.runtimeId)
+                            }
+                            return
+                        }
+                        do {
+                            let status = try result.get()
+                            try self.finishReconnect(status: status, oldRuntimeID: oldRuntimeID)
+                        } catch {
+                            self.displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
+                        }
                     }
-                    return
-                }
-                do {
-                    let status = try result.get()
-                    try self.finishReconnect(status: status, oldRuntimeID: oldRuntimeID)
-                } catch {
-                    self.displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
                 }
             }
             return LiveShellStatus(
@@ -1059,28 +1168,15 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             )
         }
 
-        var didDisplayFailureDuringReconnect = false
+        _ = try? bridge.closeLiveSSHShell(runtimeID: oldRuntimeID)
         do {
-            let status: LiveShellStatus
-            switch trigger {
-            case .manual:
-                status = try reconnecter.reconnectRemoteTerminal(title: terminalTitle)
-            case .automatic:
-                status = try reconnecter.reconnectRemoteTerminalAutomatically(title: terminalTitle)
-            }
-            guard status.status == "running" else {
-                _ = try? bridge.closeLiveSSHShell(runtimeID: status.runtimeId)
-                let message = RuntimeDiagnosticFormatter.userMessage(status.diagnostic)
-                displayConnectionFailure(message)
-                didDisplayFailureDuringReconnect = true
-                throw RemoteTerminalLifecycleError.reconnectFailed(message: message)
-            }
+            let status = try trigger == .manual
+                ? reconnecter.reconnectRemoteTerminal(title: terminalTitle)
+                : reconnecter.reconnectRemoteTerminalAutomatically(title: terminalTitle)
             try finishReconnect(status: status, oldRuntimeID: oldRuntimeID)
             return status
         } catch {
-            if didDisplayFailureDuringReconnect == false {
-                displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
-            }
+            displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
             throw error
         }
     }
@@ -1089,7 +1185,6 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         guard status.status == "running" else {
             _ = try? bridge.closeLiveSSHShell(runtimeID: status.runtimeId)
             let message = RuntimeDiagnosticFormatter.userMessage(status.diagnostic)
-            displayConnectionFailure(message)
             throw RemoteTerminalLifecycleError.reconnectFailed(message: message)
         }
         resetSilentInputEchoRecoveryState()
@@ -1137,8 +1232,32 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
         guard TerminalResizeValidator.shouldForward(cols: newCols, rows: newRows) else { return }
-        try? eventSink.terminalDidResize(runtimeID: runtimeID, cols: newCols, rows: newRows)
+        enqueueTerminalResize(runtimeID: runtimeID, cols: newCols, rows: newRows)
         refreshLineInfoGutter()
+    }
+
+    private func enqueueTerminalResize(runtimeID: String, cols: Int, rows: Int) {
+        pendingTerminalResize = (runtimeID, cols, rows)
+        sendPendingTerminalResizeIfNeeded()
+    }
+
+    private func sendPendingTerminalResizeIfNeeded() {
+        guard isSendingTerminalResize == false, let resize = pendingTerminalResize else { return }
+        pendingTerminalResize = nil
+        isSendingTerminalResize = true
+        let eventSink = eventSink
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            try? eventSink.terminalDidResize(
+                runtimeID: resize.runtimeID,
+                cols: resize.cols,
+                rows: resize.rows
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isSendingTerminalResize = false
+                self.sendPendingTerminalResizeIfNeeded()
+            }
+        }
     }
 
     public func setTerminalTitle(source: TerminalView, title: String) {
@@ -1283,6 +1402,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
                 metadata: event.metadata
             )
         )
+        agentTraceOverlay.render(agentTraceController.eventsSnapshot)
         TerminalAgentTraceNotification.post(
             runtimeID: runtimeID,
             title: terminalTitle,
@@ -1292,6 +1412,14 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public var agentTraceSnapshotForTesting: String {
         agentTraceController.snapshot
+    }
+
+    public var agentTraceOverlayTextForTesting: String {
+        agentTraceOverlay.visibleTextForTesting
+    }
+
+    public var agentTraceOverlayVisibleForTesting: Bool {
+        agentTraceOverlay.isHidden == false
     }
 
     public var commandHintVisibleTextForTesting: String {
@@ -1599,6 +1727,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         }
         var didRecordDirectory = false
         for directory in TerminalOSC7SequenceParser.currentDirectories(from: osc7OutputBuffer) {
+            commandCompletionGeneration &+= 1
             onCommandFinished?(self)
             updateCurrentRemoteDirectory(directory)
             didRecordDirectory = true
@@ -1754,6 +1883,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         else {
             return false
         }
+        commandCompletionGeneration &+= 1
         onCommandFinished?(self)
         updateCurrentRemoteDirectory(normalized)
         return true

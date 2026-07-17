@@ -233,11 +233,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private let emptyLabel = NSTextField(labelWithString: L10n.Files.empty)
     private let pathField = NSTextField(string: "~")
     private let transferStatusContainer = NSView()
-    private let transferStatusLabel = NSTextField(labelWithString: "暂无传输任务")
-    private let transferProgressIndicator = NSProgressIndicator()
-    private let transferStatusActions = NSStackView()
-    private let transferPrimaryActionButton = NSButton()
-    private let transferSecondaryActionButton = NSButton()
+    private let transferStatusScrollView = NSScrollView()
+    private let transferStatusRowsStack = FilesTransferStatusRowsStack()
     private let parentButton = FilesViewController.makeToolbarButton(
         title: L10n.Files.parentDirectory,
         symbolName: "chevron.up",
@@ -323,8 +320,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var needsInitialEditorSplitPosition = false
     private var transferStatusHeightConstraint: NSLayoutConstraint?
     private var transferSamplesByJobID: [String: FilesTransferSample] = [:]
-    private var pinnedTransferStatusJobID: String?
-    private var displayedTransferStatusRow: TransferQueueSnapshot.Row?
+    private var transferStatusRowViews: [FilesTransferStatusRowView] = []
+    private var supplementalTransferStatusRowView: FilesTransferStatusRowView?
     private let settingsStore: AppSettingsStore
     private var directoryFollowEnabled = true
     private var showHiddenFilesEnabled = false
@@ -377,7 +374,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             values.append(emptyLabel.stringValue)
         }
         if !transferStatusContainer.isHidden {
-            values.append(transferStatusLabel.stringValue)
+            values.append(contentsOf: transferStatusRowViews.map(\.statusText))
         }
         values.append(contentsOf: rows.flatMap { $0.visibleValues(sizeUnit: selectedSizeUnit) })
         return values.joined(separator: "\n")
@@ -619,7 +616,11 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         ]
         NSLayoutConstraint.deactivate(fileBrowserStandaloneConstraints)
         transferStatusHeightConstraint = transferStatusContainer.heightAnchor.constraint(equalToConstant: 0)
+        transferStatusHeightConstraint?.priority = .defaultHigh
         searchBarHeightConstraint = searchBar.heightAnchor.constraint(equalToConstant: 0)
+
+        let remoteFileListMinimumHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
+        remoteFileListMinimumHeight.priority = NSLayoutConstraint.Priority(751)
 
         NSLayoutConstraint.activate([
             titleLabel.leadingAnchor.constraint(equalTo: fileBrowserPaneView.leadingAnchor, constant: 12),
@@ -662,29 +663,22 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             scrollView.trailingAnchor.constraint(equalTo: fileBrowserPaneView.trailingAnchor, constant: -8),
             scrollView.topAnchor.constraint(equalTo: pathBar.bottomAnchor, constant: 6),
             scrollView.bottomAnchor.constraint(equalTo: transferStatusContainer.topAnchor, constant: -6),
+            remoteFileListMinimumHeight,
 
             transferStatusContainer.leadingAnchor.constraint(equalTo: fileBrowserPaneView.leadingAnchor, constant: 8),
             transferStatusContainer.trailingAnchor.constraint(equalTo: fileBrowserPaneView.trailingAnchor, constant: -8),
             transferStatusContainer.bottomAnchor.constraint(equalTo: fileBrowserPaneView.bottomAnchor, constant: -6),
             transferStatusHeightConstraint ?? transferStatusContainer.heightAnchor.constraint(equalToConstant: 0),
 
-            transferStatusLabel.leadingAnchor.constraint(equalTo: transferStatusContainer.leadingAnchor, constant: 8),
-            transferStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: transferStatusActions.leadingAnchor, constant: -8),
-            transferStatusLabel.topAnchor.constraint(equalTo: transferStatusContainer.topAnchor, constant: 4),
+            transferStatusScrollView.leadingAnchor.constraint(equalTo: transferStatusContainer.leadingAnchor, constant: 4),
+            transferStatusScrollView.trailingAnchor.constraint(equalTo: transferStatusContainer.trailingAnchor, constant: -4),
+            transferStatusScrollView.topAnchor.constraint(equalTo: transferStatusContainer.topAnchor, constant: 4),
+            transferStatusScrollView.bottomAnchor.constraint(equalTo: transferStatusContainer.bottomAnchor, constant: -4),
 
-            transferProgressIndicator.leadingAnchor.constraint(equalTo: transferStatusLabel.leadingAnchor),
-            transferProgressIndicator.trailingAnchor.constraint(equalTo: transferStatusActions.leadingAnchor, constant: -8),
-            transferProgressIndicator.topAnchor.constraint(equalTo: transferStatusLabel.bottomAnchor, constant: 4),
-            transferProgressIndicator.heightAnchor.constraint(equalToConstant: 4),
-
-            transferStatusActions.trailingAnchor.constraint(equalTo: transferStatusContainer.trailingAnchor, constant: -6),
-            transferStatusActions.centerYAnchor.constraint(equalTo: transferStatusContainer.centerYAnchor),
-
-            transferPrimaryActionButton.widthAnchor.constraint(equalToConstant: 26),
-            transferPrimaryActionButton.heightAnchor.constraint(equalToConstant: 24),
-
-            transferSecondaryActionButton.widthAnchor.constraint(equalToConstant: 26),
-            transferSecondaryActionButton.heightAnchor.constraint(equalToConstant: 24),
+            transferStatusRowsStack.leadingAnchor.constraint(equalTo: transferStatusScrollView.contentView.leadingAnchor),
+            transferStatusRowsStack.trailingAnchor.constraint(equalTo: transferStatusScrollView.contentView.trailingAnchor),
+            transferStatusRowsStack.topAnchor.constraint(equalTo: transferStatusScrollView.contentView.topAnchor),
+            transferStatusRowsStack.widthAnchor.constraint(equalTo: transferStatusScrollView.contentView.widthAnchor),
 
             emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
@@ -709,6 +703,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     public override func viewDidLayout() {
         super.viewDidLayout()
         synchronizeStandaloneFileBrowserFrameIfNeeded()
+        updateTransferStatusScrollerVisibility()
         applyInitialEditorSplitPositionIfNeeded()
         updateTableColumnWidths()
         layoutPathBreadcrumbs()
@@ -1043,49 +1038,68 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     }
 
     public func setTransferStatusSnapshot(_ snapshot: TransferQueueSnapshot) {
-        guard let row = preferredTransferStatusRow(from: snapshot.rows) else {
-            transferStatusContainer.isHidden = true
-            transferStatusHeightConstraint?.constant = 0
-            transferStatusLabel.stringValue = L10n.Transfers.empty
-            transferProgressIndicator.doubleValue = 0
-            displayedTransferStatusRow = nil
-            updateTransferStatusActionButtons(for: nil)
+        guard snapshot.rows.isEmpty == false else {
             transferSamplesByJobID = [:]
-            pinnedTransferStatusJobID = nil
+            displayTransferStatusRowViews(jobRows: [])
             return
         }
 
-        pinnedTransferStatusJobID = row.jobID
-        displayedTransferStatusRow = row
-        let metric = transferMetric(for: row, capturedAt: snapshot.capturedAt)
-        let progressText = Self.formatTransferProgress(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal)
-        let directionText = row.direction == .upload ? L10n.Transfers.upload : L10n.Transfers.download
-        let fileName = Self.transferDisplayName(for: row)
-        let taskPrefix = snapshot.rows.count > 1 ? "\(snapshot.rows.count) 个任务 · " : ""
-        let statusText = L10n.Transfers.status(row.rawStatus)
-        let etaSuffix = metric.etaText.isEmpty ? "" : " · \(L10n.Transfers.remainingPrefix) \(metric.etaText)"
-        let speedSuffix = metric.speedText.isEmpty ? "" : " · \(metric.speedText)"
+        let visibleJobIDs = Set(snapshot.rows.map(\.jobID))
+        transferSamplesByJobID = transferSamplesByJobID.filter { visibleJobIDs.contains($0.key) }
+        let existingRowsByJobID = Dictionary(uniqueKeysWithValues: transferStatusRowViews.compactMap { rowView in
+            rowView.representedJobID.map { ($0, rowView) }
+        })
+        let rowViews = snapshot.rows.enumerated().map { index, row in
+            let metric = transferMetric(for: row, capturedAt: snapshot.capturedAt)
+            let progressText = Self.formatTransferProgress(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal)
+            let directionText = row.direction == .upload ? L10n.Transfers.upload : L10n.Transfers.download
+            let fileName = Self.transferDisplayName(for: row)
+            let statusText = L10n.Transfers.status(row.rawStatus)
+            let etaSuffix = metric.etaText.isEmpty ? "" : " · \(L10n.Transfers.remainingPrefix) \(metric.etaText)"
+            let speedSuffix = metric.speedText.isEmpty ? "" : " · \(metric.speedText)"
+            let rowView = existingRowsByJobID[row.jobID]
+                ?? FilesTransferStatusRowView(identifierIndex: index)
+            rowView.configure(
+                jobID: row.jobID,
+                statusText: "\(directionText) \(fileName) · \(progressText)\(etaSuffix) · \(statusText)\(speedSuffix)",
+                progressValue: Self.transferProgressValue(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal),
+                primaryAction: Self.primaryTransferStatusAction(for: row.rawStatus),
+                secondaryAction: Self.secondaryTransferStatusAction(for: row.rawStatus),
+                actionLabel: { Self.transferActionLabel(for: $0) },
+                actionImage: { [weak self] action in
+                    self?.transferActionImage(for: action) ?? NSImage()
+                }
+            )
+            rowView.onAction = { [weak self] action, jobID in
+                self?.onTransferStatusAction?(action, jobID)
+            }
+            return rowView
+        }
 
-        transferStatusContainer.isHidden = false
-        transferStatusHeightConstraint?.constant = 42
-        transferStatusLabel.stringValue = "\(taskPrefix)\(directionText) \(fileName) · \(progressText)\(etaSuffix) · \(statusText)\(speedSuffix)"
-        transferProgressIndicator.doubleValue = Self.transferProgressValue(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal)
-        updateTransferStatusActionButtons(for: row)
-        view.needsLayout = true
+        supplementalTransferStatusRowView = nil
+        displayTransferStatusRowViews(jobRows: rowViews)
     }
 
     public func setRemoteEditSyncStatus(message: String, progressValue: Double?) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
+            supplementalTransferStatusRowView = nil
+            displayTransferStatusRowViews(jobRows: currentTransferJobRowViews)
             return
         }
-        transferStatusContainer.isHidden = false
-        transferStatusHeightConstraint?.constant = 36
-        transferStatusLabel.stringValue = trimmed
-        transferProgressIndicator.doubleValue = min(max(progressValue ?? 0, 0), 100)
-        displayedTransferStatusRow = nil
-        updateTransferStatusActionButtons(for: nil)
-        view.needsLayout = true
+        let rowView = supplementalTransferStatusRowView
+            ?? FilesTransferStatusRowView(identifierIndex: currentTransferJobRowViews.count)
+        rowView.configure(
+            jobID: nil,
+            statusText: trimmed,
+            progressValue: min(max(progressValue ?? 0, 0), 100),
+            primaryAction: nil,
+            secondaryAction: nil,
+            actionLabel: { Self.transferActionLabel(for: $0) },
+            actionImage: { _ in NSImage() }
+        )
+        supplementalTransferStatusRowView = rowView
+        displayTransferStatusRowViews(jobRows: currentTransferJobRowViews)
     }
 
     public func setRemoteListingLoading(remotePath: String) {
@@ -1489,7 +1503,9 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         )
         browserWidth.priority = .defaultHigh
         editorWidth.priority = .defaultHigh
-        currentFileBrowserWidth.priority = NSLayoutConstraint.Priority(999)
+        // Keep the browser width authoritative while the split view applies the
+        // initial editor-first position or a user drag.
+        currentFileBrowserWidth.priority = .required
         fileBrowserMinimumWidthConstraint = browserWidth
         fileBrowserCurrentWidthConstraint = currentFileBrowserWidth
         editorSplitWidthConstraints = [browserWidth, editorWidth, currentFileBrowserWidth]
@@ -1624,6 +1640,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         needsInitialEditorSplitPosition = false
         contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
         fileBrowserCurrentWidthConstraint?.constant = browserWidth
+        contentSplitView.adjustSubviews()
         contentSplitView.layoutSubtreeIfNeeded()
         view.layoutSubtreeIfNeeded()
     }
@@ -2070,97 +2087,86 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         )
         transferStatusContainer.setAccessibilityIdentifier("Stacio.Files.transferStatusStrip")
 
-        transferStatusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        transferStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
-        transferStatusLabel.lineBreakMode = .byTruncatingMiddle
-        transferStatusLabel.maximumNumberOfLines = 1
-        transferStatusLabel.translatesAutoresizingMaskIntoConstraints = false
-        transferStatusLabel.setAccessibilityIdentifier("Stacio.Files.transferStatus")
+        transferStatusScrollView.hasVerticalScroller = false
+        transferStatusScrollView.hasHorizontalScroller = false
+        transferStatusScrollView.autohidesScrollers = true
+        transferStatusScrollView.borderType = .noBorder
+        transferStatusScrollView.drawsBackground = false
+        transferStatusScrollView.translatesAutoresizingMaskIntoConstraints = false
+        transferStatusScrollView.setAccessibilityIdentifier("Stacio.Files.transferStatusList")
 
-        transferProgressIndicator.isIndeterminate = false
-        transferProgressIndicator.minValue = 0
-        transferProgressIndicator.maxValue = 100
-        transferProgressIndicator.doubleValue = 0
-        transferProgressIndicator.controlSize = .small
-        transferProgressIndicator.style = .bar
-        transferProgressIndicator.translatesAutoresizingMaskIntoConstraints = false
-        transferProgressIndicator.setAccessibilityIdentifier("Stacio.Files.transferProgress")
+        transferStatusRowsStack.orientation = .vertical
+        transferStatusRowsStack.alignment = .width
+        transferStatusRowsStack.distribution = .fill
+        transferStatusRowsStack.spacing = Self.transferStatusRowSpacing
+        transferStatusRowsStack.translatesAutoresizingMaskIntoConstraints = false
 
-        configureTransferStatusActionButton(
-            transferPrimaryActionButton,
-            identifier: "Stacio.Files.transferPrimaryAction"
-        )
-        configureTransferStatusActionButton(
-            transferSecondaryActionButton,
-            identifier: "Stacio.Files.transferSecondaryAction"
-        )
-
-        transferStatusActions.orientation = .horizontal
-        transferStatusActions.alignment = .centerY
-        transferStatusActions.spacing = 4
-        transferStatusActions.distribution = .fill
-        transferStatusActions.translatesAutoresizingMaskIntoConstraints = false
-        transferStatusActions.setContentHuggingPriority(.required, for: .horizontal)
-        transferStatusActions.setContentCompressionResistancePriority(.required, for: .horizontal)
-        transferStatusActions.addArrangedSubview(transferPrimaryActionButton)
-        transferStatusActions.addArrangedSubview(transferSecondaryActionButton)
-
-        transferStatusContainer.addSubview(transferStatusLabel)
-        transferStatusContainer.addSubview(transferProgressIndicator)
-        transferStatusContainer.addSubview(transferStatusActions)
-        updateTransferStatusActionButtons(for: nil)
+        transferStatusScrollView.documentView = transferStatusRowsStack
+        transferStatusContainer.addSubview(transferStatusScrollView)
     }
 
-    private func configureTransferStatusActionButton(_ button: NSButton, identifier: String) {
-        button.bezelStyle = .texturedRounded
-        button.imagePosition = .imageOnly
-        button.target = self
-        button.action = #selector(transferStatusActionButtonPressed(_:))
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.setAccessibilityIdentifier(identifier)
-        button.isEnabled = false
-        button.isHidden = true
-        StacioDesignSystem.styleIconButton(button)
-    }
+    private func replaceTransferStatusRowViews(with rowViews: [FilesTransferStatusRowView]) {
+        let previousOrigin = transferStatusScrollView.contentView.bounds.origin
+        let hasSameRowsInSameOrder = transferStatusRowsStack.arrangedSubviews.count == rowViews.count
+            && zip(transferStatusRowsStack.arrangedSubviews, rowViews).allSatisfy { $0 === $1 }
 
-    private func updateTransferStatusActionButtons(for row: TransferQueueSnapshot.Row?) {
-        let primaryAction = Self.primaryTransferStatusAction(for: row?.rawStatus)
-        let secondaryAction = Self.secondaryTransferStatusAction(for: row?.rawStatus)
-        updateTransferStatusActionButton(transferPrimaryActionButton, action: primaryAction)
-        updateTransferStatusActionButton(transferSecondaryActionButton, action: secondaryAction)
-        transferStatusActions.isHidden = primaryAction == nil && secondaryAction == nil
-    }
-
-    private func updateTransferStatusActionButton(_ button: NSButton, action: TransferQueueAction?) {
-        guard let action,
-              displayedTransferStatusRow != nil
-        else {
-            button.image = nil
-            button.toolTip = nil
-            button.setAccessibilityLabel(nil)
-            button.isEnabled = false
-            button.isHidden = true
+        transferStatusRowViews = rowViews
+        guard hasSameRowsInSameOrder == false else {
             return
         }
+        for view in transferStatusRowsStack.arrangedSubviews {
+            transferStatusRowsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        rowViews.forEach(transferStatusRowsStack.addArrangedSubview)
+        transferStatusRowsStack.layoutSubtreeIfNeeded()
 
-        let label = Self.transferActionLabel(for: action)
-        button.image = transferActionImage(for: action)
-        button.toolTip = label
-        button.setAccessibilityLabel(label)
-        button.isEnabled = true
-        button.isHidden = false
-    }
-
-    @objc private func transferStatusActionButtonPressed(_ sender: NSButton) {
-        guard sender.isEnabled,
-              sender.isHidden == false,
-              let row = displayedTransferStatusRow,
-              let label = sender.accessibilityLabel(),
-              let action = Self.transferAction(for: label)
-        else {
+        guard rowViews.isEmpty == false else {
+            transferStatusScrollView.contentView.scroll(to: .zero)
             return
         }
-        onTransferStatusAction?(action, row.jobID)
+        let maximumOffset = max(
+            transferStatusRowsStack.frame.height - transferStatusScrollView.contentView.bounds.height,
+            0
+        )
+        transferStatusScrollView.contentView.scroll(to: NSPoint(
+            x: previousOrigin.x,
+            y: min(max(previousOrigin.y, 0), maximumOffset)
+        ))
+        transferStatusScrollView.reflectScrolledClipView(transferStatusScrollView.contentView)
+    }
+
+    private var currentTransferJobRowViews: [FilesTransferStatusRowView] {
+        transferStatusRowViews.filter { $0.representedJobID != nil }
+    }
+
+    private func displayTransferStatusRowViews(jobRows: [FilesTransferStatusRowView]) {
+        var rowViews = jobRows
+        if let supplementalTransferStatusRowView {
+            rowViews.append(supplementalTransferStatusRowView)
+        }
+        for (index, rowView) in rowViews.enumerated() {
+            rowView.updateIdentifierIndex(index)
+        }
+
+        transferStatusContainer.isHidden = rowViews.isEmpty
+        transferStatusScrollView.hasVerticalScroller = rowViews.count > Self.maxVisibleTransferStatusRows
+        transferStatusHeightConstraint?.constant = Self.transferStatusHeight(rowCount: rowViews.count)
+        replaceTransferStatusRowViews(with: rowViews)
+        view.needsLayout = true
+    }
+
+    private func updateTransferStatusScrollerVisibility() {
+        guard transferStatusContainer.isHidden == false else {
+            transferStatusScrollView.hasVerticalScroller = false
+            return
+        }
+        let contentHeight = max(
+            transferStatusRowsStack.frame.height,
+            transferStatusRowsStack.fittingSize.height
+        )
+        transferStatusScrollView.hasVerticalScroller = contentHeight
+            > transferStatusScrollView.contentView.bounds.height + 0.5
     }
 
     private func transferActionImage(for action: TransferQueueAction) -> NSImage {
@@ -2197,24 +2203,11 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         updateActionStates()
     }
 
-    private func preferredTransferStatusRow(from rows: [TransferQueueSnapshot.Row]) -> TransferQueueSnapshot.Row? {
-        if let pinnedTransferStatusJobID,
-           let pinnedRow = rows.first(where: { $0.jobID == pinnedTransferStatusJobID }),
-           Self.isActiveTransferStatus(pinnedRow.rawStatus)
-        {
-            return pinnedRow
-        }
-
-        return rows.last { $0.rawStatus == "running" }
-            ?? rows.last { $0.rawStatus == "queued" }
-            ?? rows.last
-    }
-
     private func transferMetric(
         for row: TransferQueueSnapshot.Row,
         capturedAt: Date
     ) -> FilesTransferMetric {
-        guard row.rawStatus == "running" else {
+        guard row.rawStatus == "running" || row.rawStatus == "resuming" else {
             transferSamplesByJobID[row.jobID] = FilesTransferSample(
                 bytesDone: row.bytesDone,
                 capturedAt: capturedAt,
@@ -3215,13 +3208,9 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         return fileName.isEmpty ? path : fileName
     }
 
-    private static func isActiveTransferStatus(_ rawStatus: String) -> Bool {
-        rawStatus == "running" || rawStatus == "queued" || rawStatus == "paused"
-    }
-
     private static func primaryTransferStatusAction(for rawStatus: String?) -> TransferQueueAction? {
         switch rawStatus {
-        case "queued", "running":
+        case "queued", "running", "resuming":
             .pause
         case "paused":
             .resume
@@ -3232,7 +3221,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
 
     private static func secondaryTransferStatusAction(for rawStatus: String?) -> TransferQueueAction? {
         switch rawStatus {
-        case "queued", "running", "paused":
+        case "queued", "running", "resuming", "paused":
             .stop
         case "failed", "stopped", "canceled", "cancelled":
             .retry
@@ -3256,21 +3245,12 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
-    private static func transferAction(for label: String) -> TransferQueueAction? {
-        switch label {
-        case L10n.Transfers.retry:
-            return .retry
-        case L10n.Transfers.pause:
-            return .pause
-        case L10n.Transfers.resume:
-            return .resume
-        case L10n.Transfers.restart:
-            return .restart
-        case L10n.Transfers.stop:
-            return .stop
-        default:
-            return nil
-        }
+    private static func transferStatusHeight(rowCount: Int) -> CGFloat {
+        let visibleRows = min(max(rowCount, 0), maxVisibleTransferStatusRows)
+        guard visibleRows > 0 else { return 0 }
+        let rowsHeight = CGFloat(visibleRows) * FilesTransferStatusRowView.preferredHeight
+        let spacingHeight = CGFloat(max(visibleRows - 1, 0)) * transferStatusRowSpacing
+        return rowsHeight + spacingHeight + 8
     }
 
     private static func formatTransferProgress(bytesDone: UInt64, bytesTotal: UInt64) -> String {
@@ -3318,6 +3298,177 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             return "\(Int(rounded))"
         }
         return String(format: "%.1f", rounded)
+    }
+
+    private static let maxVisibleTransferStatusRows = 4
+    private static let transferStatusRowSpacing: CGFloat = 4
+}
+
+private final class FilesTransferStatusRowsStack: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
+private final class FilesTransferStatusRowView: NSView {
+    static let preferredHeight: CGFloat = 38
+
+    var onAction: ((TransferQueueAction, String) -> Void)?
+    var statusText: String { statusLabel.stringValue }
+    private(set) var representedJobID: String?
+
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let progressIndicator = NSProgressIndicator()
+    private let actions = NSStackView()
+    private let primaryActionButton = NSButton()
+    private let secondaryActionButton = NSButton()
+    private var primaryAction: TransferQueueAction?
+    private var secondaryAction: TransferQueueAction?
+
+    init(identifierIndex: Int) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        statusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.maximumNumberOfLines = 1
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        progressIndicator.isIndeterminate = false
+        progressIndicator.minValue = 0
+        progressIndicator.maxValue = 100
+        progressIndicator.doubleValue = 0
+        progressIndicator.controlSize = .small
+        progressIndicator.style = .bar
+        progressIndicator.translatesAutoresizingMaskIntoConstraints = false
+
+        configureActionButton(
+            primaryActionButton,
+            identifier: "Stacio.Files.transferPrimaryAction"
+        )
+        configureActionButton(
+            secondaryActionButton,
+            identifier: "Stacio.Files.transferSecondaryAction"
+        )
+
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 4
+        actions.distribution = .fill
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        actions.setContentHuggingPriority(.required, for: .horizontal)
+        actions.setContentCompressionResistancePriority(.required, for: .horizontal)
+        actions.addArrangedSubview(primaryActionButton)
+        actions.addArrangedSubview(secondaryActionButton)
+
+        addSubview(statusLabel)
+        addSubview(progressIndicator)
+        addSubview(actions)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: Self.preferredHeight),
+
+            statusLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: actions.leadingAnchor, constant: -8),
+            statusLabel.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+
+            progressIndicator.leadingAnchor.constraint(equalTo: statusLabel.leadingAnchor),
+            progressIndicator.trailingAnchor.constraint(equalTo: actions.leadingAnchor, constant: -8),
+            progressIndicator.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 4),
+            progressIndicator.heightAnchor.constraint(equalToConstant: 4),
+
+            actions.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            actions.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            primaryActionButton.widthAnchor.constraint(equalToConstant: 26),
+            primaryActionButton.heightAnchor.constraint(equalToConstant: 24),
+            secondaryActionButton.widthAnchor.constraint(equalToConstant: 26),
+            secondaryActionButton.heightAnchor.constraint(equalToConstant: 24)
+        ])
+        updateIdentifierIndex(identifierIndex)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func updateIdentifierIndex(_ index: Int) {
+        let suffix = index == 0 ? "" : ".\(index)"
+        setAccessibilityIdentifier("Stacio.Files.transferStatusRow\(suffix)")
+        statusLabel.setAccessibilityIdentifier("Stacio.Files.transferStatus\(suffix)")
+        progressIndicator.setAccessibilityIdentifier("Stacio.Files.transferProgress\(suffix)")
+        primaryActionButton.setAccessibilityIdentifier("Stacio.Files.transferPrimaryAction\(suffix)")
+        secondaryActionButton.setAccessibilityIdentifier("Stacio.Files.transferSecondaryAction\(suffix)")
+    }
+
+    func configure(
+        jobID: String?,
+        statusText: String,
+        progressValue: Double,
+        primaryAction: TransferQueueAction?,
+        secondaryAction: TransferQueueAction?,
+        actionLabel: (TransferQueueAction) -> String,
+        actionImage: (TransferQueueAction) -> NSImage
+    ) {
+        representedJobID = jobID
+        self.primaryAction = primaryAction
+        self.secondaryAction = secondaryAction
+        statusLabel.stringValue = statusText
+        statusLabel.toolTip = statusText
+        progressIndicator.doubleValue = min(max(progressValue, 0), 100)
+        update(
+            button: primaryActionButton,
+            action: primaryAction,
+            actionLabel: actionLabel,
+            actionImage: actionImage
+        )
+        update(
+            button: secondaryActionButton,
+            action: secondaryAction,
+            actionLabel: actionLabel,
+            actionImage: actionImage
+        )
+        actions.isHidden = primaryAction == nil && secondaryAction == nil
+    }
+
+    private func configureActionButton(_ button: NSButton, identifier: String) {
+        button.bezelStyle = .texturedRounded
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = #selector(actionButtonPressed(_:))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setAccessibilityIdentifier(identifier)
+        button.isEnabled = false
+        button.isHidden = true
+        StacioDesignSystem.styleIconButton(button)
+    }
+
+    private func update(
+        button: NSButton,
+        action: TransferQueueAction?,
+        actionLabel: (TransferQueueAction) -> String,
+        actionImage: (TransferQueueAction) -> NSImage
+    ) {
+        guard let action, representedJobID != nil else {
+            button.image = nil
+            button.toolTip = nil
+            button.setAccessibilityLabel(nil)
+            button.isEnabled = false
+            button.isHidden = true
+            return
+        }
+        let label = actionLabel(action)
+        button.image = actionImage(action)
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
+        button.isEnabled = true
+        button.isHidden = false
+    }
+
+    @objc private func actionButtonPressed(_ sender: NSButton) {
+        guard let jobID = representedJobID else { return }
+        let action = sender === primaryActionButton ? primaryAction : secondaryAction
+        guard let action else { return }
+        onAction?(action, jobID)
     }
 }
 

@@ -5,6 +5,60 @@ import StacioCoreBindings
 
 @MainActor
 final class SessionSidebarViewControllerTests: XCTestCase {
+    func testSSHSessionRowUsesSavedManualIcon() throws {
+        let session = SessionRecord(
+            id: "session_icon",
+            folderId: nil,
+            name: "Ubuntu Server",
+            protocol: "ssh",
+            host: "ubuntu.example.com",
+            port: 22,
+            username: "root",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]],
+            configJSONByID: ["session_icon": #"{"sessionIconID":"ubuntu"}"#]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.manualSessionIconIDForTesting(sessionID: "session_icon"), "ubuntu")
+        XCTAssertEqual(controller.sessionIconForTesting(sessionID: "session_icon")?.accessibilityDescription, "Ubuntu")
+    }
+
+    func testUnknownManualIconFallsBackToSSHProtocolIcon() {
+        let session = SessionRecord(
+            id: "session_unknown_icon",
+            folderId: nil,
+            name: "Legacy Server",
+            protocol: "ssh",
+            host: "legacy.example.com",
+            port: 22,
+            username: "root",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]],
+            configJSONByID: ["session_unknown_icon": #"{"sessionIconID":"removed"}"#]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+
+        controller.loadView()
+
+        XCTAssertNil(controller.manualSessionIconIDForTesting(sessionID: "session_unknown_icon"))
+        XCTAssertNil(controller.sessionIconForTesting(sessionID: "session_unknown_icon"))
+    }
+
     func testSidebarExposesDocumentNavigationAndSessionList() {
         let controller = SessionSidebarViewController()
 
@@ -152,7 +206,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         controller.loadView()
 
-        XCTAssertEqual(store.events, ["folders", "sessions:nil", "sessions:folder_prod"])
+        XCTAssertEqual(store.events, ["snapshot"])
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "Production\nAPI Server\ndeploy@api.example.com:22")
         XCTAssertEqual(controller.outlineRootCount, 1)
         XCTAssertEqual(controller.outlineView.rowHeight, 44)
@@ -345,13 +399,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         controller.loadView()
 
-        XCTAssertEqual(store.events, [
-            "folders",
-            "sessions:nil",
-            "sessions:folder_prod",
-            "sessions:folder_db",
-            "sessions:folder_primary"
-        ])
+        XCTAssertEqual(store.events, ["snapshot"])
         XCTAssertEqual(
             controller.sessionOutlineTextSnapshot,
             "Production\nDatabase\nPrimary\nPrimary DB\ndeploy@db.example.com:22"
@@ -512,6 +560,56 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             "收藏\n堡垒机\nops@jump.example.com:22\n堡垒机\nops@jump.example.com:22\n最近 API\ndeploy@api.example.com:22"
         )
         XCTAssertFalse(controller.sessionOutlineTextSnapshot.contains("\n最近\n"))
+    }
+
+    func testRecentSessionsUseChineseTitleAndFollowThePersistedVisibilitySetting() {
+        let suiteName = "StacioSidebarRecentSessionsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let favorite = makeSession(
+            id: "favorite",
+            protocolName: "ssh",
+            name: "Favorite",
+            tags: ["favorite"]
+        )
+        let recent = SessionRecord(
+            id: "session_recent",
+            folderId: nil,
+            name: "Recently Opened",
+            protocol: "ssh",
+            host: "recent.example.com",
+            port: 22,
+            username: "ops",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "2026-07-15T12:00:00Z"
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: [favorite, recent]]
+            ),
+            settingsStore: settingsStore
+        )
+        controller.loadView()
+
+        XCTAssertEqual(controller.virtualGroupTitlesForTesting, ["最近使用", "收藏"])
+
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = false
+        }
+
+        XCTAssertEqual(controller.virtualGroupTitlesForTesting, ["收藏"])
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("Recently Opened"))
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("Favorite"))
+
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = true
+        }
+
+        XCTAssertEqual(controller.virtualGroupTitlesForTesting, ["最近使用", "收藏"])
     }
 
     func testSearchFiltersSessionsByNameHostUserAndFolder() throws {
@@ -676,6 +774,41 @@ final class SessionSidebarViewControllerTests: XCTestCase {
                 "复制会话设置"
             ]
         )
+    }
+
+    func testRecentAndFavoriteShortcutMenusOnlyExposeConnectionActions() {
+        let suiteName = "StacioSidebarVirtualMenuTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = true
+        }
+        let session = SessionRecord(
+            id: "session_shortcut",
+            folderId: nil,
+            name: "Shortcut",
+            protocol: "ssh",
+            host: "shortcut.example.com",
+            port: 22,
+            username: "ops",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: ["favorite"],
+            lastOpenedAt: "2026-07-15T12:00:00Z"
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: [session]]
+            ),
+            settingsStore: settingsStore
+        )
+        controller.loadView()
+
+        let connectionActions = ["执行", "连接为...", "Ping 主机"]
+        XCTAssertEqual(controller.contextMenuTitlesForTesting(row: 1), connectionActions)
+        XCTAssertEqual(controller.contextMenuTitlesForTesting(row: 3), connectionActions)
     }
 
     func testContextMenuExecuteAndConnectAsOpenRealSessions() {
@@ -1144,7 +1277,9 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         let store = RecordingSessionSidebarStore(
             folders: [],
             sessionsByFolderID: [nil: [session]],
-            configJSONByID: ["session_api": ##"{"tagStyle":{"color":"#2266AA"}}"##]
+            configJSONByID: [
+                "session_api": ##"{"sessionIconID":"ubuntu","tagStyle":{"color":"#2266AA"},"startupCommand":"export TOKEN=hidden","environmentVariables":["PASSWORD=hidden"]}"##
+            ]
         )
         let operations = RecordingSessionSidebarOperationsPresenter(singleSessionExportURL: destinationURL)
         let controller = SessionSidebarViewController(
@@ -1162,7 +1297,12 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions.first?["id"] as? String, "session_api")
         XCTAssertEqual(sessions.first?["host"] as? String, "api.example.com")
-        XCTAssertNotNil(sessions.first?["config_json"])
+        XCTAssertEqual(
+            sessions.first?["config_json"] as? String,
+            #"{"sessionIconID":"ubuntu"}"#
+        )
+        XCTAssertFalse(String(data: data, encoding: .utf8)?.contains("TOKEN") == true)
+        XCTAssertFalse(String(data: data, encoding: .utf8)?.contains("PASSWORD") == true)
         XCTAssertEqual(operations.singleSessionExportRequestIDs, ["session_api"])
         XCTAssertEqual(operations.completedExportURLs, [destinationURL])
     }
@@ -1223,7 +1363,9 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         let store = RecordingSessionSidebarStore(
             folders: [],
             sessionsByFolderID: [nil: [session]],
-            configJSONByID: ["session_api": ##"{"tagStyle":{"color":"#2266AA"}}"##]
+            configJSONByID: [
+                "session_api": ##"{"sessionIconID":"ubuntu","tagStyle":{"color":"#2266AA"},"postConnectScript":"curl https://secret.example"}"##
+            ]
         )
         let operations = RecordingSessionSidebarOperationsPresenter()
         let presetStore = RecordingSessionSidebarDefaultPresetStore()
@@ -1240,11 +1382,17 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         controller.performContextMenuActionForTesting(.copySettings, id: "session_api")
 
         XCTAssertEqual(presetStore.requests.map(\.session.id), ["session_api"])
-        XCTAssertEqual(presetStore.requests.map(\.configJSON), [##"{"tagStyle":{"color":"#2266AA"}}"##])
+        XCTAssertEqual(
+            presetStore.requests.map(\.configJSON),
+            [##"{"sessionIconID":"ubuntu","tagStyle":{"color":"#2266AA"},"postConnectScript":"curl https://secret.example"}"##]
+        )
         XCTAssertEqual(operations.defaultPresetSavedSessionIDs, ["session_api"])
         XCTAssertEqual(settingsCopier.texts.count, 1)
         XCTAssertTrue(settingsCopier.texts[0].contains(#""format" : "stacio.sessions.v1""#))
         XCTAssertTrue(settingsCopier.texts[0].contains(#""API Server""#))
+        XCTAssertTrue(settingsCopier.texts[0].contains(#"\"sessionIconID\":\"ubuntu\""#))
+        XCTAssertFalse(settingsCopier.texts[0].contains("postConnectScript"))
+        XCTAssertFalse(settingsCopier.texts[0].contains("secret.example"))
         XCTAssertEqual(operations.settingsCopiedCount, 1)
     }
 
@@ -1637,6 +1785,27 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(store.movedRequests.count, 0)
     }
 
+    func testMoveSessionToCurrentFolderDoesNotReorderStore() {
+        let session = makeSession(id: "api", protocolName: "ssh", name: "API Server")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]]
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(
+            moveDestination: SessionSidebarMoveDestination(folderID: nil)
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations
+        )
+        controller.loadView()
+
+        controller.performMoveSessionForTesting(id: session.id)
+
+        XCTAssertEqual(operations.moveRequestSessionIDs, [session.id])
+        XCTAssertTrue(store.movedRequests.isEmpty)
+    }
+
     func testExportSessionsWritesJSONToPresenterDestination() throws {
         let destinationURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -1797,6 +1966,322 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(errorPresenter.contexts, [.deleteSession])
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "API Server\ndeploy@api.example.com:22")
     }
+
+    func testFolderContextMenuIsBuiltFromTheRightClickedOutlineRow() {
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(folders: [folder])
+        )
+        controller.loadView()
+
+        XCTAssertEqual(
+            controller.contextMenuTitlesForTesting(row: 0),
+            ["新建分组", "重命名分组", "删除分组", "导出分组会话"]
+        )
+    }
+
+    func testSidebarMovesSessionIntoFolderAtRequestedMixedSiblingIndex() {
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let root = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let existing = makeSession(
+            id: "existing",
+            protocolName: "ssh",
+            name: "Existing",
+            folderID: folder.id
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [nil: [root], folder.id: [existing]]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+        controller.loadView()
+
+        XCTAssertTrue(
+            controller.performSidebarDropForTesting(
+                kind: "session",
+                id: root.id,
+                targetFolderID: folder.id,
+                targetIndex: 0
+            )
+        )
+
+        XCTAssertEqual(store.placedSidebarRequests.map(\.kind), ["session"])
+        XCTAssertEqual(store.placedSidebarRequests.map(\.targetFolderID), [folder.id])
+        XCTAssertEqual(store.placedSidebarRequests.map(\.targetIndex), [0])
+        XCTAssertEqual(
+            controller.sessionOutlineTextSnapshot,
+            "Production\nRoot\nops@root.example.com:22\nExisting\nops@existing.example.com:22"
+        )
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: folder.id))
+    }
+
+    func testSidebarMovesSessionOutOfFolderAndKeepsTheNewOrderAcrossReload() {
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let root = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let nested = makeSession(
+            id: "nested",
+            protocolName: "ssh",
+            name: "Nested",
+            folderID: folder.id
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [nil: [root], folder.id: [nested]]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+        controller.loadView()
+
+        XCTAssertTrue(
+            controller.performSidebarDropForTesting(
+                kind: "session",
+                id: nested.id,
+                targetFolderID: nil,
+                targetIndex: 0
+            )
+        )
+        controller.reloadSessions()
+
+        XCTAssertEqual(
+            controller.sessionOutlineTextSnapshot,
+            "Nested\nops@nested.example.com:22\nRoot\nops@root.example.com:22\nProduction"
+        )
+    }
+
+    func testSidebarReordersFoldersAndSessionsInOneSiblingSequence() {
+        let firstFolder = SessionFolder(id: "folder_first", parentId: nil, name: "First Folder")
+        let secondFolder = SessionFolder(id: "folder_second", parentId: nil, name: "Second Folder")
+        let session = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let store = RecordingSessionSidebarStore(
+            folders: [firstFolder, secondFolder],
+            sessionsByFolderID: [nil: [session]]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+        controller.loadView()
+
+        XCTAssertTrue(
+            controller.performSidebarDropForTesting(
+                kind: "folder",
+                id: secondFolder.id,
+                targetFolderID: nil,
+                targetIndex: 0
+            )
+        )
+
+        XCTAssertEqual(
+            controller.sessionOutlineTextSnapshot,
+            "Second Folder\nRoot\nops@root.example.com:22\nFirst Folder"
+        )
+    }
+
+    func testDropOnPersistedSessionRowRetargetsToBeforeOrAfterTheRow() throws {
+        let source = makeSession(id: "source", protocolName: "ssh", name: "Source")
+        let target = makeSession(id: "target", protocolName: "ssh", name: "Target")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: [source, target]]
+            )
+        )
+        controller.loadView()
+
+        let before = try XCTUnwrap(
+            controller.resolvedSidebarDropOnItemForTesting(
+                kind: "session",
+                id: source.id,
+                targetKind: "session",
+                targetID: target.id,
+                insertAfter: false
+            )
+        )
+        let after = try XCTUnwrap(
+            controller.resolvedSidebarDropOnItemForTesting(
+                kind: "session",
+                id: source.id,
+                targetKind: "session",
+                targetID: target.id,
+                insertAfter: true
+            )
+        )
+
+        XCTAssertNil(before.targetFolderID)
+        XCTAssertEqual(before.targetIndex, 0)
+        XCTAssertNil(after.targetFolderID)
+        XCTAssertEqual(after.targetIndex, 1)
+    }
+
+    func testDropOnPersistedSessionRowRetargetsFolderWithinTheSameParent() throws {
+        let folder = SessionFolder(id: "folder_source", parentId: nil, name: "Source Folder")
+        let target = makeSession(id: "target", protocolName: "ssh", name: "Target")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [folder],
+                sessionsByFolderID: [nil: [target]]
+            )
+        )
+        controller.loadView()
+
+        let before = try XCTUnwrap(
+            controller.resolvedSidebarDropOnItemForTesting(
+                kind: "folder",
+                id: folder.id,
+                targetKind: "session",
+                targetID: target.id,
+                insertAfter: false
+            )
+        )
+        let after = try XCTUnwrap(
+            controller.resolvedSidebarDropOnItemForTesting(
+                kind: "folder",
+                id: folder.id,
+                targetKind: "session",
+                targetID: target.id,
+                insertAfter: true
+            )
+        )
+
+        XCTAssertNil(before.targetFolderID)
+        XCTAssertEqual(before.targetIndex, 0)
+        XCTAssertNil(after.targetFolderID)
+        XCTAssertEqual(after.targetIndex, 1)
+    }
+
+    func testVirtualGroupsDoNotShiftRootDropIndexAndCannotBeDragged() throws {
+        let favorite = makeSession(
+            id: "favorite",
+            protocolName: "ssh",
+            name: "Favorite",
+            tags: ["favorite"]
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: [favorite]]
+            )
+        )
+        controller.loadView()
+
+        let virtualFolder = controller.outlineView(controller.outlineView, child: 0, ofItem: nil)
+        let virtualSession = controller.outlineView(controller.outlineView, child: 0, ofItem: virtualFolder)
+        let persistedSession = controller.outlineView(controller.outlineView, child: 1, ofItem: nil)
+        let proposal = try XCTUnwrap(
+            controller.resolvedSidebarDropForTesting(
+                kind: "session",
+                id: favorite.id,
+                proposedFolderID: nil,
+                childIndex: 1
+            )
+        )
+
+        XCTAssertNil(controller.outlineView(controller.outlineView, pasteboardWriterForItem: virtualSession))
+        XCTAssertNotNil(controller.outlineView(controller.outlineView, pasteboardWriterForItem: persistedSession))
+        XCTAssertNil(proposal.targetFolderID)
+        XCTAssertEqual(proposal.targetIndex, 0)
+    }
+
+    func testSidebarDisablesReorderingWhileSearchIsFilteringTheTree() throws {
+        let session = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]]
+        )
+        let controller = SessionSidebarViewController(sessionStore: store)
+        controller.loadView()
+        try controller.performSearchForTesting("Root")
+
+        XCTAssertFalse(
+            controller.performSidebarDropForTesting(
+                kind: "session",
+                id: session.id,
+                targetFolderID: nil,
+                targetIndex: 0
+            )
+        )
+        XCTAssertTrue(store.placedSidebarRequests.isEmpty)
+    }
+
+    func testSidebarKeepsCurrentTreeWhenPersistedDropFails() {
+        let session = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]],
+            placeError: TestSessionSidebarError.failed
+        )
+        let errorPresenter = RecordingSessionSidebarErrorPresenter()
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            errorPresenter: errorPresenter
+        )
+        controller.loadView()
+        let before = controller.sessionOutlineTextSnapshot
+
+        XCTAssertFalse(
+            controller.performSidebarDropForTesting(
+                kind: "session",
+                id: session.id,
+                targetFolderID: nil,
+                targetIndex: 0
+            )
+        )
+
+        XCTAssertEqual(controller.sessionOutlineTextSnapshot, before)
+        XCTAssertEqual(errorPresenter.contexts, [.moveSession])
+    }
+
+    func testExpandAndCollapseAllGroupsPersistAcrossReload() {
+        let root = SessionFolder(id: "folder_root", parentId: nil, name: "Root")
+        let child = SessionFolder(id: "folder_child", parentId: root.id, name: "Child")
+        let grandchild = SessionFolder(id: "folder_grandchild", parentId: child.id, name: "Grandchild")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(folders: [root, child, grandchild])
+        )
+        controller.loadView()
+
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.expandAllGroups"))
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.collapseAllGroups"))
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: root.id))
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: child.id))
+
+        controller.performCollapseAllFoldersForTesting()
+        controller.reloadSessions()
+
+        XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: root.id))
+        XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: child.id))
+
+        controller.performExpandAllFoldersForTesting()
+
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: root.id))
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: child.id))
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: grandchild.id))
+    }
+
+    func testSearchDisablesExpansionControlsAndRestoresThePreviousExpansionState() throws {
+        let root = SessionFolder(id: "folder_root", parentId: nil, name: "Root")
+        let child = SessionFolder(id: "folder_child", parentId: root.id, name: "Matching Child")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(folders: [root, child])
+        )
+        controller.loadView()
+        let expandButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.expandAllGroups") as? NSButton
+        )
+        let collapseButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.collapseAllGroups") as? NSButton
+        )
+        controller.performCollapseAllFoldersForTesting()
+
+        try controller.performSearchForTesting("Matching")
+
+        XCTAssertFalse(expandButton.isEnabled)
+        XCTAssertFalse(collapseButton.isEnabled)
+        XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: root.id))
+
+        try controller.performSearchForTesting("")
+
+        XCTAssertTrue(expandButton.isEnabled)
+        XCTAssertTrue(collapseButton.isEnabled)
+        XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: root.id))
+        XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: child.id))
+    }
 }
 
 private extension SessionSidebarViewController {
@@ -1809,10 +2294,16 @@ private extension SessionSidebarViewController {
     }
 }
 
-private func makeSession(id: String, protocolName: String, name: String) -> SessionRecord {
+private func makeSession(
+    id: String,
+    protocolName: String,
+    name: String,
+    folderID: String? = nil,
+    tags: [String] = []
+) -> SessionRecord {
     SessionRecord(
         id: "session_\(id)",
-        folderId: nil,
+        folderId: folderID,
         name: name,
         protocol: protocolName,
         host: "\(id).example.com",
@@ -1820,7 +2311,7 @@ private func makeSession(id: String, protocolName: String, name: String) -> Sess
         username: "ops",
         privateKeyPath: nil,
         credentialId: nil,
-        tags: [],
+        tags: tags,
         lastOpenedAt: nil
     )
 }
@@ -1831,6 +2322,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     var updatedRequests: [(id: String, update: SessionUpdate)] = []
     var duplicatedRequests: [(id: String, targetFolderID: String?)] = []
     var movedRequests: [(id: String, targetFolderID: String?)] = []
+    var placedSidebarRequests: [(kind: String, id: String, targetFolderID: String?, targetIndex: UInt32)] = []
     var createdFolderRequests: [(parentID: String?, name: String)] = []
     var renamedFolderRequests: [(id: String, name: String)] = []
     var deletedFolderIDs: [String] = []
@@ -1839,6 +2331,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     var exportCount = 0
     private var folders: [SessionFolder]
     private var sessionsByFolderID: Dictionary<String?, [SessionRecord]>
+    private var sidebarOrderByParentID: Dictionary<String?, [(kind: String, id: String)]> = [:]
     private let createdSession: SessionRecord?
     private let updatedSession: SessionRecord?
     private let duplicatedSession: SessionRecord?
@@ -1849,6 +2342,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     private let createError: Error?
     private let updateError: Error?
     private let deleteError: Error?
+    private let placeError: Error?
 
     init(
         folders: [SessionFolder],
@@ -1862,7 +2356,8 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         configJSONByID: [String: String] = [:],
         createError: Error? = nil,
         updateError: Error? = nil,
-        deleteError: Error? = nil
+        deleteError: Error? = nil,
+        placeError: Error? = nil
     ) {
         self.folders = folders
         self.sessionsByFolderID = sessionsByFolderID
@@ -1876,11 +2371,21 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         self.createError = createError
         self.updateError = updateError
         self.deleteError = deleteError
+        self.placeError = placeError
+        rebuildSidebarOrder()
     }
 
     func listFolders() throws -> [SessionFolder] {
         events.append("folders")
         return folders
+    }
+
+    func listSidebarOrder() throws -> [SessionSidebarOrderItem] {
+        sidebarOrderByParentID.flatMap { parentID, items in
+            items.map { item in
+                SessionSidebarOrderItem(kind: item.kind, id: item.id, parentId: parentID)
+            }
+        }
     }
 
     func createFolder(parentID: String?, name: String) throws -> SessionFolder {
@@ -1892,6 +2397,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
             name: name
         )
         folders.append(folder)
+        sidebarOrderByParentID[parentID, default: []].append((kind: "folder", id: folder.id))
         return folder
     }
 
@@ -1911,11 +2417,50 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         events.append("deleteFolder:\(id)")
         deletedFolderIDs.append(id)
         folders.removeAll { $0.id == id || $0.parentId == id }
+        sidebarOrderByParentID = sidebarOrderByParentID.mapValues { items in
+            items.filter { $0.kind != "folder" || $0.id != id }
+        }
     }
 
     func listSessions(folderID: String?) throws -> [SessionRecord] {
         events.append("sessions:\(folderID ?? "nil")")
         return sessionsByFolderID[folderID] ?? []
+    }
+
+    func loadSnapshot() throws -> SessionSidebarSnapshot {
+        events.append("snapshot")
+        let sessions = sessionsByFolderID.values.flatMap { $0 }
+        let orderItems = sidebarOrderByParentID.flatMap { parentID, items in
+            items.map { item in
+                SessionSidebarOrderItem(kind: item.kind, id: item.id, parentId: parentID)
+            }
+        }
+        let sessionIDs = Set(sessions.map(\.id))
+        let iconAssignments = configJSONByID.compactMap { sessionID, configJSON -> SessionIconAssignment? in
+            guard sessionIDs.contains(sessionID),
+                  let data = configJSON.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let iconID = (object["sessionIconID"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !iconID.isEmpty,
+                  iconID.count <= 64,
+                  iconID.utf8.allSatisfy({ byte in
+                      (48...57).contains(byte)
+                          || (65...90).contains(byte)
+                          || (97...122).contains(byte)
+                          || byte == 45
+                          || byte == 95
+                  })
+            else {
+                return nil
+            }
+            return SessionIconAssignment(sessionId: sessionID, iconId: iconID)
+        }
+        return SessionSidebarSnapshot(
+            folders: folders,
+            sessions: sessions,
+            orderItems: orderItems,
+            manualIconAssignments: iconAssignments
+        )
     }
 
     func createSession(_ draft: SessionDraft) throws -> SessionRecord {
@@ -1938,6 +2483,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
             lastOpenedAt: nil
         )
         sessionsByFolderID[draft.folderId, default: []].append(session)
+        sidebarOrderByParentID[draft.folderId, default: []].append((kind: "session", id: session.id))
         return session
     }
 
@@ -1947,6 +2493,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         }
         events.append("update:\(id)")
         updatedRequests.append((id: id, update: update))
+        let previous = sessionsByFolderID.values.flatMap { $0 }.first { $0.id == id }
         let session = updatedSession ?? SessionRecord(
             id: id,
             folderId: update.folderId,
@@ -1960,8 +2507,17 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
             tags: update.tags ?? [],
             lastOpenedAt: nil
         )
-        sessionsByFolderID = sessionsByFolderID.mapValues { sessions in
-            sessions.map { $0.id == id ? session : $0 }
+        if previous?.folderId != session.folderId {
+            sessionsByFolderID = sessionsByFolderID.mapValues { sessions in
+                sessions.filter { $0.id != id }
+            }
+            sessionsByFolderID[session.folderId, default: []].append(session)
+            removeSidebarOrderItem(kind: "session", id: id)
+            sidebarOrderByParentID[session.folderId, default: []].append((kind: "session", id: id))
+        } else {
+            sessionsByFolderID = sessionsByFolderID.mapValues { sessions in
+                sessions.map { $0.id == id ? session : $0 }
+            }
         }
         return session
     }
@@ -1984,6 +2540,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
             lastOpenedAt: nil
         )
         sessionsByFolderID[targetFolderID, default: []].append(session)
+        sidebarOrderByParentID[targetFolderID, default: []].append((kind: "session", id: session.id))
         return session
     }
 
@@ -2008,7 +2565,54 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
             sessions.filter { $0.id != id }
         }
         sessionsByFolderID[targetFolderID, default: []].append(session)
+        removeSidebarOrderItem(kind: "session", id: id)
+        sidebarOrderByParentID[targetFolderID, default: []].append((kind: "session", id: session.id))
         return session
+    }
+
+    func placeSidebarItem(
+        kind: String,
+        id: String,
+        targetFolderID: String?,
+        targetIndex: UInt32
+    ) throws {
+        if let placeError {
+            throw placeError
+        }
+        placedSidebarRequests.append((
+            kind: kind,
+            id: id,
+            targetFolderID: targetFolderID,
+            targetIndex: targetIndex
+        ))
+        removeSidebarOrderItem(kind: kind, id: id)
+        var targetItems = sidebarOrderByParentID[targetFolderID] ?? []
+        let insertionIndex = min(Int(targetIndex), targetItems.count)
+        targetItems.insert((kind: kind, id: id), at: insertionIndex)
+        sidebarOrderByParentID[targetFolderID] = targetItems
+
+        guard kind == "session",
+              let source = sessionsByFolderID.values.flatMap({ $0 }).first(where: { $0.id == id })
+        else {
+            return
+        }
+        let moved = SessionRecord(
+            id: source.id,
+            folderId: targetFolderID,
+            name: source.name,
+            protocol: source.protocol,
+            host: source.host,
+            port: source.port,
+            username: source.username,
+            privateKeyPath: source.privateKeyPath,
+            credentialId: source.credentialId,
+            tags: source.tags,
+            lastOpenedAt: source.lastOpenedAt
+        )
+        sessionsByFolderID = sessionsByFolderID.mapValues { sessions in
+            sessions.filter { $0.id != id }
+        }
+        sessionsByFolderID[targetFolderID, default: []].append(moved)
     }
 
     func exportSessionsJSON() throws -> String {
@@ -2036,6 +2640,26 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         deletedIDs.append(id)
         sessionsByFolderID = sessionsByFolderID.mapValues { sessions in
             sessions.filter { $0.id != id }
+        }
+        removeSidebarOrderItem(kind: "session", id: id)
+    }
+
+    private func rebuildSidebarOrder() {
+        sidebarOrderByParentID = [:]
+        let rootSessions = sessionsByFolderID[nil] ?? []
+        sidebarOrderByParentID[nil] = rootSessions.map { (kind: "session", id: $0.id) }
+            + folders.filter { $0.parentId == nil }.map { (kind: "folder", id: $0.id) }
+        for folder in folders {
+            let childFolders = folders.filter { $0.parentId == folder.id }
+            let sessions = sessionsByFolderID[folder.id] ?? []
+            sidebarOrderByParentID[folder.id] = childFolders.map { (kind: "folder", id: $0.id) }
+                + sessions.map { (kind: "session", id: $0.id) }
+        }
+    }
+
+    private func removeSidebarOrderItem(kind: String, id: String) {
+        sidebarOrderByParentID = sidebarOrderByParentID.mapValues { items in
+            items.filter { $0.kind != kind || $0.id != id }
         }
     }
 }

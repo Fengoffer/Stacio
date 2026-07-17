@@ -717,6 +717,7 @@ final class RemoteSSHSessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(contextStore.current()?.config.host, "initial.example.com")
 
         _ = try pane.reconnectTerminal()
+        XCTAssertTrue(waitUntil { shellBridge.startedRuntimeCount == 2 })
         pane.closeTerminal()
 
         XCTAssertTrue(waitUntil { shellBridge.closedRuntimeIDs.contains("term_after_close") })
@@ -998,6 +999,7 @@ private final class SequencedDelayLiveShellStarter: LiveShellStarting, LiveShell
     private let lock = NSLock()
     private var entries: [(delay: TimeInterval, status: LiveShellStatus)]
     private var closedIDs: [String] = []
+    private var startCount = 0
 
     init(entries: [(delay: TimeInterval, status: LiveShellStatus)]) {
         self.entries = entries
@@ -1005,6 +1007,10 @@ private final class SequencedDelayLiveShellStarter: LiveShellStarting, LiveShell
 
     var closedRuntimeIDs: [String] {
         lock.withLock { closedIDs }
+    }
+
+    var startedRuntimeCount: Int {
+        lock.withLock { startCount }
     }
 
     func startLiveSSHShellRuntime(
@@ -1015,7 +1021,8 @@ private final class SequencedDelayLiveShellStarter: LiveShellStarting, LiveShell
         rows: UInt32
     ) throws -> LiveShellStatus {
         let entry = lock.withLock {
-            entries.isEmpty
+            startCount += 1
+            return entries.isEmpty
                 ? (delay: 0, status: LiveShellStatus(runtimeId: "term_fallback", status: "running", diagnostic: "running"))
                 : entries.removeFirst()
         }

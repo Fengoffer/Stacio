@@ -2,7 +2,9 @@ import AppKit
 import StacioCoreBindings
 
 @MainActor
-public final class SessionSidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
+public final class SessionSidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    private static let sidebarItemPasteboardType = NSPasteboard.PasteboardType("cn.stacio.session-sidebar-item")
+
     private let sessionStore: SessionSidebarStoring?
     private let onOpenSession: (SessionRecord) throws -> Void
     private let sessionEditor: SessionSidebarSessionEditing
@@ -17,22 +19,25 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let settingsCopier: SessionSidebarSettingsCopying
     private let quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
+    private let settingsStore: AppSettingsStore
     private var activePingRuns: [String: SessionSidebarPingRunning] = [:]
     private var activePingPresenters: [String: SessionSidebarPingProgressPresenting] = [:]
     private var allNodes: [NSObject] = []
     private var nodes: [NSObject] = []
+    private var manualSessionIconIDs: [String: String] = [:]
+    private var expandedFolderKeys: Set<String> = []
+    private var hasInitializedExpansionState = false
     private var searchQuery = ""
     private weak var newGroupButton: NSButton?
+    private weak var expandAllButton: NSButton?
+    private weak var collapseAllButton: NSButton?
     private weak var clipboardSuggestionBanner: SessionSidebarClipboardSuggestionBannerView?
     private var currentClipboardSuggestion: QuickConnectParsedSSHCommand?
     private var clipboardDismissWorkItem: DispatchWorkItem?
     private var appActivationObserver: NSObjectProtocol?
-    public let outlineView = NSOutlineView()
-    private lazy var contextMenu: NSMenu = {
-        let menu = NSMenu(title: L10n.Sidebar.sessions)
-        menu.delegate = self
-        return menu
-    }()
+    private var settingsObserver: NSObjectProtocol?
+    private var showsRecentSessions: Bool
+    public let outlineView: NSOutlineView = SessionSidebarOutlineView()
 
     public init(
         sessionStore: SessionSidebarStoring? = nil,
@@ -48,7 +53,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         defaultPresetStore: SessionSidebarDefaultPresetStoring = UserDefaultsSessionSidebarDefaultPresetStore(),
         settingsCopier: SessionSidebarSettingsCopying = PasteboardSessionSidebarSettingsCopier(),
         quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore = QuickConnectPromptPrefillStore(),
-        clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore()
+        clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
+        settingsStore: AppSettingsStore = .shared
     ) {
         self.sessionStore = sessionStore
         self.onOpenSession = onOpenSession
@@ -64,6 +70,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.settingsCopier = settingsCopier
         self.quickConnectPromptPrefillStore = quickConnectPromptPrefillStore
         self.clipboardDismissalStore = clipboardDismissalStore
+        self.settingsStore = settingsStore
+        showsRecentSessions = settingsStore.snapshot().sessionSidebarShowRecentSessions
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -75,6 +83,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     deinit {
         if let appActivationObserver {
             NotificationCenter.default.removeObserver(appActivationObserver)
+        }
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
         }
         clipboardDismissWorkItem?.cancel()
     }
@@ -105,18 +116,39 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         addGroupButton.isHidden = true
         newGroupButton = addGroupButton
 
+        let collapseButton = makeManagementButton(
+            symbolName: "chevron.right",
+            accessibilityDescription: L10n.Sidebar.collapseAllGroups,
+            identifier: "Stacio.Sidebar.collapseAllGroups",
+            action: #selector(collapseAllFoldersButtonPressed(_:))
+        )
+        collapseAllButton = collapseButton
+        let expandButton = makeManagementButton(
+            symbolName: "chevron.down",
+            accessibilityDescription: L10n.Sidebar.expandAllGroups,
+            identifier: "Stacio.Sidebar.expandAllGroups",
+            action: #selector(expandAllFoldersButtonPressed(_:))
+        )
+        expandAllButton = expandButton
+        let titleActions = NSStackView(views: [collapseButton, expandButton, addGroupButton])
+        titleActions.orientation = .horizontal
+        titleActions.alignment = .centerY
+        titleActions.spacing = 2
+        titleActions.detachesHiddenViews = true
+        titleActions.translatesAutoresizingMaskIntoConstraints = false
+
         let titleRow = SessionSidebarHeaderHoverView(actionButton: addGroupButton)
         titleRow.setAccessibilityIdentifier("Stacio.Sidebar.sessionTitleRow")
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         titleRow.addSubview(titleLabel)
-        titleRow.addSubview(addGroupButton)
+        titleRow.addSubview(titleActions)
         NSLayoutConstraint.activate([
             titleRow.heightAnchor.constraint(equalToConstant: 30),
             titleLabel.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
             titleLabel.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor),
-            addGroupButton.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
-            addGroupButton.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
-            addGroupButton.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor)
+            titleActions.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
+            titleActions.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
+            titleActions.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor)
         ])
 
         let clipboardBanner = SessionSidebarClipboardSuggestionBannerView()
@@ -155,7 +187,13 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         outlineView.doubleAction = #selector(openSelectedSession(_:))
         outlineView.backgroundColor = .clear
         outlineView.rowHeight = 44
-        outlineView.menu = contextMenu
+        outlineView.registerForDraggedTypes([Self.sidebarItemPasteboardType])
+        outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
+        if let sidebarOutlineView = outlineView as? SessionSidebarOutlineView {
+            sidebarOutlineView.rowContextMenuProvider = { [weak self] row in
+                self?.contextMenu(forRow: row)
+            }
+        }
         outlineView.setAccessibilityIdentifier("Stacio.Sidebar.sessionOutline")
 
         let scrollView = NSScrollView()
@@ -193,6 +231,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             arrangedSubview.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -16).isActive = true
         }
 
+        observeSettingsChanges()
         reloadSessionNodes()
         view = container
     }
@@ -210,6 +249,17 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     public var sessionOutlineTextSnapshot: String {
         nodes.flatMap(textSnapshot(for:))
         .joined(separator: "\n")
+    }
+
+    public var virtualGroupTitlesForTesting: [String] {
+        nodes.compactMap { item in
+            guard let folder = item as? SessionSidebarFolderNode,
+                  folder.folder == nil
+            else {
+                return nil
+            }
+            return folder.title
+        }
     }
 
     public func performOpenSessionForTesting(id: String) {
@@ -311,6 +361,103 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
     }
 
+    public func contextMenuTitlesForTesting(row: Int) -> [String] {
+        contextMenu(forRow: row)?.items.map { item in
+            item.isSeparatorItem ? "-" : item.title
+        } ?? []
+    }
+
+    public func performSidebarDropForTesting(
+        kind: String,
+        id: String,
+        targetFolderID: String?,
+        targetIndex: Int
+    ) -> Bool {
+        guard let kind = SessionSidebarPersistedItemKind(rawValue: kind) else {
+            return false
+        }
+        return performDrop(
+            SessionSidebarDragPayload(kind: kind, id: id),
+            proposal: SessionSidebarDropProposal(
+                targetFolderID: targetFolderID,
+                targetIndex: targetIndex
+            )
+        )
+    }
+
+    public func resolvedSidebarDropForTesting(
+        kind: String,
+        id: String,
+        proposedFolderID: String?,
+        childIndex: Int
+    ) -> (targetFolderID: String?, targetIndex: Int)? {
+        guard let kind = SessionSidebarPersistedItemKind(rawValue: kind) else {
+            return nil
+        }
+        let item = proposedFolderID.flatMap { folderNode(id: $0) }
+        guard let proposal = dropProposal(
+            for: SessionSidebarDragPayload(kind: kind, id: id),
+            proposedItem: item,
+            childIndex: childIndex
+        ) else {
+            return nil
+        }
+        return (proposal.targetFolderID, proposal.targetIndex)
+    }
+
+    public func resolvedSidebarDropOnItemForTesting(
+        kind: String,
+        id: String,
+        targetKind: String,
+        targetID: String,
+        insertAfter: Bool
+    ) -> (targetFolderID: String?, targetIndex: Int)? {
+        guard let kind = SessionSidebarPersistedItemKind(rawValue: kind) else {
+            return nil
+        }
+        let targetItem: NSObject?
+        switch SessionSidebarPersistedItemKind(rawValue: targetKind) {
+        case .folder:
+            targetItem = folderNode(id: targetID)
+        case .session:
+            targetItem = persistedSessionNode(id: targetID)
+        case nil:
+            return nil
+        }
+        let payload = SessionSidebarDragPayload(kind: kind, id: id)
+        guard let targetItem,
+              let dropTarget = resolvedOutlineDropTarget(
+                  for: payload,
+                  proposedItem: targetItem,
+                  childIndex: NSOutlineViewDropOnItemIndex,
+                  isAfterTarget: insertAfter
+              ),
+              let proposal = dropProposal(
+                  for: payload,
+                  proposedItem: dropTarget.item,
+                  childIndex: dropTarget.childIndex
+              )
+        else {
+            return nil
+        }
+        return (proposal.targetFolderID, proposal.targetIndex)
+    }
+
+    public func performExpandAllFoldersForTesting() {
+        expandAllFolders()
+    }
+
+    public func performCollapseAllFoldersForTesting() {
+        collapseAllFolders()
+    }
+
+    public func isFolderExpandedForTesting(folderID: String) -> Bool {
+        guard let folder = folderNode(id: folderID) else {
+            return false
+        }
+        return outlineView.isItemExpanded(folder)
+    }
+
     public func performFolderContextMenuActionForTesting(
         _ action: SessionSidebarFolderContextMenuAction,
         folderID: String
@@ -334,7 +481,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         numberOfChildrenOfItem item: Any?
     ) -> Int {
         if let folder = item as? SessionSidebarFolderNode {
-            return folder.folders.count + folder.sessions.count
+            return folder.children.count
         }
         return item == nil ? nodes.count : 0
     }
@@ -355,12 +502,79 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         ofItem item: Any?
     ) -> Any {
         if let folder = item as? SessionSidebarFolderNode {
-            if index < folder.folders.count {
-                return folder.folders[index]
-            }
-            return folder.sessions[index - folder.folders.count]
+            return folder.children[index]
         }
         return nodes[index]
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView,
+        pasteboardWriterForItem item: Any
+    ) -> NSPasteboardWriting? {
+        guard normalizedSearchQuery.isEmpty,
+              let payload = dragPayload(for: item),
+              let data = try? JSONEncoder().encode(payload)
+        else {
+            return nil
+        }
+        let pasteboardItem = NSPasteboardItem()
+        pasteboardItem.setData(data, forType: Self.sidebarItemPasteboardType)
+        return pasteboardItem
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView,
+        validateDrop info: NSDraggingInfo,
+        proposedItem item: Any?,
+        proposedChildIndex index: Int
+    ) -> NSDragOperation {
+        guard normalizedSearchQuery.isEmpty,
+              (info.draggingSource as AnyObject?) === outlineView,
+              let payload = dragPayload(from: info.draggingPasteboard),
+              let dropTarget = resolvedOutlineDropTarget(
+                  for: payload,
+                  proposedItem: item,
+                  childIndex: index,
+                  isAfterTarget: dropInsertionSide(for: item, draggingInfo: info)
+              ),
+              dropProposal(
+                  for: payload,
+                  proposedItem: dropTarget.item,
+                  childIndex: dropTarget.childIndex
+              ) != nil
+        else {
+            return []
+        }
+        if dropTarget.childIndex != index {
+            outlineView.setDropItem(dropTarget.item, dropChildIndex: dropTarget.childIndex)
+        }
+        return .move
+    }
+
+    public func outlineView(
+        _ outlineView: NSOutlineView,
+        acceptDrop info: NSDraggingInfo,
+        item: Any?,
+        childIndex index: Int
+    ) -> Bool {
+        guard normalizedSearchQuery.isEmpty,
+              (info.draggingSource as AnyObject?) === outlineView,
+              let payload = dragPayload(from: info.draggingPasteboard),
+              let dropTarget = resolvedOutlineDropTarget(
+                  for: payload,
+                  proposedItem: item,
+                  childIndex: index,
+                  isAfterTarget: dropInsertionSide(for: item, draggingInfo: info)
+              ),
+              let proposal = dropProposal(
+                  for: payload,
+                  proposedItem: dropTarget.item,
+                  childIndex: dropTarget.childIndex
+              )
+        else {
+            return false
+        }
+        return performDrop(payload, proposal: proposal)
     }
 
     public func outlineView(
@@ -458,12 +672,22 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let iconDescriptor = sessionProtocolIconDescriptor(for: session.session.protocol)
-        let iconView = makeRowIcon(
-            symbolName: iconDescriptor.symbolName,
-            accessibilityDescription: iconDescriptor.accessibilityDescription,
-            identifier: "Stacio.Sidebar.sessionProtocolIcon"
-        )
+        let iconView: NSImageView
+        if let iconID = manualSessionIconIDs[session.session.id],
+           let image = SessionIconCatalog.image(for: iconID, size: NSSize(width: 18, height: 18)) {
+            iconView = makeRowIcon(
+                image: image,
+                accessibilityDescription: image.accessibilityDescription ?? "会话图标",
+                identifier: "Stacio.Sidebar.sessionProtocolIcon"
+            )
+        } else {
+            let iconDescriptor = sessionProtocolIconDescriptor(for: session.session.protocol)
+            iconView = makeRowIcon(
+                symbolName: iconDescriptor.symbolName,
+                accessibilityDescription: iconDescriptor.accessibilityDescription,
+                identifier: "Stacio.Sidebar.sessionProtocolIcon"
+            )
+        }
 
         cell.textField = titleLabel
         cell.addSubview(iconView)
@@ -507,6 +731,20 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return imageView
     }
 
+    private func makeRowIcon(
+        image: NSImage,
+        accessibilityDescription: String,
+        identifier: String
+    ) -> NSImageView {
+        image.accessibilityDescription = accessibilityDescription
+        let imageView = NSImageView(image: image)
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.setAccessibilityIdentifier(identifier)
+        imageView.setAccessibilityLabel(accessibilityDescription)
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        return imageView
+    }
+
     private func sessionProtocolIconDescriptor(for protocolName: String) -> (
         symbolName: String,
         accessibilityDescription: String
@@ -540,6 +778,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     @objc
     private func searchFieldChanged(_ sender: NSSearchField) {
+        if normalizedSearchQuery.isEmpty,
+           sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            captureExpandedFolderState()
+        }
         searchQuery = sender.stringValue
         applySearchFilter()
     }
@@ -586,22 +828,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         createFolder(parentFolder: nil)
     }
 
-    public func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === contextMenu else {
-            return
-        }
-        menu.removeAllItems()
-        if let session = contextMenuSession() {
-            for item in makeContextMenu(for: session).items {
-                menu.addItem(item)
-            }
-            return
-        }
-        if let folder = contextMenuFolder() {
-            for item in makeContextMenu(for: folder).items {
-                menu.addItem(item)
-            }
-        }
+    @objc
+    private func expandAllFoldersButtonPressed(_ sender: Any?) {
+        expandAllFolders()
+    }
+
+    @objc
+    private func collapseAllFoldersButtonPressed(_ sender: Any?) {
+        collapseAllFolders()
     }
 
     @objc
@@ -628,30 +862,27 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         open(node.session)
     }
 
-    private func contextMenuSession() -> SessionRecord? {
-        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0,
-              let node = outlineView.item(atRow: row) as? SessionSidebarSessionNode
-        else {
+    private func contextMenu(forRow row: Int) -> NSMenu? {
+        guard row >= 0 else {
             return nil
         }
-        outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        return node.session
-    }
-
-    private func contextMenuFolder() -> SessionSidebarFolderNode? {
-        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0,
-              let node = outlineView.item(atRow: row) as? SessionSidebarFolderNode,
-              node.folder != nil
-        else {
-            return nil
+        if let session = outlineView.item(atRow: row) as? SessionSidebarSessionNode {
+            return makeContextMenu(
+                for: session.session,
+                includesManagementActions: session.isPersistedRepresentation
+            )
         }
-        outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        return node
+        if let folder = outlineView.item(atRow: row) as? SessionSidebarFolderNode,
+           folder.folder != nil {
+            return makeContextMenu(for: folder)
+        }
+        return nil
     }
 
-    private func makeContextMenu(for session: SessionRecord) -> NSMenu {
+    private func makeContextMenu(
+        for session: SessionRecord,
+        includesManagementActions: Bool = true
+    ) -> NSMenu {
         let menu = NSMenu(title: session.name)
         [
             (L10n.Sidebar.executeSession, SessionSidebarContextMenuAction.execute),
@@ -659,6 +890,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             (L10n.Sidebar.pingHost, .pingHost)
         ].forEach { title, action in
             menu.addItem(makeContextMenuItem(title: title, action: action, session: session))
+        }
+        guard includesManagementActions else {
+            return menu
         }
         menu.addItem(.separator())
         [
@@ -715,6 +949,226 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         item.target = self
         item.representedObject = FolderContextMenuRepresentedAction(action: action, folderID: folder.id ?? "")
         return item
+    }
+
+    private var normalizedSearchQuery: String {
+        searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func dragPayload(for item: Any) -> SessionSidebarDragPayload? {
+        if let folder = item as? SessionSidebarFolderNode,
+           let id = folder.id {
+            return SessionSidebarDragPayload(kind: .folder, id: id)
+        }
+        if let session = item as? SessionSidebarSessionNode,
+           session.isPersistedRepresentation {
+            return SessionSidebarDragPayload(kind: .session, id: session.session.id)
+        }
+        return nil
+    }
+
+    private func dragPayload(from pasteboard: NSPasteboard) -> SessionSidebarDragPayload? {
+        guard let data = pasteboard.data(forType: Self.sidebarItemPasteboardType) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(SessionSidebarDragPayload.self, from: data)
+    }
+
+    private func resolvedOutlineDropTarget(
+        for payload: SessionSidebarDragPayload,
+        proposedItem item: Any?,
+        childIndex: Int,
+        isAfterTarget: Bool?
+    ) -> SessionSidebarOutlineDropTarget? {
+        guard childIndex == NSOutlineViewDropOnItemIndex else {
+            return SessionSidebarOutlineDropTarget(item: item, childIndex: childIndex)
+        }
+        if payload.kind == .session,
+           let folder = item as? SessionSidebarFolderNode,
+           folder.id != nil {
+            return SessionSidebarOutlineDropTarget(item: item, childIndex: childIndex)
+        }
+        guard let target = item as? NSObject,
+              persistedItemKey(for: target) != nil,
+              let isAfterTarget
+        else {
+            return nil
+        }
+        return siblingInsertionTarget(around: target, insertAfter: isAfterTarget)
+    }
+
+    private func dropInsertionSide(for item: Any?, draggingInfo: NSDraggingInfo) -> Bool? {
+        guard let item,
+              outlineView.row(forItem: item) >= 0
+        else {
+            return nil
+        }
+        let row = outlineView.row(forItem: item)
+        let point = outlineView.convert(draggingInfo.draggingLocation, from: nil)
+        let midpoint = outlineView.rect(ofRow: row).midY
+        return outlineView.isFlipped ? point.y >= midpoint : point.y < midpoint
+    }
+
+    private func siblingInsertionTarget(
+        around target: NSObject,
+        insertAfter: Bool
+    ) -> SessionSidebarOutlineDropTarget? {
+        siblingInsertionTarget(
+            around: target,
+            insertAfter: insertAfter,
+            in: nodes,
+            parent: nil
+        )
+    }
+
+    private func siblingInsertionTarget(
+        around target: NSObject,
+        insertAfter: Bool,
+        in items: [NSObject],
+        parent: SessionSidebarFolderNode?
+    ) -> SessionSidebarOutlineDropTarget? {
+        for (index, item) in items.enumerated() {
+            if item === target {
+                return SessionSidebarOutlineDropTarget(
+                    item: parent,
+                    childIndex: index + (insertAfter ? 1 : 0)
+                )
+            }
+            if let folder = item as? SessionSidebarFolderNode,
+               let result = siblingInsertionTarget(
+                   around: target,
+                   insertAfter: insertAfter,
+                   in: folder.children,
+                   parent: folder
+               ) {
+                return result
+            }
+        }
+        return nil
+    }
+
+    private func dropProposal(
+        for payload: SessionSidebarDragPayload,
+        proposedItem item: Any?,
+        childIndex: Int
+    ) -> SessionSidebarDropProposal? {
+        guard let sourceLocation = sourceLocation(for: payload) else {
+            return nil
+        }
+        let sourceParentID = sourceLocation.parentFolderID
+
+        if childIndex == NSOutlineViewDropOnItemIndex {
+            guard payload.kind == .session,
+                  let folder = item as? SessionSidebarFolderNode,
+                  let targetFolderID = folder.id
+            else {
+                return nil
+            }
+            var targetIndex = folder.children.compactMap(persistedItemKey(for:)).count
+            if sourceParentID == targetFolderID,
+               folder.children.contains(where: { persistedItemKey(for: $0) == payload.key }) {
+                targetIndex -= 1
+            }
+            return SessionSidebarDropProposal(
+                targetFolderID: targetFolderID,
+                targetIndex: max(0, targetIndex)
+            )
+        }
+
+        guard childIndex >= 0 else {
+            return nil
+        }
+        let targetFolderID: String?
+        let displayedChildren: [NSObject]
+        if item == nil {
+            targetFolderID = nil
+            displayedChildren = nodes
+        } else if let folder = item as? SessionSidebarFolderNode,
+                  let folderID = folder.id {
+            targetFolderID = folderID
+            displayedChildren = folder.children
+        } else {
+            return nil
+        }
+        guard childIndex <= displayedChildren.count else {
+            return nil
+        }
+        if payload.kind == .folder,
+           sourceParentID != targetFolderID {
+            return nil
+        }
+
+        let precedingItems = displayedChildren.prefix(childIndex)
+        var targetIndex = precedingItems.compactMap(persistedItemKey(for:)).count
+        if sourceParentID == targetFolderID,
+           precedingItems.contains(where: { persistedItemKey(for: $0) == payload.key }) {
+            targetIndex -= 1
+        }
+        return SessionSidebarDropProposal(
+            targetFolderID: targetFolderID,
+            targetIndex: max(0, targetIndex)
+        )
+    }
+
+    private func sourceLocation(for payload: SessionSidebarDragPayload) -> SessionSidebarSourceLocation? {
+        switch payload.kind {
+        case .folder:
+            guard let folder = folderNode(id: payload.id)?.folder else {
+                return nil
+            }
+            return SessionSidebarSourceLocation(parentFolderID: folder.parentId)
+        case .session:
+            guard let session = persistedSessionNode(id: payload.id)?.session else {
+                return nil
+            }
+            return SessionSidebarSourceLocation(parentFolderID: session.folderId)
+        }
+    }
+
+    private func persistedItemKey(for item: NSObject) -> SessionSidebarPersistedItemKey? {
+        if let folder = item as? SessionSidebarFolderNode,
+           let id = folder.id {
+            return SessionSidebarPersistedItemKey(kind: .folder, id: id)
+        }
+        if let session = item as? SessionSidebarSessionNode,
+           session.isPersistedRepresentation {
+            return SessionSidebarPersistedItemKey(kind: .session, id: session.session.id)
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func performDrop(
+        _ payload: SessionSidebarDragPayload,
+        proposal: SessionSidebarDropProposal
+    ) -> Bool {
+        guard normalizedSearchQuery.isEmpty,
+              let sessionStore
+        else {
+            return false
+        }
+        do {
+            if hasInitializedExpansionState,
+               normalizedSearchQuery.isEmpty {
+                captureExpandedFolderState()
+            }
+            try sessionStore.placeSidebarItem(
+                kind: payload.kind.rawValue,
+                id: payload.id,
+                targetFolderID: proposal.targetFolderID,
+                targetIndex: UInt32(clamping: proposal.targetIndex)
+            )
+            if let targetFolderID = proposal.targetFolderID {
+                expandFolderAndAncestors(id: targetFolderID)
+            }
+            reloadSessionNodes(captureExpansionState: false)
+            selectPersistedItem(payload.key)
+            return true
+        } catch {
+            let context: SessionSidebarErrorContext = payload.kind == .session ? .moveSession : .updateFolder
+            errorPresenter.present(error, context: context, parentWindow: view.window)
+            return false
+        }
     }
 
     private func performContextMenuAction(_ action: SessionSidebarContextMenuAction, session: SessionRecord) {
@@ -934,7 +1388,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 for: session,
                 folders: folders,
                 parentWindow: view.window
-            ) else {
+            ), destination.folderID != session.folderId else {
                 return
             }
             _ = try sessionStore.moveSession(id: session.id, targetFolderID: destination.folderID)
@@ -1206,15 +1660,55 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         )
     }
 
-    private func reloadSessionNodes() {
+    private func reloadSessionNodes(captureExpansionState: Bool = true) {
+        if captureExpansionState,
+           hasInitializedExpansionState,
+           normalizedSearchQuery.isEmpty {
+            captureExpandedFolderState()
+        }
         allNodes = makeSessionNodes()
         applySearchFilter()
+    }
+
+    private func observeSettingsChanges() {
+        guard settingsObserver == nil else {
+            return
+        }
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: AppSettingsStore.didChangeNotification,
+            object: settingsStore,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshRecentSessionsVisibility()
+            }
+        }
+    }
+
+    private func refreshRecentSessionsVisibility() {
+        let showsRecentSessions = settingsStore.snapshot().sessionSidebarShowRecentSessions
+        guard showsRecentSessions != self.showsRecentSessions else {
+            return
+        }
+        self.showsRecentSessions = showsRecentSessions
+        reloadSessionNodes()
     }
 
     private func applySearchFilter() {
         nodes = filteredNodes(from: allNodes, query: searchQuery)
         outlineView.reloadData()
-        expandFolderNodes(nodes)
+        let expansionControlsEnabled = normalizedSearchQuery.isEmpty
+        expandAllButton?.isEnabled = expansionControlsEnabled
+        collapseAllButton?.isEnabled = expansionControlsEnabled
+        if normalizedSearchQuery.isEmpty == false {
+            expandFolderNodes(nodes)
+            return
+        }
+        if hasInitializedExpansionState == false {
+            expandedFolderKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
+            hasInitializedExpansionState = true
+        }
+        restoreExpandedFolderState()
     }
 
     private func filteredNodes(
@@ -1249,64 +1743,113 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         if folder.title.lowercased().contains(query) {
             return folder
         }
-        let folders = folder.folders.compactMap { filteredNode($0, query: query) }
-        let sessions = folder.sessions.filter { $0.matchesSearchQuery(query) }
-        guard !folders.isEmpty || !sessions.isEmpty else {
+        let children = folder.children.compactMap { filteredNode($0, query: query) }
+        guard !children.isEmpty else {
             return nil
         }
-        return folder.copy(folders: folders, sessions: sessions)
+        return folder.copy(children: children)
     }
 
     private func makeSessionNodes() -> [NSObject] {
         guard let sessionStore else {
             return ["收藏", "生产", "开发"].map { title in
-                SessionSidebarFolderNode(title: title, sessions: [])
+                SessionSidebarFolderNode(title: title, children: [])
             }
         }
 
         do {
-            let folders = try sessionStore.listFolders()
-            let rootSessions = try sessionStore.listSessions(folderID: nil)
-            var sessionsByFolderID: [String?: [SessionRecord]] = [nil: rootSessions]
-            var loadedSessions = rootSessions
-            for folder in folders {
-                let sessions = try sessionStore.listSessions(folderID: folder.id)
-                sessionsByFolderID[folder.id] = sessions
-                loadedSessions.append(contentsOf: sessions)
+            let snapshot = try sessionStore.loadSnapshot()
+            let folders = snapshot.folders
+            let loadedSessions = snapshot.sessions
+            let sessionsByFolderID = Dictionary(grouping: loadedSessions, by: \.folderId)
+            manualSessionIconIDs = snapshot.manualIconAssignments.reduce(into: [:]) { result, assignment in
+                guard SessionIconCatalog.definition(id: assignment.iconId) != nil else {
+                    return
+                }
+                result[assignment.sessionId] = assignment.iconId
             }
-            var loadedNodes: [NSObject] = rootSessions.map { SessionSidebarSessionNode(session: $0) }
-            loadedNodes.append(
-                contentsOf: makeFolderNodes(
-                    parentID: nil,
-                    folders: folders,
-                    sessionsByFolderID: sessionsByFolderID
-                )
+            let orderByParentID: [String?: [SessionSidebarOrderItem]] = Dictionary(
+                grouping: snapshot.orderItems,
+                by: { $0.parentId }
+            )
+            let loadedNodes = makePersistedChildren(
+                parentID: nil,
+                folders: folders,
+                sessionsByFolderID: sessionsByFolderID,
+                orderByParentID: orderByParentID
             )
             let virtualNodes = virtualSessionNodes(from: loadedSessions).map { $0 as NSObject }
             return virtualNodes + loadedNodes
         } catch {
+            manualSessionIconIDs = [:]
             return []
         }
     }
 
-    private func makeFolderNodes(
+    func manualSessionIconIDForTesting(sessionID: String) -> String? {
+        manualSessionIconIDs[sessionID]
+    }
+
+    func sessionIconForTesting(sessionID: String) -> NSImage? {
+        guard let iconID = manualSessionIconIDs[sessionID] else { return nil }
+        return SessionIconCatalog.image(for: iconID, size: NSSize(width: 18, height: 18))
+    }
+
+    private func makePersistedChildren(
         parentID: String?,
         folders: [SessionFolder],
-        sessionsByFolderID: [String?: [SessionRecord]]
-    ) -> [SessionSidebarFolderNode] {
-        folders
+        sessionsByFolderID: [String?: [SessionRecord]],
+        orderByParentID: [String?: [SessionSidebarOrderItem]]
+    ) -> [NSObject] {
+        let folderNodes: [SessionSidebarFolderNode] = folders
             .filter { $0.parentId == parentID }
             .map { folder in
                 SessionSidebarFolderNode(
                     folder: folder,
-                    folders: makeFolderNodes(
+                    children: makePersistedChildren(
                         parentID: folder.id,
                         folders: folders,
-                        sessionsByFolderID: sessionsByFolderID
-                    ),
-                    sessions: (sessionsByFolderID[folder.id] ?? []).map { SessionSidebarSessionNode(session: $0) }
+                        sessionsByFolderID: sessionsByFolderID,
+                        orderByParentID: orderByParentID
+                    )
                 )
             }
+        let sessionNodes: [SessionSidebarSessionNode] = (sessionsByFolderID[parentID] ?? []).map {
+            SessionSidebarSessionNode(session: $0)
+        }
+        let foldersByID: [String: NSObject] = Dictionary(uniqueKeysWithValues: folderNodes.compactMap { node in
+            node.id.map { ($0, node as NSObject) }
+        })
+        let sessionsByID: [String: NSObject] = Dictionary(uniqueKeysWithValues: sessionNodes.map { node in
+            (node.session.id, node as NSObject)
+        })
+        var children: [NSObject] = []
+        var insertedKeys: Set<SessionSidebarPersistedItemKey> = []
+        for item in orderByParentID[parentID] ?? [] {
+            guard let kind = SessionSidebarPersistedItemKind(rawValue: item.kind) else {
+                continue
+            }
+            let key = SessionSidebarPersistedItemKey(kind: kind, id: item.id)
+            let node = kind == .folder ? foldersByID[item.id] : sessionsByID[item.id]
+            if let node, insertedKeys.insert(key).inserted {
+                children.append(node)
+            }
+        }
+        let fallback: [NSObject]
+        if parentID == nil {
+            fallback = sessionNodes.map { $0 as NSObject } + folderNodes.map { $0 as NSObject }
+        } else {
+            fallback = folderNodes.map { $0 as NSObject } + sessionNodes.map { $0 as NSObject }
+        }
+        for node in fallback {
+            guard let key = persistedItemKey(for: node),
+                  insertedKeys.insert(key).inserted
+            else {
+                continue
+            }
+            children.append(node)
+        }
+        return children
     }
 
     private func virtualSessionNodes(from sessions: [SessionRecord]) -> [SessionSidebarFolderNode] {
@@ -1318,11 +1861,11 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             }
         }
         var nodes: [SessionSidebarFolderNode] = []
-        if !recent.isEmpty {
+        if showsRecentSessions, !recent.isEmpty {
             nodes.append(
                 SessionSidebarFolderNode(
-                    title: "Recent",
-                    sessions: recent,
+                    title: L10n.Sidebar.recentSessions,
+                    children: recent,
                     isHiddenFromTextSnapshot: true
                 )
             )
@@ -1331,7 +1874,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             nodes.append(
                 SessionSidebarFolderNode(
                     title: L10n.Sidebar.favorites,
-                    sessions: favorites.map { SessionSidebarSessionNode(session: $0) }
+                    children: favorites.map {
+                        SessionSidebarSessionNode(session: $0, isPersistedRepresentation: false)
+                    }
                 )
             )
         }
@@ -1350,7 +1895,13 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             }
             .sorted { lhs, rhs in lhs.date > rhs.date }
             .prefix(5)
-            .map { SessionSidebarSessionNode(session: $0.session, displayStyle: .recent(lastOpenedAt: $0.date)) }
+            .map {
+                SessionSidebarSessionNode(
+                    session: $0.session,
+                    displayStyle: .recent(lastOpenedAt: $0.date),
+                    isPersistedRepresentation: false
+                )
+            }
     }
 
     private static func date(fromSessionTimestamp timestamp: String) -> Date? {
@@ -1368,8 +1919,95 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 continue
             }
             outlineView.expandItem(folder)
-            expandFolderNodes(folder.folders)
+            expandFolderNodes(folder.children)
         }
+    }
+
+    private func restoreExpandedFolderState() {
+        restoreExpandedFolderState(in: nodes)
+    }
+
+    private func restoreExpandedFolderState(in items: [NSObject]) {
+        for item in items {
+            guard let folder = item as? SessionSidebarFolderNode else {
+                continue
+            }
+            if expandedFolderKeys.contains(folder.expansionKey) {
+                outlineView.expandItem(folder)
+                restoreExpandedFolderState(in: folder.children)
+            } else {
+                outlineView.collapseItem(folder, collapseChildren: true)
+            }
+        }
+    }
+
+    private func captureExpandedFolderState() {
+        guard hasInitializedExpansionState else {
+            return
+        }
+        expandedFolderKeys = Set(
+            allFolderNodes(in: allNodes)
+                .filter { outlineView.isItemExpanded($0) }
+                .map(\.expansionKey)
+        )
+    }
+
+    private func expandAllFolders() {
+        guard normalizedSearchQuery.isEmpty else {
+            return
+        }
+        expandedFolderKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
+        hasInitializedExpansionState = true
+        expandFolderNodes(nodes)
+    }
+
+    private func collapseAllFolders() {
+        guard normalizedSearchQuery.isEmpty else {
+            return
+        }
+        expandedFolderKeys = []
+        hasInitializedExpansionState = true
+        for folder in allFolderNodes(in: nodes).reversed() {
+            outlineView.collapseItem(folder, collapseChildren: true)
+        }
+    }
+
+    private func allFolderNodes(in items: [NSObject]) -> [SessionSidebarFolderNode] {
+        items.flatMap { item -> [SessionSidebarFolderNode] in
+            guard let folder = item as? SessionSidebarFolderNode else {
+                return []
+            }
+            return [folder] + allFolderNodes(in: folder.children)
+        }
+    }
+
+    private func expandFolderAndAncestors(id: String) {
+        var currentID: String? = id
+        while let folderID = currentID,
+              let folder = folderNode(id: folderID),
+              let record = folder.folder {
+            expandedFolderKeys.insert(folder.expansionKey)
+            currentID = record.parentId
+        }
+    }
+
+    private func selectPersistedItem(_ key: SessionSidebarPersistedItemKey) {
+        let item: NSObject?
+        switch key.kind {
+        case .folder:
+            item = folderNode(id: key.id)
+        case .session:
+            item = persistedSessionNode(id: key.id)
+        }
+        guard let item else {
+            return
+        }
+        let row = outlineView.row(forItem: item)
+        guard row >= 0 else {
+            return
+        }
+        outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        outlineView.scrollRowToVisible(row)
     }
 
     private func title(for item: Any) -> String {
@@ -1408,6 +2046,12 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         nodes
             .flatMap(allSessionNodes(in:))
             .first { $0.session.id == id }
+    }
+
+    private func persistedSessionNode(id: String) -> SessionSidebarSessionNode? {
+        nodes
+            .flatMap(allSessionNodes(in:))
+            .first { $0.session.id == id && $0.isPersistedRepresentation }
     }
 
     private func folderNode(id: String) -> SessionSidebarFolderNode? {
@@ -1629,36 +2273,43 @@ private final class SessionSidebarFolderCellView: NSTableCellView {
 private final class SessionSidebarFolderNode: NSObject {
     let folder: SessionFolder?
     let title: String
-    let folders: [SessionSidebarFolderNode]
-    let sessions: [SessionSidebarSessionNode]
+    let children: [NSObject]
     let isHiddenFromTextSnapshot: Bool
 
     var id: String? {
         folder?.id
     }
 
+    var expansionKey: String {
+        id.map { "folder:\($0)" } ?? "virtual:\(title)"
+    }
+
+    var folders: [SessionSidebarFolderNode] {
+        children.compactMap { $0 as? SessionSidebarFolderNode }
+    }
+
+    var sessions: [SessionSidebarSessionNode] {
+        children.compactMap { $0 as? SessionSidebarSessionNode }
+    }
+
     init(
         folder: SessionFolder,
-        folders: [SessionSidebarFolderNode],
-        sessions: [SessionSidebarSessionNode]
+        children: [NSObject]
     ) {
         self.folder = folder
         title = folder.name
-        self.folders = folders
-        self.sessions = sessions
+        self.children = children
         isHiddenFromTextSnapshot = false
     }
 
     init(
         title: String,
-        folders: [SessionSidebarFolderNode] = [],
-        sessions: [SessionSidebarSessionNode],
+        children: [NSObject],
         isHiddenFromTextSnapshot: Bool = false
     ) {
         folder = nil
         self.title = title
-        self.folders = folders
-        self.sessions = sessions
+        self.children = children
         self.isHiddenFromTextSnapshot = isHiddenFromTextSnapshot
     }
 
@@ -1666,26 +2317,36 @@ private final class SessionSidebarFolderNode: NSObject {
         guard isHiddenFromTextSnapshot == false else {
             return []
         }
-        return [title]
-            + folders.flatMap(\.textSnapshot)
-            + sessions.flatMap { [$0.title, $0.subtitle] }
+        return [title] + children.flatMap { child in
+            if let folder = child as? SessionSidebarFolderNode {
+                return folder.textSnapshot
+            }
+            if let session = child as? SessionSidebarSessionNode {
+                return [session.title, session.subtitle]
+            }
+            return []
+        }
     }
 
     var allSessionNodes: [SessionSidebarSessionNode] {
-        sessions + folders.flatMap(\.allSessionNodes)
+        children.flatMap { child in
+            if let folder = child as? SessionSidebarFolderNode {
+                return folder.allSessionNodes
+            }
+            if let session = child as? SessionSidebarSessionNode {
+                return [session]
+            }
+            return []
+        }
     }
 
-    func copy(
-        folders: [SessionSidebarFolderNode],
-        sessions: [SessionSidebarSessionNode]
-    ) -> SessionSidebarFolderNode {
+    func copy(children: [NSObject]) -> SessionSidebarFolderNode {
         if let folder {
-            return SessionSidebarFolderNode(folder: folder, folders: folders, sessions: sessions)
+            return SessionSidebarFolderNode(folder: folder, children: children)
         }
         return SessionSidebarFolderNode(
             title: title,
-            folders: folders,
-            sessions: sessions,
+            children: children,
             isHiddenFromTextSnapshot: isHiddenFromTextSnapshot
         )
     }
@@ -1705,11 +2366,17 @@ private final class SessionSidebarSessionNode: NSObject {
     }
 
     let session: SessionRecord
+    let isPersistedRepresentation: Bool
     private let displayStyle: DisplayStyle
 
-    init(session: SessionRecord, displayStyle: DisplayStyle = .normal) {
+    init(
+        session: SessionRecord,
+        displayStyle: DisplayStyle = .normal,
+        isPersistedRepresentation: Bool = true
+    ) {
         self.session = session
         self.displayStyle = displayStyle
+        self.isPersistedRepresentation = isPersistedRepresentation
     }
 
     var title: String {
@@ -1831,6 +2498,55 @@ private final class SessionSidebarClipboardSuggestionBannerView: NSView {
     @objc private func closeButtonPressed(_ sender: NSButton) {
         dismissHandler?()
     }
+}
+
+private final class SessionSidebarOutlineView: NSOutlineView {
+    var rowContextMenuProvider: ((Int) -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        guard row >= 0 else {
+            return nil
+        }
+        if selectedRowIndexes.contains(row) == false {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        return rowContextMenuProvider?(row)
+    }
+}
+
+private enum SessionSidebarPersistedItemKind: String, Codable {
+    case folder
+    case session
+}
+
+private struct SessionSidebarPersistedItemKey: Hashable {
+    let kind: SessionSidebarPersistedItemKind
+    let id: String
+}
+
+private struct SessionSidebarDragPayload: Codable {
+    let kind: SessionSidebarPersistedItemKind
+    let id: String
+
+    var key: SessionSidebarPersistedItemKey {
+        SessionSidebarPersistedItemKey(kind: kind, id: id)
+    }
+}
+
+private struct SessionSidebarDropProposal {
+    let targetFolderID: String?
+    let targetIndex: Int
+}
+
+private struct SessionSidebarOutlineDropTarget {
+    let item: Any?
+    let childIndex: Int
+}
+
+private struct SessionSidebarSourceLocation {
+    let parentFolderID: String?
 }
 
 private final class ContextMenuRepresentedAction: NSObject {

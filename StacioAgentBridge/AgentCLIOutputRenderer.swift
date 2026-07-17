@@ -21,12 +21,28 @@ public enum AgentCLIOutputRenderer {
         if let control = trimmedNonEmpty(event.metadata?["control"]) {
             return controlLine(for: event, control: control)
         }
+        if let terminalOutput = trimmedNonEmpty(event.metadata?["terminalOutputSummary"]) {
+            return terminalFeedbackLine(for: event, output: terminalOutput)
+        }
         let command = event.redactedCommand?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let command, command.isEmpty == false else {
             return "[\(event.state.rawValue)] \(event.message)"
         }
         return "[\(event.state.rawValue)] \(event.message) | \(command)"
+    }
+
+    private static func terminalFeedbackLine(for event: AgentTraceEvent, output: String) -> String {
+        var lines = [
+            "[terminal-status] \(event.state.rawValue) | request=\(event.requestID)"
+        ]
+        if let command = trimmedNonEmpty(event.redactedCommand) {
+            lines.append("[terminal-command] \(command)")
+        }
+        lines.append("[terminal-output]")
+        lines.append(output)
+        lines.append("[/terminal-output]")
+        return lines.joined(separator: "\n")
     }
 
     private static func controlLine(for event: AgentTraceEvent, control: String) -> String {

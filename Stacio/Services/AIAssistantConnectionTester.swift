@@ -57,9 +57,7 @@ public extension AIModelCatalogLoading {
             envelope: settings.aiProviderSettings,
             requestedSelection: nil
         ) {
-        case .stacioRules:
-            return []
-        case let .external(provider, _):
+        case let .unconfigured(provider), let .external(provider, _):
             return try listModels(
                 for: provider,
                 apiKey: try apiKeyStore.readAPIKey(for: provider.id)
@@ -86,8 +84,8 @@ public extension AIAssistantConnectionTesting {
             envelope: settings.aiProviderSettings,
             requestedSelection: nil
         ) {
-        case .stacioRules:
-            return AIAssistantConnectionTestResult(message: L10n.Settings.aiRulesConnectionSuccess)
+        case .unconfigured:
+            throw AIAssistantProviderError.missingModel
         case let .external(provider, modelID):
             return try testConnection(
                 provider: provider,

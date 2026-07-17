@@ -8,12 +8,26 @@ public protocol AgentTerminalTarget: AnyObject {
     var agentTitle: String { get }
     var agentLiveSessionContext: TunnelLiveSessionContext? { get }
     var agentAutomationPolicy: SessionAutomationPolicy { get }
+    var agentCommandCompletionGeneration: UInt64 { get }
+    var agentTerminalOutputTranscript: String { get }
+    var agentTerminalDisplaySnapshot: String { get }
+    var supportsAgentCompletionMarker: Bool { get }
+    func setAgentInteractionLocked(_ locked: Bool)
+    func refreshAgentTerminalOutput()
     func appendAgentTrace(_ event: AgentTraceEvent)
     func sendInput(_ bytes: [UInt8])
+    func sendAgentInput(_ bytes: [UInt8])
 }
 
 public extension AgentTerminalTarget {
     var agentAutomationPolicy: SessionAutomationPolicy { .default }
+    var agentCommandCompletionGeneration: UInt64 { 0 }
+    var agentTerminalOutputTranscript: String { "" }
+    var agentTerminalDisplaySnapshot: String { agentTerminalOutputTranscript }
+    var supportsAgentCompletionMarker: Bool { false }
+    func setAgentInteractionLocked(_ locked: Bool) {}
+    func refreshAgentTerminalOutput() {}
+    func sendAgentInput(_ bytes: [UInt8]) { sendInput(bytes) }
 }
 
 @MainActor
@@ -133,6 +147,11 @@ public protocol AgentTaskControlling {
     func pauseTask(requestID: String) -> AgentTraceEvent?
     func cancelTask(requestID: String) -> AgentTraceEvent?
     func takeOverTask(requestID: String) -> AgentTraceEvent?
+    func confirmTaskComplete(requestID: String) -> AgentTraceEvent?
+}
+
+public extension AgentTaskControlling {
+    func confirmTaskComplete(requestID: String) -> AgentTraceEvent? { nil }
 }
 
 public enum AgentExecutionMode: Equatable {
@@ -284,10 +303,23 @@ private final class VisibleTerminalObservationSession {
     private let outputHub: TerminalOutputBroadcastHub
     private let completion: AgentVisibleTerminalCompletion
     private let onOutputUpdate: (VisibleTerminalOutputUpdate) -> Void
+    private let completionMarker: [UInt8]?
+    private let commandCompletionGeneration: () -> UInt64
+    private let terminalOutputTranscript: () -> String
+    private let terminalDisplaySnapshot: () -> String
+    private let refreshTerminalOutput: () -> Void
+    private let initialCommandCompletionGeneration: UInt64
+    private let initialTerminalOutputTranscript: String
+    private let initialTerminalDisplaySnapshot: String
     private var outputBytes: [UInt8] = []
     private var sawUserInput = false
     private var commandOutputCaptureStarted = false
     private var lastOutputAt: Date?
+    private var auditCompletionSummary: String?
+    private var sawShellPrompt = false
+    private var lastTerminalOutputTranscript: String
+    private var lastTerminalDisplaySnapshot: String
+    private var lastTerminalRefreshAt = Date.distantPast
     private var subscription: TerminalOutputBroadcastHub.Subscription?
 
     init(
@@ -297,6 +329,11 @@ private final class VisibleTerminalObservationSession {
         redactedCommand: String,
         outputHub: TerminalOutputBroadcastHub,
         completion: AgentVisibleTerminalCompletion,
+        commandCompletionGeneration: @escaping () -> UInt64,
+        terminalOutputTranscript: @escaping () -> String,
+        terminalDisplaySnapshot: @escaping () -> String,
+        refreshTerminalOutput: @escaping () -> Void,
+        completionMarker: [UInt8]?,
         onOutputUpdate: @escaping (VisibleTerminalOutputUpdate) -> Void
     ) {
         self.requestID = requestID
@@ -305,6 +342,16 @@ private final class VisibleTerminalObservationSession {
         self.redactedCommand = redactedCommand
         self.outputHub = outputHub
         self.completion = completion
+        self.commandCompletionGeneration = commandCompletionGeneration
+        self.terminalOutputTranscript = terminalOutputTranscript
+        self.terminalDisplaySnapshot = terminalDisplaySnapshot
+        self.refreshTerminalOutput = refreshTerminalOutput
+        self.completionMarker = completionMarker
+        self.initialCommandCompletionGeneration = commandCompletionGeneration()
+        self.initialTerminalOutputTranscript = terminalOutputTranscript()
+        self.initialTerminalDisplaySnapshot = terminalDisplaySnapshot()
+        self.lastTerminalOutputTranscript = self.initialTerminalOutputTranscript
+        self.lastTerminalDisplaySnapshot = self.initialTerminalDisplaySnapshot
         self.onOutputUpdate = onOutputUpdate
     }
 
@@ -314,28 +361,59 @@ private final class VisibleTerminalObservationSession {
         }
     }
 
-    func markCommandWritten() {
+    func markCommandWriteStarted() {
         commandOutputCaptureStarted = true
     }
 
     func wait() -> VisibleTerminalObservationResult {
         defer { close() }
         if Self.requiresManualCompletion(command) {
-            waitUntilManualCommandHasInitialObservation()
+            if let completed = waitUntilManualCommandHasInitialObservation() {
+                return completed
+            }
             return VisibleTerminalObservationResult(
                 outcome: .manualRequired,
-                summary: "",
+                summary: Self.summary(from: outputBytes),
                 reason: "longRunningCommand"
             )
         }
         let deadline = Date().addingTimeInterval(completion.maximumDuration)
-        while Date() < deadline {
+        let outputGraceDeadline = deadline.addingTimeInterval(completion.idleInterval * 2)
+        while Date() < outputGraceDeadline {
+            if Date() >= deadline,
+               (lastOutputAt == nil || outputBytes.isEmpty) {
+                break
+            }
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            refreshTerminalOutputIfNeeded()
             if sawUserInput {
                 return VisibleTerminalObservationResult(
                     outcome: .ambiguousUserInput,
                     summary: "",
                     reason: "userInputDuringCommand"
+                )
+            }
+            captureDirectTerminalOutputIfNeeded()
+            captureVisibleTerminalDisplayIfNeeded()
+            if let auditCompletionSummary {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: auditCompletionSummary,
+                    reason: "auditEndMarker"
+                )
+            }
+            if let markerSummary = agentCompletionMarkerSummary() {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: markerSummary,
+                    reason: "agentCompletionMarker"
+                )
+            }
+            if sawShellPrompt {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: Self.summary(from: outputBytes),
+                    reason: "shellPromptObserved"
                 )
             }
             if let lastOutputAt,
@@ -353,9 +431,39 @@ private final class VisibleTerminalObservationSession {
         }
         return VisibleTerminalObservationResult(
             outcome: .manualRequired,
-            summary: "",
+            summary: Self.summary(from: outputBytes),
             reason: outputBytes.isEmpty ? "noOutputBeforeTimeout" : "timeoutBeforeSafeCompletion"
         )
+    }
+
+    func completedResultFromTranscriptIfPromptPresent() -> VisibleTerminalObservationResult? {
+        guard sawUserInput == false else { return nil }
+        captureDirectTerminalOutputIfNeeded()
+        captureVisibleTerminalDisplayIfNeeded()
+        guard Self.hasTrailingShellPrompt(in: outputBytes) else { return nil }
+        return VisibleTerminalObservationResult(
+            outcome: .completed,
+            summary: Self.summary(from: outputBytes),
+            reason: "shellPromptObserved"
+        )
+    }
+
+    var diagnosticDescription: String {
+        let markerSeen = agentCompletionMarkerSummary() != nil || auditCompletionSummary != nil
+        return [
+            "request=\(requestID)",
+            "runtime=\(runtimeID)",
+            "output_bytes=\(outputBytes.count)",
+            "transcript_initial=\(initialTerminalOutputTranscript.utf8.count)",
+            "transcript_current=\(terminalOutputTranscript().utf8.count)",
+            "display_initial=\(initialTerminalDisplaySnapshot.utf8.count)",
+            "display_current=\(terminalDisplaySnapshot().utf8.count)",
+            "generation_initial=\(initialCommandCompletionGeneration)",
+            "generation_current=\(commandCompletionGeneration())",
+            "marker_seen=\(markerSeen)",
+            "prompt_seen=\(sawShellPrompt)",
+            "user_input=\(sawUserInput)"
+        ].joined(separator: " ")
     }
 
     private func ingest(_ event: TerminalBroadcastEvent) {
@@ -365,6 +473,11 @@ private final class VisibleTerminalObservationSession {
             guard sawUserInput == false else { return }
             outputBytes.append(contentsOf: event.bytes)
             lastOutputAt = event.createdAt
+            sawShellPrompt = TerminalOSC7SequenceParser.currentDirectories(from: outputBytes).isEmpty == false
+                || Self.hasTrailingShellPrompt(in: outputBytes)
+            if let markerRange = Self.auditEndMarkerRange(in: outputBytes) {
+                auditCompletionSummary = Self.summary(from: Array(outputBytes[..<markerRange.lowerBound]))
+            }
             let summary = Self.summary(from: outputBytes)
             if summary.isEmpty == false {
                 onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
@@ -375,17 +488,56 @@ private final class VisibleTerminalObservationSession {
             } else {
                 sawUserInput = true
             }
+        case .commandFinished:
+            guard commandOutputCaptureStarted, sawUserInput == false else { return }
+            sawShellPrompt = true
         }
     }
 
-    private func waitUntilManualCommandHasInitialObservation() {
-        let deadline = Date().addingTimeInterval(min(completion.maximumDuration, max(completion.idleInterval, 0.25)))
+    private func waitUntilManualCommandHasInitialObservation() -> VisibleTerminalObservationResult? {
+        let deadline = Date().addingTimeInterval(
+            min(completion.maximumDuration, max(completion.idleInterval * 2, 0.75))
+        )
         while Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
-            if sawUserInput || outputBytes.isEmpty == false {
-                return
+            refreshTerminalOutputIfNeeded()
+            if sawUserInput {
+                return VisibleTerminalObservationResult(
+                    outcome: .ambiguousUserInput,
+                    summary: "",
+                    reason: "userInputDuringCommand"
+                )
+            }
+            captureDirectTerminalOutputIfNeeded()
+            captureVisibleTerminalDisplayIfNeeded()
+            if let auditCompletionSummary {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: auditCompletionSummary,
+                    reason: "auditEndMarker"
+                )
+            }
+            if let markerSummary = agentCompletionMarkerSummary() {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: markerSummary,
+                    reason: "agentCompletionMarker"
+                )
+            }
+            if sawShellPrompt {
+                return VisibleTerminalObservationResult(
+                    outcome: .completed,
+                    summary: Self.summary(from: outputBytes),
+                    reason: "shellPromptObserved"
+                )
+            }
+            if let lastOutputAt,
+               Date().timeIntervalSince(lastOutputAt) >= completion.idleInterval,
+               outputBytes.isEmpty == false {
+                return nil
             }
         }
+        return nil
     }
 
     private func close() {
@@ -395,19 +547,150 @@ private final class VisibleTerminalObservationSession {
         subscription = nil
     }
 
+    private func refreshTerminalOutputIfNeeded() {
+        let now = Date()
+        guard now.timeIntervalSince(lastTerminalRefreshAt) >= 0.05 else { return }
+        lastTerminalRefreshAt = now
+        refreshTerminalOutput()
+    }
+
+    private func agentCompletionMarkerSummary() -> String? {
+        guard let completionMarker,
+              let markerRange = Self.range(of: completionMarker, in: outputBytes)
+        else { return nil }
+        return Self.summary(from: Array(outputBytes[..<markerRange.lowerBound]))
+    }
+
+    private func captureDirectTerminalOutputIfNeeded() {
+        guard sawUserInput == false else { return }
+        let currentTranscript = terminalOutputTranscript()
+        guard currentTranscript != lastTerminalOutputTranscript else { return }
+        let commandTranscript: Substring
+        if currentTranscript.hasPrefix(initialTerminalOutputTranscript) {
+            commandTranscript = currentTranscript.dropFirst(initialTerminalOutputTranscript.count)
+        } else {
+            commandTranscript = currentTranscript[...]
+        }
+        lastTerminalOutputTranscript = currentTranscript
+        guard commandTranscript.isEmpty == false else { return }
+        outputBytes = Array(commandTranscript.utf8)
+        lastOutputAt = Date()
+        sawShellPrompt = commandCompletionGeneration() != initialCommandCompletionGeneration
+            || TerminalOSC7SequenceParser.currentDirectories(from: outputBytes).isEmpty == false
+            || Self.hasTrailingShellPrompt(in: outputBytes)
+        if let markerRange = Self.auditEndMarkerRange(in: outputBytes) {
+            auditCompletionSummary = Self.summary(from: Array(outputBytes[..<markerRange.lowerBound]))
+        }
+        let summary = Self.summary(from: outputBytes)
+        if summary.isEmpty == false {
+            onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
+        }
+    }
+
+    private func captureVisibleTerminalDisplayIfNeeded() {
+        guard sawUserInput == false else { return }
+        let currentSnapshot = terminalDisplaySnapshot()
+        guard currentSnapshot != lastTerminalDisplaySnapshot else { return }
+        lastTerminalDisplaySnapshot = currentSnapshot
+
+        let commandSnapshot: Substring
+        if currentSnapshot.hasPrefix(initialTerminalDisplaySnapshot) {
+            commandSnapshot = currentSnapshot.dropFirst(initialTerminalDisplaySnapshot.count)
+        } else if let commandRange = currentSnapshot.range(of: command, options: .backwards) {
+            commandSnapshot = currentSnapshot[commandRange.upperBound...]
+        } else {
+            commandSnapshot = currentSnapshot[...]
+        }
+        guard commandSnapshot.isEmpty == false else { return }
+
+        let visibleBytes = Array(commandSnapshot.utf8)
+        let displayShowsPrompt = TerminalOSC7SequenceParser.currentDirectories(from: visibleBytes).isEmpty == false
+            || Self.hasTrailingShellPrompt(in: visibleBytes)
+        guard displayShowsPrompt else { return }
+
+        if outputBytes.isEmpty {
+            outputBytes = visibleBytes
+        }
+        lastOutputAt = Date()
+        sawShellPrompt = true
+        let summary = Self.summary(from: outputBytes)
+        if summary.isEmpty == false {
+            onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
+        }
+    }
+
     private static func summary(from bytes: [UInt8]) -> String {
         let text = String(decoding: bytes, as: UTF8.self)
-        return AgentProtocolRedaction.redact(text)
+        let withoutAgentMarkers = text.replacingOccurrences(
+            of: #"\x1B\]777;stacio-agent-done=[^\x07]*(?:\x07|\x1B\\)"#,
+            with: "",
+            options: .regularExpression
+        )
+        var lines = AgentProtocolRedaction.redactPreservingLineBreaks(withoutAgentMarkers)
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.contains("\u{001B}]7;") == false }
+            .filter { $0 != "STACIO_AUDIT_BEGIN" && $0 != "STACIO_AUDIT_END" }
             .filter { $0.isEmpty == false }
-            .joined(separator: "\n")
+        if let trailingLine = lines.last,
+           "STACIO_AUDIT_END".hasPrefix(trailingLine) {
+            lines.removeLast()
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func auditEndMarkerRange(in bytes: [UInt8]) -> Range<Int>? {
+        let marker = Array("STACIO_AUDIT_END".utf8)
+        guard bytes.count >= marker.count else { return nil }
+
+        for start in 0...(bytes.count - marker.count) where bytes[start..<(start + marker.count)].elementsEqual(marker) {
+            let linePrefix = bytes[..<start].reversed().prefix { $0 != 0x0A && $0 != 0x0D }
+            guard linePrefix.allSatisfy({ $0 == 0x20 || $0 == 0x09 }) else { continue }
+
+            let end = start + marker.count
+            let lineSuffix = bytes[end...].prefix { $0 != 0x0A && $0 != 0x0D }
+            guard lineSuffix.allSatisfy({ $0 == 0x20 || $0 == 0x09 }) else { continue }
+            return start..<end
+        }
+        return nil
+    }
+
+    private static func range(of marker: [UInt8], in bytes: [UInt8]) -> Range<Int>? {
+        guard marker.isEmpty == false, bytes.count >= marker.count else { return nil }
+        for start in 0...(bytes.count - marker.count)
+            where bytes[start..<(start + marker.count)].elementsEqual(marker) {
+            return start..<(start + marker.count)
+        }
+        return nil
+    }
+
+    private static func hasTrailingShellPrompt(in bytes: [UInt8]) -> Bool {
+        let text = String(decoding: bytes.suffix(4_096), as: UTF8.self)
+        guard let rawLine = text
+            .split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .last(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false })
+        else { return false }
+        let line = String(rawLine)
+            .replacingOccurrences(
+                of: #"\x1B\[[0-?]*[ -/]*[@-~]"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let marker = line.last, marker == "#" || marker == "$" || marker == "%" else {
+            return false
+        }
+        let promptBody = line.dropLast()
+        return promptBody.contains("@")
+            && (promptBody.contains(":") || promptBody.contains(" "))
     }
 
     private static func isAICommandEcho(_ bytes: [UInt8], command: String) -> Bool {
         let text = String(decoding: bytes, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return text == command
+        guard text.isEmpty == false else { return false }
+        if text == command || text.contains(command) { return true }
+        return text.contains("stacio-agent-done=") && text.contains(command)
     }
 
     private static func requiresManualCompletion(_ command: String) -> Bool {
@@ -415,32 +698,80 @@ private final class VisibleTerminalObservationSession {
         guard lower.isEmpty == false else {
             return false
         }
-        let longRunningPrefixes = [
-            "tail -f",
-            "tail -F",
-            "top",
-            "htop",
-            "less ",
-            "more ",
-            "vim",
-            "vi ",
-            "nano",
-            "ssh ",
-            "mysql",
-            "psql",
-            "redis-cli",
-            "python",
-            "node",
-            "irb",
-            "rails console",
-            "ping ",
-            "watch "
-        ]
-        return longRunningPrefixes.contains { prefix in
-            lower == prefix.trimmingCharacters(in: .whitespaces)
-                || lower.hasPrefix(prefix)
-                || lower.contains(" \(prefix)")
+
+        return lower
+            .components(separatedBy: CharacterSet(charactersIn: ";\n|&"))
+            .compactMap(commandInvocation(from:))
+            .contains { invocation in
+                let arguments = invocation.arguments
+                switch invocation.executable {
+                case "tail":
+                    return hasShortOption("f", in: arguments) || arguments.contains("--follow")
+                case "top":
+                    return hasShortOption("b", in: arguments) == false
+                        && arguments.contains("--batch") == false
+                case "htop", "less", "more", "vim", "vi", "nano", "ssh", "watch", "irb":
+                    return true
+                case "mysql":
+                    return hasShortOption("e", in: arguments) == false
+                        && arguments.contains("--execute") == false
+                case "psql":
+                    return hasShortOption("c", in: arguments) == false
+                        && arguments.contains("--command") == false
+                case "redis-cli":
+                    return arguments.isEmpty
+                case "python", "python3", "node":
+                    return arguments.isEmpty || hasShortOption("i", in: arguments)
+                case "rails":
+                    return arguments.first == "console"
+                case "ping", "ping6":
+                    return hasShortOption("c", in: arguments) == false
+                        && arguments.contains("--count") == false
+                        && hasShortOption("w", in: arguments) == false
+                        && arguments.contains("--deadline") == false
+                default:
+                    return false
+                }
+            }
+    }
+
+    private static func hasShortOption(_ option: Character, in arguments: [String]) -> Bool {
+        arguments.contains { argument in
+            guard argument.hasPrefix("-"), argument.hasPrefix("--") == false else { return false }
+            return argument.dropFirst().contains(option)
         }
+    }
+
+    private static func commandInvocation(from rawSegment: String) -> (
+        executable: String,
+        arguments: [String]
+    )? {
+        var words = rawSegment
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+        guard words.isEmpty == false else { return nil }
+
+        while let first = words.first,
+              first.contains("=") && first.hasPrefix("-") == false {
+            words.removeFirst()
+        }
+        if words.first == "env" {
+            words.removeFirst()
+            while let first = words.first,
+                  first.contains("=") && first.hasPrefix("-") == false {
+                words.removeFirst()
+            }
+        }
+        if words.first == "sudo" {
+            words.removeFirst()
+            while let first = words.first, first.hasPrefix("-") {
+                words.removeFirst()
+            }
+        }
+        guard let executableWord = words.first else { return nil }
+        words.removeFirst()
+        let executable = URL(fileURLWithPath: executableWord).lastPathComponent
+        return (executable, words)
     }
 }
 
@@ -811,7 +1142,7 @@ public final class RemoteSSHAgentBackgroundCommandRunner: AgentBackgroundCommand
         guard normalized.isEmpty == false else {
             return ""
         }
-        let redacted = AgentProtocolRedaction.redact(normalized)
+        let redacted = AgentProtocolRedaction.redactPreservingLineBreaks(normalized)
         if redacted.count <= limit {
             return redacted
         }
@@ -866,6 +1197,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
         let sourceRuntimeID: String
         let redactedCommand: String
         let executionMode: String
+        let actor: AgentActor
     }
 
     private struct AuditContext {
@@ -874,6 +1206,11 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
         let risk: AgentActionRisk
         let redactedInput: String
         let decision: AgentAuthorizationDecision
+    }
+
+    private struct BridgeFollowStream {
+        let emit: @MainActor (AgentTraceEvent) -> Void
+        let completion: @MainActor () -> Void
     }
 
     private let terminalResolver: AgentTerminalResolving
@@ -888,6 +1225,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
     private var backgroundTargetsByRequestID: [String: AgentTerminalTarget] = [:]
     private var trackedTasksByRequestID: [String: TrackedTask] = [:]
     private var auditContextsByRequestID: [String: AuditContext] = [:]
+    private var bridgeFollowStreamsByRequestID: [String: BridgeFollowStream] = [:]
 
     public init(
         terminalResolver: AgentTerminalResolving,
@@ -946,6 +1284,8 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
             if let extra {
                 metadata.merge(extra) { _, new in new }
             }
+            metadata["actorKind"] = request.actor.kind.rawValue
+            metadata["actorName"] = request.actor.name
             return metadata
         }
 
@@ -1029,8 +1369,10 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 target: target,
                 sourceRuntimeID: target.runtimeID,
                 redactedCommand: redactedCommand,
-                executionMode: "visibleTerminal"
+                executionMode: "visibleTerminal",
+                actor: request.actor
             )
+            target.setAgentInteractionLocked(true)
             emit(.typing, "正在写入终端", decision: decision)
             let visibleObservation = VisibleTerminalObservationSession(
                 requestID: request.id,
@@ -1039,6 +1381,13 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 redactedCommand: redactedCommand,
                 outputHub: visibleTerminalOutputHub,
                 completion: visibleTerminalCompletion,
+                commandCompletionGeneration: { target.agentCommandCompletionGeneration },
+                terminalOutputTranscript: { target.agentTerminalOutputTranscript },
+                terminalDisplaySnapshot: { target.agentTerminalDisplaySnapshot },
+                refreshTerminalOutput: { target.refreshAgentTerminalOutput() },
+                completionMarker: target.supportsAgentCompletionMarker
+                    ? Self.agentCompletionMarker(requestID: request.id)
+                    : nil,
                 onOutputUpdate: { update in
                     emit(
                         .waitingForOutput,
@@ -1052,32 +1401,57 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 }
             )
             visibleObservation.begin()
-            target.sendInput(Array((commandRequest.command + "\n").utf8))
-            visibleObservation.markCommandWritten()
+            visibleObservation.markCommandWriteStarted()
+            let terminalCommand = target.supportsAgentCompletionMarker
+                ? Self.commandWithCompletionMarker(commandRequest.command, requestID: request.id)
+                : commandRequest.command
+            target.sendAgentInput(Array((terminalCommand + "\n").utf8))
             emit(.running, "命令已在终端执行，输出将实时显示", decision: decision)
             recordRunningAuditIfNeeded()
-            let observation = visibleObservation.wait()
+            let initialObservation = visibleObservation.wait()
+            let observation = initialObservation.outcome == .manualRequired
+                ? (visibleObservation.completedResultFromTranscriptIfPromptPresent() ?? initialObservation)
+                : initialObservation
+            StacioLogStore.shared.append(
+                level: observation.outcome == .completed ? .info : .warning,
+                category: "Agent",
+                message: "agent.visible.observation outcome=\(observation.outcome) reason=\(observation.reason) \(visibleObservation.diagnosticDescription)"
+            )
             switch observation.outcome {
             case .completed:
+                let completionConfidence: String
+                switch observation.reason {
+                case "auditEndMarker", "agentCompletionMarker":
+                    completionConfidence = "explicitMarker"
+                case "shellPromptObserved":
+                    completionConfidence = "observedPrompt"
+                default:
+                    completionConfidence = "observedIdle"
+                }
                 emit(
                     .completed,
                     "本次命令已完成：\(observation.summary)",
                     metadata: [
                         "terminalOutputSummary": observation.summary,
-                        "completionConfidence": "observedIdle",
-                        "completionReason": "outputIdle"
+                        "completionConfidence": completionConfidence,
+                        "completionReason": observation.reason
                     ],
                     decision: decision
                 )
                 trackedTasksByRequestID.removeValue(forKey: request.id)
+                target.setAgentInteractionLocked(false)
             case .manualRequired:
+                var metadata = [
+                    "completionConfidence": "manualRequired",
+                    "completionReason": observation.reason
+                ]
+                if observation.summary.isEmpty == false {
+                    metadata["terminalOutputSummary"] = observation.summary
+                }
                 emit(
                     .waitingForOutput,
                     "这条命令可能仍在运行，Stacio 不会根据静默输出自动判定完成；请手动停止、确认或接管。",
-                    metadata: [
-                        "completionConfidence": "manualRequired",
-                        "completionReason": observation.reason
-                    ],
+                    metadata: metadata,
                     decision: decision
                 )
             case .ambiguousUserInput:
@@ -1121,7 +1495,8 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 target: target,
                 sourceRuntimeID: target.runtimeID,
                 redactedCommand: redactedCommand,
-                executionMode: "backgroundTask"
+                executionMode: "backgroundTask",
+                actor: request.actor
             )
             recordRunningAuditIfNeeded()
             try backgroundCommandRunner.runBackgroundCommand(
@@ -1145,6 +1520,10 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                     target.appendAgentTrace(contextualEvent)
                     externalEmit(contextualEvent)
                     self.recordAuditTerminalStateIfNeeded(contextualEvent)
+                    if Self.shouldRemoveTrackedTask(for: contextualEvent.state) {
+                        self.trackedTasksByRequestID.removeValue(forKey: contextualEvent.requestID)
+                        self.backgroundTargetsByRequestID.removeValue(forKey: contextualEvent.requestID)
+                    }
                 }
             )
         }
@@ -1154,10 +1533,25 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
         return events
     }
 
+    private static func agentCompletionMarker(requestID: String) -> [UInt8] {
+        Array("\u{001B}]777;stacio-agent-done=\(sanitizedMarkerID(requestID))\u{0007}".utf8)
+    }
+
+    private static func commandWithCompletionMarker(_ command: String, requestID: String) -> String {
+        let markerID = sanitizedMarkerID(requestID)
+        return "{ \(command)\n}; printf '\\033]777;stacio-agent-done=\(markerID)\\007'"
+    }
+
+    private static func sanitizedMarkerID(_ requestID: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        return String(requestID.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "_" })
+    }
+
     public func pauseTask(requestID: String) -> AgentTraceEvent? {
         guard let task = trackedTasksByRequestID.removeValue(forKey: requestID) else {
             return nil
         }
+        task.target.setAgentInteractionLocked(false)
         backgroundTargetsByRequestID.removeValue(forKey: requestID)
         let event = AgentTraceEvent(
             requestID: requestID,
@@ -1168,11 +1562,14 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 "executionMode": task.executionMode,
                 "sourceRuntimeID": task.sourceRuntimeID,
                 "targetTitle": task.target.agentTitle,
+                "actorKind": task.actor.kind.rawValue,
+                "actorName": task.actor.name,
                 "control": "pause"
             ]
         )
         task.target.appendAgentTrace(event)
         recordAuditTerminalStateIfNeeded(event, removeContext: true)
+        finishBridgeFollowStream(requestID: requestID, event: event)
         return event
     }
 
@@ -1181,6 +1578,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
            task.executionMode == "visibleTerminal" {
             trackedTasksByRequestID.removeValue(forKey: requestID)
             backgroundTargetsByRequestID.removeValue(forKey: requestID)
+            task.target.setAgentInteractionLocked(false)
             guard let currentTarget = currentTerminalTarget(for: task) else {
                 return nil
             }
@@ -1194,28 +1592,48 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                     "executionMode": task.executionMode,
                     "sourceRuntimeID": task.sourceRuntimeID,
                     "targetTitle": currentTarget.agentTitle,
+                    "actorKind": task.actor.kind.rawValue,
+                    "actorName": task.actor.name,
                     "control": "cancel"
                 ]
             )
             currentTarget.appendAgentTrace(event)
             recordAuditTerminalStateIfNeeded(event, removeContext: true)
+            finishBridgeFollowStream(requestID: requestID, event: event)
             return event
         }
+        let trackedTask = trackedTasksByRequestID[requestID]
         guard let event = backgroundCommandRunner.cancel(requestID: requestID) else {
             return nil
         }
         trackedTasksByRequestID.removeValue(forKey: requestID)
-        if let target = backgroundTargetsByRequestID.removeValue(forKey: requestID) {
-            target.appendAgentTrace(event)
+        var metadata = event.metadata ?? [:]
+        if let trackedTask {
+            metadata["executionMode"] = trackedTask.executionMode
+            metadata["sourceRuntimeID"] = trackedTask.sourceRuntimeID
+            metadata["targetTitle"] = trackedTask.target.agentTitle
+            metadata["actorKind"] = trackedTask.actor.kind.rawValue
+            metadata["actorName"] = trackedTask.actor.name
         }
-        recordAuditTerminalStateIfNeeded(event, removeContext: true)
-        return event
+        let contextualEvent = AgentTraceEvent(
+            requestID: event.requestID,
+            state: event.state,
+            message: event.message,
+            redactedCommand: event.redactedCommand ?? trackedTask?.redactedCommand,
+            metadata: metadata
+        )
+        let target = backgroundTargetsByRequestID.removeValue(forKey: requestID) ?? trackedTask?.target
+        target?.appendAgentTrace(contextualEvent)
+        recordAuditTerminalStateIfNeeded(contextualEvent, removeContext: true)
+        finishBridgeFollowStream(requestID: requestID, event: contextualEvent)
+        return contextualEvent
     }
 
     public func takeOverTask(requestID: String) -> AgentTraceEvent? {
         guard let task = trackedTasksByRequestID.removeValue(forKey: requestID) else {
             return nil
         }
+        task.target.setAgentInteractionLocked(false)
         backgroundTargetsByRequestID.removeValue(forKey: requestID)
         let cancelEvent = task.executionMode == "backgroundTask"
             ? backgroundCommandRunner.cancel(requestID: requestID)
@@ -1224,6 +1642,8 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
             "executionMode": task.executionMode,
             "sourceRuntimeID": task.sourceRuntimeID,
             "targetTitle": task.target.agentTitle,
+            "actorKind": task.actor.kind.rawValue,
+            "actorName": task.actor.name,
             "control": "takeover"
         ]
         if let taskRuntimeID = cancelEvent?.metadata?["taskRuntimeID"] {
@@ -1241,7 +1661,58 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
         )
         task.target.appendAgentTrace(event)
         recordAuditTerminalStateIfNeeded(event, removeContext: true)
+        finishBridgeFollowStream(requestID: requestID, event: event)
         return event
+    }
+
+    public func confirmTaskComplete(requestID: String) -> AgentTraceEvent? {
+        guard let task = trackedTasksByRequestID.removeValue(forKey: requestID) else {
+            return nil
+        }
+        task.target.setAgentInteractionLocked(false)
+        backgroundTargetsByRequestID.removeValue(forKey: requestID)
+        let event = AgentTraceEvent(
+            requestID: requestID,
+            state: .completed,
+            message: "已确认本步结束。",
+            redactedCommand: task.redactedCommand,
+            metadata: [
+                "executionMode": task.executionMode,
+                "sourceRuntimeID": task.sourceRuntimeID,
+                "targetTitle": task.target.agentTitle,
+                "actorKind": task.actor.kind.rawValue,
+                "actorName": task.actor.name,
+                "completionConfidence": "userConfirmed",
+                "completionReason": "userConfirmed"
+            ]
+        )
+        task.target.appendAgentTrace(event)
+        recordAuditTerminalStateIfNeeded(event, removeContext: true)
+        finishBridgeFollowStream(requestID: requestID, event: event)
+        return event
+    }
+
+    private func finishBridgeFollowStream(requestID: String, event: AgentTraceEvent) {
+        guard let stream = bridgeFollowStreamsByRequestID.removeValue(forKey: requestID) else {
+            return
+        }
+        stream.emit(event)
+        stream.completion()
+    }
+
+    func registerBridgeFollowStream(
+        requestID: String,
+        emit: @escaping @MainActor (AgentTraceEvent) -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        bridgeFollowStreamsByRequestID[requestID] = BridgeFollowStream(
+            emit: emit,
+            completion: completion
+        )
+    }
+
+    func discardBridgeFollowStream(requestID: String) {
+        bridgeFollowStreamsByRequestID.removeValue(forKey: requestID)
     }
 
     private func currentTerminalTarget(for task: TrackedTask) -> AgentTerminalTarget? {
@@ -1290,6 +1761,15 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
         case .completed, .failed, .cancelled, .takenOver:
             return true
         case .paused, .queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput:
+            return false
+        }
+    }
+
+    private static func shouldRemoveTrackedTask(for state: AgentTraceState) -> Bool {
+        switch state {
+        case .completed, .failed, .cancelled, .paused, .takenOver:
+            return true
+        case .queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput:
             return false
         }
     }
@@ -1386,6 +1866,11 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
 extension AgentExecutionCoordinator: AgentCommandExecuting, AgentTaskControlling {}
 
 extension TerminalPaneViewController: AgentTerminalTarget {
+    public var agentCommandCompletionGeneration: UInt64 { commandCompletionGeneration }
+    public var agentTerminalOutputTranscript: String { terminalOutputTranscript }
+    public var agentTerminalDisplaySnapshot: String { terminalDisplaySnapshotForTesting }
+    public var supportsAgentCompletionMarker: Bool { true }
+
     public var agentTitle: String {
         title ?? L10n.Workspace.local
     }
@@ -1410,6 +1895,11 @@ extension TerminalPaneViewController: AgentTerminalTarget {
 }
 
 extension RemoteTerminalPaneViewController: AgentTerminalTarget {
+    public var agentCommandCompletionGeneration: UInt64 { commandCompletionGeneration }
+    public var agentTerminalOutputTranscript: String { terminalOutputTranscript }
+    public var agentTerminalDisplaySnapshot: String { terminalDisplaySnapshotForTesting }
+    public var supportsAgentCompletionMarker: Bool { true }
+
     public var agentTitle: String {
         terminalTitle
     }

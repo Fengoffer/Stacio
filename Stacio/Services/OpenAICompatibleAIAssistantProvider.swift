@@ -1028,8 +1028,8 @@ public enum AIAssistantProviderFactory {
             envelope: snapshot.aiProviderSettings,
             requestedSelection: requestedSelection
         ) {
-        case .stacioRules:
-            return RuleBasedAIAssistantProvider()
+        case .unconfigured:
+            return FailingAIAssistantProvider(error: AIAssistantProviderError.missingModel)
         case let .external(provider, modelID):
             let model = provider.models.first(where: { $0.id == modelID })
             return makeExternalProvider(

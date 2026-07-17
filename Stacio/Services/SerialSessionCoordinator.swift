@@ -129,25 +129,43 @@ public final class SerialSessionCoordinator: SerialSessionStarting {
         config: SerialConnectionConfig,
         pane: RemoteTerminalPaneViewController?
     ) {
+        startRuntimeInBackground(config: config) { [weak pane] result in
+            switch result {
+            case let .success(status):
+                pane?.attachConnectedRuntime(status: status)
+            case let .failure(error):
+                pane?.displayConnectionFailure(Self.diagnosticMessage(for: error))
+            }
+        }
+    }
+
+    fileprivate func startRuntimeInBackground(
+        config: SerialConnectionConfig,
+        completion: @escaping @MainActor (Result<LiveShellStatus, Error>) -> Void
+    ) {
         let runtimeStarter = SerialUncheckedSendable(value: runtimeStarter)
         let defaultCols = defaultCols
         let defaultRows = defaultRows
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak pane] in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: Result<LiveShellStatus, Error>
             do {
                 let status = try runtimeStarter.value.startLiveSerialShellRuntime(
                     config: config,
                     cols: defaultCols,
                     rows: defaultRows
                 )
-                DispatchQueue.main.async {
-                    pane?.attachConnectedRuntime(status: status)
+                guard status.status == "running" else {
+                    throw SerialSessionError.startFailed(
+                        message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic)
+                    )
                 }
+                result = .success(status)
             } catch {
-                let diagnostic = Self.diagnosticMessage(for: error)
-                DispatchQueue.main.async {
-                    pane?.displayConnectionFailure(diagnostic)
-                }
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                completion(result)
             }
         }
     }
@@ -178,7 +196,7 @@ public final class SerialSessionCoordinator: SerialSessionStarting {
 }
 
 @MainActor
-private final class SerialSessionReconnecter: RemoteTerminalReconnecting {
+private final class SerialSessionReconnecter: RemoteTerminalBackgroundReconnecting {
     private weak var coordinator: SerialSessionCoordinator?
     private let config: SerialConnectionConfig
 
@@ -192,5 +210,17 @@ private final class SerialSessionReconnecter: RemoteTerminalReconnecting {
             throw RemoteTerminalLifecycleError.reconnectUnavailable
         }
         return try coordinator.startRuntime(config: config)
+    }
+
+    func reconnectRemoteTerminalInBackground(
+        title: String,
+        automatically: Bool,
+        completion: @escaping @MainActor (Result<LiveShellStatus, Error>) -> Void
+    ) {
+        guard let coordinator else {
+            completion(.failure(RemoteTerminalLifecycleError.reconnectUnavailable))
+            return
+        }
+        coordinator.startRuntimeInBackground(config: config, completion: completion)
     }
 }

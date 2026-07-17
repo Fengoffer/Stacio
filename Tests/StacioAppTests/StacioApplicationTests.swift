@@ -69,7 +69,7 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.13.3-Beta"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.13.3"))
     }
 
     func testApplicationLaunchRevalidatesLicenseAndStartsNetworkMonitoring() async {
@@ -446,7 +446,7 @@ final class StacioApplicationTests: XCTestCase {
         )
     }
 
-    func testAboutPanelUsesCurrentBetaVersionAndRepositoryActions() {
+    func testAboutPanelUsesCurrentStableVersionAndProductLinks() {
         let presenter = RecordingAboutPanelPresenter()
         let delegate = AppDelegate(factory: { FakeWorkbenchWindowController() })
 
@@ -454,9 +454,13 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.13.3-Beta")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.13.3")
+        XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
+        XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")
         XCTAssertEqual(content?.githubAccessibilityLabel, "GitHub")
+        XCTAssertEqual(content?.giteeRepositoryURL.absoluteString, "https://gitee.com/fengoffer/Stacio")
+        XCTAssertEqual(content?.giteeAccessibilityLabel, "Gitee")
         XCTAssertEqual(content?.weChatAccessibilityLabel, "微信公众号")
         XCTAssertNotNil(content?.weChatQRCodeImage)
     }
@@ -488,21 +492,39 @@ final class StacioApplicationTests: XCTestCase {
         let image = NSImage(size: NSSize(width: 32, height: 32))
         let content = StacioAboutContent(
             applicationName: "Stacio",
-            displayVersion: "Stacio-0.13.2-Beta",
+            displayVersion: "Stacio-0.13.3",
+            websiteURL: URL(string: "https://www.stacio.cn/")!,
             repositoryURL: URL(string: "https://github.com/Fengoffer/Stacio")!,
+            giteeRepositoryURL: URL(string: "https://gitee.com/fengoffer/Stacio")!,
             weChatQRCodeImage: image
         )
         let controller = StacioAboutViewController(content: content, urlOpener: opener)
 
         controller.loadView()
+        controller.openWebsiteForTesting()
         controller.openGitHubForTesting()
+        controller.openGiteeForTesting()
 
+        XCTAssertEqual(controller.websiteButtonForTesting?.title, "官网")
+        XCTAssertEqual(controller.websiteButtonForTesting?.toolTip, "Stacio 官网")
+        XCTAssertNotNil(controller.websiteButtonForTesting?.image)
+        XCTAssertEqual(controller.websiteButtonForTesting?.image?.size, NSSize(width: 18, height: 18))
+        XCTAssertEqual(controller.websiteButtonForTesting?.image?.isTemplate, true)
         XCTAssertEqual(controller.githubButtonForTesting?.toolTip, "GitHub")
         XCTAssertNotNil(controller.githubButtonForTesting?.image)
         XCTAssertEqual(controller.githubButtonForTesting?.image?.size, NSSize(width: 18, height: 18))
         XCTAssertEqual(controller.githubButtonForTesting?.image?.isTemplate, true)
         XCTAssertFalse(controller.githubButtonForTesting?.image?.representations.isEmpty ?? true)
-        XCTAssertEqual(opener.openedURLs.map(\.absoluteString), ["https://github.com/Fengoffer/Stacio"])
+        XCTAssertEqual(opener.openedURLs.map(\.absoluteString), [
+            "https://www.stacio.cn/",
+            "https://github.com/Fengoffer/Stacio",
+            "https://gitee.com/fengoffer/Stacio"
+        ])
+        XCTAssertEqual(controller.giteeButtonForTesting?.title, "Gitee")
+        XCTAssertEqual(controller.giteeButtonForTesting?.toolTip, "Gitee")
+        XCTAssertNotNil(controller.giteeButtonForTesting?.image)
+        XCTAssertEqual(controller.giteeButtonForTesting?.image?.size, NSSize(width: 18, height: 18))
+        XCTAssertEqual(controller.giteeButtonForTesting?.image?.isTemplate, true)
         XCTAssertFalse(controller.view.buttonTitlesForTesting.contains("反馈"))
         XCTAssertEqual(controller.weChatButtonForTesting?.title, "微信公众号")
         XCTAssertEqual(controller.weChatButtonForTesting?.toolTip, "微信公众号")

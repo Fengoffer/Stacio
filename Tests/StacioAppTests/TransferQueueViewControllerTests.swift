@@ -64,6 +64,7 @@ final class TransferQueueViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.tableView.viewText(atColumn: 3, row: 0), "续传中")
         controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         XCTAssertTrue(controller.selectedTransferDetailTextForTesting.contains("状态\n续传中"))
+        XCTAssertEqual(controller.transferActionLabels, ["暂停", "停止"])
     }
 
     func testEmptyTransferQueueUsesAccessibleNativeInspectorState() {
@@ -158,6 +159,36 @@ final class TransferQueueViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.tableView.viewText(atColumn: 2, row: 0), "50% · 剩余 1 秒")
         controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         XCTAssertTrue(controller.selectedTransferDetailTextForTesting.contains("50% · 剩余 1 秒  1 KB/s"))
+    }
+
+    func testTransferQueueRendersLiveSpeedAndETAWhileResuming() {
+        var now = Date(timeIntervalSince1970: 100)
+        let controller = TransferQueueViewController(nowProvider: { now })
+        controller.loadView()
+        let job = ScpTransferJob(
+            id: "job_resume_speed_eta",
+            direction: .download,
+            sourcePath: "/srv/releases/build.zip",
+            destinationPath: "/Users/alice/build.zip",
+            bytesTotal: 2_048
+        )
+        controller.setTransfers(
+            jobs: [job],
+            progressEvents: [
+                ScpTransferProgress(jobId: job.id, bytesDone: 512, bytesTotal: 2_048, status: "resuming")
+            ]
+        )
+        now = Date(timeIntervalSince1970: 101)
+        controller.setTransfers(
+            jobs: [job],
+            progressEvents: [
+                ScpTransferProgress(jobId: job.id, bytesDone: 1_024, bytesTotal: 2_048, status: "resuming")
+            ]
+        )
+
+        XCTAssertEqual(controller.tableView.viewText(atColumn: 2, row: 0), "50% · 剩余 2 秒")
+        controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        XCTAssertTrue(controller.selectedTransferDetailTextForTesting.contains("50% · 剩余 2 秒  512 B/s"))
     }
 
     func testTransferQueueRendersFailureDetailWithoutChangingProgressColumns() {

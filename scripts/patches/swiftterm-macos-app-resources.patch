@@ -1,0 +1,24 @@
+diff --git a/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift b/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
+--- a/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
++++ b/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
+@@ -2733,9 +2733,20 @@ private final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
+ 
+     private static func candidateBundles() -> [Bundle] {
+         var bundles: [Bundle] = []
++        #if os(macOS)
++        // Stacio macOS packages keep SwiftPM resources under Contents/Resources.
++        if let resourceBundleURL = Bundle.main.resourceURL?
++            .appendingPathComponent("SwiftTerm_SwiftTerm.bundle", isDirectory: true),
++           let resourceBundle = Bundle(url: resourceBundleURL)
++        {
++            bundles.append(resourceBundle)
++        }
++        #endif
+         #if SWIFT_PACKAGE
+-        bundles.append(Bundle.module)
++        if bundles.isEmpty {
++            bundles.append(Bundle.module)
++        }
+         #endif
+         bundles.append(Bundle(for: MetalTerminalRenderer.self))
+         bundles.append(Bundle.main)

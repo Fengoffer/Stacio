@@ -77,12 +77,9 @@ public enum SessionSidebarSingleSessionExport {
         sessionObject["private_key_path"] = session.privateKeyPath as Any?
         sessionObject["credential_id"] = session.credentialId as Any?
         sessionObject["last_opened_at"] = session.lastOpenedAt as Any?
-        if let configJSON,
-           let data = configJSON.data(using: .utf8),
-           let object = try? JSONSerialization.jsonObject(with: data) {
-            sessionObject["config_json"] = object
-        } else if let configJSON {
-            sessionObject["config_json"] = configJSON
+        if let iconID = SessionIconConfigCodec.iconID(from: configJSON),
+           let safeConfigJSON = try SessionIconConfigCodec.updatingIconID(iconID, in: nil) {
+            sessionObject["config_json"] = safeConfigJSON
         }
 
         let bundle: [String: Any] = [

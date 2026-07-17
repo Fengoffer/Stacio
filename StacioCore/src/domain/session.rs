@@ -13,6 +13,27 @@ pub struct SessionFolder {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionSidebarOrderItem {
+    pub kind: String,
+    pub id: String,
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionIconAssignment {
+    pub session_id: String,
+    pub icon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionSidebarSnapshot {
+    pub folders: Vec<SessionFolder>,
+    pub sessions: Vec<SessionRecord>,
+    pub order_items: Vec<SessionSidebarOrderItem>,
+    pub manual_icon_assignments: Vec<SessionIconAssignment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct SessionRecord {
     pub id: String,

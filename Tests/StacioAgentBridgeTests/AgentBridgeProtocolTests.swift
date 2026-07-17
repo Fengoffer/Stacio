@@ -24,6 +24,14 @@ final class AgentBridgeProtocolTests: XCTestCase {
         XCTAssertFalse(text.contains("secret-value"))
     }
 
+    func testTerminalOutputRedactionPreservesLineBreaks() {
+        let redacted = AgentProtocolRedaction.redactPreservingLineBreaks(
+            "CPU 20%\nTOKEN=secret-value\nMemory 40%"
+        )
+
+        XCTAssertEqual(redacted, "CPU 20%\n[redacted]\nMemory 40%")
+    }
+
     func testRiskClassifierMarksDestructiveCommands() {
         XCTAssertEqual(
             AgentActionClassifier.risk(forCommand: "rm -rf /tmp/build"),
@@ -490,6 +498,27 @@ final class AgentBridgeProtocolTests: XCTestCase {
         XCTAssertTrue(rendered.contains("命令已在终端执行"))
         XCTAssertTrue(rendered.contains("uptime"))
         XCTAssertFalse(rendered.contains(#""requestID""#))
+    }
+
+    func testTraceOutputRendererReturnsExplicitTerminalContentAndStatusToLocalAgent() throws {
+        let event = AgentTraceEvent(
+            requestID: "req-output",
+            state: .completed,
+            message: "本次命令已完成：Linux dev 6.8.0",
+            redactedCommand: "uname -a",
+            metadata: [
+                "terminalOutputSummary": "Linux dev 6.8.0",
+                "completionConfidence": "observedIdle"
+            ]
+        )
+        let line = String(decoding: try JSONEncoder().encode(event), as: UTF8.self)
+
+        let rendered = AgentCLIOutputRenderer.render(socketLine: line, mode: .text)
+
+        XCTAssertTrue(rendered.contains("[terminal-status] completed"))
+        XCTAssertTrue(rendered.contains("request=req-output"))
+        XCTAssertTrue(rendered.contains("[terminal-command] uname -a"))
+        XCTAssertTrue(rendered.contains("[terminal-output]\nLinux dev 6.8.0\n[/terminal-output]"))
     }
 
     func testTraceOutputRendererKeepsRawLinesInJsonMode() throws {

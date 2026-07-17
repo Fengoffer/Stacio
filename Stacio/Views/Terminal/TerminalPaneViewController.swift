@@ -45,6 +45,10 @@ public struct SwiftTermLocalTerminalProcessLauncher: LocalTerminalProcessLaunchi
     }
 
     public func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView) {
+        if let stacioTerminalView = terminalView as? StacioLocalTerminalView {
+            stacioTerminalView.sendProgrammaticInput(bytes)
+            return
+        }
         terminalView.send(data: ArraySlice(bytes))
     }
 }
@@ -54,10 +58,13 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     public let shellPath: String
     public let terminalView: StacioLocalTerminalView
     public var keyboardFocusView: NSView { terminalView }
+    public var onUserInput: ((TerminalPaneViewController, [UInt8]) -> Bool)?
     public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
     public var onCommandSubmitted: ((TerminalPaneViewController, String) -> Void)?
     public var onCommandFinished: ((TerminalPaneViewController) -> Void)?
     public private(set) var currentLocalDirectory: String?
+    public private(set) var commandCompletionGeneration: UInt64 = 0
+    private var agentInteractionLocked = false
 
     private let eventSink: TerminalEventSink
     private let transcriptRecorder: TranscriptRecorder
@@ -69,6 +76,8 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
     private var commandSuggestionHistoryCommands: [String] = []
     private let commandHintOverlay = TerminalCommandHintOverlayView()
+    private let agentTraceOverlay = TerminalAgentTraceOverlayView(frame: .zero)
+    private let agentInteractionGlow = TerminalAgentInteractionGlowView(frame: .zero)
     private let lineInfoGutter = TerminalLineInfoGutterView()
     private lazy var terminalSearchController = TerminalSearchController(
         terminalView: terminalView,
@@ -159,11 +168,21 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         commandHintOverlay.onVisibilityChanged = { [weak self] visible in
             self?.setCommandHintOverlayVisible(visible)
         }
+        agentTraceOverlay.onControlAction = { [weak self] requestID, action in
+            guard let self else { return }
+            TerminalAgentTaskControlNotification.post(
+                runtimeID: self.runtimeID,
+                requestID: requestID,
+                action: action
+            )
+        }
 
         container.addSubview(terminalView)
         container.terminalFocusView = terminalView
         container.addSubview(lineInfoGutter)
+        container.addSubview(agentInteractionGlow, positioned: .above, relativeTo: terminalView)
         container.addSubview(commandHintOverlay)
+        container.addSubview(agentTraceOverlay)
         terminalSearchController.install(in: container, overlaying: terminalView)
         let terminalBottomToContainer = terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         let terminalBottomToCommandHint = terminalView.bottomAnchor.constraint(
@@ -205,6 +224,10 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             terminalTrailingToContainer,
             terminalTopToContainer,
             terminalBottomToContainer,
+            agentInteractionGlow.leadingAnchor.constraint(equalTo: terminalView.leadingAnchor),
+            agentInteractionGlow.trailingAnchor.constraint(equalTo: terminalView.trailingAnchor),
+            agentInteractionGlow.topAnchor.constraint(equalTo: terminalView.topAnchor),
+            agentInteractionGlow.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
             lineInfoGutter.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             lineInfoGutter.topAnchor.constraint(equalTo: terminalView.topAnchor),
             lineInfoGutter.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
@@ -214,7 +237,11 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             commandHintBottom,
             commandHintOverlay.widthAnchor.constraint(
                 lessThanOrEqualToConstant: TerminalCommandHintOverlayLayout.submittedPreferredMaxWidth
-            )
+            ),
+            agentTraceOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            agentTraceOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
+            agentTraceOverlay.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
         ])
         applyTerminalRuntimeSettings(settingsStore.snapshot())
 
@@ -307,6 +334,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             return
         }
         currentLocalDirectory = normalized
+        commandCompletionGeneration &+= 1
         onCommandFinished?(self)
     }
 
@@ -366,6 +394,11 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         recordSubmittedCommands(bytes)
     }
 
+    public func sendAgentInput(_ bytes: [UInt8]) {
+        processLauncher.sendInput(bytes, to: terminalView)
+        recordSubmittedCommands(bytes)
+    }
+
     public func appendAgentTrace(
         requestID: String,
         state: AgentTraceState,
@@ -389,6 +422,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
                 metadata: event.metadata
             )
         )
+        agentTraceOverlay.render(agentTraceController.eventsSnapshot)
         TerminalAgentTraceNotification.post(
             runtimeID: runtimeID,
             title: title ?? L10n.Workspace.local,
@@ -400,8 +434,20 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         transcriptRecorder.snapshot
     }
 
+    public var terminalDisplaySnapshotForTesting: String {
+        String(data: terminalView.getTerminal().getBufferAsData(), encoding: .utf8) ?? ""
+    }
+
     public var agentTraceSnapshotForTesting: String {
         agentTraceController.snapshot
+    }
+
+    public var agentTraceOverlayTextForTesting: String {
+        agentTraceOverlay.visibleTextForTesting
+    }
+
+    public var agentTraceOverlayVisibleForTesting: Bool {
+        agentTraceOverlay.isHidden == false
     }
 
     public var commandHintVisibleTextForTesting: String {
@@ -606,6 +652,8 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     private func handleUserInput(_ bytes: [UInt8]) -> Bool {
+        if agentInteractionLocked { return true }
+        if onUserInput?(self, bytes) == true { return true }
         let observation = commandInputObserver.ingest(
             bytes: bytes,
             settings: settingsStore.snapshot(),
@@ -625,6 +673,15 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: bytes)
         recordSubmittedCommands(bytes)
         return false
+    }
+
+    public func setAgentInteractionLocked(_ locked: Bool) {
+        agentInteractionLocked = locked
+        agentInteractionGlow.setActive(locked)
+    }
+
+    public var agentInteractionGlowActiveForTesting: Bool {
+        agentInteractionGlow.isActiveForTesting
     }
 
     private func renderCommandInputObservation(_ observation: TerminalCommandInputObservation) {

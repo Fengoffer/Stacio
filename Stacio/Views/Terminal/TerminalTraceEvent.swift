@@ -64,3 +64,50 @@ public enum TerminalAgentTraceNotification {
         return (runtimeID, title, event)
     }
 }
+
+public enum TerminalAgentTaskControlAction: String, Equatable {
+    case pause
+    case cancel
+    case takeOver
+    case confirmComplete
+}
+
+public enum TerminalAgentTaskControlNotification {
+    public static let didRequest = Notification.Name("Stacio.Terminal.agentTaskControlDidRequest")
+    public static let runtimeIDKey = "runtimeID"
+    public static let requestIDKey = "requestID"
+    public static let actionKey = "action"
+
+    public static func post(
+        runtimeID: String,
+        requestID: String,
+        action: TerminalAgentTaskControlAction,
+        center: NotificationCenter = .default
+    ) {
+        center.post(
+            name: didRequest,
+            object: nil,
+            userInfo: [
+                runtimeIDKey: runtimeID,
+                requestIDKey: requestID,
+                actionKey: action.rawValue
+            ]
+        )
+    }
+
+    public static func payload(from notification: Notification) -> (
+        runtimeID: String,
+        requestID: String,
+        action: TerminalAgentTaskControlAction
+    )? {
+        guard notification.name == didRequest,
+              let runtimeID = notification.userInfo?[runtimeIDKey] as? String,
+              let requestID = notification.userInfo?[requestIDKey] as? String,
+              let rawAction = notification.userInfo?[actionKey] as? String,
+              let action = TerminalAgentTaskControlAction(rawValue: rawAction)
+        else {
+            return nil
+        }
+        return (runtimeID, requestID, action)
+    }
+}

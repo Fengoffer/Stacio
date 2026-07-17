@@ -92,7 +92,12 @@ public final class AIProviderConfigurationCoordinator: AIProviderMutationCoordin
 
     public func deleteProvider(id: UUID) throws -> AIProviderSettingsEnvelope {
         try Self.withSharedTransaction {
-            var envelope = try settingsStore.loadAIProviderSettings()
+            var envelope = AIProviderSettingsNormalizer.normalized(
+                try settingsStore.loadAIProviderSettings()
+            )
+            guard id != BuiltInAIProvider.mozheAPIID else {
+                return envelope
+            }
             let oldAPIKey = try keyStore.readAPIKey(for: id)
             try keyStore.deleteAPIKey(for: id)
             envelope.aiProviders.removeAll { $0.id == id }

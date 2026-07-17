@@ -6,11 +6,14 @@ public protocol SessionSidebarStoring {
     func renameFolder(id: String, name: String) throws -> SessionFolder
     func deleteFolder(id: String) throws
     func listFolders() throws -> [SessionFolder]
+    func listSidebarOrder() throws -> [SessionSidebarOrderItem]
     func listSessions(folderID: String?) throws -> [SessionRecord]
+    func loadSnapshot() throws -> SessionSidebarSnapshot
     func createSession(_ draft: SessionDraft) throws -> SessionRecord
     func updateSession(id: String, update: SessionUpdate) throws -> SessionRecord
     func duplicateSession(id: String, targetFolderID: String?) throws -> SessionRecord
     func moveSession(id: String, targetFolderID: String?) throws -> SessionRecord
+    func placeSidebarItem(kind: String, id: String, targetFolderID: String?, targetIndex: UInt32) throws
     func exportSessionsJSON() throws -> String
     func exportSessionFolderJSON(folderID: String) throws -> String
     func getSessionConfigJSON(id: String) throws -> String?
@@ -26,6 +29,14 @@ public final class CoreBridgeSessionSidebarStore: SessionSidebarStoring {
 
     public func listFolders() throws -> [SessionFolder] {
         try CoreBridge.listSessionFolders(databasePath: databasePath)
+    }
+
+    public func listSidebarOrder() throws -> [SessionSidebarOrderItem] {
+        try CoreBridge.listSessionSidebarOrder(databasePath: databasePath)
+    }
+
+    public func loadSnapshot() throws -> SessionSidebarSnapshot {
+        try CoreBridge.loadSessionSidebarSnapshot(databasePath: databasePath)
     }
 
     public func createFolder(parentID: String?, name: String) throws -> SessionFolder {
@@ -65,6 +76,21 @@ public final class CoreBridgeSessionSidebarStore: SessionSidebarStoring {
             databasePath: databasePath,
             id: id,
             targetFolderID: targetFolderID
+        )
+    }
+
+    public func placeSidebarItem(
+        kind: String,
+        id: String,
+        targetFolderID: String?,
+        targetIndex: UInt32
+    ) throws {
+        try CoreBridge.placeSessionSidebarItem(
+            databasePath: databasePath,
+            kind: kind,
+            id: id,
+            targetFolderID: targetFolderID,
+            targetIndex: targetIndex
         )
     }
 

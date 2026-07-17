@@ -302,13 +302,14 @@ final class LocalAgentSessionViewController: NSViewController, LocalProcessTermi
     }
 
     override func loadView() {
-        let container = NSView()
+        let container = TerminalFocusContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.processDelegate = self
         TerminalAppearanceApplier.apply(settings: settingsStore.snapshot(), to: terminalView)
 
         container.addSubview(terminalView)
+        container.terminalFocusView = terminalView
         NSLayoutConstraint.activate([
             terminalView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             terminalView.trailingAnchor.constraint(equalTo: container.trailingAnchor),

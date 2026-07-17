@@ -2468,6 +2468,7 @@ public final class FilesCoordinator {
             bytesTotal: localFile.size
         )
         transferScheduler.scheduleLiveFTPTransfer(
+            runtimeID: ftpRemoteEditRuntimeID(for: context),
             config: context.config,
             secret: context.secret,
             job: job,
@@ -2807,6 +2808,7 @@ public final class FilesCoordinator {
                let ftpTransferScheduler
             {
                 ftpTransferScheduler.scheduleLiveFTPTransfer(
+                    runtimeID: ftpRemoteEditRuntimeID(for: context),
                     config: context.config,
                     secret: context.secret,
                     job: job
@@ -3391,6 +3393,7 @@ public final class FilesCoordinator {
                 bytesTotal: selection.size
             )
             transferScheduler.scheduleLiveFTPTransfer(
+                runtimeID: runtimeID,
                 config: context.config,
                 secret: context.secret,
                 job: job,
@@ -3744,6 +3747,7 @@ public final class FilesCoordinator {
                 message: "file.save.ftp.upload.scheduled path=\(selection.path) bytes=\(job.bytesTotal)"
             )
             transferScheduler.scheduleLiveFTPTransfer(
+                runtimeID: runtimeID,
                 config: context.config,
                 secret: context.secret,
                 job: job,
@@ -3909,7 +3913,11 @@ public final class FilesCoordinator {
     }
 
     private func ftpRemoteEditRuntimeID(for context: FTPLiveSessionContext) -> String {
-        "ftp://\(context.config.username)@\(context.config.host):\(context.config.port)"
+        let runtimeID = liveSessionRuntimeIDProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let runtimeID, runtimeID.isEmpty == false {
+            return runtimeID
+        }
+        return "ftp://\(context.config.username)@\(context.config.host):\(context.config.port)"
     }
 
     private func isFTPSessionRuntimeCurrent(_ runtimeID: String) -> Bool {
@@ -4061,6 +4069,7 @@ public final class FilesCoordinator {
         if let context = ftpSessionContextProvider(),
            let ftpTransferScheduler
         {
+            let runtimeID = ftpRemoteEditRuntimeID(for: context)
             for plannedDownload in plannedDownloads {
                 let job = ScpTransferJob(
                     id: "ftp_backup_download_\(UUID().uuidString)",
@@ -4070,6 +4079,7 @@ public final class FilesCoordinator {
                     bytesTotal: plannedDownload.candidate.size
                 )
                 ftpTransferScheduler.scheduleLiveFTPTransfer(
+                    runtimeID: runtimeID,
                     config: context.config,
                     secret: context.secret,
                     job: job

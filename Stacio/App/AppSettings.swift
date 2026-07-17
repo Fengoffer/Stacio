@@ -149,7 +149,6 @@ public enum AIProviderProfile: String, CaseIterable, Codable, Equatable {
     case openAICompatible = "OpenAI Compatible"
 
     public static let settingsMenuProfiles: [AIProviderProfile] = [
-        .portDeskRules,
         .openAI,
         .deepSeek,
         .openRouter,
@@ -402,6 +401,7 @@ public struct AppSettings: Equatable {
     public var terminalFontFamily: TerminalFontFamilyPreference
     public var terminalTheme: TerminalThemePreference
     public var sessionTabIconMode: SessionTabIconModePreference
+    public var sessionSidebarShowRecentSessions: Bool
     public var terminalBuiltInThemeID: String
     public var terminalCloseConfirmationEnabled: Bool
     public var terminalSelectionAutoCopyEnabled: Bool
@@ -446,7 +446,7 @@ public struct AppSettings: Equatable {
             guard let profile = AIProviderProfile.recognizedProfile(for: newValue),
                   profile.usesModelInterface
             else {
-                aiProviderSettings.defaultAIProviderID = BuiltInAIProvider.stacioRulesID
+                aiProviderSettings.defaultAIProviderID = BuiltInAIProvider.mozheAPIID
                 return
             }
 
@@ -588,6 +588,7 @@ public struct AppSettings: Equatable {
         terminalFontFamily: TerminalFontFamilyPreference = .sfMono,
         terminalTheme: TerminalThemePreference = .system,
         sessionTabIconMode: SessionTabIconModePreference = .defaultIcon,
+        sessionSidebarShowRecentSessions: Bool = true,
         terminalBuiltInThemeID: String = "stacio-dark",
         terminalCloseConfirmationEnabled: Bool = true,
         terminalSelectionAutoCopyEnabled: Bool = true,
@@ -630,7 +631,7 @@ public struct AppSettings: Equatable {
         aiIncludeRecentTerminalTranscript: Bool = true,
         aiContextCharacterLimit: Int = 12_000,
         agentConfirmationPolicy: AgentConfirmationPolicyPreference = .allowLowRiskWithoutPrompt,
-        agentExecutionMode: AgentExecutionModePreference = .backgroundTask,
+        agentExecutionMode: AgentExecutionModePreference = .visibleTerminal,
         aiAutoRunProposedCommands: Bool = true,
         agentCommandAllowPatterns: String = "",
         agentCommandDenyPatterns: String = "",
@@ -659,6 +660,7 @@ public struct AppSettings: Equatable {
         self.terminalFontFamily = terminalFontFamily
         self.terminalTheme = terminalTheme
         self.sessionTabIconMode = sessionTabIconMode
+        self.sessionSidebarShowRecentSessions = sessionSidebarShowRecentSessions
         self.terminalBuiltInThemeID = TerminalColorTheme.resolvedBuiltInTheme(id: terminalBuiltInThemeID).id ?? "stacio-dark"
         self.terminalCloseConfirmationEnabled = terminalCloseConfirmationEnabled
         self.terminalSelectionAutoCopyEnabled = terminalSelectionAutoCopyEnabled
@@ -712,7 +714,7 @@ public struct AppSettings: Equatable {
                 .init(aiProviders: [provider], defaultAIProviderID: provider.id)
             )
         } else {
-            self.aiProviderSettings = .rulesOnly
+            self.aiProviderSettings = .defaultConfiguration
         }
         self.aiReasoningEffort = aiReasoningEffort
         self.aiIncludeRecentTerminalTranscript = aiIncludeRecentTerminalTranscript
@@ -888,6 +890,7 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
         static let terminalFontFamily = "Stacio.Settings.terminalFontFamily"
         static let terminalTheme = "Stacio.Settings.terminalTheme"
         static let sessionTabIconMode = "Stacio.Settings.sessionTabIconMode"
+        static let sessionSidebarShowRecentSessions = "Stacio.Settings.sessionSidebarShowRecentSessions"
         static let terminalBuiltInThemeID = "Stacio.Settings.terminalBuiltInThemeID"
         static let terminalCloseConfirmationEnabled = "Stacio.Settings.terminalCloseConfirmationEnabled"
         static let terminalSelectionAutoCopyEnabled = "Stacio.Settings.terminalSelectionAutoCopyEnabled"
@@ -1004,14 +1007,17 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
         ) as? Int ?? 5
         let customTheme = defaults.data(forKey: Key.customTerminalTheme)
             .flatMap { try? JSONDecoder().decode(TerminalColorTheme.self, from: $0) }
-        let aiProviderSettings = (try? loadAIProviderSettings()) ?? .rulesOnly
+        let aiProviderSettings = (try? loadAIProviderSettings()) ?? .defaultConfiguration
         let rawReasoningEffort = defaults.string(forKey: Key.aiReasoningEffort)
             ?? AIReasoningEffortPreference.medium.rawValue
         let contextCharacterLimit = defaults.object(forKey: Key.aiContextCharacterLimit) as? Int ?? 12_000
         let rawConfirmationPolicy = defaults.string(forKey: Key.agentConfirmationPolicy)
             ?? AgentConfirmationPolicyPreference.allowLowRiskWithoutPrompt.rawValue
         let rawExecutionMode = defaults.string(forKey: Key.agentExecutionMode)
-            ?? AgentExecutionModePreference.backgroundTask.rawValue
+        let agentExecutionMode = AgentExecutionModePreference.visibleTerminal
+        if rawExecutionMode != agentExecutionMode.rawValue {
+            defaults.set(agentExecutionMode.rawValue, forKey: Key.agentExecutionMode)
+        }
         let rawFilesTransferConflictPolicy = defaults.string(forKey: Key.filesTransferConflictPolicy)
             ?? FilesTransferConflictPolicyPreference.ask.rawValue
         let deviceMetricsRefreshIntervalSeconds = defaults.object(forKey: Key.deviceMetricsRefreshIntervalSeconds) as? Int ?? 2
@@ -1028,6 +1034,9 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
             terminalFontFamily: TerminalFontFamilyPreference(rawValue: rawFontFamily) ?? .sfMono,
             terminalTheme: TerminalThemePreference(rawValue: rawTheme) ?? .system,
             sessionTabIconMode: SessionTabIconModePreference(rawValue: rawSessionTabIconMode) ?? .defaultIcon,
+            sessionSidebarShowRecentSessions: defaults.object(
+                forKey: Key.sessionSidebarShowRecentSessions
+            ) as? Bool ?? true,
             terminalBuiltInThemeID: TerminalColorTheme.resolvedBuiltInTheme(id: rawBuiltInThemeID).id ?? "stacio-dark",
             terminalCloseConfirmationEnabled: defaults.object(forKey: Key.terminalCloseConfirmationEnabled) as? Bool ?? true,
             terminalSelectionAutoCopyEnabled: defaults.object(forKey: Key.terminalSelectionAutoCopyEnabled) as? Bool ?? true,
@@ -1062,7 +1071,7 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
             aiIncludeRecentTerminalTranscript: defaults.object(forKey: Key.aiIncludeRecentTerminalTranscript) as? Bool ?? true,
             aiContextCharacterLimit: contextCharacterLimit,
             agentConfirmationPolicy: AgentConfirmationPolicyPreference.fromStoredRawValue(rawConfirmationPolicy),
-            agentExecutionMode: AgentExecutionModePreference(rawValue: rawExecutionMode) ?? .backgroundTask,
+            agentExecutionMode: agentExecutionMode,
             aiAutoRunProposedCommands: defaults.object(forKey: Key.aiAutoRunProposedCommands) as? Bool ?? true,
             agentCommandAllowPatterns: defaults.string(forKey: Key.agentCommandAllowPatterns) ?? "",
             agentCommandDenyPatterns: defaults.string(forKey: Key.agentCommandDenyPatterns) ?? "",
@@ -1106,7 +1115,7 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
                     normalized,
                     rawEnvelopeData: data
                 )
-                if migrated != normalized {
+                if migrated != decoded {
                     try persistAIProviderSettings(migrated)
                     return (migrated, true)
                 }
@@ -1154,7 +1163,7 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
         guard let profile = AIProviderProfile.recognizedProfile(for: legacyProvider),
               profile.usesModelInterface
         else {
-            return .rulesOnly
+            return .defaultConfiguration
         }
 
         let providerID = aiProviderIDGenerator()
@@ -1246,6 +1255,10 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
         defaults.set(settings.terminalFontFamily.rawValue, forKey: Key.terminalFontFamily)
         defaults.set(settings.terminalTheme.rawValue, forKey: Key.terminalTheme)
         defaults.set(settings.sessionTabIconMode.rawValue, forKey: Key.sessionTabIconMode)
+        defaults.set(
+            settings.sessionSidebarShowRecentSessions,
+            forKey: Key.sessionSidebarShowRecentSessions
+        )
         defaults.set(TerminalColorTheme.resolvedBuiltInTheme(id: settings.terminalBuiltInThemeID).id, forKey: Key.terminalBuiltInThemeID)
         defaults.set(settings.terminalCloseConfirmationEnabled, forKey: Key.terminalCloseConfirmationEnabled)
         defaults.set(settings.terminalSelectionAutoCopyEnabled, forKey: Key.terminalSelectionAutoCopyEnabled)
@@ -1301,7 +1314,7 @@ public final class AppSettingsStore: AIProviderSettingsStoring {
         defaults.set(settings.aiIncludeRecentTerminalTranscript, forKey: Key.aiIncludeRecentTerminalTranscript)
         defaults.set(AppSettings.clampedAIContextCharacterLimit(settings.aiContextCharacterLimit), forKey: Key.aiContextCharacterLimit)
         defaults.set(settings.agentConfirmationPolicy.rawValue, forKey: Key.agentConfirmationPolicy)
-        defaults.set(settings.agentExecutionMode.rawValue, forKey: Key.agentExecutionMode)
+        defaults.set(AgentExecutionModePreference.visibleTerminal.rawValue, forKey: Key.agentExecutionMode)
         defaults.set(settings.aiAutoRunProposedCommands, forKey: Key.aiAutoRunProposedCommands)
         defaults.set(Self.normalizedCommandPatterns(settings.agentCommandAllowPatterns), forKey: Key.agentCommandAllowPatterns)
         defaults.set(Self.normalizedCommandPatterns(settings.agentCommandDenyPatterns), forKey: Key.agentCommandDenyPatterns)
@@ -1381,6 +1394,8 @@ public enum TerminalAppearanceApplier {
             return false
         }
         let shaderURL = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
             .appendingPathComponent("SwiftTerm_SwiftTerm.bundle", isDirectory: true)
             .appendingPathComponent("Shaders.metal", isDirectory: false)
         return fileManager.fileExists(atPath: shaderURL.path)

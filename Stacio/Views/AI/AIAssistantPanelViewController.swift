@@ -11,6 +11,11 @@ private struct PendingAgentTaskContinuation {
     let modelSelection: AIModelSelection
 }
 
+private struct AgentTraceOwnershipKey: Hashable {
+    let runtimeID: String
+    let requestID: String
+}
+
 private enum AIAssistantSurfaceMode: Int {
     case assistant = 0
     case localAgent = 1
@@ -26,6 +31,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private static let taskHistoryDisplayLimit = 3
     private static let taskHistoryScanLimit = 24
     private static let conversationHistoryLimit = 30
+    private static let unconfiguredProviderMessage = "请先在设置中配置供应商模型"
 
     public var onCollapse: (() -> Void)?
 
@@ -62,7 +68,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let composerPermissionButton = NSButton()
     private let composerModelButton = NSButton()
     private let askButton = NSButton(title: L10n.AI.ask, target: nil, action: nil)
-    private let stopButton = NSButton(title: "停止", target: nil, action: nil)
     private let messageLabel = NSTextField(labelWithString: L10n.AI.noTerminal)
     private let surfaceModeSegmentedControl = NSSegmentedControl(
         labels: ["排查助手", "本地 Agent"],
@@ -72,7 +77,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     )
     private let transcriptScrollView = NSScrollView()
     private let transcriptDocumentView = AIAssistantFlippedView()
-    private let transcriptContentStack = NSStackView()
+    private let transcriptContentStack = AIAssistantFlippedStackView()
+    private let transcriptBottomSpacer = NSView()
     private let localAgentContainer = NSStackView()
     private let localAgentHeaderStack = NSStackView()
     private let localAgentTitleLabel = NSTextField(labelWithString: "本地 Agent")
@@ -105,10 +111,14 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var commandCards: [AICommandCardView] = []
     private var transcriptEntries: [AITranscriptEntry] = []
     private var traceEventsByRequestID: [String: [AgentTraceEvent]] = [:]
+    private var traceActorKindsByRequest: [AgentTraceOwnershipKey: AgentActorKind] = [:]
     private var traceRuntimeTitlesByRequestID: [String: String] = [:]
     private var activeOrchestrator: AgentTaskOrchestrator?
     private var activeAutonomousTask: Task<Void, Never>?
     private var activeAutonomousRunID: UUID?
+    private var activeProcessGroupID: UUID?
+    private var processGroupTimings: [UUID: AIProcessGroupTiming] = [:]
+    private var manualProcessGroupIDsByRequestID: [String: UUID] = [:]
     private var activeAskID: UUID?
     private var activeAskCancellation: AIAssistantRequestCancelling?
     private var activeStreamingAssistantIndex: Int?
@@ -129,6 +139,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var appendedVirtualTerminalEntryKeys: Set<String> = []
     private var appendedExecutionResultRequestIDs: Set<String> = []
     private var traceObserver: NSObjectProtocol?
+    private var terminalTaskControlObserver: NSObjectProtocol?
     private var settingsObserver: NSObjectProtocol?
     private var composerAddPickerPopover: NSPopover?
     private var composerAddPickerViewController: AIComposerAddPickerViewController?
@@ -213,6 +224,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         if let traceObserver {
             NotificationCenter.default.removeObserver(traceObserver)
         }
+        if let terminalTaskControlObserver {
+            NotificationCenter.default.removeObserver(terminalTaskControlObserver)
+        }
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }
@@ -283,12 +297,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         askButton.setAccessibilityIdentifier("Stacio.AI.ask")
         askButton.translatesAutoresizingMaskIntoConstraints = false
         configureIconButton(askButton, symbolName: "arrow.up", accessibilityLabel: L10n.AI.ask, emphasized: true)
-        stopButton.target = self
-        stopButton.action = #selector(stopButtonPressed(_:))
-        stopButton.setAccessibilityIdentifier("Stacio.AI.stop")
-        stopButton.translatesAutoresizingMaskIntoConstraints = false
-        configureIconButton(stopButton, symbolName: "stop.fill", accessibilityLabel: "停止当前 AI 请求")
-        stopButton.isEnabled = false
         targetButton.target = self
         targetButton.action = #selector(targetButtonPressed(_:))
         targetButton.setAccessibilityIdentifier("Stacio.AI.targetPicker")
@@ -366,6 +374,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         transcriptContentStack.alignment = .leading
         transcriptContentStack.distribution = .fill
         transcriptContentStack.translatesAutoresizingMaskIntoConstraints = false
+        transcriptBottomSpacer.translatesAutoresizingMaskIntoConstraints = false
+        transcriptBottomSpacer.setAccessibilityIdentifier("Stacio.AI.transcript.bottomSpacer")
+        transcriptBottomSpacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        transcriptBottomSpacer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         localAgentContainer.orientation = .vertical
         localAgentContainer.spacing = 8
         localAgentContainer.alignment = .leading
@@ -611,7 +623,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         ].forEach { view in
             transcriptContentStack.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: transcriptContentStack.widthAnchor).isActive = true
+            view.setContentHuggingPriority(.required, for: .vertical)
         }
+        transcriptContentStack.addArrangedSubview(transcriptBottomSpacer)
+        transcriptBottomSpacer.widthAnchor.constraint(equalTo: transcriptContentStack.widthAnchor).isActive = true
 
         let composerSpacer = NSView()
         composerSpacer.translatesAutoresizingMaskIntoConstraints = false
@@ -623,7 +638,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             composerSpacer,
             composerModelButton,
             contextUsageRing,
-            stopButton,
             askButton
         ].forEach(composerToolbar.addArrangedSubview)
 
@@ -677,8 +691,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             composerPermissionButton.heightAnchor.constraint(equalToConstant: 28),
             composerModelButton.heightAnchor.constraint(equalToConstant: 28),
             composerModelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            stopButton.widthAnchor.constraint(equalToConstant: 32),
-            stopButton.heightAnchor.constraint(equalToConstant: 32),
             askButton.widthAnchor.constraint(equalToConstant: 32),
             askButton.heightAnchor.constraint(equalToConstant: 32),
             localAgentPopUpButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
@@ -783,6 +795,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         view = container
         observeTerminalTraceNotifications()
         observeSettingsChanges()
+        reconcileTemporaryModelSelection()
         refreshForCurrentContext()
         refreshComposerControls()
         updateSurfaceMode()
@@ -790,6 +803,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     public override func viewDidLayout() {
         super.viewDidLayout()
+        updateSurfaceModeSegmentWidths()
         let textWidth = max(80, transcriptContentStack.bounds.width)
         messageLabel.preferredMaxLayoutWidth = textWidth
         statusLabel.preferredMaxLayoutWidth = textWidth
@@ -800,6 +814,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         taskHistoryBodyLabel.preferredMaxLayoutWidth = textWidth
         for case let bubble as AITranscriptBubbleView in transcriptStack.arrangedSubviews {
             bubble.preferredTextWidth = textWidth
+        }
+    }
+
+    private func updateSurfaceModeSegmentWidths() {
+        let segmentCount = surfaceModeSegmentedControl.segmentCount
+        let controlWidth = surfaceModeSegmentedControl.bounds.width
+        guard segmentCount > 0, controlWidth > 0 else {
+            return
+        }
+
+        let segmentWidth = controlWidth / CGFloat(segmentCount)
+        var changed = false
+        for index in 0..<segmentCount
+        where abs(surfaceModeSegmentedControl.width(forSegment: index) - segmentWidth) > 0.5 {
+            surfaceModeSegmentedControl.setWidth(segmentWidth, forSegment: index)
+            changed = true
+        }
+        if changed {
+            surfaceModeSegmentedControl.needsDisplay = true
         }
     }
 
@@ -869,8 +902,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composer.isHidden = showsLocalAgent
         contextUsageRing.isHidden = showsLocalAgent
         updateConversationBottomLayout()
+        updateQuestionControlState()
         if showsLocalAgent {
-            view.window?.makeFirstResponder(activeLocalAgentSession?.terminalView)
+            focusActiveLocalAgentTerminal()
         }
     }
 
@@ -911,6 +945,36 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         localAgentTerminalHost.isHidden = false
         updateLocalAgentStatus(session.launchState, tool: tool)
         session.startIfNeeded()
+        focusActiveLocalAgentTerminal()
+    }
+
+    private func focusActiveLocalAgentTerminal() {
+        guard surfaceMode == .localAgent,
+              let terminalView = activeLocalAgentSession?.terminalView
+        else {
+            return
+        }
+
+        focusLocalAgentTerminal(terminalView)
+        DispatchQueue.main.async { [weak self, weak terminalView] in
+            guard let self,
+                  let terminalView,
+                  self.surfaceMode == .localAgent,
+                  self.activeLocalAgentSession?.terminalView === terminalView
+            else {
+                return
+            }
+            self.focusLocalAgentTerminal(terminalView)
+        }
+    }
+
+    private func focusLocalAgentTerminal(_ terminalView: StacioLocalAgentTerminalView) {
+        guard let window = terminalView.window,
+              window.firstResponder !== terminalView
+        else {
+            return
+        }
+        window.makeFirstResponder(terminalView)
     }
 
     @objc
@@ -1047,9 +1111,20 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     @objc
     private func askButtonPressed(_ sender: Any?) {
+        if hasActiveAIActivity {
+            stopCurrentAIRequest()
+            return
+        }
         let question = questionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard question.isEmpty == false else {
             messageLabel.stringValue = L10n.AI.emptyQuestion
+            statusLabel.stringValue = ""
+            setCommandProposals([])
+            updateQuestionControlState()
+            return
+        }
+        guard surfaceMode != .assistant || hasConfiguredAssistantModel else {
+            messageLabel.stringValue = Self.unconfiguredProviderMessage
             statusLabel.stringValue = ""
             setCommandProposals([])
             updateQuestionControlState()
@@ -1061,6 +1136,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             setCommandProposals([])
             return
         }
+        finishActiveProcessGroup(collapse: true)
         let isReplacingPendingTaskContinuation = pendingTaskContinuation != nil
         clearPendingTaskContinuation()
         if isReplacingPendingTaskContinuation {
@@ -1232,6 +1308,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 self.statusLabel.stringValue = ""
                 self.refreshHeaderStatus(context: context)
                 self.updateQuestionControlState()
+                self.invalidateActiveAutonomousRun()
             }
         }
     }
@@ -1250,12 +1327,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         isAsking = false
         isExecuting = true
         refreshHeaderStatus(context: context)
-        appendSystemTranscript("我开始自主推进这个目标。")
+        appendSystemTranscript("我开始自主推进这个目标。", isProcessEntry: true)
         activeAutonomousTask = Task { [weak self, orchestrator, runID] in
             do {
                 let result = try await orchestrator.run(
                     goal: requestQuestion,
                     context: context,
+                    contextProvider: { [weak self] in
+                        self?.contextProvider(context.runtimeID) ?? context
+                    },
                     attachments: attachments,
                     onUpdate: { [weak self] update in
                         guard let self, self.isActiveAutonomousRun(runID) else { return }
@@ -1284,6 +1364,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 self.statusLabel.stringValue = ""
                 self.refreshHeaderStatus(context: context)
                 self.updateQuestionControlState()
+                self.invalidateActiveAutonomousRun()
             }
         }
     }
@@ -1307,12 +1388,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         statusLabel.stringValue = "AI 正在分步执行。"
         refreshHeaderStatus(context: context)
         updateQuestionControlState()
-        appendSystemTranscript(introduction)
+        appendSystemTranscript(introduction, isProcessEntry: true)
         activeAutonomousTask = Task { [weak self, orchestrator, runID] in
             do {
                 let result = try await orchestrator.run(
                     goal: goal,
                     context: context,
+                    contextProvider: { [weak self] in
+                        self?.contextProvider(context.runtimeID) ?? context
+                    },
                     attachments: attachments,
                     initialResponse: initialResponse,
                     onUpdate: { [weak self] update in
@@ -1343,6 +1427,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 self.statusLabel.stringValue = ""
                 self.refreshHeaderStatus(context: context)
                 self.updateQuestionControlState()
+                self.invalidateActiveAutonomousRun()
             }
         }
     }
@@ -1361,21 +1446,27 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         recordTaskHistory(
             question: question,
             context: context,
-            response: AIAssistantResponse(message: result.summary, commandProposals: [])
+            response: AIAssistantResponse(message: result.summary, commandProposals: []),
+            stateOverride: taskSessionState(for: result.state)
         )
         if result.stopReason == .stepLimitReached {
             isExecuting = false
             activeOrchestrator = nil
+            guard let capturedTaskModelSelection else {
+                clearPendingTaskContinuation()
+                messageLabel.stringValue = Self.unconfiguredProviderMessage
+                appendSystemTranscript(Self.unconfiguredProviderMessage)
+                refreshHeaderStatus(context: context)
+                updateQuestionControlState()
+                return
+            }
             pendingTaskContinuation = PendingAgentTaskContinuation(
                 question: question,
                 goal: goal,
                 context: context,
                 attachments: attachments,
                 completedSteps: result.steps,
-                modelSelection: capturedTaskModelSelection ?? AIModelSelection(
-                    providerID: BuiltInAIProvider.stacioRulesID,
-                    modelID: ""
-                )
+                modelSelection: capturedTaskModelSelection
             )
             renderStepLimitContinuation(summary: result.summary)
             refreshHeaderStatus(context: context)
@@ -1383,12 +1474,14 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             return
         }
         clearPendingTaskContinuation()
-        appendAgentTaskFinalTranscript(result)
         if result.state != .running {
             activeOrchestrator = nil
+            activeAutonomousRunID = nil
             clearComposerSendOptions()
             endTaskModelSelectionCapture()
+            finishActiveProcessGroup(collapse: true)
         }
+        appendAgentTaskFinalTranscript(result)
     }
 
     private func appendAgentTaskFinalTranscript(_ result: AgentTaskRunResult) {
@@ -1398,58 +1491,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             appendTranscript(.assistant, text)
         case .paused, .cancelled, .takenOver, .failed:
             appendSystemTranscript(text)
-        case .idle, .planning, .awaitingUser, .running:
+        case .idle, .planning, .awaitingUser:
             if result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
                 appendSystemTranscript(text)
             }
+        case .running:
+            break
         }
     }
 
     private func agentTaskFinalTranscriptText(for result: AgentTaskRunResult) -> String {
-        var lines = [
-            agentTaskFinalTitle(for: result.state),
-            result.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        ].filter { $0.isEmpty == false }
-        let stepLines = agentTaskStepOverviewLines(for: result.steps)
-        if stepLines.isEmpty == false {
-            lines.append("")
-            lines.append("关键步骤概要：")
-            lines.append(contentsOf: stepLines)
+        let summary = result.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.state == .failed,
+           let failedStep = result.steps.last(where: { $0.state == .failed }) {
+            let detail = oneLineAgentObservation(failedStep.observation)
+            if detail.isEmpty == false {
+                return "执行失败：\(detail)"
+            }
         }
-        return lines.joined(separator: "\n")
-    }
-
-    private func agentTaskFinalTitle(for state: AgentTaskRunState) -> String {
-        switch state {
-        case .completed:
-            return "任务完成"
-        case .paused:
-            return "任务已暂停"
-        case .cancelled:
-            return "任务已取消"
-        case .takenOver:
-            return "任务已接管"
-        case .failed:
-            return "任务失败"
-        case .idle, .planning, .awaitingUser, .running:
-            return "任务已停止"
-        }
-    }
-
-    private func agentTaskStepOverviewLines(for steps: [AgentTaskStepResult]) -> [String] {
-        let visibleSteps = steps.prefix(6)
-        var lines = visibleSteps.enumerated().flatMap { index, step -> [String] in
-            let command = step.command.trimmingCharacters(in: .whitespacesAndNewlines)
-            let intent = step.intent.trimmingCharacters(in: .whitespacesAndNewlines)
-            let observation = oneLineAgentObservation(step.observation)
-            let title = "\(index + 1). \(command.isEmpty ? "未记录命令" : command) · \(label(for: step.state))"
-            let detail = intent.isEmpty ? observation : "\(intent)：\(observation)"
-            return [title, "   \(detail)"]
-        }
-        if steps.count > visibleSteps.count {
-            lines.append("还有 \(steps.count - visibleSteps.count) 个步骤已折叠。")
-        }
-        return lines
+        return summary.isEmpty ? fallbackAgentTaskFinalText(for: result.state) : summary
     }
 
     private func oneLineAgentObservation(_ observation: String) -> String {
@@ -1458,9 +1518,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { $0.isEmpty == false }
             .joined(separator: " · ")
-        guard collapsed.isEmpty == false else {
-            return "暂无输出摘要"
-        }
+        guard collapsed.isEmpty == false else { return "" }
         if collapsed.count > 220 {
             let end = collapsed.index(collapsed.startIndex, offsetBy: 220)
             return "\(collapsed[..<end])..."
@@ -1468,24 +1526,20 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         return collapsed
     }
 
-    private func label(for state: AgentTaskStepState) -> String {
+    private func fallbackAgentTaskFinalText(for state: AgentTaskRunState) -> String {
         switch state {
-        case .queued:
-            return "已排队"
-        case .awaitingConfirmation:
-            return "等待确认"
-        case .running:
-            return "运行中"
         case .completed:
-            return "已完成"
+            return "任务已完成。"
         case .paused:
-            return "已暂停"
+            return "任务已暂停。"
         case .cancelled:
-            return "已取消"
+            return "任务已取消。"
         case .takenOver:
-            return "已接管"
+            return "任务已切换为人工接管。"
         case .failed:
-            return "失败"
+            return "任务执行失败。"
+        case .idle, .planning, .awaitingUser, .running:
+            return "任务已停止。"
         }
     }
 
@@ -1516,11 +1570,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func beginAutonomousRun() -> UUID {
         let runID = UUID()
         activeAutonomousRunID = runID
+        if activeProcessGroupID == nil {
+            let processGroupID = UUID()
+            activeProcessGroupID = processGroupID
+            processGroupTimings[processGroupID] = AIProcessGroupTiming(startedAt: Date())
+        }
         return runID
     }
 
     private func invalidateActiveAutonomousRun() {
         activeAutonomousRunID = nil
+        finishActiveProcessGroup(collapse: true)
     }
 
     private func isActiveAutonomousRun(_ runID: UUID) -> Bool {
@@ -1532,10 +1592,14 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         case .thinking:
             statusLabel.stringValue = update.message
             if isCoordinatorProgressMessage(update.message) == false {
-                finalizeAssistantStreamingText(update.message, persistHistory: true)
+                finalizeAssistantStreamingText(
+                    update.message,
+                    persistHistory: true,
+                    isProcessEntry: true
+                )
             }
         case .thinkingDelta:
-            appendAssistantStreamingDelta(update.message)
+            appendAssistantStreamingDelta(update.message, isProcessEntry: true)
         case .plan:
             if let plan = update.plan {
                 renderPlanWorkspace(plan)
@@ -1561,13 +1625,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             appendSystemTranscript(update.message)
         case .completed, .paused, .cancelled, .takenOver, .failed:
             if let result = update.result {
+                if result.state == .completed {
+                    discardActiveStreamingProcessDraft()
+                }
                 messageLabel.stringValue = ""
-                statusLabel.stringValue = result.summary
+                statusLabel.stringValue = result.state == .completed ? "" : result.summary
                 isExecuting = false
                 if result.state != .running {
                     activeOrchestrator = nil
                 }
                 refreshHeaderStatusForCurrentContext()
+                collapseActiveProcessEntries()
             } else {
                 appendSystemTranscript(update.message)
             }
@@ -1621,13 +1689,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func recordTaskHistory(
         question: String,
         context: AITerminalContext,
-        response: AIAssistantResponse
+        response: AIAssistantResponse,
+        stateOverride: AgentTaskSessionState? = nil
     ) {
         currentProposalTaskRequestID = nil
         guard let taskRecorder else { return }
-        let state: AgentTaskSessionState = response.commandProposals.isEmpty
-            ? .completed
-            : .awaitingUser
+        let state = stateOverride ?? (response.commandProposals.isEmpty ? .completed : .awaitingUser)
         let task = AgentTaskSession(
             targetRuntimeID: context.runtimeID,
             targetTitle: context.title,
@@ -1654,6 +1721,23 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
+    private func taskSessionState(for state: AgentTaskRunState) -> AgentTaskSessionState {
+        switch state {
+        case .completed:
+            return .completed
+        case .running, .planning:
+            return .running
+        case .paused, .awaitingUser:
+            return .awaitingUser
+        case .cancelled:
+            return .cancelled
+        case .takenOver, .failed:
+            return .failed
+        case .idle:
+            return .idle
+        }
+    }
+
     private func loadRecentTaskHistory(for context: AITerminalContext?) {
         guard let context else {
             clearRecentTaskHistory()
@@ -1667,6 +1751,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             let records = try taskLister.listAgentTaskSessions(limit: UInt32(Self.taskHistoryScanLimit))
                 .filter { record in
                     record.targetRuntimeId == context.runtimeID
+                        && record.actorKind == AgentActorKind.builtInAI.rawValue
                 }
                 .prefix(Self.taskHistoryDisplayLimit)
             guard records.isEmpty == false else {
@@ -1709,9 +1794,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
         loadedConversationHistoryRuntimeID = context.runtimeID
         do {
-            transcriptEntries = try conversationHistoryStore
-                .listConversationHistory(runtimeID: context.runtimeID)
-                .compactMap(transcriptEntry(for:))
+            processGroupTimings = [:]
+            transcriptEntries = restoredTranscriptEntries(
+                from: try conversationHistoryStore.listConversationHistory(runtimeID: context.runtimeID),
+                runtimeID: context.runtimeID
+            )
             if transcriptEntries.count > Self.conversationHistoryLimit {
                 transcriptEntries.removeFirst(transcriptEntries.count - Self.conversationHistoryLimit)
             }
@@ -1728,11 +1815,135 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func transcriptEntry(for record: AIConversationHistoryItemRecord) -> AITranscriptEntry? {
         let content = record.content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard content.isEmpty == false else { return nil }
+        let role = AITranscriptRole(historyRole: AIConversationHistoryRole.fromStoredRawValue(record.role))
         return AITranscriptEntry(
-            role: AITranscriptRole(historyRole: AIConversationHistoryRole.fromStoredRawValue(record.role)),
+            role: role,
             text: content,
-            requestID: record.requestId
+            requestID: record.requestId,
+            isProcessEntry: role.isProcessRole,
+            isCollapsed: role.isProcessRole,
+            createdAt: ISO8601DateFormatter().date(from: record.createdAt) ?? Date()
         )
+    }
+
+    private func restoredTranscriptEntries(
+        from records: [AIConversationHistoryItemRecord],
+        runtimeID: String
+    ) -> [AITranscriptEntry] {
+        let entries = normalizedLegacyProcessEntries(
+            deduplicatingAssistantConclusions(records.compactMap(transcriptEntry(for:)))
+        )
+        var restored: [AITranscriptEntry] = []
+        var index = entries.startIndex
+        while index < entries.endIndex {
+            guard entries[index].isProcessEntry else {
+                restored.append(entries[index])
+                index += 1
+                continue
+            }
+
+            let groupStart = index
+            while index < entries.endIndex, entries[index].isProcessEntry {
+                index += 1
+            }
+            let groupEntries = Array(entries[groupStart..<index])
+            let requestIDs = Set(groupEntries.compactMap(\.requestID))
+            let ownershipByRequestID = Dictionary(uniqueKeysWithValues: requestIDs.map { requestID in
+                (requestID, isBuiltInProcessRequest(runtimeID: runtimeID, requestID: requestID))
+            })
+            let hasOwnedProcess = ownershipByRequestID.values.contains(true)
+            let restoredGroupEntries = groupEntries.filter { entry in
+                guard let requestID = entry.requestID else {
+                    switch entry.role {
+                    case .step, .plan:
+                        return true
+                    case .assistant:
+                        return hasOwnedProcess
+                    case .user, .system, .command, .terminal:
+                        return false
+                    }
+                }
+                return ownershipByRequestID[requestID] == true
+            }
+            guard restoredGroupEntries.isEmpty == false else {
+                continue
+            }
+
+            let processGroupID = UUID()
+            processGroupTimings[processGroupID] = AIProcessGroupTiming(
+                startedAt: restoredGroupEntries[0].createdAt,
+                completedAt: restoredGroupEntries[restoredGroupEntries.count - 1].createdAt
+            )
+            for restoredEntry in restoredGroupEntries {
+                var entry = restoredEntry
+                entry.processGroupID = processGroupID
+                restored.append(entry)
+            }
+        }
+        return restored
+    }
+
+    private func deduplicatingAssistantConclusions(
+        _ entries: [AITranscriptEntry]
+    ) -> [AITranscriptEntry] {
+        var retained = Array(repeating: true, count: entries.count)
+        var turnStart = entries.startIndex
+        while turnStart < entries.endIndex {
+            let turnEnd = entries[(turnStart + 1)...].firstIndex(where: { $0.role == .user })
+                ?? entries.endIndex
+            var lastAssistantIndexByText: [String: Int] = [:]
+            for index in turnStart..<turnEnd where entries[index].role == .assistant {
+                if let previousIndex = lastAssistantIndexByText[entries[index].text] {
+                    retained[previousIndex] = false
+                }
+                lastAssistantIndexByText[entries[index].text] = index
+            }
+            turnStart = turnEnd
+        }
+        return entries.indices.compactMap { retained[$0] ? entries[$0] : nil }
+    }
+
+    private func normalizedLegacyProcessEntries(
+        _ entries: [AITranscriptEntry]
+    ) -> [AITranscriptEntry] {
+        var normalized = entries
+        var turnStart = normalized.startIndex
+        while turnStart < normalized.endIndex {
+            let turnEnd = normalized[(turnStart + 1)...].firstIndex(where: { $0.role == .user })
+                ?? normalized.endIndex
+            let turnRange = turnStart..<turnEnd
+            let containsProcess = turnRange.contains { normalized[$0].isProcessEntry }
+            let assistantIndices = turnRange.filter { normalized[$0].role == .assistant }
+            if containsProcess, assistantIndices.count > 1 {
+                for index in assistantIndices.dropLast() {
+                    normalized[index].isProcessEntry = true
+                    normalized[index].isCollapsed = true
+                }
+            }
+            turnStart = turnEnd
+        }
+        return normalized
+    }
+
+    private func isBuiltInProcessRequest(runtimeID: String, requestID: String) -> Bool {
+        guard let taskLister else { return requestID.hasPrefix("agent-step-") }
+        guard let records = try? taskLister.listAgentTaskSessions(requestID: requestID) else {
+            return requestID.hasPrefix("agent-step-")
+        }
+        guard records.isEmpty == false else {
+            return requestID.hasPrefix("agent-step-")
+        }
+        let currentRuntimeRecords = records.filter { $0.targetRuntimeId == runtimeID }
+        guard currentRuntimeRecords.isEmpty == false else {
+            return false
+        }
+        let actorKinds = Set(
+            currentRuntimeRecords.map(\.actorKind)
+        )
+        guard actorKinds.count == 1 else {
+            return false
+        }
+        return actorKinds.first == AgentActorKind.builtInAI.rawValue
     }
 
     private func taskHistoryLine(for record: AgentTaskSessionRecord) -> String {
@@ -1909,6 +2120,13 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     @objc
     private func taskConfirmCompletePressed(_ sender: Any?) {
         guard let activeTaskRequestID else { return }
+        if let event = coordinator.confirmTaskComplete(requestID: activeTaskRequestID) {
+            appendTraceEvent(
+                event,
+                runtimeTitle: traceRuntimeTitlesByRequestID[activeTaskRequestID],
+                allEvents: nil
+            )
+        }
         taskControlStatusesByRequestID[activeTaskRequestID] =
             "已确认本步结束；AI 不会再把后续混入输出归入本步结果。"
         isExecuting = false
@@ -1944,6 +2162,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 let result = try await orchestrator.run(
                     goal: continuation.goal,
                     context: continuation.context,
+                    contextProvider: { [weak self] in
+                        self?.contextProvider(continuation.context.runtimeID) ?? continuation.context
+                    },
                     attachments: continuation.attachments,
                     continuingFrom: continuation.completedSteps,
                     onUpdate: { [weak self] update in
@@ -1974,6 +2195,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 self.statusLabel.stringValue = ""
                 self.refreshHeaderStatus(context: continuation.context)
                 self.updateQuestionControlState()
+                self.invalidateActiveAutonomousRun()
             }
         }
     }
@@ -2044,6 +2266,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         appendSystemTranscript("计划已取消，未写入终端。")
         statusLabel.stringValue = ""
         endTaskModelSelectionCapture()
+        invalidateActiveAutonomousRun()
     }
 
     @discardableResult
@@ -2056,11 +2279,18 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             statusLabel.stringValue = L10n.AI.noTerminal
             return nil
         }
+        let requestID = currentProposalTaskRequestID ?? UUID().uuidString
+        currentProposalTaskRequestID = nil
+        finishActiveProcessGroup(collapse: true)
+        let processGroupID = UUID()
+        activeProcessGroupID = processGroupID
+        processGroupTimings[processGroupID] = AIProcessGroupTiming(startedAt: Date())
+        manualProcessGroupIDsByRequestID[requestID] = processGroupID
         isExecuting = true
         refreshHeaderStatus(context: context)
         statusLabel.stringValue = L10n.AI.executing
         if announcePreparation {
-            appendSystemTranscript("准备把命令交给目标终端。")
+            appendSystemTranscript("准备把命令交给目标终端。", isProcessEntry: true)
         }
         updateCommandButtonState()
         defer {
@@ -2069,8 +2299,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             updateCommandButtonState()
         }
         do {
-            let requestID = currentProposalTaskRequestID ?? UUID().uuidString
-            currentProposalTaskRequestID = nil
             var streamedEvents: [AgentTraceEvent] = []
             let events = try coordinator.executeProposedCommand(
                 command,
@@ -2123,6 +2351,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             setCommandProposals([])
             return terminalExecutionEvent(from: events)
         } catch {
+            finishManualProcessGroupIfNeeded(for: requestID)
             card?.updateState(.failed)
             let message = RuntimeDiagnosticFormatter.userMessage(for: error)
             statusLabel.stringValue = message
@@ -2360,7 +2589,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func aiModeSummary() -> String {
         let resolved = resolvedComposerModel()
         guard let selection = resolved.selection else {
-            return "\(L10n.AI.rulesMode)：Stacio 规则"
+            return "\(L10n.AI.modelMode)：\(resolved.providerTitle)"
         }
         return "\(L10n.AI.modelMode)：\(resolved.providerTitle) · \(selection.modelID)"
     }
@@ -2390,7 +2619,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composerPermissionButton.toolTip = "修改 AI 命令审批权限"
         composerPermissionButton.setAccessibilityLabel(composerPermissionButton.title)
         composerModelButton.title = currentModelTitle()
-        composerModelButton.toolTip = composerModelButton.title
+        composerModelButton.toolTip = hasConfiguredAssistantModel
+            ? composerModelButton.title
+            : Self.unconfiguredProviderMessage
         composerModelButton.setAccessibilityLabel(composerModelButton.title)
         refreshContextUsageRing()
         renderComposerAttachments()
@@ -2398,6 +2629,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composerContextLabel.stringValue = context.joined(separator: " · ")
         composerContextLabel.isHidden = context.isEmpty
         updateComposerHeight()
+        updateQuestionControlState()
     }
 
     private func composerContextItems() -> [String] {
@@ -2473,7 +2705,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func currentModelTitle() -> String {
         let resolved = resolvedComposerModel()
         guard let selection = resolved.selection else {
-            return "Stacio 规则"
+            return resolved.providerTitle
         }
         return "\(resolved.providerTitle) · \(selection.modelID) \(reasoningTitle(for: resolved.model?.capabilities.effectiveReasoningEffort ?? .minimal))"
     }
@@ -2549,14 +2781,26 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             envelope: envelope,
             requestedSelection: modelSelectionSession.snapshot()
         ) {
-        case .stacioRules:
-            return (nil, L10n.Settings.portDeskRules, nil)
         case let .external(provider, modelID):
             return (
                 AIModelSelection(providerID: provider.id, modelID: modelID),
                 provider.displayName,
                 provider.models.first(where: { $0.id == modelID })
             )
+        case let .unconfigured(provider):
+            return (nil, "\(provider.displayName) · 未配置模型", nil)
+        }
+    }
+
+    private var hasConfiguredAssistantModel: Bool {
+        switch AIProviderRuntimeResolver.resolve(
+            envelope: normalizedProviderEnvelope(),
+            requestedSelection: modelSelectionSession.snapshot()
+        ) {
+        case .external:
+            return true
+        case .unconfigured:
+            return false
         }
     }
 
@@ -2565,6 +2809,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             return
         }
         if selection.providerID == BuiltInAIProvider.stacioRulesID {
+            modelSelectionSession.select(nil)
             return
         }
         let normalizedModelID = AppSettings.normalizedAIModelName(selection.modelID)
@@ -2593,12 +2838,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             updateQuestionControlState()
             return
         }
-        modelSelectionBeforeTask = modelSelectionSession.snapshot()
         let resolved = resolvedComposerModel()
-        let captured = resolved.selection ?? AIModelSelection(
-            providerID: BuiltInAIProvider.stacioRulesID,
-            modelID: ""
-        )
+        guard let captured = resolved.selection else {
+            return
+        }
+        modelSelectionBeforeTask = modelSelectionSession.snapshot()
         capturedTaskModelSelection = captured
         modelSelectionSession.select(captured)
         refreshComposerControls()
@@ -2666,19 +2910,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         followGlobalDefault.state = currentSelection == nil ? .on : .off
         followGlobalDefault.toolTip = "使用设置中的默认供应商和模型"
         menu.addItem(followGlobalDefault)
-
-        let stacioRules = AIModelSelection(
-            providerID: BuiltInAIProvider.stacioRulesID,
-            modelID: ""
-        )
-        let rulesItem = makeComposerMenuItem(
-            title: L10n.Settings.portDeskRules,
-            action: #selector(selectComposerModelPressed(_:)),
-            representedObject: stacioRules
-        )
-        rulesItem.state = currentSelection == stacioRules ? .on : .off
-        rulesItem.toolTip = "使用 Stacio 规则，不调用外部模型接口"
-        menu.addItem(rulesItem)
 
         let groups = composerModelGroups()
         guard groups.isEmpty == false else {
@@ -3003,7 +3234,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         guard hasActiveAIActivity == false, capturedTaskModelSelection == nil else {
             return
         }
-        modelSelectionSession.select(selection)
+        let effectiveSelection = selection?.providerID == BuiltInAIProvider.stacioRulesID
+            ? nil
+            : selection
+        modelSelectionSession.select(effectiveSelection)
         refreshComposerControls()
         _ = refreshContextSummary()
     }
@@ -3123,19 +3357,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                     selection: nil,
                     toolTip: "使用设置中的默认供应商和模型",
                     accessibilityIdentifier: "Stacio.AI.composer.modelPicker.option.globalDefault"
-                ),
-                AIComposerModelPickerSpecialOption(
-                    title: L10n.Settings.portDeskRules,
-                    selection: AIModelSelection(
-                        providerID: BuiltInAIProvider.stacioRulesID,
-                        modelID: ""
-                    ),
-                    toolTip: "使用 Stacio 规则，不调用外部模型接口",
-                    accessibilityIdentifier: "Stacio.AI.composer.modelPicker.option.stacioRules"
                 )
             ],
             groups: composerModelGroups(),
-            reasoningItems: reasoningEffortItems(for: resolved.model),
+            reasoningItems: resolved.model.map { reasoningEffortItems(for: $0) } ?? [],
             currentReasoning: resolved.model?.capabilities.effectiveReasoningEffort ?? .minimal,
             contextFraction: contextUsageFraction,
             contextLabel: contextUsageLabel
@@ -3276,13 +3501,23 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func observeTerminalTraceNotifications() {
-        guard traceObserver == nil else { return }
-        traceObserver = NotificationCenter.default.addObserver(
-            forName: TerminalAgentTraceNotification.didAppend,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            self?.handleTerminalTraceNotification(notification)
+        if traceObserver == nil {
+            traceObserver = NotificationCenter.default.addObserver(
+                forName: TerminalAgentTraceNotification.didAppend,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                self?.handleTerminalTraceNotification(notification)
+            }
+        }
+        if terminalTaskControlObserver == nil {
+            terminalTaskControlObserver = NotificationCenter.default.addObserver(
+                forName: TerminalAgentTaskControlNotification.didRequest,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                self?.handleTerminalTaskControlNotification(notification)
+            }
         }
     }
 
@@ -3292,8 +3527,61 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         else {
             return
         }
+        let actorKind = payload.event.metadata?["actorKind"].flatMap(AgentActorKind.init(rawValue:))
+        if let actorKind {
+            traceActorKindsByRequest[
+                AgentTraceOwnershipKey(runtimeID: payload.runtimeID, requestID: payload.event.requestID)
+            ] = actorKind
+        }
+        guard actorKind == .builtInAI else { return }
         appendTraceEvent(payload.event, runtimeTitle: payload.title, allEvents: nil)
         updateStatusFromTrace(payload.event)
+    }
+
+    private func handleTerminalTaskControlNotification(_ notification: Notification) {
+        guard let payload = TerminalAgentTaskControlNotification.payload(from: notification) else {
+            return
+        }
+        let ownershipKey = AgentTraceOwnershipKey(
+            runtimeID: payload.runtimeID,
+            requestID: payload.requestID
+        )
+        guard shouldDisplayTrace(forRuntimeID: payload.runtimeID),
+              traceActorKindsByRequest[ownershipKey] == .builtInAI
+        else {
+            performTerminalTaskControlWithoutTranscript(payload)
+            return
+        }
+        activeTaskRequestID = payload.requestID
+        switch payload.action {
+        case .pause:
+            taskPausePressed(nil)
+        case .cancel:
+            taskCancelPressed(nil)
+        case .takeOver:
+            taskTakeOverPressed(nil)
+        case .confirmComplete:
+            taskConfirmCompletePressed(nil)
+        }
+    }
+
+    private func performTerminalTaskControlWithoutTranscript(
+        _ payload: (
+            runtimeID: String,
+            requestID: String,
+            action: TerminalAgentTaskControlAction
+        )
+    ) {
+        switch payload.action {
+        case .pause:
+            _ = coordinator.pauseTask(requestID: payload.requestID)
+        case .cancel:
+            _ = coordinator.cancelTask(requestID: payload.requestID)
+        case .takeOver:
+            _ = coordinator.takeOverTask(requestID: payload.requestID)
+        case .confirmComplete:
+            _ = coordinator.confirmTaskComplete(requestID: payload.requestID)
+        }
     }
 
     private func shouldDisplayTrace(forRuntimeID runtimeID: String) -> Bool {
@@ -3325,6 +3613,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
         appendVirtualTerminalTranscript(for: event, runtimeTitle: runtimeTitle)
         renderTaskControls(for: event.requestID)
+        if isTerminalTraceState(event.state) {
+            collapseProcessEntries(for: event.requestID)
+            finishManualProcessGroupIfNeeded(for: event.requestID)
+        }
         appendPendingAssistantConclusionIfReady(for: event)
     }
 
@@ -3363,11 +3655,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 output: summary,
                 persistHistory: true
             )
-            guard appendedExecutionResultRequestIDs.insert(event.requestID).inserted else { return }
-            appendSystemTranscript("本次执行结果：\(summary)")
         case .failed:
             guard appendedExecutionResultRequestIDs.insert(event.requestID).inserted else { return }
-            appendSystemTranscript("本次执行失败：\(event.message)")
+            appendSystemTranscript(
+                "本次执行失败：\(event.message)",
+                isProcessEntry: activeProcessGroupID != nil
+            )
         case .queued, .awaitingApproval, .approved, .typing, .paused, .cancelled, .takenOver:
             return
         }
@@ -3539,7 +3832,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let text = taskControlText(for: events, controlStatus: controlStatus)
         taskControlLabel.stringValue = text
         taskControlText = text
-        taskControlContainer.isHidden = text.isEmpty
+        taskControlContainer.isHidden = pendingTaskContinuation == nil
     }
 
     private func taskControlText(for events: [AgentTraceEvent], controlStatus: String?) -> String {
@@ -3590,11 +3883,20 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         _ role: AITranscriptRole,
         _ text: String,
         requestID: String? = nil,
-        persistHistory: Bool = true
+        persistHistory: Bool = true,
+        isProcessEntry: Bool? = nil
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return }
-        let entry = AITranscriptEntry(role: role, text: trimmed, requestID: requestID)
+        let processEntry = isProcessEntry ?? role.isProcessRole
+        let entry = AITranscriptEntry(
+            role: role,
+            text: trimmed,
+            requestID: requestID,
+            isProcessEntry: processEntry,
+            processGroupID: processEntry ? activeProcessGroupID : nil,
+            isCollapsed: false
+        )
         transcriptEntries.append(entry)
         messageLabel.isHidden = true
         if transcriptEntries.count > Self.conversationHistoryLimit {
@@ -3607,19 +3909,40 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         renderTranscriptEntries()
     }
 
-    private func appendSystemTranscript(_ text: String) {
-        appendTranscript(.system, text, persistHistory: false)
+    private func appendSystemTranscript(
+        _ text: String,
+        isProcessEntry: Bool = false
+    ) {
+        appendTranscript(
+            .system,
+            text,
+            persistHistory: false,
+            isProcessEntry: isProcessEntry
+        )
     }
 
-    private func appendAssistantStreamingDelta(_ delta: String) {
+    private func appendAssistantStreamingDelta(
+        _ delta: String,
+        isProcessEntry: Bool = false
+    ) {
         let trimmedDelta = delta.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedDelta.isEmpty == false || delta.isEmpty == false else { return }
         if let index = activeStreamingAssistantIndex,
            transcriptEntries.indices.contains(index),
            transcriptEntries[index].role == .assistant {
             transcriptEntries[index].text += delta
+            transcriptEntries[index].isProcessEntry = transcriptEntries[index].isProcessEntry || isProcessEntry
+            if isProcessEntry {
+                transcriptEntries[index].processGroupID = activeProcessGroupID
+            }
         } else {
-            let entry = AITranscriptEntry(role: .assistant, text: delta, requestID: nil)
+            let entry = AITranscriptEntry(
+                role: .assistant,
+                text: delta,
+                requestID: nil,
+                isProcessEntry: isProcessEntry,
+                processGroupID: isProcessEntry ? activeProcessGroupID : nil
+            )
             transcriptEntries.append(entry)
             activeStreamingAssistantIndex = transcriptEntries.count - 1
             messageLabel.isHidden = true
@@ -3632,9 +3955,83 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         renderTranscriptEntries()
     }
 
+    @discardableResult
+    private func collapseActiveProcessEntries() -> Bool {
+        guard let activeProcessGroupID else { return false }
+        var didChange = false
+        for index in transcriptEntries.indices where transcriptEntries[index].processGroupID == activeProcessGroupID {
+            guard transcriptEntries[index].isProcessEntry,
+                  transcriptEntries[index].isCollapsed == false
+            else { continue }
+            transcriptEntries[index].isCollapsed = true
+            didChange = true
+        }
+        if didChange {
+            renderTranscriptEntries()
+        }
+        return didChange
+    }
+
+    private func discardActiveStreamingProcessDraft() {
+        guard let index = activeStreamingAssistantIndex,
+              transcriptEntries.indices.contains(index),
+              transcriptEntries[index].role == .assistant,
+              transcriptEntries[index].isProcessEntry
+        else {
+            activeStreamingAssistantIndex = nil
+            return
+        }
+        transcriptEntries.remove(at: index)
+        activeStreamingAssistantIndex = nil
+        renderTranscriptEntries()
+    }
+
+    private func finishActiveProcessGroup(collapse: Bool) {
+        var didCompleteGroup = false
+        if let activeProcessGroupID {
+            processGroupTimings[activeProcessGroupID]?.completedAt = Date()
+            didCompleteGroup = true
+        }
+        let didCollapseEntries = collapse ? collapseActiveProcessEntries() : false
+        if didCompleteGroup && didCollapseEntries == false {
+            renderTranscriptEntries()
+        }
+        activeProcessGroupID = nil
+    }
+
+    private func finishManualProcessGroupIfNeeded(for requestID: String) {
+        guard let processGroupID = manualProcessGroupIDsByRequestID.removeValue(forKey: requestID) else {
+            return
+        }
+        processGroupTimings[processGroupID]?.completedAt = Date()
+        for index in transcriptEntries.indices where transcriptEntries[index].processGroupID == processGroupID {
+            guard transcriptEntries[index].isProcessEntry else { continue }
+            transcriptEntries[index].isCollapsed = true
+        }
+        if activeProcessGroupID == processGroupID {
+            activeProcessGroupID = nil
+        }
+        renderTranscriptEntries()
+    }
+
+    private func collapseProcessEntries(for requestID: String) {
+        var didChange = false
+        for index in transcriptEntries.indices where transcriptEntries[index].requestID == requestID {
+            guard transcriptEntries[index].isProcessEntry,
+                  transcriptEntries[index].isCollapsed == false
+            else { continue }
+            transcriptEntries[index].isCollapsed = true
+            didChange = true
+        }
+        if didChange {
+            renderTranscriptEntries()
+        }
+    }
+
     private func finalizeAssistantStreamingText(
         _ text: String,
-        persistHistory: Bool
+        persistHistory: Bool,
+        isProcessEntry: Bool = false
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
@@ -3645,12 +4042,28 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
            transcriptEntries.indices.contains(index),
            transcriptEntries[index].role == .assistant {
             transcriptEntries[index].text = trimmed
+            transcriptEntries[index].isProcessEntry = transcriptEntries[index].isProcessEntry || isProcessEntry
+            if isProcessEntry {
+                transcriptEntries[index].processGroupID = activeProcessGroupID
+            }
             if persistHistory {
-                persistConversationHistory(role: .assistant, content: trimmed, requestID: nil)
+                persistConversationHistory(
+                    role: isProcessEntry ? .step : .assistant,
+                    content: trimmed,
+                    requestID: nil
+                )
             }
             renderTranscriptEntries()
         } else {
-            appendTranscript(.assistant, trimmed, persistHistory: persistHistory)
+            appendTranscript(
+                .assistant,
+                trimmed,
+                persistHistory: persistHistory && isProcessEntry == false,
+                isProcessEntry: isProcessEntry
+            )
+            if persistHistory && isProcessEntry {
+                persistConversationHistory(role: .step, content: trimmed, requestID: nil)
+            }
         }
         activeStreamingAssistantIndex = nil
     }
@@ -3682,7 +4095,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        var renderedProcessGroupIDs: Set<UUID> = []
         for entry in transcriptEntries {
+            if entry.isProcessEntry, let processGroupID = entry.processGroupID {
+                guard renderedProcessGroupIDs.insert(processGroupID).inserted else { continue }
+                let groupedEntries = transcriptEntries.filter {
+                    $0.isProcessEntry && $0.processGroupID == processGroupID
+                }
+                let timing = processGroupTimings[processGroupID]
+                let processView = AITranscriptProcessGroupView(
+                    entries: groupedEntries,
+                    elapsedText: processGroupElapsedText(timing: timing, entries: groupedEntries),
+                    onToggle: { [weak self] in
+                        self?.toggleProcessGroup(processGroupID)
+                    }
+                )
+                transcriptStack.addArrangedSubview(processView)
+                processView.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor).isActive = true
+                continue
+            }
             let bubble = makeTranscriptBubble(for: entry)
             transcriptStack.addArrangedSubview(bubble)
             bubble.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor).isActive = true
@@ -3690,10 +4121,48 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         scrollTranscriptToBottom()
     }
 
+    private func toggleProcessGroup(_ processGroupID: UUID) {
+        let matchingIndices = transcriptEntries.indices.filter {
+            transcriptEntries[$0].isProcessEntry
+                && transcriptEntries[$0].processGroupID == processGroupID
+        }
+        guard matchingIndices.isEmpty == false else { return }
+        let shouldExpand = matchingIndices.allSatisfy { transcriptEntries[$0].isCollapsed }
+        matchingIndices.forEach { transcriptEntries[$0].isCollapsed = !shouldExpand }
+        renderTranscriptEntries()
+    }
+
+    private func processGroupElapsedText(
+        timing: AIProcessGroupTiming?,
+        entries: [AITranscriptEntry]
+    ) -> String {
+        let startedAt = timing?.startedAt ?? entries.map(\.createdAt).min() ?? Date()
+        let endedAt = timing?.completedAt
+        let elapsed = max(0, (endedAt ?? Date()).timeIntervalSince(startedAt))
+        let totalSeconds = Int(elapsed.rounded(.down))
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        let duration = minutes > 0 ? "\(minutes)分 \(seconds)秒" : "\(seconds)秒"
+        return endedAt == nil ? "处理中 \(duration)" : "已处理 \(duration)"
+    }
+
     private func makeTranscriptBubble(for entry: AITranscriptEntry) -> AITranscriptBubbleView {
-        let bubble = AITranscriptBubbleView(entry: entry)
+        let bubble = AITranscriptBubbleView(entry: entry) { [weak self] in
+            self?.toggleTranscriptEntry(entry)
+        }
         bubble.preferredTextWidth = max(80, conversationContainer.bounds.width)
         return bubble
+    }
+
+    private func toggleTranscriptEntry(_ entry: AITranscriptEntry) {
+        guard let index = transcriptEntries.firstIndex(where: {
+            $0.role == entry.role
+                && $0.requestID == entry.requestID
+                && $0.text == entry.text
+                && $0.isProcessEntry == entry.isProcessEntry
+        }) else { return }
+        transcriptEntries[index].isCollapsed.toggle()
+        renderTranscriptEntries()
     }
 
     private func configureIconButton(
@@ -3839,7 +4308,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             composerToolbar,
             composerPermissionButton,
             composerModelButton,
-            stopButton,
             transcriptScrollView,
             transcriptContentStack,
             statusLabel,
@@ -3852,8 +4320,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     private func updateQuestionControlState() {
         let hasQuestion = questionField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        askButton.isEnabled = hasQuestion && isAsking == false
-        stopButton.isEnabled = hasActiveAIActivity
+        let canSubmit = surfaceMode != .assistant || hasConfiguredAssistantModel
+        let isActive = hasActiveAIActivity
+        askButton.isEnabled = isActive || (hasQuestion && canSubmit)
+        askButton.image = NSImage(
+            systemSymbolName: isActive ? "stop.fill" : "arrow.up",
+            accessibilityDescription: isActive ? "停止当前 AI 请求" : L10n.AI.ask
+        )
+        askButton.setAccessibilityLabel(isActive ? "停止当前 AI 请求" : L10n.AI.ask)
+        askButton.toolTip = isActive ? "停止当前 AI 请求" : L10n.AI.ask
         composerModelButton.isEnabled = hasActiveAIActivity == false && capturedTaskModelSelection == nil
     }
 
@@ -3897,11 +4372,60 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         transcriptEntries.map(\.displayText).joined(separator: "\n")
     }
 
+    var rawTranscriptTextForTesting: String {
+        transcriptEntries.map(\.text).joined(separator: "\n")
+    }
+
+    var collapsedProcessEntryCountForTesting: Int {
+        transcriptEntries.filter { $0.isProcessEntry && $0.isCollapsed }.count
+    }
+
+    var processGroupCountForTesting: Int {
+        Set(transcriptEntries.compactMap { $0.isProcessEntry ? $0.processGroupID : nil }).count
+    }
+
+    var processGroupSummaryTextsForTesting: [String] {
+        transcriptStack.arrangedSubviews.compactMap { view in
+            (view as? AITranscriptProcessGroupView)?.summaryTextForTesting
+        }
+    }
+
+    var collapsedThinkingEntryCountForTesting: Int {
+        transcriptEntries.filter { $0.role == .assistant && $0.isProcessEntry && $0.isCollapsed }.count
+    }
+
+    func expandFirstCollapsedProcessForTesting() {
+        guard let index = transcriptEntries.firstIndex(where: { $0.isProcessEntry && $0.isCollapsed }) else {
+            return
+        }
+        transcriptEntries[index].isCollapsed = false
+        renderTranscriptEntries()
+    }
+
+    func expandAllProcessEntriesForTesting() {
+        var didChange = false
+        for index in transcriptEntries.indices where transcriptEntries[index].isProcessEntry {
+            if transcriptEntries[index].isCollapsed {
+                transcriptEntries[index].isCollapsed = false
+                didChange = true
+            }
+        }
+        if didChange {
+            renderTranscriptEntries()
+        }
+    }
+
     var assistantTranscriptTextForTesting: String {
         transcriptEntries
             .filter { $0.role == .assistant }
             .map(\.displayText)
             .joined(separator: "\n")
+    }
+
+    var assistantConclusionTextsForTesting: [String] {
+        transcriptEntries
+            .filter { $0.role == .assistant && $0.isProcessEntry == false }
+            .map(\.text)
     }
 
     var systemTranscriptTextForTesting: String {
@@ -3972,6 +4496,16 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     var surfaceModeTitlesForTesting: [String] {
         (0..<surfaceModeSegmentedControl.segmentCount).map { index in
             surfaceModeSegmentedControl.label(forSegment: index) ?? ""
+        }
+    }
+
+    var surfaceModeControlWidthForTesting: CGFloat {
+        surfaceModeSegmentedControl.bounds.width
+    }
+
+    var surfaceModeSegmentWidthsForTesting: [CGFloat] {
+        (0..<surfaceModeSegmentedControl.segmentCount).map {
+            surfaceModeSegmentedControl.width(forSegment: $0)
         }
     }
 
@@ -4130,7 +4664,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     var generalStopEnabledForTesting: Bool {
-        stopButton.isEnabled
+        hasActiveAIActivity && askButton.isEnabled
+    }
+
+    var primaryActionAccessibilityLabelForTesting: String? {
+        askButton.accessibilityLabel()
     }
 
     var taskTakeOverEnabledForTesting: Bool {
@@ -4325,10 +4863,118 @@ private final class AIAssistantFlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class AIAssistantFlippedStackView: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
+private struct AIProcessGroupTiming {
+    let startedAt: Date
+    var completedAt: Date?
+}
+
+private final class AITranscriptProcessGroupView: NSView {
+    private let entries: [AITranscriptEntry]
+    private let elapsedText: String
+    private let onToggle: () -> Void
+    private let disclosureButton = NSButton()
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let separator = NSBox()
+
+    init(
+        entries: [AITranscriptEntry],
+        elapsedText: String,
+        onToggle: @escaping () -> Void
+    ) {
+        self.entries = entries
+        self.elapsedText = elapsedText
+        self.onToggle = onToggle
+        super.init(frame: .zero)
+        configure()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    private var isCollapsed: Bool {
+        entries.isEmpty == false && entries.allSatisfy(\.isCollapsed)
+    }
+
+    var summaryTextForTesting: String {
+        disclosureButton.title
+    }
+
+    private func configure() {
+        setAccessibilityIdentifier("Stacio.AI.transcript.processGroup")
+        translatesAutoresizingMaskIntoConstraints = false
+
+        disclosureButton.title = elapsedText
+        disclosureButton.font = .systemFont(ofSize: 12, weight: .medium)
+        disclosureButton.contentTintColor = .secondaryLabelColor
+        disclosureButton.image = NSImage(
+            systemSymbolName: isCollapsed ? "chevron.right" : "chevron.down",
+            accessibilityDescription: isCollapsed ? "展开处理过程" : "折叠处理过程"
+        )
+        disclosureButton.imagePosition = .imageTrailing
+        disclosureButton.imageScaling = .scaleProportionallyDown
+        disclosureButton.alignment = .left
+        disclosureButton.isBordered = false
+        disclosureButton.bezelStyle = .inline
+        disclosureButton.target = self
+        disclosureButton.action = #selector(togglePressed(_:))
+        disclosureButton.toolTip = isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
+        disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
+        disclosureButton.translatesAutoresizingMaskIntoConstraints = false
+
+        detailLabel.stringValue = entries.map(\.text).joined(separator: "\n\n")
+        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.maximumNumberOfLines = 0
+        detailLabel.lineBreakMode = .byCharWrapping
+        detailLabel.cell?.wraps = true
+        detailLabel.cell?.usesSingleLineMode = false
+        detailLabel.isSelectable = true
+        detailLabel.isHidden = isCollapsed
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(disclosureButton)
+        addSubview(detailLabel)
+        addSubview(separator)
+        let detailTop = detailLabel.topAnchor.constraint(equalTo: disclosureButton.bottomAnchor, constant: 8)
+        detailTop.priority = isCollapsed ? .defaultLow : .required
+        NSLayoutConstraint.activate([
+            disclosureButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+            disclosureButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            disclosureButton.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            detailLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+            detailTop,
+            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
+            separator.topAnchor.constraint(
+                equalTo: isCollapsed ? disclosureButton.bottomAnchor : detailLabel.bottomAnchor,
+                constant: 8
+            ),
+            separator.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
+        ])
+    }
+
+    @objc private func togglePressed(_ sender: Any?) {
+        onToggle()
+    }
+}
+
 private final class AITranscriptBubbleView: NSView {
     private let entry: AITranscriptEntry
+    private let onToggle: () -> Void
     private let bubbleView = NSView()
     private let label = NSTextField(labelWithString: "")
+    private let disclosureButton = NSButton()
     private var bubbleWidthConstraint: NSLayoutConstraint?
 
     var preferredTextWidth: CGFloat = 240 {
@@ -4337,8 +4983,9 @@ private final class AITranscriptBubbleView: NSView {
         }
     }
 
-    init(entry: AITranscriptEntry) {
+    init(entry: AITranscriptEntry, onToggle: @escaping () -> Void = {}) {
         self.entry = entry
+        self.onToggle = onToggle
         super.init(frame: .zero)
         configure()
     }
@@ -4391,6 +5038,21 @@ private final class AITranscriptBubbleView: NSView {
 
         addSubview(bubbleView)
         bubbleView.addSubview(label)
+        if entry.isProcessEntry {
+            disclosureButton.title = ""
+            disclosureButton.isBordered = false
+            disclosureButton.image = NSImage(
+                systemSymbolName: entry.isCollapsed ? "chevron.right" : "chevron.down",
+                accessibilityDescription: entry.isCollapsed ? "展开过程" : "折叠过程"
+            )
+            disclosureButton.imageScaling = .scaleProportionallyDown
+            disclosureButton.target = self
+            disclosureButton.action = #selector(togglePressed(_:))
+            disclosureButton.toolTip = entry.isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
+            disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
+            disclosureButton.translatesAutoresizingMaskIntoConstraints = false
+            bubbleView.addSubview(disclosureButton)
+        }
 
         bubbleWidthConstraint = bubbleView.widthAnchor.constraint(lessThanOrEqualToConstant: preferredTextWidth)
         bubbleWidthConstraint?.isActive = true
@@ -4399,10 +5061,22 @@ private final class AITranscriptBubbleView: NSView {
             bubbleView.topAnchor.constraint(equalTo: topAnchor, constant: entry.verticalInset),
             bubbleView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -entry.verticalInset),
             label.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: entry.horizontalPadding),
-            label.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -entry.horizontalPadding),
             label.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: entry.verticalPadding),
             label.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -entry.verticalPadding)
         ]
+        if entry.isProcessEntry {
+            constraints += [
+                disclosureButton.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -8),
+                disclosureButton.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: 7),
+                disclosureButton.widthAnchor.constraint(equalToConstant: 18),
+                disclosureButton.heightAnchor.constraint(equalToConstant: 18),
+                label.trailingAnchor.constraint(equalTo: disclosureButton.leadingAnchor, constant: -6)
+            ]
+        } else {
+            constraints.append(
+                label.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -entry.horizontalPadding)
+            )
+        }
 
         switch entry.role {
         case .user:
@@ -4413,7 +5087,7 @@ private final class AITranscriptBubbleView: NSView {
         case .assistant:
             constraints += [
                 bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor),
-                bubbleView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32)
+                bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor)
             ]
         case .system:
             constraints += [
@@ -4430,19 +5104,26 @@ private final class AITranscriptBubbleView: NSView {
         NSLayoutConstraint.activate(constraints)
     }
 
+    @objc private func togglePressed(_ sender: Any?) {
+        onToggle()
+    }
+
     private func updatePreferredWidth() {
         let width = max(80, preferredTextWidth)
         let maxBubbleWidth: CGFloat
         switch entry.role {
-        case .user, .assistant:
+        case .user:
             maxBubbleWidth = min(width * 0.86, 420)
+        case .assistant:
+            maxBubbleWidth = width
         case .system:
             maxBubbleWidth = min(width * 0.78, 360)
         case .command, .terminal, .plan, .step:
             maxBubbleWidth = width
         }
         bubbleWidthConstraint?.constant = maxBubbleWidth
-        label.preferredMaxLayoutWidth = max(40, maxBubbleWidth - entry.horizontalPadding * 2)
+        let disclosureWidth: CGFloat = entry.isProcessEntry ? 28 : 0
+        label.preferredMaxLayoutWidth = max(40, maxBubbleWidth - entry.horizontalPadding * 2 - disclosureWidth)
     }
 }
 
@@ -5622,6 +6303,15 @@ private enum AITranscriptRole {
     case plan
     case step
 
+    var isProcessRole: Bool {
+        switch self {
+        case .command, .terminal, .plan, .step:
+            return true
+        case .user, .assistant, .system:
+            return false
+        }
+    }
+
     init(historyRole: AIConversationHistoryRole) {
         switch historyRole {
         case .user:
@@ -5672,9 +6362,15 @@ private struct AITranscriptEntry {
     let role: AITranscriptRole
     var text: String
     let requestID: String?
+    var isProcessEntry: Bool = false
+    var processGroupID: UUID? = nil
+    var isCollapsed: Bool = false
+    var createdAt: Date = Date()
 
     var displayText: String {
-        text
+        guard isCollapsed else { return text }
+        let firstLine = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? text
+        return "\(firstLine) · 已折叠，点击展开"
     }
 
     var font: NSFont {
@@ -5758,7 +6454,7 @@ private struct AITranscriptEntry {
         case .user:
             return StacioDesignSystem.theme.accentColor
         case .assistant:
-            return StacioDesignSystem.theme.elevatedPanelColor.withAlphaComponent(0.42)
+            return .clear
         case .system:
             return .clear
         case .command:
@@ -5798,8 +6494,10 @@ private struct AITranscriptEntry {
         switch role {
         case .command, .terminal, .plan, .step:
             return 12
-        case .user, .assistant:
+        case .user:
             return 13
+        case .assistant:
+            return 0
         case .system:
             return 8
         }
@@ -5809,8 +6507,10 @@ private struct AITranscriptEntry {
         switch role {
         case .command, .terminal, .plan, .step:
             return 10
-        case .user, .assistant:
+        case .user:
             return 10
+        case .assistant:
+            return 8
         case .system:
             return 4
         }

@@ -89,6 +89,40 @@ public final class UpdatePromptTitlebarButton: NSButton {
     }
 }
 
+private final class WorkbenchRootView: NSView, StacioEffectiveAppearanceRefreshHandling {
+    override var fittingSize: NSSize {
+        bounds.size
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(constrainedContentSize(newSize))
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        stacioRefreshEffectiveAppearance()
+    }
+
+    func stacioRefreshEffectiveAppearance() {
+        StacioDesignSystem.refreshDynamicLayerColors(in: self)
+    }
+
+    private func constrainedContentSize(_ proposedSize: NSSize) -> NSSize {
+        guard let window,
+              window.contentView === self
+        else {
+            return proposedSize
+        }
+
+        let maximumWidth = window.contentRect(forFrameRect: window.frame).width
+        return NSSize(width: min(proposedSize.width, maximumWidth), height: proposedSize.height)
+    }
+}
+
 public protocol SavedSessionOpenRecording {
     @discardableResult
     func markSessionRecordOpened(databasePath: String, id: String) throws -> SessionRecord
@@ -243,7 +277,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private weak var updatePromptToolbarItem: NSToolbarItem?
     private weak var updatePromptButton: UpdatePromptTitlebarButton?
     private var updatePromptWidthConstraint: NSLayoutConstraint?
+    private var workbenchContentWidthStayConstraint: NSLayoutConstraint?
+    private var workbenchContentHeightStayConstraint: NSLayoutConstraint?
+    private var isSystemZoomingWindow = false
     private var aiAssistantOverlayViewController: AIAssistantPanelViewController?
+    private var agentExecutionCoordinator: AgentExecutionCoordinator?
     private var splitResizeObserver: NSObjectProtocol?
     private var isMultiExecBroadcasting = false
     private var isUserLiveResizingWindow = false
@@ -258,10 +296,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var isPendingInspectorWidthRepairScheduled = false
     private var allowsUserSplitWidthPersistence = false
     private var isSidebarTemporarilyExpanded = false
+    private var pendingProgrammaticWindowFrameRestore: NSRect?
     private var rootContentViewController: NSViewController?
     private let minimumReadableSidebarWidth: CGFloat = 220
     private let minimumWorkspaceWidthWhenOpeningInspector: CGFloat = 248
     private let defaultInspectorPanelWidth: CGFloat = 320
+    private let minimumInspectorWidthBeforeDeferredUncollapse: CGFloat = 420
     private let preferredFilesCapabilityInspectorWidth: CGFloat = 960
     private let unrestrictedInspectorPanelWidth: CGFloat = 100_000
 
@@ -461,10 +501,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
         contentSplitViewController = makeSplitViewController()
         let rootController = NSViewController()
-        let rootView = StacioAppearanceRefreshView(
+        let rootView = WorkbenchRootView(
             frame: NSRect(origin: .zero, size: window.contentRect(forFrameRect: window.frame).size)
         )
         window.contentView = rootView
+        installWorkbenchContentSizeStayConstraints(on: rootView)
         StacioDesignSystem.applyRootSurface(rootView)
 
         let splitView = contentSplitViewController.view
@@ -488,15 +529,27 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-        frameSize
+        if let preservedFrame = pendingProgrammaticWindowFrameRestore,
+           isRestoringWindowFrame == false,
+           isUserLiveResizingWindow == false
+        {
+            return preservedFrame.size
+        }
+        if isUserLiveResizingWindow {
+            updateWorkbenchContentSizeStayConstraints(forFrameSize: frameSize, in: sender)
+        }
+        return frameSize
     }
 
     public func windowWillStartLiveResize(_ notification: Notification) {
+        pendingProgrammaticWindowFrameRestore = nil
         isUserLiveResizingWindow = true
     }
 
     public func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool {
-        true
+        prepareWorkbenchContentSizeForSystemResize(toFrameSize: newFrame.size, in: window)
+        updateWorkbenchContentSizeStayConstraints(forFrameSize: newFrame.size, in: window)
+        return true
     }
 
     public func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
@@ -504,7 +557,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             return newFrame
         }
 
-        return clampedRestoredWindowFrame(visibleFrame, for: window, limitsSizeToVisibleFrame: true)
+        let standardFrame = clampedRestoredWindowFrame(visibleFrame, for: window, limitsSizeToVisibleFrame: true)
+        prepareWorkbenchContentSizeForSystemResize(toFrameSize: standardFrame.size, in: window)
+        updateWorkbenchContentSizeStayConstraints(forFrameSize: standardFrame.size, in: window)
+        return standardFrame
     }
 
     public func windowDidEndLiveResize(_ notification: Notification) {
@@ -529,7 +585,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
               isRestoringWindowFrame == false
         else { return }
 
+        updateWorkbenchContentSizeStayConstraints(forFrameSize: window.frame.size, in: window)
         layoutWorkbenchContent(in: window)
+        finishWorkbenchSystemResizeIfNeeded()
     }
 
     private func removeLegacyAutosavedFramesIfNeeded() {
@@ -601,6 +659,51 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         applyInitialSplitColumnWidthsIfNeeded(in: window)
     }
 
+    private func installWorkbenchContentSizeStayConstraints(on contentView: NSView) {
+        let widthConstraint = contentView.widthAnchor.constraint(
+            equalToConstant: contentView.bounds.width
+        )
+        widthConstraint.priority = NSLayoutConstraint.Priority(999)
+        widthConstraint.identifier = "Stacio.Workbench.contentWidthStay"
+        let heightConstraint = contentView.heightAnchor.constraint(
+            equalToConstant: contentView.bounds.height
+        )
+        heightConstraint.priority = NSLayoutConstraint.Priority(999)
+        heightConstraint.identifier = "Stacio.Workbench.contentHeightStay"
+        NSLayoutConstraint.activate([widthConstraint, heightConstraint])
+        workbenchContentWidthStayConstraint = widthConstraint
+        workbenchContentHeightStayConstraint = heightConstraint
+    }
+
+    private func updateWorkbenchContentSizeStayConstraints(
+        forFrameSize frameSize: NSSize,
+        in window: NSWindow
+    ) {
+        let contentSize = window.contentRect(
+            forFrameRect: NSRect(origin: .zero, size: frameSize)
+        ).size
+        workbenchContentWidthStayConstraint?.constant = max(1, contentSize.width)
+        workbenchContentHeightStayConstraint?.constant = max(1, contentSize.height)
+    }
+
+    private func prepareWorkbenchContentSizeForSystemResize(
+        toFrameSize frameSize: NSSize,
+        in window: NSWindow
+    ) {
+        guard isUserLiveResizingWindow == false else { return }
+        isSystemZoomingWindow = true
+        workbenchContentWidthStayConstraint?.priority = .defaultLow
+        workbenchContentHeightStayConstraint?.priority = .defaultLow
+        updateWorkbenchContentSizeStayConstraints(forFrameSize: frameSize, in: window)
+    }
+
+    private func finishWorkbenchSystemResizeIfNeeded() {
+        guard isSystemZoomingWindow else { return }
+        workbenchContentWidthStayConstraint?.priority = NSLayoutConstraint.Priority(999)
+        workbenchContentHeightStayConstraint?.priority = NSLayoutConstraint.Priority(999)
+        isSystemZoomingWindow = false
+    }
+
     private func applyInitialSplitColumnWidthsIfNeeded(in window: NSWindow?) {
         guard didApplyInitialSplitColumnWidths == false,
               let window,
@@ -645,7 +748,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func keepSidebarReadableWithoutResizingWindow() {
-        let windowFrame = window?.frame
+        let windowFrame = programmaticWindowFrameForLayout()
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -838,7 +941,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         force: Bool = false,
         preferredDefaultWidth: CGFloat? = nil
     ) {
-        let windowFrame = window?.frame
+        let windowFrame = programmaticWindowFrameForLayout()
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -857,21 +960,34 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
         let storedInspectorWidth = storedSplitWidth(column: "inspector")
         let storedSidebarWidth = storedSplitWidth(column: "sidebar")
-        let pinnedSidebarWidth = storedSidebarWidth.map {
-            clampedSidebarWidth($0, availableWidth: splitView.bounds.width)
-        }
+        let pinnedSidebarWidth = storedSidebarWidth
+            .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
+            ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+        let maximumInspectorWidth = max(
+            0,
+            splitView.bounds.width
+                - pinnedSidebarWidth
+                - minimumWorkspaceWidthWhenOpeningInspector
+                - splitView.dividerThickness * 2
+        )
         let configuredDefaultWidth = defaultInspectorWidth(
             for: splitView.bounds.width,
             preferredWidth: preferredDefaultWidth ?? defaultInspectorPanelWidth
         )
-        let defaultWidth = pendingDefaultInspectorWidth(
-            splitWidth: splitView.bounds.width,
-            fallback: configuredDefaultWidth
+        let defaultWidth = min(
+            pendingDefaultInspectorWidth(
+                splitWidth: splitView.bounds.width,
+                fallback: configuredDefaultWidth
+            ),
+            maximumInspectorWidth
         )
-        let targetWidth = targetInspectorWidth(
-            storedWidth: storedInspectorWidth,
-            defaultWidth: defaultWidth,
-            splitWidth: splitView.bounds.width
+        let targetWidth = min(
+            targetInspectorWidth(
+                storedWidth: storedInspectorWidth,
+                defaultWidth: defaultWidth,
+                splitWidth: splitView.bounds.width
+            ),
+            maximumInspectorWidth
         )
         guard targetWidth > 0 else {
             inspectorSplitViewItem.holdingPriority = .defaultHigh
@@ -889,12 +1005,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         updatePreferredInspectorFraction(targetWidth, splitWidth: splitView.bounds.width)
         pendingInspectorWidth = targetWidth
         performProgrammaticSplitLayout {
-            if let storedSidebarWidth {
-                splitView.setPosition(
-                    pinnedSidebarWidth ?? clampedSidebarWidth(storedSidebarWidth, availableWidth: splitView.bounds.width),
-                    ofDividerAt: 0
-                )
-            }
             applyInspectorWidth(
                 targetWidth,
                 in: splitView,
@@ -902,6 +1012,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 pinsInspectorWidthDuringLayout: true,
                 pinnedSidebarWidth: pinnedSidebarWidth
             )
+            if let storedSidebarWidth {
+                splitView.setPosition(
+                    clampedSidebarWidth(storedSidebarWidth, availableWidth: splitView.bounds.width),
+                    ofDividerAt: 0
+                )
+            }
             splitView.layoutSubtreeIfNeeded()
         }
         inspectorSplitViewItem.holdingPriority = .defaultHigh
@@ -1144,6 +1260,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
               contentSplitViewController.splitViewItems[2].isCollapsed == false
         else { return }
 
+        let windowFrame = programmaticWindowFrameForLayout()
         let splitView = contentSplitViewController.splitView
         if let pinnedSplitView = splitView as? StacioPinnedSplitView,
            pinnedSplitView.isPerformingLayoutPass
@@ -1164,6 +1281,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         applyWorkbenchSplitFrames(
             forDividerOnePosition: dividerPosition,
             in: splitView,
+            preservingWindowFrame: windowFrame,
             pinsInspectorWidthDuringLayout: true
         )
     }
@@ -1387,8 +1505,37 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         else { return }
 
         isRestoringWindowFrame = true
+        updateWorkbenchContentSizeStayConstraints(forFrameSize: frame.size, in: window)
         window.setFrame(frame, display: false)
         isRestoringWindowFrame = false
+    }
+
+    private func programmaticWindowFrameForLayout() -> NSRect? {
+        pendingProgrammaticWindowFrameRestore ?? window?.frame
+    }
+
+    private func preserveProgrammaticWindowFrame(_ frame: NSRect?) {
+        guard let frame else { return }
+
+        pendingProgrammaticWindowFrameRestore = frame
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreProgrammaticFrameIfNeeded(frame)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+            guard let self,
+                  self.pendingProgrammaticWindowFrameRestore?.equalTo(frame) == true
+            else { return }
+
+            self.restoreProgrammaticFrameIfNeeded(frame)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self,
+                  self.pendingProgrammaticWindowFrameRestore?.equalTo(frame) == true
+            else { return }
+
+            self.restoreProgrammaticFrameIfNeeded(frame)
+            self.pendingProgrammaticWindowFrameRestore = nil
+        }
     }
 
     private func scheduleSidebarReadabilityRepair(preserving frame: NSRect? = nil) {
@@ -1465,6 +1612,16 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return frame
     }
 
+    private static func defaultTransferCompletionNotificationPresenter() -> TransferCompletionNotificationPresenting {
+        let processName = ProcessInfo.processInfo.processName.lowercased()
+        guard processName != "xctest",
+              processName.hasSuffix("xctest") == false
+        else {
+            return NoopTransferCompletionNotificationPresenter()
+        }
+        return TransferCompletionNotificationPresenter.shared
+    }
+
     private func makeSplitViewController() -> NSSplitViewController {
         let split = StacioPinnedSplitViewController(usesPositionHookSplitView: true)
         split.splitView.isVertical = true
@@ -1523,7 +1680,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 }
             },
             sessionEditor: makeDefaultSessionSidebarSessionEditor(credentialSaver: credentialManager),
-            credentialCleaner: credentialManager
+            credentialCleaner: credentialManager,
+            settingsStore: settingsStore
         )
         _ = sidebarController.view
         let readableSidebarWidth = sidebarController.view.widthAnchor.constraint(
@@ -1632,6 +1790,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 }
             },
             settingsStore: settingsStore,
+            transferCompletionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
             transferQueueCoordinatorFactory: transferQueueCoordinatorFactory
         )
         _ = inspectorController.view
@@ -1657,7 +1816,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             )
         }
         workspaceViewController.onRemoteTerminalClosed = { [weak inspectorController] pane in
-            inspectorController?.disconnectFilesBindingIfNeeded(runtimeID: pane.runtimeID) ?? true
+            let canClose = inspectorController?.disconnectFilesBindingIfNeeded(runtimeID: pane.runtimeID) ?? true
+            if canClose {
+                inspectorController?.dismissTransferNotifications(runtimeID: pane.runtimeID)
+            }
+            return canClose
         }
         workspaceViewController.onCurrentRemoteTerminalAttached = { [weak self, weak inspectorController] pane in
             guard let context = pane.liveSessionContext else {
@@ -1858,18 +2021,22 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         else {
             return
         }
+        let preservedWindowFrame = window?.frame
+        defer {
+            restoreProgrammaticFrameIfNeeded(preservedWindowFrame)
+        }
         performProgrammaticSplitLayout {
             inspectorSplitViewItem.isCollapsed = false
         }
-        inspectorViewController.selectAIAssistantTab()
         applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        inspectorViewController.selectAIAssistantTab()
         scheduleInspectorReadabilityRepair(
-            preserving: window?.frame,
+            preserving: preservedWindowFrame,
             preferredDefaultWidth: defaultInspectorPanelWidth,
             force: true
         )
         keepSidebarReadableWithoutResizingWindow()
-        scheduleSidebarReadabilityRepair(preserving: window?.frame)
+        scheduleSidebarReadabilityRepair(preserving: preservedWindowFrame)
         inspectorViewController.aiAssistantViewController?.refreshForCurrentContext()
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmed, trimmed.isEmpty == false {
@@ -1879,7 +2046,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func makeAgentExecutionCoordinator(parentWindow: NSWindow?) -> AgentExecutionCoordinator {
-        AgentExecutionCoordinator(
+        if let agentExecutionCoordinator {
+            return agentExecutionCoordinator
+        }
+        let coordinator = AgentExecutionCoordinator(
             terminalResolver: workspaceViewController,
             authorizer: SettingsBackedAgentActionAuthorizer(
                 settingsStore: settingsStore,
@@ -1888,11 +2058,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             ),
             auditRecorder: makeAgentActionAuditStore(),
             sessionLister: workspaceViewController,
-            executionMode: AgentExecutionMode(preference: settingsStore.snapshot().agentExecutionMode),
-            executionModeResolver: { [settingsStore] in
-                AgentExecutionMode(preference: settingsStore.snapshot().agentExecutionMode)
-            }
+            executionMode: .visibleTerminal
         )
+        agentExecutionCoordinator = coordinator
+        return coordinator
     }
 
     private func makeAgentActionAuditStore() -> AgentActionAuditRecording? {
@@ -2360,17 +2529,30 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func performVerticalSplitTerminalFromToolbar(_ sender: Any?) {
-        workspaceViewController.setCurrentTerminalSplitLayout(.vertical)
+        performExistingTerminalSplit(layout: .vertical)
     }
 
     @objc
     public func performHorizontalSplitTerminalFromToolbar(_ sender: Any?) {
-        workspaceViewController.setCurrentTerminalSplitLayout(.horizontal)
+        performExistingTerminalSplit(layout: .horizontal)
     }
 
     @objc
     public func performGridSplitTerminalFromToolbar(_ sender: Any?) {
-        workspaceViewController.setCurrentTerminalSplitLayout(.grid)
+        performExistingTerminalSplit(layout: .grid)
+    }
+
+    private func performExistingTerminalSplit(layout: TerminalSplitLayoutMode) {
+        let targets = workspaceViewController.splitTargets()
+        if targets.count < 2 {
+            guard (try? workspaceViewController.splitCurrentTerminal()) != nil else { return }
+            workspaceViewController.setCurrentTerminalSplitLayout(layout)
+            return
+        }
+        guard let selection = multiExecSessionSelector.selectMultiExecTargets(targets: targets, parentWindow: window) else {
+            return
+        }
+        _ = try? workspaceViewController.splitExistingTerminals(targetIDs: selection.targetIDs, layout: layout)
     }
 
     @objc
@@ -2381,6 +2563,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showFilesFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2422,6 +2605,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showTunnelsFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2443,6 +2627,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showBrowserFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2464,6 +2649,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showDiagnosticsFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2485,6 +2671,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showTerminalMacrosFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2507,6 +2694,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showCommandHistoryFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2527,6 +2715,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func toggleDeviceDashboardFromToolbar(_ sender: Any?) {
+        preserveProgrammaticWindowFrame(window?.frame)
         workspaceViewController.toggleDeviceMetricsDashboardVisibility()
     }
 
@@ -2538,6 +2727,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func showAIAssistantFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2550,6 +2740,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func toggleInspectorFromToolbar(_ sender: Any?) {
         let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
         }
@@ -2630,13 +2821,19 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             multiExecSessionSelector.presentMultiExecError(error, parentWindow: window)
             throw error
         }
-        guard let selection = multiExecSessionSelector.selectMultiExecTargets(
+        let currentSplitIDs = workspaceViewController.currentSplitTargetIDs()
+        let selectedIDs: [String]
+        if currentSplitIDs.count >= 2 {
+            selectedIDs = currentSplitIDs
+        } else if let selection = multiExecSessionSelector.selectMultiExecTargets(
             targets: targets,
             parentWindow: window
-        ) else { return }
+        ) {
+            selectedIDs = selection.targetIDs
+        } else { return }
 
         do {
-            try workspaceViewController.startMultiExecSession(targetIDs: selection.targetIDs)
+            try workspaceViewController.startMultiExecSession(targetIDs: selectedIDs)
         } catch {
             multiExecSessionSelector.presentMultiExecError(error, parentWindow: window)
             throw error
@@ -2986,6 +3183,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         let config = try savedSessionSSHConfig(for: session)
         let proxyJumpSelection = savedSessionProxyJumpSelection(for: session)
+        let manualIconID = savedSessionIconID(for: session)
         let databasePath = try databasePathProvider()
         let title = savedSessionTitle(for: session, username: session.username)
         let status = try startRemoteSession(
@@ -2997,6 +3195,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 try CoreBridge.listAllSessionRecords(databasePath: databasePath).first(where: { $0.id == id })
             }
         )
+        workspaceViewController.setManualSessionIcon(manualIconID, runtimeID: status.runtimeId)
         markSavedSessionOpened(session)
         return status
     }
@@ -3275,8 +3474,63 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
               inspectorSplitViewItem.isCollapsed
         else { return }
 
+        layoutWorkbenchContent(in: window)
+        let splitView = contentSplitViewController.splitView
+        guard splitView.bounds.width > 0 else { return }
+        let defaultWidth = defaultInspectorWidth(
+            for: splitView.bounds.width,
+            preferredWidth: defaultInspectorPanelWidth
+        )
+        let restoredSidebarWidth = storedSplitWidth(column: "sidebar")
+            .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
+            ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+        let maximumInitialWidth = max(
+            0,
+            splitView.bounds.width
+                - restoredSidebarWidth
+                - minimumWorkspaceWidthWhenOpeningInspector
+                - splitView.dividerThickness * 2
+        )
+        let initialWidth = min(
+            storedSplitWidth(column: "inspector") ?? defaultWidth,
+            maximumInitialWidth
+        )
+        let needsTemporaryWidthCap = initialWidth > 0
+            && maximumInitialWidth < minimumInspectorWidthBeforeDeferredUncollapse
+        let contentSize = window?.contentView?.bounds.size
+        let previousMinimumThickness = inspectorSplitViewItem.minimumThickness
+        let previousMaximumThickness = inspectorSplitViewItem.maximumThickness
         performProgrammaticSplitLayout {
+            inspectorSplitViewItem.holdingPriority = .defaultLow
+            if needsTemporaryWidthCap {
+                inspectorSplitViewItem.maximumThickness = initialWidth
+                inspectorSplitViewItem.preferredThicknessFraction = initialWidth / splitView.bounds.width
+                pendingInspectorWidth = initialWidth
+            }
             inspectorSplitViewItem.isCollapsed = false
+        }
+        guard needsTemporaryWidthCap else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self,
+                  let inspectorSplitViewItem = self.inspectorSplitViewItem
+            else { return }
+
+            inspectorSplitViewItem.minimumThickness = previousMinimumThickness
+            inspectorSplitViewItem.maximumThickness = previousMaximumThickness
+        }
+        if let contentSize,
+           let contentView = window?.contentView,
+           contentView.bounds.size != contentSize
+        {
+            contentView.setFrameSize(contentSize)
+            contentView.layoutSubtreeIfNeeded()
+            let targetBounds = NSRect(origin: .zero, size: contentSize)
+            let containerView = contentSplitViewController.view
+            containerView.frame = targetBounds
+            containerView.bounds = targetBounds
+            containerView.needsLayout = true
+            containerView.layoutSubtreeIfNeeded()
         }
     }
 
@@ -3399,6 +3653,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             return .default
         }
         return SessionAutomationPolicy.fromConfigJSON(configJSON)
+    }
+
+    private func savedSessionIconID(for session: SessionRecord) -> String? {
+        guard let databasePath = try? databasePathProvider(),
+              let configJSON = try? CoreBridge.getSessionConfigJSON(databasePath: databasePath, id: session.id)
+        else { return nil }
+        return SessionIconConfigCodec.iconID(from: configJSON)
     }
 
     private func savedSessionProxyJumpSelection(for session: SessionRecord) -> SSHProxyJumpSelection {

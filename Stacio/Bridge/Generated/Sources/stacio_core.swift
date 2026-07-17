@@ -3469,11 +3469,12 @@ public struct ImportSessionPreview {
     public var port: UInt16
     public var username: String?
     public var privateKeyPath: String?
+    public var configJson: String?
     public var conflict: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, folder: String?, `protocol`: String, host: String, port: UInt16, username: String?, privateKeyPath: String?, conflict: Bool) {
+    public init(name: String, folder: String?, `protocol`: String, host: String, port: UInt16, username: String?, privateKeyPath: String?, configJson: String?, conflict: Bool) {
         self.name = name
         self.folder = folder
         self.`protocol` = `protocol`
@@ -3481,6 +3482,7 @@ public struct ImportSessionPreview {
         self.port = port
         self.username = username
         self.privateKeyPath = privateKeyPath
+        self.configJson = configJson
         self.conflict = conflict
     }
 }
@@ -3513,6 +3515,9 @@ extension ImportSessionPreview: Equatable, Hashable {
         if lhs.privateKeyPath != rhs.privateKeyPath {
             return false
         }
+        if lhs.configJson != rhs.configJson {
+            return false
+        }
         if lhs.conflict != rhs.conflict {
             return false
         }
@@ -3527,6 +3532,7 @@ extension ImportSessionPreview: Equatable, Hashable {
         hasher.combine(port)
         hasher.combine(username)
         hasher.combine(privateKeyPath)
+        hasher.combine(configJson)
         hasher.combine(conflict)
     }
 }
@@ -3547,6 +3553,7 @@ public struct FfiConverterTypeImportSessionPreview: FfiConverterRustBuffer {
                 port: FfiConverterUInt16.read(from: &buf),
                 username: FfiConverterOptionString.read(from: &buf),
                 privateKeyPath: FfiConverterOptionString.read(from: &buf),
+                configJson: FfiConverterOptionString.read(from: &buf),
                 conflict: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3559,6 +3566,7 @@ public struct FfiConverterTypeImportSessionPreview: FfiConverterRustBuffer {
         FfiConverterUInt16.write(value.port, into: &buf)
         FfiConverterOptionString.write(value.username, into: &buf)
         FfiConverterOptionString.write(value.privateKeyPath, into: &buf)
+        FfiConverterOptionString.write(value.configJson, into: &buf)
         FfiConverterBool.write(value.conflict, into: &buf)
     }
 }
@@ -5319,6 +5327,76 @@ public func FfiConverterTypeSessionFolder_lower(_ value: SessionFolder) -> RustB
 }
 
 
+public struct SessionIconAssignment {
+    public var sessionId: String
+    public var iconId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sessionId: String, iconId: String) {
+        self.sessionId = sessionId
+        self.iconId = iconId
+    }
+}
+
+#if compiler(>=6)
+extension SessionIconAssignment: Sendable {}
+#endif
+
+
+extension SessionIconAssignment: Equatable, Hashable {
+    public static func ==(lhs: SessionIconAssignment, rhs: SessionIconAssignment) -> Bool {
+        if lhs.sessionId != rhs.sessionId {
+            return false
+        }
+        if lhs.iconId != rhs.iconId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sessionId)
+        hasher.combine(iconId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionIconAssignment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionIconAssignment {
+        return
+            try SessionIconAssignment(
+                sessionId: FfiConverterString.read(from: &buf),
+                iconId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionIconAssignment, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterString.write(value.iconId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionIconAssignment_lift(_ buf: RustBuffer) throws -> SessionIconAssignment {
+    return try FfiConverterTypeSessionIconAssignment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionIconAssignment_lower(_ value: SessionIconAssignment) -> RustBuffer {
+    return FfiConverterTypeSessionIconAssignment.lower(value)
+}
+
+
 public struct SessionRecord {
     public var id: String
     public var folderId: String?
@@ -5458,6 +5536,170 @@ public func FfiConverterTypeSessionRecord_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionRecord_lower(_ value: SessionRecord) -> RustBuffer {
     return FfiConverterTypeSessionRecord.lower(value)
+}
+
+
+public struct SessionSidebarOrderItem {
+    public var kind: String
+    public var id: String
+    public var parentId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: String, id: String, parentId: String?) {
+        self.kind = kind
+        self.id = id
+        self.parentId = parentId
+    }
+}
+
+#if compiler(>=6)
+extension SessionSidebarOrderItem: Sendable {}
+#endif
+
+
+extension SessionSidebarOrderItem: Equatable, Hashable {
+    public static func ==(lhs: SessionSidebarOrderItem, rhs: SessionSidebarOrderItem) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.parentId != rhs.parentId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(id)
+        hasher.combine(parentId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionSidebarOrderItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionSidebarOrderItem {
+        return
+            try SessionSidebarOrderItem(
+                kind: FfiConverterString.read(from: &buf),
+                id: FfiConverterString.read(from: &buf),
+                parentId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionSidebarOrderItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterOptionString.write(value.parentId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSidebarOrderItem_lift(_ buf: RustBuffer) throws -> SessionSidebarOrderItem {
+    return try FfiConverterTypeSessionSidebarOrderItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSidebarOrderItem_lower(_ value: SessionSidebarOrderItem) -> RustBuffer {
+    return FfiConverterTypeSessionSidebarOrderItem.lower(value)
+}
+
+
+public struct SessionSidebarSnapshot {
+    public var folders: [SessionFolder]
+    public var sessions: [SessionRecord]
+    public var orderItems: [SessionSidebarOrderItem]
+    public var manualIconAssignments: [SessionIconAssignment]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(folders: [SessionFolder], sessions: [SessionRecord], orderItems: [SessionSidebarOrderItem], manualIconAssignments: [SessionIconAssignment]) {
+        self.folders = folders
+        self.sessions = sessions
+        self.orderItems = orderItems
+        self.manualIconAssignments = manualIconAssignments
+    }
+}
+
+#if compiler(>=6)
+extension SessionSidebarSnapshot: Sendable {}
+#endif
+
+
+extension SessionSidebarSnapshot: Equatable, Hashable {
+    public static func ==(lhs: SessionSidebarSnapshot, rhs: SessionSidebarSnapshot) -> Bool {
+        if lhs.folders != rhs.folders {
+            return false
+        }
+        if lhs.sessions != rhs.sessions {
+            return false
+        }
+        if lhs.orderItems != rhs.orderItems {
+            return false
+        }
+        if lhs.manualIconAssignments != rhs.manualIconAssignments {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(folders)
+        hasher.combine(sessions)
+        hasher.combine(orderItems)
+        hasher.combine(manualIconAssignments)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionSidebarSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionSidebarSnapshot {
+        return
+            try SessionSidebarSnapshot(
+                folders: FfiConverterSequenceTypeSessionFolder.read(from: &buf),
+                sessions: FfiConverterSequenceTypeSessionRecord.read(from: &buf),
+                orderItems: FfiConverterSequenceTypeSessionSidebarOrderItem.read(from: &buf),
+                manualIconAssignments: FfiConverterSequenceTypeSessionIconAssignment.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionSidebarSnapshot, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSessionFolder.write(value.folders, into: &buf)
+        FfiConverterSequenceTypeSessionRecord.write(value.sessions, into: &buf)
+        FfiConverterSequenceTypeSessionSidebarOrderItem.write(value.orderItems, into: &buf)
+        FfiConverterSequenceTypeSessionIconAssignment.write(value.manualIconAssignments, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSidebarSnapshot_lift(_ buf: RustBuffer) throws -> SessionSidebarSnapshot {
+    return try FfiConverterTypeSessionSidebarSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSidebarSnapshot_lower(_ value: SessionSidebarSnapshot) -> RustBuffer {
+    return FfiConverterTypeSessionSidebarSnapshot.lower(value)
 }
 
 
@@ -9160,6 +9402,31 @@ fileprivate struct FfiConverterSequenceTypeSessionFolder: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSessionIconAssignment: FfiConverterRustBuffer {
+    typealias SwiftType = [SessionIconAssignment]
+
+    public static func write(_ value: [SessionIconAssignment], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSessionIconAssignment.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SessionIconAssignment] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SessionIconAssignment]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSessionIconAssignment.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSessionRecord: FfiConverterRustBuffer {
     typealias SwiftType = [SessionRecord]
 
@@ -9177,6 +9444,31 @@ fileprivate struct FfiConverterSequenceTypeSessionRecord: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSessionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSessionSidebarOrderItem: FfiConverterRustBuffer {
+    typealias SwiftType = [SessionSidebarOrderItem]
+
+    public static func write(_ value: [SessionSidebarOrderItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSessionSidebarOrderItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SessionSidebarOrderItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SessionSidebarOrderItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSessionSidebarOrderItem.read(from: &buf))
         }
         return seq
     }
@@ -9691,6 +9983,13 @@ public func listSessionRecords(databasePath: String, folderId: String?)throws  -
     )
 })
 }
+public func listSessionSidebarOrder(databasePath: String)throws  -> [SessionSidebarOrderItem]  {
+    return try  FfiConverterSequenceTypeSessionSidebarOrderItem.lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
+    uniffi_stacio_core_fn_func_list_session_sidebar_order(
+        FfiConverterString.lower(databasePath),$0
+    )
+})
+}
 public func listTerminalMacros(databasePath: String)throws  -> [TerminalMacroRecord]  {
     return try  FfiConverterSequenceTypeTerminalMacroRecord.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_list_terminal_macros(
@@ -9718,6 +10017,13 @@ public func liveSshSessionInfo(runtimeId: String) -> LiveSshSessionInfo?  {
     return try!  FfiConverterOptionTypeLiveSshSessionInfo.lift(try! rustCall() {
     uniffi_stacio_core_fn_func_live_ssh_session_info(
         FfiConverterString.lower(runtimeId),$0
+    )
+})
+}
+public func loadSessionSidebarSnapshot(databasePath: String)throws  -> SessionSidebarSnapshot  {
+    return try  FfiConverterTypeSessionSidebarSnapshot_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
+    uniffi_stacio_core_fn_func_load_session_sidebar_snapshot(
+        FfiConverterString.lower(databasePath),$0
     )
 })
 }
@@ -9777,6 +10083,17 @@ public func parseRemoteListing(input: String)throws  -> [RemoteFileEntry]  {
     return try  FfiConverterSequenceTypeRemoteFileEntry.lift(try rustCallWithError(FfiConverterTypeFilesError_lift) {
     uniffi_stacio_core_fn_func_parse_remote_listing(
         FfiConverterString.lower(input),$0
+    )
+})
+}
+public func placeSessionSidebarItem(databasePath: String, kind: String, id: String, targetParentId: String?, targetIndex: UInt32)throws  -> SessionSidebarOrderItem  {
+    return try  FfiConverterTypeSessionSidebarOrderItem_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
+    uniffi_stacio_core_fn_func_place_session_sidebar_item(
+        FfiConverterString.lower(databasePath),
+        FfiConverterString.lower(kind),
+        FfiConverterString.lower(id),
+        FfiConverterOptionString.lower(targetParentId),
+        FfiConverterUInt32.lower(targetIndex),$0
     )
 })
 }
@@ -10401,6 +10718,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_list_session_records() != 8555) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_list_session_sidebar_order() != 44249) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_list_terminal_macros() != 46500) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10411,6 +10731,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_live_ssh_session_info() != 49767) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_load_session_sidebar_snapshot() != 30630) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_mark_broadcast_executed() != 26) {
@@ -10432,6 +10755,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_parse_remote_listing() != 51859) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_place_session_sidebar_item() != 10152) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_playback_macro_steps() != 22661) {

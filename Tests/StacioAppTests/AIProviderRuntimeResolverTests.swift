@@ -48,7 +48,7 @@ final class AIProviderRuntimeResolverTests: XCTestCase {
         )
     }
 
-    func testRuntimeResolverFallsBackToRulesWhenGlobalDefaultIsInvalid() {
+    func testRuntimeResolverReturnsUnconfiguredMozheAPIWhenGlobalDefaultIsInvalid() {
         let disabledProvider = makeProvider(
             id: providerAID,
             modelIDs: ["a-model"],
@@ -64,11 +64,11 @@ final class AIProviderRuntimeResolverTests: XCTestCase {
                 envelope: envelope,
                 requestedSelection: .init(providerID: providerBID, modelID: "missing-model")
             ),
-            .stacioRules
+            .unconfigured(provider: BuiltInAIProvider.defaultConfiguration)
         )
     }
 
-    func testRuntimeResolverResolvesRequestedRulesSelection() {
+    func testRuntimeResolverTreatsRequestedRulesSelectionAsFollowingGlobalDefault() {
         let providerA = makeProvider(id: providerAID, modelIDs: ["a-model"])
         let envelope = makeEnvelope(providers: [providerA], defaultProviderID: providerA.id)
 
@@ -80,7 +80,61 @@ final class AIProviderRuntimeResolverTests: XCTestCase {
                     modelID: "ignored"
                 )
             ),
-            .stacioRules
+            .external(provider: providerA, modelID: "a-model")
+        )
+    }
+
+    func testRuntimeResolverReturnsUnconfiguredMozheAPIForLegacyRulesOnlyEnvelope() {
+        XCTAssertEqual(
+            AIProviderRuntimeResolver.resolve(
+                envelope: .rulesOnly,
+                requestedSelection: nil
+            ),
+            .unconfigured(provider: BuiltInAIProvider.defaultConfiguration)
+        )
+    }
+
+    func testLegacyCatalogPathCanLoadModelsForUnconfiguredMozheAPI() throws {
+        let catalog = RuntimeRecordingModelCatalog()
+        let keyStore = ScopedRecordingAIApiKeyStore(
+            keys: [BuiltInAIProvider.mozheAPIID: "mozhe-secret"]
+        )
+
+        let models = try catalog.listModels(
+            settings: AppSettings(),
+            apiKeyStore: keyStore
+        )
+
+        XCTAssertEqual(models, ["remote-model"])
+        XCTAssertEqual(catalog.providerIDs, [BuiltInAIProvider.mozheAPIID])
+        XCTAssertEqual(catalog.apiKeys, ["mozhe-secret"])
+        XCTAssertEqual(keyStore.readProviderIDs, [BuiltInAIProvider.mozheAPIID])
+    }
+
+    func testLegacyConnectionPathReportsMissingModelForUnconfiguredMozheAPI() {
+        let tester = RuntimeRecordingConnectionTester()
+        let keyStore = ScopedRecordingAIApiKeyStore(
+            keys: [BuiltInAIProvider.mozheAPIID: "mozhe-secret"]
+        )
+
+        XCTAssertThrowsError(
+            try tester.testConnection(settings: AppSettings(), apiKeyStore: keyStore)
+        ) { error in
+            XCTAssertEqual(error as? AIAssistantProviderError, .missingModel)
+        }
+        XCTAssertTrue(tester.providerIDs.isEmpty)
+        XCTAssertTrue(keyStore.readProviderIDs.isEmpty)
+    }
+
+    func testUnconfiguredMozheAPIUsesLegacyContextLimit() {
+        let settings = AppSettings(
+            aiProviderSettings: .rulesOnly,
+            aiContextCharacterLimit: 23_456
+        )
+
+        XCTAssertEqual(
+            AIAssistantCoordinator.effectiveContextCharacterLimit(settings: settings),
+            23_456
         )
     }
 
@@ -388,13 +442,11 @@ final class AIProviderRuntimeResolverTests: XCTestCase {
         XCTAssertEqual((json["reasoning"] as? [String: Any])?["effort"] as? String, "medium")
     }
 
-    func testFactoryReturnsRulesWithoutReadingAnyScopedKey() {
-        let providerA = makeProvider(id: providerAID, modelIDs: ["a-model"])
-        let envelope = makeEnvelope(providers: [providerA], defaultProviderID: providerA.id)
+    func testFactoryReturnsMissingModelForLegacyRulesWithoutReadingAnyScopedKey() {
         var keyLookupProviderIDs: [UUID] = []
 
         let provider = AIAssistantProviderFactory.makeProvider(
-            settings: AppSettings(aiProviderSettings: envelope),
+            settings: AppSettings(aiProviderSettings: .rulesOnly),
             requestedSelection: .init(
                 providerID: BuiltInAIProvider.stacioRulesID,
                 modelID: "ignored"
@@ -406,7 +458,9 @@ final class AIProviderRuntimeResolverTests: XCTestCase {
             transport: RuntimeRecordingTransport()
         )
 
-        XCTAssertTrue(provider is RuleBasedAIAssistantProvider)
+        XCTAssertThrowsError(try provider.respond(to: makeAIRequest())) { error in
+            XCTAssertEqual(error as? AIAssistantProviderError, .missingModel)
+        }
         XCTAssertEqual(keyLookupProviderIDs, [])
     }
 
@@ -890,6 +944,33 @@ private struct SecretSafeRuntimeError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         "Keychain access denied (\(code))"
+    }
+}
+
+private final class RuntimeRecordingModelCatalog: AIModelCatalogLoading {
+    private(set) var providerIDs: [UUID] = []
+    private(set) var apiKeys: [String?] = []
+
+    func listModels(
+        for provider: AIProviderConfiguration,
+        apiKey: String?
+    ) throws -> [String] {
+        providerIDs.append(provider.id)
+        apiKeys.append(apiKey)
+        return ["remote-model"]
+    }
+}
+
+private final class RuntimeRecordingConnectionTester: AIAssistantConnectionTesting {
+    private(set) var providerIDs: [UUID] = []
+
+    func testConnection(
+        provider: AIProviderConfiguration,
+        modelID: String,
+        apiKey: String?
+    ) throws -> AIAssistantConnectionTestResult {
+        providerIDs.append(provider.id)
+        return AIAssistantConnectionTestResult(message: "unexpected")
     }
 }
 

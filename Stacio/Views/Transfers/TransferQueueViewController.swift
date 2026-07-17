@@ -495,7 +495,7 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
         now: Date
     ) -> TransferMetric {
         guard let latestProgress,
-              latestProgress.status == "running",
+              latestProgress.status == "running" || latestProgress.status == "resuming",
               latestProgress.bytesDone > 0
         else {
             samplesByJobID[job.id] = latestProgress.map {
@@ -617,7 +617,7 @@ private struct TransferRow {
         status = L10n.Transfers.status(rawStatus)
         speedText = metric.speedText
         etaText = metric.etaText
-        progressText = rawStatus == "running" && etaText != "-"
+        progressText = (rawStatus == "running" || rawStatus == "resuming") && etaText != "-"
             ? "\(baseProgressText) · \(L10n.Transfers.remainingPrefix) \(etaText)"
             : baseProgressText
         self.detailText = detailText
@@ -707,7 +707,7 @@ private struct TransferRow {
     }
 
     var canPause: Bool {
-        rawStatus == "queued" || rawStatus == "running"
+        rawStatus == "queued" || rawStatus == "running" || rawStatus == "resuming"
     }
 
     var canResume: Bool {
@@ -715,7 +715,7 @@ private struct TransferRow {
     }
 
     var canStop: Bool {
-        rawStatus == "queued" || rawStatus == "running" || rawStatus == "paused"
+        rawStatus == "queued" || rawStatus == "running" || rawStatus == "resuming" || rawStatus == "paused"
     }
 
     var isFinished: Bool {

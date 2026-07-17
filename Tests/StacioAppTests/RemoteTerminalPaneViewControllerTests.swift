@@ -89,7 +89,7 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertLessThan(darkBackground.stacioTestRelativeLuminance, 0.25)
     }
 
-    func testRemoteAgentTraceDoesNotWriteToRemoteInputTranscriptOrOverlay() {
+    func testRemoteAgentTraceRendersOverlayWithoutWritingRemoteInputOrTranscript() {
         let sink = RecordingRemoteTerminalEventSink()
         let controller = RemoteTerminalPaneViewController(
             runtimeID: "term_remote",
@@ -109,11 +109,14 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(sink.userInputEvents, [])
         XCTAssertEqual(controller.terminalOutputTranscript, "")
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("等待确认"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayVisibleForTesting)
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("等待确认"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("rm -rf /tmp/build"))
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-1"))
     }
 
-    func testRemoteAgentTraceBackgroundMetadataStaysInDataLayerOnly() {
+    func testRemoteAgentTraceOverlayShowsBackgroundProgressWithoutInternalMetadata() {
         let controller = RemoteTerminalPaneViewController(
             runtimeID: "term_remote",
             title: "prod@example.com",
@@ -134,7 +137,9 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         )
 
         XCTAssertTrue(controller.agentTraceSnapshotForTesting.contains("已创建独立执行终端"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(controller.agentTraceOverlayTextForTesting.contains("已创建独立执行终端"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("agent_bg_1"))
+        XCTAssertFalse(controller.agentTraceOverlayTextForTesting.contains("backgroundTask"))
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-background"))
     }
 
@@ -152,6 +157,131 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(sink.userInputEvents, [
             TerminalInputEvent(runtimeID: "term_remote", bytes: Array("whoami\n".utf8))
         ])
+    }
+
+    func testAgentLockShowsDedicatedFourEdgeGlowAndUnlockHidesIt() throws {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_agent_glow",
+            title: "FengLee@FengStor",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+
+        controller.setAgentInteractionLocked(true)
+
+        XCTAssertTrue(controller.agentInteractionGlowActiveForTesting)
+        XCTAssertTrue(controller.agentInteractionGlowPreservesTransparentCenterForTesting)
+        let glow = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentInteractionGlow")
+        )
+        XCTAssertTrue(glow.superview === controller.terminalView.superview)
+        XCTAssertNil(glow.hitTest(NSPoint(x: 1, y: 1)))
+
+        controller.setAgentInteractionLocked(false)
+
+        XCTAssertFalse(controller.agentInteractionGlowActiveForTesting)
+    }
+
+    func testCoordinatorCompletesScreenshotCommandThroughRealRemoteTerminalController() throws {
+        let sink = RecordingRemoteTerminalEventSink()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_real_controller",
+            title: "FengLee@FengStor",
+            eventSink: sink,
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+        sink.onInput = { [weak controller] event in
+            guard String(decoding: event.bytes, as: UTF8.self).contains("top -bn1 | head -20") else {
+                return
+            }
+            controller?.feedRemoteOutput(Array("top - 19:10:05 up 3 days, load average: 5.18\n%Cpu(s): 0.0 us, 0.0 sy\n793861 root 314.3 java\nFengLee@FengStor:~$ ".utf8))
+        }
+        let coordinator = AgentExecutionCoordinator(
+            terminalResolver: SingleRemoteTerminalResolver(target: controller),
+            authorizer: AllowingRemoteTerminalAuthorizer(),
+            visibleTerminalCompletion: .init(idleInterval: 0.05, maximumDuration: 0.5)
+        )
+        var broadcastUserInputCount = 0
+        let subscription = TerminalOutputBroadcastHub.shared.subscribe(runtimeID: "term_real_controller") { event in
+            if event.kind == .userInput {
+                broadcastUserInputCount += 1
+            }
+        }
+        defer {
+            TerminalOutputBroadcastHub.shared.unsubscribe(
+                runtimeID: "term_real_controller",
+                subscription: subscription
+            )
+        }
+        let request = AgentBridgeRequest(
+            id: "req-real-controller-top",
+            actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+            action: .runCommand(.init(
+                target: .runtimeID("term_real_controller"),
+                command: "top -bn1 | head -20",
+                follow: true
+            ))
+        )
+
+        let events = try coordinator.runCommand(request)
+
+        XCTAssertEqual(events.last?.state, .completed)
+        XCTAssertEqual(events.last?.metadata?["completionReason"], "shellPromptObserved")
+        XCTAssertTrue(events.last?.metadata?["terminalOutputSummary"]?.contains("793861 root 314.3 java") == true)
+        XCTAssertFalse(events.last?.message.contains("可能仍在运行") == true)
+        XCTAssertFalse(controller.agentInteractionGlowActiveForTesting)
+        XCTAssertEqual(broadcastUserInputCount, 0, "agent input must not be classified as user input")
+    }
+
+    func testCoordinatorPumpsRemoteBridgeOutputWhileSynchronouslyObservingAgentCommand() throws {
+        let runtimeID = "term_nested_runloop"
+        let bridge = RecordingRemoteTerminalBridge(
+            statuses: Array(
+                repeating: LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: "running"),
+                count: 3
+            ),
+            outputBatches: [
+                TerminalOutputBatch(runtimeId: runtimeID, bytes: Data(), droppedByteCount: 0),
+                TerminalOutputBatch(
+                    runtimeId: runtimeID,
+                    bytes: Data("5 0 3454288 603448 208988 1611640 12 0 20 0 4 4069 6832 86 6\n\u{001B}]777;stacio-agent-done=req-vmstat\u{0007}FengLee@FengStor:~$ ".utf8),
+                    droppedByteCount: 0
+                )
+            ]
+        )
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: runtimeID,
+            title: "FengLee@FengStor",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            bridge: bridge,
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+        let coordinator = AgentExecutionCoordinator(
+            terminalResolver: SingleRemoteTerminalResolver(target: controller),
+            authorizer: AllowingRemoteTerminalAuthorizer(),
+            visibleTerminalCompletion: .init(idleInterval: 0.5, maximumDuration: 1)
+        )
+        let request = AgentBridgeRequest(
+            id: "req-vmstat",
+            actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+            action: .runCommand(.init(
+                target: .runtimeID(runtimeID),
+                command: "LC_ALL=C vmstat 1 2 | tail -n 1",
+                follow: true
+            ))
+        )
+
+        let events = try coordinator.runCommand(request)
+
+        XCTAssertGreaterThanOrEqual(bridge.outputRuntimeIDs.count, 2)
+        XCTAssertEqual(events.last?.state, .completed)
+        XCTAssertEqual(events.last?.metadata?["completionReason"], "agentCompletionMarker")
+        XCTAssertTrue(events.last?.metadata?["terminalOutputSummary"]?.contains("3454288") == true)
+        XCTAssertFalse(events.last?.message.contains("可能仍在运行") == true)
+        XCTAssertFalse(controller.agentInteractionGlowActiveForTesting)
     }
 
     func testRemoteOutputBroadcastsSameBatchTakenByTerminalPane() {
@@ -1750,6 +1880,12 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         controller.sizeChanged(source: controller.terminalView, newCols: 120, newRows: 40)
         controller.closeTerminal()
 
+        let resizeDeadline = Date().addingTimeInterval(1)
+        while sink.resizeEvents.contains(
+            TerminalResizeEvent(runtimeID: "term_remote", cols: 120, rows: 40)
+        ) == false, Date() < resizeDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
         XCTAssertTrue(sink.resizeEvents.contains(
             TerminalResizeEvent(runtimeID: "term_remote", cols: 120, rows: 40)
         ))
@@ -2090,7 +2226,7 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(reattachedRuntimeIDs, ["term_auto"])
     }
 
-    func testBackgroundReconnectOnlyAttachesLatestResultAndClosesSupersededRuntime() throws {
+    func testBackgroundReconnectCoalescesRapidRequestsAndAttachesLatestResult() throws {
         let bridge = RecordingRemoteTerminalBridge(outputBatches: [])
         let reconnecter = ControlledBackgroundRemoteTerminalReconnecter()
         let controller = RemoteTerminalPaneViewController(
@@ -2106,17 +2242,14 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
 
         _ = try controller.reconnectTerminal()
         _ = try controller.reconnectTerminal()
-        XCTAssertEqual(reconnecter.pendingCompletionCount, 2)
+        let registrationDeadline = Date().addingTimeInterval(1)
+        while reconnecter.pendingCompletionCount != 1, Date() < registrationDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(reconnecter.pendingCompletionCount, 1)
 
         reconnecter.complete(
             at: 0,
-            with: .success(LiveShellStatus(runtimeId: "term_stale", status: "running", diagnostic: "running"))
-        )
-        XCTAssertEqual(controller.runtimeID, "term_old")
-        XCTAssertTrue(bridge.closedRuntimeIDs.contains("term_stale"))
-
-        reconnecter.complete(
-            at: 1,
             with: .success(LiveShellStatus(runtimeId: "term_latest", status: "running", diagnostic: "running"))
         )
         XCTAssertEqual(controller.runtimeID, "term_latest")
@@ -2137,6 +2270,11 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         controller.loadView()
         controller.displayConnectionFailure("连接超时")
         _ = try controller.reconnectTerminal()
+        let registrationDeadline = Date().addingTimeInterval(1)
+        while reconnecter.pendingCompletionCount != 1, Date() < registrationDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(reconnecter.pendingCompletionCount, 1)
 
         controller.closeTerminal()
         reconnecter.complete(
@@ -2688,6 +2826,13 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
             startsPollingAutomatically: false
         )
         var completedRuntimeIDs: [String] = []
+        var broadcastKinds: [TerminalBroadcastEventKind] = []
+        let subscription = TerminalOutputBroadcastHub.shared.subscribe(runtimeID: "term_remote") { event in
+            broadcastKinds.append(event.kind)
+        }
+        defer {
+            TerminalOutputBroadcastHub.shared.unsubscribe(runtimeID: "term_remote", subscription: subscription)
+        }
         controller.onCommandFinished = { pane in
             completedRuntimeIDs.append(pane.runtimeID)
         }
@@ -2696,6 +2841,7 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         controller.feedRemoteOutput(Array("deploy@host:/srv/app$ ".utf8))
 
         XCTAssertEqual(completedRuntimeIDs, ["term_remote"])
+        XCTAssertEqual(broadcastKinds, [.output, .commandFinished])
     }
 
     func testRemoteTerminalCommandClickLinkRequestsBrowserOpen() {
@@ -3084,6 +3230,7 @@ private final class RecordingRemoteTerminalEventSink: TerminalEventSink {
     private(set) var inputEvents: [TerminalInputEvent] = []
     private(set) var closedRuntimeIDs: [String] = []
     var inputError: Error?
+    var onInput: ((TerminalInputEvent) -> Void)?
 
     var userInputEvents: [TerminalInputEvent] {
         inputEvents.filter { event in
@@ -3102,10 +3249,40 @@ private final class RecordingRemoteTerminalEventSink: TerminalEventSink {
             throw inputError
         }
         inputEvents.append(TerminalInputEvent(runtimeID: runtimeID, bytes: bytes))
+        onInput?(inputEvents[inputEvents.count - 1])
     }
 
     func terminalDidClose(runtimeID: String) throws {
         closedRuntimeIDs.append(runtimeID)
+    }
+}
+
+@MainActor
+private final class SingleRemoteTerminalResolver: AgentTerminalResolving {
+    let target: AgentTerminalTarget
+
+    init(target: AgentTerminalTarget) {
+        self.target = target
+    }
+
+    func resolveTerminalTarget(_ target: AgentTarget) throws -> AgentTerminalTarget {
+        self.target
+    }
+}
+
+@MainActor
+private final class AllowingRemoteTerminalAuthorizer: AgentActionAuthorizing {
+    func requiresUserConfirmation(actor: AgentActor, command: String, targetTitle: String) -> Bool {
+        false
+    }
+
+    func authorize(actor: AgentActor, command: String, targetTitle: String) throws -> AgentAuthorizationDecision {
+        AgentAuthorizationDecision(
+            allowed: true,
+            reason: "test",
+            risk: .readOnly,
+            requiredUserConfirmation: false
+        )
     }
 }
 

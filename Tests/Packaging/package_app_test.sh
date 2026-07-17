@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 cleanup() {
-  local status=$?
+  local status="$1"
   if (( status != 0 )) && [[ -f "${LOG_FILE:-}" ]]; then
     cat "$LOG_FILE" >&2
   fi
   rm -rf "$TMP_DIR"
   exit "$status"
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 
 FAKE_BIN_DIR="$TMP_DIR/bin"
 SWIFT_BIN_DIR="$TMP_DIR/swift-release"
@@ -28,9 +28,33 @@ mkdir -p \
   "$SWIFT_BIN_DIR" \
   "$CORE_DIR" \
   "$MONACO_VS_DIR" \
+  "$SWIFT_BIN_DIR/SwiftTerm_SwiftTerm.bundle" \
   "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS" \
   "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS" \
-  "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS"
+  "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS" \
+  "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Resources"
+
+SWIFTTERM_PATCH_TEST_CHECKOUT="$TMP_DIR/swiftterm-checkout"
+SWIFTTERM_PATCH_TEST_SOURCE="$SWIFTTERM_PATCH_TEST_CHECKOUT/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift"
+mkdir -p "$(dirname "$SWIFTTERM_PATCH_TEST_SOURCE")"
+cat >"$SWIFTTERM_PATCH_TEST_SOURCE" <<'EOF'
+private final class MetalTerminalRenderer {
+    private static func candidateBundles() -> [Bundle] {
+        var bundles: [Bundle] = []
+        #if SWIFT_PACKAGE
+        bundles.append(Bundle.module)
+        #endif
+        bundles.append(Bundle(for: MetalTerminalRenderer.self))
+        bundles.append(Bundle.main)
+        return bundles
+    }
+}
+EOF
+"$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh" "$SWIFTTERM_PATCH_TEST_CHECKOUT"
+grep -Fq "Stacio macOS packages keep SwiftPM resources under Contents/Resources." "$SWIFTTERM_PATCH_TEST_SOURCE"
+grep -Fq "if bundles.isEmpty" "$SWIFTTERM_PATCH_TEST_SOURCE"
+test ! -e "$SWIFTTERM_PATCH_TEST_SOURCE.orig"
+"$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh" "$SWIFTTERM_PATCH_TEST_CHECKOUT"
 
 cat >"$SWIFT_BIN_DIR/Stacio" <<'EOF'
 #!/usr/bin/env bash
@@ -56,6 +80,18 @@ printf 'fake autoupdate\n' >"$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Autoupd
 printf 'fake updater\n' >"$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater"
 printf 'fake downloader\n' >"$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
 printf 'fake installer\n' >"$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+cat >"$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Resources/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>2.9.4</string>
+</dict>
+</plist>
+EOF
+printf 'fake SwiftTerm shader\n' >"$SWIFT_BIN_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
+chmod 444 "$SWIFT_BIN_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
 chmod +x \
   "$SWIFT_BIN_DIR/Sparkle.framework/Sparkle" \
   "$SWIFT_BIN_DIR/Sparkle.framework/Versions/B/Autoupdate" \
@@ -217,12 +253,15 @@ fi
 grep -Fq "Prebuilt Stacio executable is older than source input" "$TMP_DIR/stale-prebuilt.log"
 touch "$SWIFT_BIN_DIR/Stacio"
 
-touch -t 201001010000 "$SWIFT_BIN_DIR/Sparkle.framework/Sparkle"
+MISMATCHED_SPARKLE_DIR="$TMP_DIR/sparkle-version-mismatch"
+cp -R "$SWIFT_BIN_DIR/Sparkle.framework" "$MISMATCHED_SPARKLE_DIR"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 0.0.0' "$MISMATCHED_SPARKLE_DIR/Versions/B/Resources/Info.plist"
 if env \
   PATH="$FAKE_BIN_DIR:$PATH" \
   STACIO_PACKAGE_TEST_LOG="$LOG_FILE" \
   STACIO_SKIP_BUILD=1 \
   STACIO_SWIFT_BIN_PATH="$SWIFT_BIN_DIR" \
+  STACIO_SPARKLE_FRAMEWORK_PATH="$MISMATCHED_SPARKLE_DIR" \
   STACIO_CORE_DYLIB_PATH="$CORE_DIR/libstacio_core.dylib" \
   STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
   STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
@@ -233,11 +272,10 @@ if env \
   STACIO_SPARKLE_PUBLIC_ED_KEY="$ED25519_TEST_PUBLIC_KEY" \
   STACIO_LICENSE_PUBLIC_ED25519_KEY="$ED25519_TEST_PUBLIC_KEY" \
   "$ROOT_DIR/scripts/package-app.sh" >"$TMP_DIR/stale-sparkle.log" 2>&1; then
-  echo "expected packaging with a stale Sparkle framework to fail" >&2
+  echo "expected packaging with a mismatched Sparkle framework to fail" >&2
   exit 1
 fi
-grep -Fq "Prebuilt Sparkle.framework is older than source input" "$TMP_DIR/stale-sparkle.log"
-touch "$SWIFT_BIN_DIR/Sparkle.framework/Sparkle"
+grep -Fq "Sparkle.framework version 0.0.0 does not match Package.resolved 2.9.4." "$TMP_DIR/stale-sparkle.log"
 
 MISSING_SPARKLE_DIR="$TMP_DIR/sparkle-missing-downloader-binary"
 cp -R "$SWIFT_BIN_DIR/Sparkle.framework" "$MISSING_SPARKLE_DIR"
@@ -271,7 +309,7 @@ STACIO_CORE_DYLIB_PATH="$CORE_DIR/libstacio_core.dylib" \
 STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
 STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
 STACIO_OUTPUT_DIR="$OUT_DIR" \
-STACIO_VERSION="0.13.3-Beta" \
+STACIO_VERSION="0.13.3" \
 STACIO_BUILD_NUMBER="11" \
 STACIO_PRODUCT_OPS_API_BASE_URL="https://ops.example.test" \
 STACIO_PRODUCT_OPS_UPDATE_CHANNEL="beta" \
@@ -295,14 +333,22 @@ SPARKLE_UPDATER="$SPARKLE_FRAMEWORK/Versions/B/Updater.app"
 SPARKLE_DOWNLOADER="$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Downloader.xpc"
 SPARKLE_INSTALLER="$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Installer.xpc"
 SPARKLE_AUTOUPDATE="$SPARKLE_FRAMEWORK/Versions/B/Autoupdate"
+SWIFTTERM_SHADER="$APP_DIR/Contents/Resources/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
+INVALID_ROOT_SWIFTTERM_SHADER="$APP_DIR/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
 ICON="$APP_DIR/Contents/Resources/Stacio.icns"
 GITHUB_ICON="$APP_DIR/Contents/Resources/github.svg"
+GITEE_ICON="$APP_DIR/Contents/Resources/gitee.svg"
+SESSION_ICON_UBUNTU="$APP_DIR/Contents/Resources/SessionIcons/ubuntu.svg"
+SESSION_ICON_LINUX="$APP_DIR/Contents/Resources/SessionIcons/linux-generic.svg"
+SESSION_ICON_ALIYUN="$APP_DIR/Contents/Resources/SessionIcons/aliyun.svg"
+SESSION_ICON_RAINCLOUD="$APP_DIR/Contents/Resources/SessionIcons/raincloud.png"
 MONACO_LOADER="$APP_DIR/Contents/Resources/MonacoEditor/vs/loader.js"
 ABOUT_QR="$APP_DIR/Contents/Resources/About/wechat-qrcode.jpg"
 ABOUT_WECHAT_ICON="$APP_DIR/Contents/Resources/About/wechat-official-account.svg"
 PLIST="$APP_DIR/Contents/Info.plist"
 SOURCE_ICON="$ROOT_DIR/logo/icon.icns"
 SOURCE_GITHUB_ICON="$ROOT_DIR/Stacio/Resources/github.svg"
+SOURCE_GITEE_ICON="$ROOT_DIR/Stacio/Resources/gitee.svg"
 SOURCE_ABOUT_QR="$ROOT_DIR/Stacio/Resources/About/wechat-qrcode.jpg"
 SOURCE_ABOUT_WECHAT_ICON="$ROOT_DIR/Stacio/Resources/About/wechat-official-account.svg"
 
@@ -319,9 +365,23 @@ grep -q 'fake VNC adapter' "$VNC_ADAPTER"
 test -f "$DYLIB"
 test -d "$SPARKLE_FRAMEWORK"
 grep -q 'fake sparkle framework' "$SPARKLE_FRAMEWORK/Sparkle"
+test -f "$SWIFTTERM_SHADER"
+grep -q 'fake SwiftTerm shader' "$SWIFTTERM_SHADER"
+test ! -e "$INVALID_ROOT_SWIFTTERM_SHADER"
 test -s "$ICON"
 test -s "$GITHUB_ICON"
 cmp -s "$SOURCE_GITHUB_ICON" "$GITHUB_ICON"
+test -s "$GITEE_ICON"
+cmp -s "$SOURCE_GITEE_ICON" "$GITEE_ICON"
+test -s "$SESSION_ICON_UBUNTU"
+test -s "$SESSION_ICON_LINUX"
+test -s "$SESSION_ICON_ALIYUN"
+test -s "$SESSION_ICON_RAINCLOUD"
+if /usr/bin/xattr -lr "$APP_DIR/Contents/Resources/SessionIcons" \
+  | grep -Eq 'com\.apple\.(FinderInfo|ResourceFork)'; then
+  echo "session icon resources contain signing-incompatible extended attributes" >&2
+  exit 1
+fi
 test -f "$MONACO_LOADER"
 grep -q 'fake monaco loader' "$MONACO_LOADER"
 test -f "$ABOUT_QR"
@@ -347,7 +407,7 @@ if grep -q "<string>$LEGACY_HELPER_NAME</string>" "$PLIST"; then
   exit 1
 fi
 grep -q '<key>CFBundleShortVersionString</key>' "$PLIST"
-grep -q '<string>0.13.3-Beta</string>' "$PLIST"
+grep -q '<string>0.13.3</string>' "$PLIST"
 /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST" | grep -Fq "11"
 /usr/libexec/PlistBuddy -c "Print :NSQuitAlwaysKeepsWindows" "$PLIST" | grep -Fq "false"
 /usr/libexec/PlistBuddy -c "Print :StacioProductOpsProductID" "$PLIST" | grep -Fq "stacio"

@@ -18,21 +18,29 @@ public struct WorkspaceURLOpener: StacioURLOpening {
 public struct StacioAboutContent {
     public let applicationName: String
     public let displayVersion: String
+    public let websiteURL: URL
     public let repositoryURL: URL
+    public let giteeRepositoryURL: URL
     public let weChatQRCodeImage: NSImage?
 
+    public var websiteAccessibilityLabel: String { "Stacio 官网" }
     public var githubAccessibilityLabel: String { "GitHub" }
+    public var giteeAccessibilityLabel: String { "Gitee" }
     public var weChatAccessibilityLabel: String { "微信公众号" }
 
     public init(
         applicationName: String,
         displayVersion: String,
+        websiteURL: URL,
         repositoryURL: URL,
+        giteeRepositoryURL: URL,
         weChatQRCodeImage: NSImage?
     ) {
         self.applicationName = applicationName
         self.displayVersion = displayVersion
+        self.websiteURL = websiteURL
         self.repositoryURL = repositoryURL
+        self.giteeRepositoryURL = giteeRepositoryURL
         self.weChatQRCodeImage = weChatQRCodeImage
     }
 
@@ -40,7 +48,9 @@ public struct StacioAboutContent {
         StacioAboutContent(
             applicationName: StacioAppMetadata.applicationName,
             displayVersion: StacioAppMetadata.displayVersion,
+            websiteURL: URL(string: StacioAppMetadata.websiteURL)!,
             repositoryURL: URL(string: StacioAppMetadata.repositoryURL)!,
+            giteeRepositoryURL: URL(string: StacioAppMetadata.giteeRepositoryURL)!,
             weChatQRCodeImage: loadWeChatQRCodeImage()
         )
     }
@@ -113,7 +123,9 @@ public final class StacioAboutWindowPresenter: AboutPanelPresenting {
 public final class StacioAboutViewController: NSViewController {
     private static let actionIconSize = NSSize(width: 18, height: 18)
 
+    public private(set) var websiteButtonForTesting: NSButton?
     public private(set) var githubButtonForTesting: NSButton?
+    public private(set) var giteeButtonForTesting: NSButton?
     public private(set) var weChatButtonForTesting: NSButton?
     public private(set) var weChatQRCodeImageForTesting: NSImage?
 
@@ -151,6 +163,22 @@ public final class StacioAboutViewController: NSViewController {
         versionLabel.alignment = .center
         versionLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        let websiteButton = NSButton(
+            title: "官网",
+            target: self,
+            action: #selector(openWebsite(_:))
+        )
+        websiteButton.bezelStyle = .inline
+        websiteButton.isBordered = false
+        websiteButton.image = Self.makeWebsiteIcon()
+        websiteButton.imagePosition = .imageLeading
+        websiteButton.contentTintColor = .linkColor
+        websiteButton.font = .systemFont(ofSize: 13, weight: .medium)
+        websiteButton.toolTip = content.websiteAccessibilityLabel
+        websiteButton.setAccessibilityLabel(content.websiteAccessibilityLabel)
+        websiteButton.translatesAutoresizingMaskIntoConstraints = false
+        websiteButtonForTesting = websiteButton
+
         let githubButton = NSButton(
             title: "GitHub",
             target: self,
@@ -166,6 +194,22 @@ public final class StacioAboutViewController: NSViewController {
         githubButton.setAccessibilityLabel(content.githubAccessibilityLabel)
         githubButton.translatesAutoresizingMaskIntoConstraints = false
         githubButtonForTesting = githubButton
+
+        let giteeButton = NSButton(
+            title: "Gitee",
+            target: self,
+            action: #selector(openGitee(_:))
+        )
+        giteeButton.bezelStyle = .inline
+        giteeButton.isBordered = false
+        giteeButton.image = Self.makeGiteeIcon()
+        giteeButton.imagePosition = .imageLeading
+        giteeButton.contentTintColor = .linkColor
+        giteeButton.font = .systemFont(ofSize: 13, weight: .medium)
+        giteeButton.toolTip = content.giteeAccessibilityLabel
+        giteeButton.setAccessibilityLabel(content.giteeAccessibilityLabel)
+        giteeButton.translatesAutoresizingMaskIntoConstraints = false
+        giteeButtonForTesting = giteeButton
 
         let qrImage = content.weChatQRCodeImage ?? Self.makeQRCodePlaceholderImage()
         let weChatButton = QRCodeHoverButton(
@@ -183,11 +227,11 @@ public final class StacioAboutViewController: NSViewController {
         weChatButtonForTesting = weChatButton
         weChatQRCodeImageForTesting = qrImage
 
-        let actionStack = NSStackView(views: [githubButton, weChatButton])
+        let actionStack = NSStackView(views: [websiteButton, githubButton, giteeButton, weChatButton])
         actionStack.orientation = .horizontal
         actionStack.alignment = .centerY
         actionStack.distribution = .gravityAreas
-        actionStack.spacing = 22
+        actionStack.spacing = 16
         actionStack.translatesAutoresizingMaskIntoConstraints = false
 
         rootView.addSubview(appIconView)
@@ -221,6 +265,23 @@ public final class StacioAboutViewController: NSViewController {
         openGitHub()
     }
 
+    public func openWebsiteForTesting() {
+        openWebsite()
+    }
+
+    public func openGiteeForTesting() {
+        openGitee()
+    }
+
+    @objc
+    private func openWebsite(_ sender: Any? = nil) {
+        openWebsite()
+    }
+
+    private func openWebsite() {
+        urlOpener.open(content.websiteURL)
+    }
+
     @objc
     private func openGitHub(_ sender: Any? = nil) {
         openGitHub()
@@ -228,6 +289,25 @@ public final class StacioAboutViewController: NSViewController {
 
     private func openGitHub() {
         urlOpener.open(content.repositoryURL)
+    }
+
+    @objc
+    private func openGitee(_ sender: Any? = nil) {
+        openGitee()
+    }
+
+    private func openGitee() {
+        urlOpener.open(content.giteeRepositoryURL)
+    }
+
+    private static func makeWebsiteIcon() -> NSImage {
+        let image = NSImage(
+            systemSymbolName: "globe",
+            accessibilityDescription: "Stacio 官网"
+        ) ?? NSImage(size: actionIconSize)
+        image.size = actionIconSize
+        image.isTemplate = true
+        return image
     }
 
     private static func makeGitHubIcon() -> NSImage {
@@ -251,6 +331,32 @@ public final class StacioAboutViewController: NSViewController {
 
     private static func loadGitHubIcon(from bundle: Bundle) -> NSImage? {
         guard let url = bundle.url(forResource: "github", withExtension: "svg") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }
+
+    private static func makeGiteeIcon() -> NSImage {
+        let image = loadGiteeIcon() ?? NSImage(size: actionIconSize)
+        image.size = actionIconSize
+        image.isTemplate = true
+        return image
+    }
+
+    private static func loadGiteeIcon() -> NSImage? {
+        if let image = loadGiteeIcon(from: .main) {
+            return image
+        }
+
+        #if DEBUG
+        return loadGiteeIcon(from: .module)
+        #else
+        return nil
+        #endif
+    }
+
+    private static func loadGiteeIcon(from bundle: Bundle) -> NSImage? {
+        guard let url = bundle.url(forResource: "gitee", withExtension: "svg") else {
             return nil
         }
         return NSImage(contentsOf: url)

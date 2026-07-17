@@ -93,12 +93,18 @@ where
 }
 
 pub fn record_live_scp_transfer_progress(progress: ScpTransferProgress) {
-    progress_registry()
-        .lock()
-        .expect("scp progress registry")
-        .entry(progress.job_id.clone())
-        .or_default()
-        .push_back(progress);
+    let mut registry = progress_registry().lock().expect("scp progress registry");
+    let events = registry.entry(progress.job_id.clone()).or_default();
+    let should_replace = matches!(progress.status.as_str(), "running" | "resuming")
+        && events
+            .back()
+            .map(|last| last.status == progress.status)
+            .unwrap_or(false);
+    if should_replace {
+        *events.back_mut().expect("progress event exists") = progress;
+    } else {
+        events.push_back(progress);
+    }
 }
 
 pub fn take_live_scp_transfer_progress_batch(job_id: &str) -> Vec<ScpTransferProgress> {
@@ -150,6 +156,48 @@ mod scp_progress_tests {
             .lock()
             .expect("scp progress registry")
             .contains_key(job_id));
+    }
+
+    #[test]
+    fn live_progress_batch_keeps_only_latest_running_sample() {
+        let job_id = "job_progress_coalesced";
+        for bytes_done in [4_u64, 8, 12] {
+            record_live_scp_transfer_progress(ScpTransferProgress {
+                job_id: job_id.to_string(),
+                bytes_done,
+                bytes_total: 20,
+                status: "running".to_string(),
+            });
+        }
+
+        let progress = take_live_scp_transfer_progress_batch(job_id);
+
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].bytes_done, 12);
+    }
+
+    #[test]
+    fn live_progress_batch_preserves_status_transitions() {
+        let job_id = "job_progress_status_transition";
+        for (bytes_done, status) in [(4_u64, "running"), (8, "resuming"), (12, "running")] {
+            record_live_scp_transfer_progress(ScpTransferProgress {
+                job_id: job_id.to_string(),
+                bytes_done,
+                bytes_total: 20,
+                status: status.to_string(),
+            });
+        }
+
+        let progress = take_live_scp_transfer_progress_batch(job_id);
+
+        assert_eq!(progress.len(), 3);
+        assert_eq!(
+            progress
+                .iter()
+                .map(|event| event.status.as_str())
+                .collect::<Vec<_>>(),
+            ["running", "resuming", "running"]
+        );
     }
 }
 

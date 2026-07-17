@@ -23,9 +23,11 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.13.3-Beta"
+    private static let fallbackDisplayVersion = "Stacio-0.13.3"
     public static var displayVersion: String { displayVersion(in: .main) }
+    public static let websiteURL = "https://www.stacio.cn/"
     public static let repositoryURL = "https://github.com/Fengoffer/Stacio"
+    public static let giteeRepositoryURL = "https://gitee.com/fengoffer/Stacio"
     public static let supportedURLSchemes = Set(["stacio", "stacio"])
 
     public static func displayVersion(in bundle: Bundle) -> String {
@@ -1480,6 +1482,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        TransferCompletionNotificationPresenter.dismissAllForApplicationTermination()
         licenseNetworkMonitor?.cancel()
         licenseRevalidationTask?.cancel()
         licenseRevalidationTask = nil

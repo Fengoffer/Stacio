@@ -20,7 +20,7 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testMigratesRecognizedLegacyProviderIntoSingleEnvelope() throws {
+    func testMigratesRecognizedLegacyProviderAlongsideCanonicalMozheAPI() throws {
         let migratedID = migrationProviderID(1)
         var generatedIDs = 0
         setLegacyProviderValues(
@@ -39,12 +39,13 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         }
 
         let envelope = try store.loadAIProviderSettings()
-        let provider = try XCTUnwrap(envelope.aiProviders.only)
+        let provider = try XCTUnwrap(envelope.aiProviders.first(where: { $0.id == migratedID }))
 
         XCTAssertEqual(generatedIDs, 1)
         XCTAssertEqual(envelope.formatVersion, AIProviderSettingsEnvelope.currentFormatVersion)
         XCTAssertEqual(envelope.defaultAIProviderID, migratedID)
         XCTAssertEqual(envelope.legacyKeyMigrationProviderID, migratedID)
+        XCTAssertEqual(envelope.aiProviders.map(\.id), [migratedID, BuiltInAIProvider.mozheAPIID])
         XCTAssertEqual(provider.id, migratedID)
         XCTAssertEqual(provider.profile, .deepSeek)
         XCTAssertEqual(provider.displayName, AIProviderProfile.deepSeek.displayName)
@@ -79,7 +80,9 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         defaults.set(16_000, forKey: "Stacio.Settings.aiContextCharacterLimit")
         let store = AppSettingsStore(defaults: defaults, aiProviderIDGenerator: { migratedID })
 
-        let provider = try XCTUnwrap(try store.loadAIProviderSettings().aiProviders.only)
+        let provider = try XCTUnwrap(
+            try store.loadAIProviderSettings().aiProviders.first(where: { $0.id == migratedID })
+        )
 
         XCTAssertTrue(provider.models.allSatisfy {
             $0.capabilities.contextCharacterLimit == 16_000
@@ -147,7 +150,9 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         )
         let store = AppSettingsStore(defaults: defaults, aiProviderIDGenerator: { migratedID })
 
-        let provider = try XCTUnwrap(store.loadAIProviderSettings().aiProviders.only)
+        let provider = try XCTUnwrap(
+            store.loadAIProviderSettings().aiProviders.first(where: { $0.id == migratedID })
+        )
 
         XCTAssertEqual(provider.defaultModelID, AIProviderProfile.openAI.defaultModel)
     }
@@ -170,7 +175,49 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
 
         XCTAssertEqual(generatedIDs, 1)
         XCTAssertEqual(first, second)
-        XCTAssertEqual(second.aiProviders.map(\.id), [migratedID])
+        XCTAssertEqual(second.aiProviders.map(\.id), [migratedID, BuiltInAIProvider.mozheAPIID])
+    }
+
+    func testExistingRulesEnvelopeMigratesToMozheAPIAndSecondLoadIsIdempotent() throws {
+        defaults.set(
+            try JSONEncoder().encode(AIProviderSettingsEnvelope.rulesOnly),
+            forKey: AppSettingsStore.aiProviderSettingsDefaultsKey
+        )
+        let store = AppSettingsStore(defaults: defaults)
+
+        let first = try store.loadAIProviderSettings()
+        let persistedAfterFirstLoad = try XCTUnwrap(
+            defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey)
+        )
+        let second = try store.loadAIProviderSettings()
+
+        XCTAssertEqual(first, .defaultConfiguration)
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(try decodedPersistedEnvelope(), .defaultConfiguration)
+        XCTAssertEqual(
+            defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey),
+            persistedAfterFirstLoad
+        )
+    }
+
+    func testExistingExternalDefaultIsPreservedWhileMozheAPIIsInsertedAndPersisted() throws {
+        let provider = migrationProvider(id: migrationProviderID(30), modelID: "saved-model")
+        let existing = AIProviderSettingsEnvelope(
+            aiProviders: [provider],
+            defaultAIProviderID: provider.id,
+            legacyKeyMigrationProviderID: provider.id
+        )
+        defaults.set(
+            try JSONEncoder().encode(existing),
+            forKey: AppSettingsStore.aiProviderSettingsDefaultsKey
+        )
+
+        let loaded = try AppSettingsStore(defaults: defaults).loadAIProviderSettings()
+
+        XCTAssertEqual(loaded.defaultAIProviderID, provider.id)
+        XCTAssertEqual(loaded.legacyKeyMigrationProviderID, provider.id)
+        XCTAssertEqual(loaded.aiProviders.map(\.id), [provider.id, BuiltInAIProvider.mozheAPIID])
+        XCTAssertEqual(try decodedPersistedEnvelope(), loaded)
     }
 
     func testRulesResidueDoesNotCreateExternalProvider() throws {
@@ -188,12 +235,12 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
 
         let envelope = try store.loadAIProviderSettings()
 
-        XCTAssertEqual(envelope, .rulesOnly)
+        XCTAssertEqual(envelope, .defaultConfiguration)
         XCTAssertEqual(generatedIDs, 0)
         XCTAssertEqual(defaults.string(forKey: LegacyKey.baseURL), "https://stale.example/v1")
         XCTAssertEqual(defaults.string(forKey: LegacyKey.model), "stale-model")
         XCTAssertEqual(defaults.stringArray(forKey: LegacyKey.customModels), ["another-stale-model"])
-        XCTAssertEqual(try decodedPersistedEnvelope(), .rulesOnly)
+        XCTAssertEqual(try decodedPersistedEnvelope(), .defaultConfiguration)
     }
 
     func testUnknownLegacyProviderDoesNotCreateExternalProvider() throws {
@@ -211,10 +258,10 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
 
         let envelope = try store.loadAIProviderSettings()
 
-        XCTAssertEqual(envelope, .rulesOnly)
+        XCTAssertEqual(envelope, .defaultConfiguration)
         XCTAssertEqual(generatedIDs, 0)
         XCTAssertEqual(defaults.string(forKey: LegacyKey.provider), "Private Mystery Provider")
-        XCTAssertEqual(try decodedPersistedEnvelope(), .rulesOnly)
+        XCTAssertEqual(try decodedPersistedEnvelope(), .defaultConfiguration)
     }
 
     func testCorruptedEnvelopeFallsBackWithoutReplacingOriginalData() throws {
@@ -225,7 +272,7 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         XCTAssertThrowsError(try store.loadAIProviderSettings()) { error in
             XCTAssertTrue(error is DecodingError)
         }
-        XCTAssertEqual(store.snapshot().aiProviderSettings, .rulesOnly)
+        XCTAssertEqual(store.snapshot().aiProviderSettings, .defaultConfiguration)
         XCTAssertEqual(defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey), corrupted)
     }
 
@@ -245,7 +292,7 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
                 .unsupportedVersion(AIProviderSettingsEnvelope.currentFormatVersion + 1)
             )
         }
-        XCTAssertEqual(store.snapshot().aiProviderSettings, .rulesOnly)
+        XCTAssertEqual(store.snapshot().aiProviderSettings, .defaultConfiguration)
         XCTAssertEqual(defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey), original)
     }
 
@@ -386,7 +433,10 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         }
 
         XCTAssertEqual(defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey), originalData)
-        XCTAssertEqual(try store.loadAIProviderSettings(), originalEnvelope)
+        XCTAssertEqual(
+            try store.loadAIProviderSettings(),
+            AIProviderSettingsNormalizer.normalized(originalEnvelope)
+        )
         XCTAssertEqual(defaults.object(forKey: "Stacio.Settings.terminalFontSize") as? Double, 17)
     }
 
@@ -482,7 +532,10 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         XCTAssertEqual(snapshot.aiProviders, snapshot.aiProviderSettings.aiProviders)
         XCTAssertEqual(snapshot.defaultAIProviderID, provider.id)
         XCTAssertEqual(snapshot.aiModel, "enabled model")
-        XCTAssertEqual(defaults.data(forKey: AppSettingsStore.aiProviderSettingsDefaultsKey), original)
+        XCTAssertEqual(
+            try decodedPersistedEnvelope(),
+            AIProviderSettingsNormalizer.normalized(unnormalized)
+        )
     }
 
     func testRecognizedProfileDoesNotFoldUnknownValueIntoRules() {
@@ -492,6 +545,7 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         }
         XCTAssertNil(AIProviderProfile.recognizedProfile(for: "Private Mystery Provider"))
         XCTAssertEqual(AIProviderProfile.profile(for: "Private Mystery Provider"), .portDeskRules)
+        XCTAssertFalse(AIProviderProfile.settingsMenuProfiles.contains(.portDeskRules))
     }
 
     func testStoreConformsToStorageBoundaryAndSavePostsNotification() throws {
@@ -510,7 +564,7 @@ final class AIProviderSettingsMigrationTests: XCTestCase {
         try storage.saveAIProviderSettings(.rulesOnly)
 
         wait(for: [notification], timeout: 1)
-        XCTAssertEqual(try storage.loadAIProviderSettings(), .rulesOnly)
+        XCTAssertEqual(try storage.loadAIProviderSettings(), .defaultConfiguration)
     }
 
     private func setLegacyProviderValues(

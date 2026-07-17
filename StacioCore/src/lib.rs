@@ -33,7 +33,8 @@ use domain::{
     serial::{validate_serial_config as validate_serial_config_target, SerialConnectionConfig},
     session::{
         parse_quick_connect as parse_quick_connect_target, QuickConnectTarget, SessionDraft,
-        SessionError, SessionFolder, SessionRecord, SessionUpdate,
+        SessionError, SessionFolder, SessionRecord, SessionSidebarOrderItem,
+        SessionSidebarSnapshot, SessionUpdate,
     },
     ssh::{
         fingerprint_sha256 as fingerprint_sha256_target, redact_ssh_diagnostic,
@@ -107,7 +108,7 @@ use services::{
         ImportPreview, ImportReport, ImportSessionPreview,
     },
     live_shell_service::{
-        start_ssh_live_shell_worker, LiveShellManager, LiveShellPumpSignal, LiveShellStatus,
+        ssh_osc7_bootstrap_input_chunks, LiveShellManager, LiveShellPumpSignal, LiveShellStatus,
         LiveShellWorker, ShellChannel, ShellWaitInterest,
     },
     macro_service::{
@@ -396,6 +397,40 @@ fn start_live_shell_pump_if_needed() {
             })
             .expect("start live shell pump thread");
     });
+}
+
+fn register_connected_live_shell(
+    runtime: TerminalRuntime,
+    channel: LiveShellChannel,
+    bootstrap_input: Option<Vec<u8>>,
+) -> Result<LiveShellStatus, SshRuntimeError> {
+    let runtime_id = runtime.id.clone();
+    let registry = recover_global_lock(terminal_registry());
+    let snapshot = registry
+        .runtime_snapshot(runtime_id.clone())
+        .map_err(|error| SshRuntimeError::Transport {
+            message: redact_ssh_diagnostic(&error.to_string()),
+        })?;
+    if snapshot.status == "closed" {
+        return Err(SshRuntimeError::Transport {
+            message: "connection cancelled".to_string(),
+        });
+    }
+
+    let worker = match bootstrap_input {
+        Some(input) => {
+            LiveShellWorker::new_with_bootstrap_input(runtime_id.clone(), channel, input)
+        }
+        None => LiveShellWorker::new(runtime_id.clone(), channel),
+    };
+    recover_global_lock(live_shell_manager()).register(worker);
+    drop(registry);
+    notify_live_shell_pump();
+    Ok(LiveShellStatus::running(runtime_id))
+}
+
+fn close_failed_live_shell_runtime(runtime_id: String) {
+    let _ = recover_global_lock(terminal_registry()).close(runtime_id);
 }
 
 fn run_live_shell_pump(signal: Arc<LiveShellPumpSignal>) {
@@ -696,6 +731,22 @@ pub fn list_session_folders(database_path: String) -> Result<Vec<SessionFolder>,
 }
 
 #[uniffi::export]
+pub fn list_session_sidebar_order(
+    database_path: String,
+) -> Result<Vec<SessionSidebarOrderItem>, SessionError> {
+    let repository = session_repository_for_path(database_path)?;
+    repository.list_session_sidebar_order()
+}
+
+#[uniffi::export]
+pub fn load_session_sidebar_snapshot(
+    database_path: String,
+) -> Result<SessionSidebarSnapshot, SessionError> {
+    let repository = session_repository_for_path(database_path)?;
+    repository.load_session_sidebar_snapshot()
+}
+
+#[uniffi::export]
 pub fn save_credential_record(
     database_path: String,
     draft: CredentialDraft,
@@ -755,6 +806,18 @@ pub fn move_session_record(
 ) -> Result<SessionRecord, SessionError> {
     let repository = session_repository_for_path(database_path)?;
     repository.move_session(id, target_folder_id)
+}
+
+#[uniffi::export]
+pub fn place_session_sidebar_item(
+    database_path: String,
+    kind: String,
+    id: String,
+    target_parent_id: Option<String>,
+    target_index: u32,
+) -> Result<SessionSidebarOrderItem, SessionError> {
+    let repository = session_repository_for_path(database_path)?;
+    repository.place_session_sidebar_item(kind, id, target_parent_id, target_index)
 }
 
 #[uniffi::export]
@@ -1079,33 +1142,34 @@ pub fn start_live_ssh_shell_runtime(
 ) -> Result<LiveShellStatus, SshRuntimeError> {
     validate_ssh_config_target(config.clone())?;
     start_live_shell_pump_if_needed();
-    let mut registry = recover_global_lock(terminal_registry());
-    let mut manager = recover_global_lock(live_shell_manager());
-    let status = start_ssh_live_shell_worker(
-        &mut registry,
-        &mut manager,
+    let runtime = recover_global_lock(terminal_registry()).open_remote_ssh(
         config.host.clone(),
         config.port,
         config.username.clone(),
         cols,
         rows,
-        |runtime| {
-            let request = Libssh2ShellRequest::new(runtime.id.clone(), cols, rows);
-            Libssh2Transport::new()
-                .open_shell_channel(
-                    &config,
-                    auth_secret_to_libssh2(secret),
-                    expected_fingerprint_sha256,
-                    request,
-                )
-                .map(|(channel, info)| {
-                    recover_global_lock(live_ssh_session_infos()).insert(runtime.id.clone(), info);
-                    LiveShellChannel::Ssh(channel)
-                })
-        },
-    )?;
-    notify_live_shell_pump();
-    Ok(status)
+    );
+    let request = Libssh2ShellRequest::new(runtime.id.clone(), cols, rows);
+    match Libssh2Transport::new().open_shell_channel(
+        &config,
+        auth_secret_to_libssh2(secret),
+        expected_fingerprint_sha256,
+        request,
+    ) {
+        Ok((channel, info)) => {
+            let status = register_connected_live_shell(
+                runtime.clone(),
+                LiveShellChannel::Ssh(channel),
+                Some(ssh_osc7_bootstrap_input_chunks().concat()),
+            )?;
+            recover_global_lock(live_ssh_session_infos()).insert(runtime.id, info);
+            Ok(status)
+        }
+        Err(error) => {
+            close_failed_live_shell_runtime(runtime.id);
+            Err(error)
+        }
+    }
 }
 
 #[uniffi::export]
@@ -1118,33 +1182,34 @@ pub fn start_live_ssh_shell_runtime_with_proxy_jump(
 ) -> Result<LiveShellStatus, SshRuntimeError> {
     validate_proxy_jump_runtime_config_target(config.clone(), proxy_jump.clone())?;
     start_live_shell_pump_if_needed();
-    let mut registry = recover_global_lock(terminal_registry());
-    let mut manager = recover_global_lock(live_shell_manager());
-    let status = start_ssh_live_shell_worker(
-        &mut registry,
-        &mut manager,
+    let runtime = recover_global_lock(terminal_registry()).open_remote_ssh(
         config.host.clone(),
         config.port,
         config.username.clone(),
         cols,
         rows,
-        |runtime| {
-            let request = Libssh2ShellRequest::new(runtime.id.clone(), cols, rows);
-            Libssh2Transport::new()
-                .open_shell_channel_via_proxy_jump(
-                    &config,
-                    auth_secret_to_libssh2(secret),
-                    proxy_jump,
-                    request,
-                )
-                .map(|(channel, info)| {
-                    recover_global_lock(live_ssh_session_infos()).insert(runtime.id.clone(), info);
-                    LiveShellChannel::Ssh(channel)
-                })
-        },
-    )?;
-    notify_live_shell_pump();
-    Ok(status)
+    );
+    let request = Libssh2ShellRequest::new(runtime.id.clone(), cols, rows);
+    match Libssh2Transport::new().open_shell_channel_via_proxy_jump(
+        &config,
+        auth_secret_to_libssh2(secret),
+        proxy_jump,
+        request,
+    ) {
+        Ok((channel, info)) => {
+            let status = register_connected_live_shell(
+                runtime.clone(),
+                LiveShellChannel::Ssh(channel),
+                Some(ssh_osc7_bootstrap_input_chunks().concat()),
+            )?;
+            recover_global_lock(live_ssh_session_infos()).insert(runtime.id, info);
+            Ok(status)
+        }
+        Err(error) => {
+            close_failed_live_shell_runtime(runtime.id);
+            Err(error)
+        }
+    }
 }
 
 #[uniffi::export]
@@ -1155,9 +1220,7 @@ pub fn start_live_telnet_shell_runtime(
 ) -> Result<LiveShellStatus, SshRuntimeError> {
     validate_telnet_config_target(&config)?;
     start_live_shell_pump_if_needed();
-    let mut registry = recover_global_lock(terminal_registry());
-    let mut manager = recover_global_lock(live_shell_manager());
-    let runtime = registry.open_remote_telnet(
+    let runtime = recover_global_lock(terminal_registry()).open_remote_telnet(
         config.host.trim().to_string(),
         config.port,
         config.username.clone(),
@@ -1166,15 +1229,10 @@ pub fn start_live_telnet_shell_runtime(
     );
     match TelnetShellChannel::connect(&config.host, config.port, config.connect_timeout_ms) {
         Ok(channel) => {
-            manager.register(LiveShellWorker::new(
-                runtime.id.clone(),
-                LiveShellChannel::Telnet(channel),
-            ));
-            notify_live_shell_pump();
-            Ok(LiveShellStatus::running(runtime.id))
+            register_connected_live_shell(runtime, LiveShellChannel::Telnet(channel), None)
         }
         Err(error) => {
-            let _ = registry.close(runtime.id);
+            close_failed_live_shell_runtime(runtime.id);
             Err(error)
         }
     }
@@ -1188,9 +1246,7 @@ pub fn start_live_serial_shell_runtime(
 ) -> Result<LiveShellStatus, SshRuntimeError> {
     validate_serial_config_target(&config)?;
     start_live_shell_pump_if_needed();
-    let mut registry = recover_global_lock(terminal_registry());
-    let mut manager = recover_global_lock(live_shell_manager());
-    let runtime = registry.open_serial(
+    let runtime = recover_global_lock(terminal_registry()).open_serial(
         config.device_path.trim().to_string(),
         config.baud_rate,
         cols,
@@ -1198,15 +1254,10 @@ pub fn start_live_serial_shell_runtime(
     );
     match SerialShellChannel::open_with_config(config) {
         Ok(channel) => {
-            manager.register(LiveShellWorker::new(
-                runtime.id.clone(),
-                LiveShellChannel::Serial(channel),
-            ));
-            notify_live_shell_pump();
-            Ok(LiveShellStatus::running(runtime.id))
+            register_connected_live_shell(runtime, LiveShellChannel::Serial(channel), None)
         }
         Err(error) => {
-            let _ = registry.close(runtime.id);
+            close_failed_live_shell_runtime(runtime.id);
             Err(error)
         }
     }
@@ -1932,7 +1983,7 @@ fn import_preview_session(
             .filter(|path| !path.is_empty()),
         credential_id: None,
         tags: vec![],
-        config_json: None,
+        config_json: session.config_json.clone(),
     })?;
     existing_names.insert(normalized_import_name(&record.name));
     Ok(record)
@@ -3402,6 +3453,93 @@ mod session_api_tests {
 
         assert_eq!(folders, vec![folder]);
         assert_eq!(sessions, vec![session]);
+    }
+
+    #[test]
+    fn session_bridge_lists_and_places_mixed_sidebar_items() {
+        let temp = tempfile::NamedTempFile::new().expect("temp database");
+        let database_path = temp.path().to_string_lossy().to_string();
+        let root_a = super::create_session_record(
+            database_path.clone(),
+            SessionDraft {
+                folder_id: None,
+                name: "Root A".to_string(),
+                protocol: "ssh".to_string(),
+                host: "a.example.com".to_string(),
+                port: 22,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: None,
+            },
+        )
+        .expect("create first root session");
+        let folder =
+            super::create_session_folder(database_path.clone(), None, "Production".to_string())
+                .expect("create folder");
+        let root_b = super::create_session_record(
+            database_path.clone(),
+            SessionDraft {
+                folder_id: None,
+                name: "Root B".to_string(),
+                protocol: "ssh".to_string(),
+                host: "b.example.com".to_string(),
+                port: 22,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: None,
+            },
+        )
+        .expect("create second root session");
+
+        let initial = super::list_session_sidebar_order(database_path.clone())
+            .expect("list initial sidebar order");
+        assert_eq!(
+            initial
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![root_a.id.as_str(), folder.id.as_str(), root_b.id.as_str()]
+        );
+        super::place_session_sidebar_item(
+            database_path.clone(),
+            "folder".to_string(),
+            folder.id.clone(),
+            None,
+            0,
+        )
+        .expect("reorder folder");
+        let placed = super::place_session_sidebar_item(
+            database_path.clone(),
+            "session".to_string(),
+            root_b.id.clone(),
+            Some(folder.id.clone()),
+            0,
+        )
+        .expect("move session into folder");
+        let reordered =
+            super::list_session_sidebar_order(database_path).expect("list reordered sidebar order");
+
+        assert_eq!(placed.parent_id, Some(folder.id.clone()));
+        assert_eq!(
+            reordered
+                .iter()
+                .filter(|item| item.parent_id.is_none())
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![folder.id.as_str(), root_a.id.as_str()]
+        );
+        assert_eq!(
+            reordered
+                .iter()
+                .filter(|item| item.parent_id.as_deref() == Some(folder.id.as_str()))
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![root_b.id.as_str()]
+        );
     }
 
     #[test]
