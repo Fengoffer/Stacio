@@ -310,8 +310,12 @@ final class AddAIProviderSheetControllerTests: XCTestCase {
         let saveButton = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.Settings.addAIProvider.save") as? NSButton
         )
-        let cancelFrame = cancelButton.convert(cancelButton.bounds, to: controller.view)
-        let saveFrame = saveButton.convert(saveButton.bounds, to: controller.view)
+        func alignmentFrame(_ view: NSView) -> NSRect {
+            let alignmentRect = view.alignmentRect(forFrame: view.bounds)
+            return view.convert(alignmentRect, to: controller.view)
+        }
+        let cancelFrame = alignmentFrame(cancelButton)
+        let saveFrame = alignmentFrame(saveButton)
 
         XCTAssertTrue(modelScrollView.hasVerticalScroller)
         XCTAssertLessThan(cancelFrame.maxX, saveFrame.minX)

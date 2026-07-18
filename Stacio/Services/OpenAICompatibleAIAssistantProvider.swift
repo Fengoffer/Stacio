@@ -85,7 +85,18 @@ public final class URLSessionAIAssistantHTTPTransport: AIAssistantHTTPTransport 
         guard let result else {
             throw AIAssistantProviderError.invalidResponse
         }
-        return try result.get()
+        switch result {
+        case .success(let response):
+            return response
+        case .failure(let error):
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain,
+               nsError.code == NSURLErrorTimedOut
+            {
+                throw AIAssistantProviderError.timeout
+            }
+            throw error
+        }
     }
 
     public func performAsync(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {

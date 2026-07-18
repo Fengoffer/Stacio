@@ -5411,17 +5411,23 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         controller.showFilesFromToolbar(nil)
         let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
         let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        let initialDirectoryRequest = expectation(description: "files requests followed terminal directory")
+        filesBridge.observeNextLiveRemoteDirectoryRequest(matching: "/srv/app") {
+            initialDirectoryRequest.fulfill()
+        }
         pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
-        XCTAssertTrue(waitUntil {
-            filesBridge.liveRemotePaths.last == "/srv/app"
-                && inspector.filesViewController?.currentRemotePath == "/srv/app"
-        })
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+        wait(for: [initialDirectoryRequest], timeout: 3)
 
+        let uploadDirectoryRefresh = expectation(description: "files refreshes after terminal drop upload")
+        filesBridge.observeNextLiveRemoteDirectoryRequest(matching: "/srv/app") {
+            uploadDirectoryRefresh.fulfill()
+        }
         pane.performDropLocalFilesForTesting([localFile.path])
 
+        wait(for: [uploadDirectoryRefresh], timeout: 3)
         XCTAssertTrue(waitUntil {
-            filesBridge.liveRemotePaths.filter { $0 == "/srv/app" }.count >= 2
-                && inspector.filesViewController?.containsRemoteEntry(named: "release.tar.gz") == true
+            inspector.filesViewController?.containsRemoteEntry(named: "release.tar.gz") == true
         })
         XCTAssertEqual(scpBridge.destinationPaths, ["/srv/app/release.tar.gz"])
         XCTAssertTrue(inspector.filesViewController?.visibleTextSnapshot.contains("release.tar.gz") == true)
@@ -8150,6 +8156,7 @@ private final class RecordingWorkbenchRemoteFilesBridge: RemoteFilesBridging {
     private var recordedFTPUsernames: [String] = []
     private var recordedFTPSecrets: [String] = []
     private var recordedEntries: [RemoteFileEntry]
+    private var nextLiveRemoteDirectoryRequestObserver: (path: String, handler: () -> Void)?
 
     init(entries: [RemoteFileEntry]) {
         self.recordedEntries = entries
@@ -8185,6 +8192,15 @@ private final class RecordingWorkbenchRemoteFilesBridge: RemoteFilesBridging {
         recordingQueue.sync { recordedFTPSecrets }
     }
 
+    func observeNextLiveRemoteDirectoryRequest(
+        matching path: String,
+        handler: @escaping () -> Void
+    ) {
+        recordingQueue.sync {
+            nextLiveRemoteDirectoryRequestObserver = (path, handler)
+        }
+    }
+
     func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
         recordingQueue.sync { recordedEntries }
     }
@@ -8195,12 +8211,21 @@ private final class RecordingWorkbenchRemoteFilesBridge: RemoteFilesBridging {
         expectedFingerprintSHA256: String,
         remotePath: String
     ) throws -> [RemoteFileEntry] {
-        recordingQueue.sync {
+        let result = recordingQueue.sync { () -> ([RemoteFileEntry], (() -> Void)?) in
             recordedLiveHosts.append(config.host)
             recordedLiveRemotePaths.append(remotePath)
             recordedExpectedFingerprints.append(expectedFingerprintSHA256)
-            return recordedEntries
+            let observer: (() -> Void)?
+            if nextLiveRemoteDirectoryRequestObserver?.path == remotePath {
+                observer = nextLiveRemoteDirectoryRequestObserver?.handler
+                nextLiveRemoteDirectoryRequestObserver = nil
+            } else {
+                observer = nil
+            }
+            return (recordedEntries, observer)
         }
+        result.1?()
+        return result.0
     }
 
     func listLiveFTPDirectory(
