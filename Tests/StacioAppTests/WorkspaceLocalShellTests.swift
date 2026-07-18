@@ -3347,11 +3347,10 @@ final class WorkspaceLocalShellTests: XCTestCase {
             connectionKind: .ssh
         )
 
-        let startedAt = Date()
         try workspace.performTabContextActionForTesting(.duplicate, index: 0)
-        let elapsed = Date().timeIntervalSince(startedAt)
 
-        XCTAssertLessThan(elapsed, 0.08)
+        // The reconnect is deliberately asynchronous; the synchronous call count is the
+        // contract, while wall-clock time varies with AppKit runner load.
         XCTAssertEqual(reconnecter.synchronousReconnectCount, 0)
         XCTAssertEqual(workspace.openTerminalPaneCount, 2)
         XCTAssertTrue(waitUntil {

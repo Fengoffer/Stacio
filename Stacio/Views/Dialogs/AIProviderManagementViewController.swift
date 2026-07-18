@@ -956,7 +956,8 @@ final class AIProviderManagementViewController: NSViewController,
         let compatibilityProtocolRow = makeFormRow(
             label: "协议",
             control: compatibilityProtocolPopup,
-            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.compatibilityProtocol"
+            accessibilityIdentifier: "Stacio.Settings.aiProviders.form.compatibilityProtocol",
+            stabilizesPopupLayout: true
         )
         let retryCountRow = makeFormRow(
             label: "重试次数",
@@ -1132,7 +1133,8 @@ final class AIProviderManagementViewController: NSViewController,
     private func makeFormRow(
         label title: String,
         control: NSView,
-        accessibilityIdentifier: String? = nil
+        accessibilityIdentifier: String? = nil,
+        stabilizesPopupLayout: Bool = false
     ) -> NSView {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 12)
@@ -1142,10 +1144,29 @@ final class AIProviderManagementViewController: NSViewController,
         label.widthAnchor.constraint(equalToConstant: 82).isActive = true
         label.setContentHuggingPriority(.required, for: .horizontal)
         label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        control.translatesAutoresizingMaskIntoConstraints = false
-        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let arrangedControl: NSView
+        if stabilizesPopupLayout, let popup = control as? NSPopUpButton {
+            // AppKit 14 applies a five-point alignment inset to popup buttons on some runners.
+            // Keep the form column stable by measuring a zero-inset container instead.
+            let container = NSView()
+            container.translatesAutoresizingMaskIntoConstraints = false
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(popup)
+            NSLayoutConstraint.activate([
+                popup.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                popup.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                popup.topAnchor.constraint(equalTo: container.topAnchor),
+                popup.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ])
+            arrangedControl = container
+        } else {
+            control.translatesAutoresizingMaskIntoConstraints = false
+            arrangedControl = control
+        }
+        arrangedControl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        arrangedControl.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [label, control])
+        let row = NSStackView(views: [label, arrangedControl])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.distribution = .fill

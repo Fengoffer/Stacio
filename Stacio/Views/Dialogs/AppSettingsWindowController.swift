@@ -294,8 +294,8 @@ private final class AppSettingsSwitchProxy: NSView {
             nativeSwitch.leadingAnchor.constraint(equalTo: leadingAnchor),
             nativeSwitch.trailingAnchor.constraint(equalTo: trailingAnchor),
             nativeSwitch.centerYAnchor.constraint(equalTo: centerYAnchor),
-            nativeSwitch.widthAnchor.constraint(greaterThanOrEqualToConstant: AppSettingsLayout.settingsSwitchSize.width),
-            nativeSwitch.heightAnchor.constraint(greaterThanOrEqualToConstant: AppSettingsLayout.settingsSwitchSize.height),
+            nativeSwitch.widthAnchor.constraint(equalToConstant: AppSettingsLayout.settingsSwitchSize.width),
+            nativeSwitch.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsSwitchSize.height),
 
             backingButton.widthAnchor.constraint(equalToConstant: 0),
             backingButton.heightAnchor.constraint(equalToConstant: 0),

@@ -205,10 +205,12 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
         guard width.isFinite, width > 20 else {
             return 180
         }
-        let contentWidth = width - 20
+        let contentWidth = max(0, floor(width - 20))
         contentStack.frame.size.width = contentWidth
         contentStack.layoutSubtreeIfNeeded()
         let contentHeight = contentStack.fittingSize.height
+        // Scroll-view rounding can add a point back to the constrained frame on macOS 14.
+        contentStack.frame.size.width = contentWidth
         return ceil(contentHeight + 20)
     }
 

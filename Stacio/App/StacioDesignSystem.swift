@@ -489,6 +489,10 @@ public final class StacioAppearanceRefreshView: NSView, StacioEffectiveAppearanc
 private class StacioPaddedTextFieldCell: NSTextFieldCell {
     private let horizontalInset: CGFloat = 10
 
+    // AppKit 14 may query this private compatibility hook while measuring a cell.
+    @objc(_usesCenteredLook)
+    func stacioUsesCenteredLook() -> Bool { false }
+
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         adjustedTextRect(for: rect)
     }
@@ -550,6 +554,9 @@ private class StacioPaddedTextFieldCell: NSTextFieldCell {
 
 private final class StacioPaddedSecureTextFieldCell: NSSecureTextFieldCell {
     private let horizontalInset: CGFloat = 10
+
+    @objc(_usesCenteredLook)
+    func stacioUsesCenteredLook() -> Bool { false }
 
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         adjustedTextRect(for: rect)
