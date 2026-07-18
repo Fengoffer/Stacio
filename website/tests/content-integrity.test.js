@@ -93,6 +93,16 @@ test('top navigation Gitee link uses the verified repository and telemetry event
   assert.equal(fs.existsSync(path.join(websiteRoot, 'assets', 'gitee.svg')), true);
 });
 
+test('GitHub and Gitee repository actions open safely in a new tab', () => {
+  const repositoryActions = [...indexHTML.matchAll(/<a\b[^>]*class="[^"]*\b(?:github-link|gitee-link)\b[^"]*"[^>]*>/g)].map((match) => match[0]);
+
+  assert.equal(repositoryActions.length, 8);
+  for (const action of repositoryActions) {
+    assert.match(action, /target="_blank"/);
+    assert.match(action, /rel="noopener noreferrer"/);
+  }
+});
+
 test('hero actions place Gitee after GitHub', () => {
   const heroActions = indexHTML.match(/<div class="hero-actions"[\s\S]*?<\/div>/)?.[0] ?? '';
   const itemIDs = [...heroActions.matchAll(/<a[^>]+data-od-id="([^"]+)"/g)].map((match) => match[1]);
