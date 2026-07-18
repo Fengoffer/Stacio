@@ -50,7 +50,7 @@ test('unsupported database and Redis landing pages are removed', () => {
   assert.equal(fs.existsSync(path.join(websiteRoot, 'mac-redis-management-visualization.html')), false);
 });
 
-test('top navigation places FAQ after releases and Gitee after GitHub', () => {
+test('top navigation omits visible FAQ and keeps Gitee after GitHub', () => {
   const navigation = indexHTML.match(/<nav class="nav-links"[\s\S]*?<\/nav>/)?.[0] ?? '';
   const itemIDs = [...navigation.matchAll(/<a[^>]+data-od-id="([^"]+)"/g)].map((match) => match[1]);
 
@@ -59,10 +59,16 @@ test('top navigation places FAQ after releases and Gitee after GitHub', () => {
     'nav-workflow',
     'nav-security',
     'nav-releases',
-    'nav-faq',
     'nav-github',
     'nav-gitee'
   ]);
+});
+
+test('homepage hides the FAQ section while retaining FAQ structured data', () => {
+  assert.doesNotMatch(indexHTML, /data-od-id="nav-faq"/);
+  assert.doesNotMatch(indexHTML, /data-od-id="faq-section"/);
+  assert.doesNotMatch(indexHTML, /<section class="section faq-section"/);
+  assert.match(indexHTML, /"@type": "FAQPage"/);
 });
 
 test('top navigation Gitee link uses the verified repository and telemetry event', () => {
