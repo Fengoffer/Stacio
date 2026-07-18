@@ -1,8 +1,7 @@
 diff --git a/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift b/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
 --- a/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
 +++ b/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift
-@@ -2733,9 +2733,20 @@ private final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
- 
+@@ -2734,8 +2734,19 @@ private final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
      private static func candidateBundles() -> [Bundle] {
          var bundles: [Bundle] = []
 +        #if os(macOS)
