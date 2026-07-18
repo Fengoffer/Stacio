@@ -174,14 +174,14 @@ final class AddAIProviderSheetController: NSViewController,
         manualRow.alignment = .centerY
         manualRow.spacing = 8
 
-        let footerSpacer = NSView()
-        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        footerSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = NSStackView(views: [footerSpacer, cancelButton, saveButton])
-        footer.orientation = .horizontal
-        footer.alignment = .centerY
-        footer.spacing = 10
+        let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        saveButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        saveButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        footer.addSubview(cancelButton)
+        footer.addSubview(saveButton)
 
         let stack = NSStackView(views: [
             header,
@@ -221,6 +221,11 @@ final class AddAIProviderSheetController: NSViewController,
             manualModelField.widthAnchor.constraint(equalToConstant: 320),
             addManualModelButton.heightAnchor.constraint(equalToConstant: 30),
             statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 30),
+            saveButton.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            saveButton.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            cancelButton.trailingAnchor.constraint(equalTo: saveButton.leadingAnchor, constant: -10),
+            cancelButton.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             saveButton.heightAnchor.constraint(equalToConstant: 30),
             cancelButton.heightAnchor.constraint(equalToConstant: 30)
         ])

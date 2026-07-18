@@ -21,17 +21,17 @@ final class URLSessionAIAssistantHTTPTransportTests: XCTestCase {
         XCTAssertEqual(data, Data("{}".utf8))
     }
 
-    func testSynchronousPerformUsesConstructionFallbackWithoutPositiveRequestTimeout() {
+    func testSynchronousPerformTimesOutWhenRequestTimeoutExpires() {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DelayedAIAssistantHTTPResponseURLProtocol.self]
         let transport = URLSessionAIAssistantHTTPTransport(
             configuration: configuration,
-            timeout: 0.05
+            timeout: 1
         )
         var request = URLRequest(
             url: URL(string: "https://transport-timeout.test/models")!
         )
-        request.timeoutInterval = 0
+        request.timeoutInterval = 0.05
 
         XCTAssertThrowsError(try transport.perform(request)) { error in
             XCTAssertEqual(error as? AIAssistantProviderError, .timeout)

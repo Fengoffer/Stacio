@@ -2893,8 +2893,10 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             abs(frame(historyLimitRow, in: content).minY - frame(diskLimitRow, in: content).minY),
             95
         )
-        XCTAssertLessThanOrEqual(frame(keepLastSwitch, in: content).height, 28)
-        XCTAssertLessThanOrEqual(frame(hideVirtualNetworksSwitch, in: content).height, 28)
+        // NSSwitch reports 26 points on newer AppKit and 29 points on macOS 14.
+        // Both stay comfortably within the compact 46-point settings row.
+        XCTAssertLessThanOrEqual(frame(keepLastSwitch, in: content).height, 30)
+        XCTAssertLessThanOrEqual(frame(hideVirtualNetworksSwitch, in: content).height, 30)
         XCTAssertEqual(frame(intervalLabel, in: content).midY, frame(intervalField, in: content).midY, accuracy: 1.5)
         XCTAssertEqual(frame(diskLimitLabel, in: content).midY, frame(diskLimitField, in: content).midY, accuracy: 1.5)
     }
