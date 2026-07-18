@@ -33,7 +33,6 @@
       const publicApiBase = (document.documentElement.dataset.publicApiBase || '/api/v1').replace(/\/+$/, '');
       const publicProductId = document.documentElement.dataset.publicProductId || 'stacio';
       const publicApiUrl = (path) => `${publicApiBase}${path}`;
-      const releasesEndpoint = publicApiUrl(`/public/products/${publicProductId}/releases`);
       const telemetryEndpoint = publicApiUrl(`/public/products/${publicProductId}/telemetry`);
       const stableMacosDownloads = {
         arm64: {
@@ -51,6 +50,7 @@
       };
       const currentStableVersion = '0.13.3';
       const currentStableBuildNumber = '245';
+      const githubReleaseEndpoint = `https://api.github.com/repos/Fengoffer/Stacio/releases/tags/v${currentStableVersion}`;
       const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
       let lastReleaseTrigger = null;
       let releaseNotesRequest = null;
@@ -416,21 +416,29 @@
       const configureLatestPublicRelease = (release) => {
         if (!release) return;
         latestPublicRelease = release;
+        if (releaseGitHub && release.releaseUrl) releaseGitHub.href = release.releaseUrl;
+      };
+
+      const normalizeGitHubRelease = (payload) => {
+        const version = String(payload?.tag_name || '').replace(/^v/i, '');
+        if (version !== currentStableVersion || !String(payload?.body || '').trim()) return null;
+        return {
+          id: payload.id,
+          version,
+          releaseNotes: payload.body,
+          releaseUrl: payload.html_url
+        };
       };
 
       const loadLatestReleaseNotes = () => {
         if (releaseNotesRequest || !releaseNotes) return releaseNotesRequest;
-        releaseNotesRequest = fetch(releasesEndpoint)
+        releaseNotesRequest = fetch(githubReleaseEndpoint, {
+          headers: { Accept: 'application/vnd.github+json' }
+        })
           .then((response) => response.ok ? response.json() : Promise.reject(new Error(`Release catalog request failed: ${response.status}`)))
           .then((payload) => {
-            const releases = Array.isArray(payload?.data?.releases) ? payload.data.releases : [];
-            const release = releases.find((item) => {
-              const version = String(item.version || '').replace(/^v/i, '');
-              return item.channel === 'stable'
-                && item.downloadAvailable
-                && version === currentStableVersion
-                && String(item.buildNumber || '') === currentStableBuildNumber;
-            }) || null;
+            const release = normalizeGitHubRelease(payload);
+            if (!release) throw new Error('Matching GitHub release is unavailable');
             configureLatestPublicRelease(release);
             renderReleaseNotes(release);
           })

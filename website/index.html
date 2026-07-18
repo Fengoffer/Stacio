@@ -421,34 +421,52 @@
       <div class="modal-head">
         <div>
           <p class="eyebrow" data-i18n="modal.eyebrow">UPDATE NOTES</p>
-          <h2 id="release-modal-title" data-od-id="release-modal-title">Stacio 0.13.3 更新说明</h2>
+          <h2 id="release-modal-title" data-od-id="release-modal-title">Stacio 0.13.3</h2>
         </div>
         <button class="modal-close" type="button" aria-label="关闭更新清单" data-i18n-attr="aria-label:modal.close" data-od-id="release-modal-close">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         </button>
       </div>
-      <p class="section-lead" id="release-modal-copy" data-od-id="release-modal-copy">正式版 · 构建号 245 · 支持 macOS 14 及以上</p>
+      <p class="section-lead" id="release-modal-copy" data-od-id="release-modal-copy">本次正式版优化本地 Agent 与终端协作体验，并提升远程会话稳定性。</p>
       <div class="release-list release-notes" id="release-notes" data-od-id="release-list">
         <section class="release-note-section" data-od-id="release-note-highlights">
-          <h3>本次更新</h3>
+          <h3>主要更新</h3>
           <ul>
-            <li>排查助手现在能识别终端任务完成；即使完成标记分散在多段输出中，也能自动继续并给出总结。</li>
-            <li>改善终端输出回传与会话完成状态，减少任务停留在等待状态或需要手动确认的情况。</li>
-            <li>提供 Apple Silicon 与 Intel Mac 的独立安装包。</li>
-            <li>优化远程会话、文件面板和 AI 助手的稳定性。</li>
+            <li>本地 Agent 能识别终端审计完成标记；即使标记分散在多段输出中，也会在命令结束后自动继续并返回总结。</li>
+            <li>改善终端输出回传和会话完成状态，减少排查任务停留在等待或需要手动确认的情况。</li>
+            <li>提供独立的 Apple Silicon 与 Intel Mac 安装包，并在发布前校验 App、CLI、VNC、Core 与 Sparkle 组件架构。</li>
+            <li>优化远程会话、文件面板与 AI 助手的稳定性。</li>
           </ul>
         </section>
         <section class="release-note-section" data-od-id="release-note-install">
-          <h3>首次打开</h3>
-          <p><strong>当前包未公证。</strong>首次打开如被 macOS 拦截，请在 Finder 中右键 <code>Stacio.app</code> 并选择“打开”。</p>
+          <h3>下载</h3>
+          <ul>
+            <li>Apple Silicon：<code>Stacio-0.13.3-arm64.dmg</code></li>
+            <li>Intel Mac：<code>Stacio-0.13.3-x86_64.dmg</code></li>
+          </ul>
+        </section>
+        <section class="release-note-section" data-od-id="release-note-install">
+          <h3>安装提示</h3>
+          <ul>
+            <li>支持 macOS 14 及以上版本。</li>
+            <li>当前版本为未公证的 ad-hoc 签名包；首次打开如被 macOS 拦截，请在 Finder 中右键 <code>Stacio.app</code> 并选择“打开”。</li>
+            <li>已保存的会话、凭据引用、AI 配置、传输记录和应用设置会继续保留。</li>
+          </ul>
+        </section>
+        <section class="release-note-section" data-od-id="release-note-checksums">
+          <h3>下载校验</h3>
+          <ul>
+            <li><code>Stacio-0.13.3-arm64.dmg</code><br>SHA-256：<code>623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5</code></li>
+            <li><code>Stacio-0.13.3-x86_64.dmg</code><br>SHA-256：<code>4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd</code></li>
+          </ul>
         </section>
       </div>
       <div class="modal-foot">
-        <a class="btn primary github-link" href="https://github.com/Fengoffer/Stacio/releases" data-event="homepage_release_modal_github_clicked" data-od-id="release-modal-github"><span class="github-icon" aria-hidden="true"></span><span data-i18n="modal.github">打开 GitHub Releases</span></a>
+        <a class="btn primary github-link" href="https://github.com/Fengoffer/Stacio/releases/tag/v0.13.3" data-event="homepage_release_modal_github_clicked" data-od-id="release-modal-github"><span class="github-icon" aria-hidden="true"></span><span data-i18n="modal.github">打开 GitHub Releases</span></a>
         <button class="btn ghost" type="button" data-i18n="modal.done" data-od-id="release-modal-done">知道了</button>
       </div>
     </section>
   </div>
-  <script src="main.js?v=20260718-stable-downloads-0133"></script>
+  <script src="main.js?v=20260718-release-notes-0133"></script>
 </body>
 </html>

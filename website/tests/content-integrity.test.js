@@ -131,19 +131,25 @@ test('homepage promotes Stacio 0.13.3 build 245 as the current stable release', 
   assert.match(mainJS, /const currentStableBuildNumber = '245';/);
 });
 
-test('current release notes cover user outcomes and the unnotarized launch instruction', () => {
+test('current release notes use the GitHub v0.13.3 release body and keep a matching fallback', () => {
   const releaseModal = indexHTML.match(/<div class="modal-backdrop"[\s\S]*?<script src=/)?.[0] ?? '';
 
-  assert.match(releaseModal, /终端任务完成/);
-  assert.match(releaseModal, /完成标记分散在多段输出/);
-  assert.match(releaseModal, /自动继续并给出总结/);
-  assert.match(releaseModal, /终端输出回传与会话完成状态/);
-  assert.match(releaseModal, /减少任务停留在等待状态或需要手动确认/);
-  assert.match(releaseModal, /Apple Silicon 与 Intel Mac 的独立安装包/);
-  assert.match(releaseModal, /远程会话、文件面板和 AI 助手的稳定性/);
-  assert.match(releaseModal, /当前包未公证/);
+  assert.match(mainJS, /githubReleaseEndpoint = `https:\/\/api\.github\.com\/repos\/Fengoffer\/Stacio\/releases\/tags\/v\$\{currentStableVersion\}`/);
+  assert.match(mainJS, /normalizeGitHubRelease/);
+  assert.doesNotMatch(mainJS, /fetch\(releasesEndpoint\)/);
+  assert.match(releaseModal, /本次正式版优化本地 Agent 与终端协作体验/);
+  assert.match(releaseModal, /终端审计完成标记/);
+  assert.match(releaseModal, /标记分散在多段输出/);
+  assert.match(releaseModal, /命令结束后自动继续并返回总结/);
+  assert.match(releaseModal, /终端输出回传和会话完成状态/);
+  assert.match(releaseModal, /减少排查任务停留在等待或需要手动确认/);
+  assert.match(releaseModal, /Apple Silicon 与 Intel Mac 安装包/);
+  assert.match(releaseModal, /远程会话、文件面板与 AI 助手的稳定性/);
+  assert.match(releaseModal, /当前版本为未公证的 ad-hoc 签名包/);
   assert.match(releaseModal, /Finder 中右键 <code>Stacio\.app<\/code> 并选择“打开”/);
-  assert.doesNotMatch(releaseModal, /CI|Tests\/|ViewController|Coordinator|Orchestrator/);
+  assert.match(releaseModal, /下载校验/);
+  assert.match(releaseModal, /623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5/);
+  assert.match(releaseModal, /4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd/);
 });
 
 test('default current-version surfaces no longer recommend a Beta release', () => {
