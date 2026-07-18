@@ -37,8 +37,11 @@ mkdir -p \
 SWIFTTERM_PATCH_TEST_CHECKOUT="$TMP_DIR/swiftterm-checkout"
 SWIFTTERM_PATCH_TEST_SOURCE="$SWIFTTERM_PATCH_TEST_CHECKOUT/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift"
 mkdir -p "$(dirname "$SWIFTTERM_PATCH_TEST_SOURCE")"
-cat >"$SWIFTTERM_PATCH_TEST_SOURCE" <<'EOF'
-private final class MetalTerminalRenderer {
+for _ in {1..2732}; do
+  printf '\n'
+done >"$SWIFTTERM_PATCH_TEST_SOURCE"
+cat >>"$SWIFTTERM_PATCH_TEST_SOURCE" <<'EOF'
+private final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private static func candidateBundles() -> [Bundle] {
         var bundles: [Bundle] = []
         #if SWIFT_PACKAGE
@@ -121,6 +124,16 @@ done
 printf '\n' >>"$STACIO_PACKAGE_TEST_LOG"
 EOF
 chmod +x "$FAKE_BIN_DIR/codesign"
+
+cat >"$FAKE_BIN_DIR/lipo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" != "-archs" ]]; then
+  echo "unexpected lipo arguments: $*" >&2
+  exit 1
+fi
+printf '%s\n' "${STACIO_PACKAGE_TEST_LIPO_ARCHS:-arm64}"
+EOF
+chmod +x "$FAKE_BIN_DIR/lipo"
 
 cat >"$FAKE_BIN_DIR/git" <<'EOF'
 #!/usr/bin/env bash
@@ -508,5 +521,55 @@ if grep -Fq "codesign --force --deep --options runtime --timestamp --sign Develo
   echo "Developer ID packaging should not use codesign --deep" >&2
   exit 1
 fi
+
+TARGET_FAILURE_LOG="$TMP_DIR/cross-target-failure.log"
+if env \
+  PATH="$FAKE_BIN_DIR:$PATH" \
+  STACIO_SKIP_BUILD=1 \
+  STACIO_SWIFT_BUILD_TRIPLE="x86_64-apple-macosx" \
+  STACIO_SWIFT_BIN_PATH="$SWIFT_BIN_DIR" \
+  STACIO_CORE_DYLIB_PATH="$CORE_DIR/libstacio_core.dylib" \
+  STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
+  STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
+  STACIO_OUTPUT_DIR="$OUT_DIR" \
+  STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG=1 \
+  "$ROOT_DIR/scripts/package-app.sh" >"$TARGET_FAILURE_LOG" 2>&1; then
+  echo "expected an incomplete cross-build target pair to fail" >&2
+  exit 1
+fi
+grep -Fq "must be set together" "$TARGET_FAILURE_LOG"
+
+TARGET_FAILURE_LOG="$TMP_DIR/cross-architecture-failure.log"
+if env \
+  PATH="$FAKE_BIN_DIR:$PATH" \
+  STACIO_SKIP_BUILD=1 \
+  STACIO_SWIFT_BUILD_TRIPLE="x86_64-apple-macosx" \
+  STACIO_CARGO_BUILD_TARGET="x86_64-apple-darwin" \
+  STACIO_PACKAGE_TEST_LIPO_ARCHS="arm64" \
+  STACIO_SWIFT_BIN_PATH="$SWIFT_BIN_DIR" \
+  STACIO_CORE_DYLIB_PATH="$CORE_DIR/libstacio_core.dylib" \
+  STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
+  STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
+  STACIO_OUTPUT_DIR="$OUT_DIR" \
+  STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG=1 \
+  "$ROOT_DIR/scripts/package-app.sh" >"$TARGET_FAILURE_LOG" 2>&1; then
+  echo "expected a mismatched cross-build architecture to fail" >&2
+  exit 1
+fi
+grep -Fq "does not contain expected x86_64 architecture" "$TARGET_FAILURE_LOG"
+
+PATH="$FAKE_BIN_DIR:$PATH" \
+STACIO_PACKAGE_TEST_LOG="$LOG_FILE" \
+STACIO_SKIP_BUILD=1 \
+STACIO_SWIFT_BUILD_TRIPLE="x86_64-apple-macosx" \
+STACIO_CARGO_BUILD_TARGET="x86_64-apple-darwin" \
+STACIO_PACKAGE_TEST_LIPO_ARCHS="x86_64" \
+STACIO_SWIFT_BIN_PATH="$SWIFT_BIN_DIR" \
+STACIO_CORE_DYLIB_PATH="$CORE_DIR/libstacio_core.dylib" \
+STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
+STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
+STACIO_OUTPUT_DIR="$OUT_DIR" \
+STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG=1 \
+"$ROOT_DIR/scripts/package-app.sh"
 
 echo "package_app_test passed"

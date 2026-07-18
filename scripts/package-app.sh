@@ -7,6 +7,8 @@ APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"
 VERSION="${STACIO_VERSION:-0.13.3}"
 BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
+SWIFT_BUILD_TRIPLE="${STACIO_SWIFT_BUILD_TRIPLE:-}"
+CARGO_BUILD_TARGET="${STACIO_CARGO_BUILD_TARGET:-}"
 OUTPUT_DIR="${STACIO_OUTPUT_DIR:-$ROOT_DIR/dist}"
 CODESIGN_IDENTITY="${STACIO_CODESIGN_IDENTITY:--}"
 CODESIGN_ARGS=(--force)
@@ -264,6 +266,55 @@ if [[ -n "${STACIO_PREVIOUS_BUILD_NUMBER:-}" ]]; then
   fi
 fi
 
+if [[ -n "$SWIFT_BUILD_TRIPLE" && -z "$CARGO_BUILD_TARGET" ]] \
+  || [[ -z "$SWIFT_BUILD_TRIPLE" && -n "$CARGO_BUILD_TARGET" ]]; then
+  echo "STACIO_SWIFT_BUILD_TRIPLE and STACIO_CARGO_BUILD_TARGET must be set together." >&2
+  exit 1
+fi
+
+EXPECTED_NATIVE_ARCH=""
+SWIFT_BUILD_TARGET_ARGS=()
+CARGO_BUILD_TARGET_ARGS=()
+CORE_TARGET_DIR="$ROOT_DIR/StacioCore/target"
+CORE_LINK_LIBRARY_DIR="$CORE_TARGET_DIR/debug"
+CORE_DYLIB_DEFAULT="$CORE_TARGET_DIR/release/libstacio_core.dylib"
+CORE_LOAD_PATH_DEFAULT="$CORE_TARGET_DIR/debug/deps/libstacio_core.dylib"
+if [[ -n "$SWIFT_BUILD_TRIPLE" ]]; then
+  EXPECTED_NATIVE_ARCH="${SWIFT_BUILD_TRIPLE%%-*}"
+  case "$EXPECTED_NATIVE_ARCH:$CARGO_BUILD_TARGET" in
+    arm64:aarch64-apple-darwin|x86_64:x86_64-apple-darwin)
+      ;;
+    *)
+      echo "Unsupported Stacio cross-build target pair: $SWIFT_BUILD_TRIPLE / $CARGO_BUILD_TARGET" >&2
+      exit 1
+      ;;
+  esac
+  SWIFT_BUILD_TARGET_ARGS=(--triple "$SWIFT_BUILD_TRIPLE")
+  CARGO_BUILD_TARGET_ARGS=(--target "$CARGO_BUILD_TARGET")
+  CORE_TARGET_DIR="$CORE_TARGET_DIR/$CARGO_BUILD_TARGET"
+  CORE_LINK_LIBRARY_DIR="$CORE_TARGET_DIR/release"
+  CORE_DYLIB_DEFAULT="$CORE_TARGET_DIR/release/libstacio_core.dylib"
+  CORE_LOAD_PATH_DEFAULT="$CORE_TARGET_DIR/release/deps/libstacio_core.dylib"
+fi
+
+swift_release_build() {
+  STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+    swift build -c release "${SWIFT_BUILD_TARGET_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
+}
+
+verify_expected_native_architecture() {
+  local label="$1"
+  local binary_path="$2"
+  [[ -n "$EXPECTED_NATIVE_ARCH" ]] || return 0
+
+  local architectures
+  architectures="$(lipo -archs "$binary_path" 2>/dev/null || true)"
+  if ! tr ' ' '\n' <<<"$architectures" | grep -Fxq "$EXPECTED_NATIVE_ARCH"; then
+    echo "$label does not contain expected $EXPECTED_NATIVE_ARCH architecture: ${architectures:-<unreadable>}" >&2
+    exit 1
+  fi
+}
+
 validate_ed25519_public_key() {
   local name="$1"
   local value="$2"
@@ -346,19 +397,19 @@ if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
     swift package resolve --package-path "$ROOT_DIR"
   fi
   "$SWIFTTERM_RESOURCE_PATCHER" "$SWIFTTERM_CHECKOUT_PATH"
-  cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
-  swift build -c release --product "$APP_NAME" --package-path "$ROOT_DIR"
-  swift build -c release --product "$CLI_PRODUCT" --package-path "$ROOT_DIR"
-  swift build -c release --product "$VNC_ADAPTER_PRODUCT" --package-path "$ROOT_DIR"
+  cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release "${CARGO_BUILD_TARGET_ARGS[@]}"
+  swift_release_build --product "$APP_NAME"
+  swift_release_build --product "$CLI_PRODUCT"
+  swift_release_build --product "$VNC_ADAPTER_PRODUCT"
 fi
 
-SWIFT_BIN_PATH="${STACIO_SWIFT_BIN_PATH:-$(swift build -c release --show-bin-path --package-path "$ROOT_DIR")}"
+SWIFT_BIN_PATH="${STACIO_SWIFT_BIN_PATH:-$(swift_release_build --show-bin-path)}"
 EXECUTABLE_SOURCE="$SWIFT_BIN_PATH/$APP_NAME"
 CLI_SOURCE="${STACIO_CLI_PATH:-$SWIFT_BIN_PATH/$CLI_PRODUCT}"
 VNC_ADAPTER_SOURCE="${STACIO_VNC_ADAPTER_PATH:-$SWIFT_BIN_PATH/$VNC_ADAPTER_PRODUCT}"
 SWIFTTERM_RESOURCE_BUNDLE_SOURCE="${STACIO_SWIFTTERM_RESOURCE_BUNDLE_PATH:-$SWIFT_BIN_PATH/$SWIFTTERM_RESOURCE_BUNDLE_NAME}"
-CORE_DYLIB_SOURCE="${STACIO_CORE_DYLIB_PATH:-$ROOT_DIR/StacioCore/target/release/libstacio_core.dylib}"
-CORE_LOAD_PATH="${STACIO_CORE_LOAD_PATH:-$ROOT_DIR/StacioCore/target/debug/deps/libstacio_core.dylib}"
+CORE_DYLIB_SOURCE="${STACIO_CORE_DYLIB_PATH:-$CORE_DYLIB_DEFAULT}"
+CORE_LOAD_PATH="${STACIO_CORE_LOAD_PATH:-$CORE_LOAD_PATH_DEFAULT}"
 SPARKLE_FRAMEWORK_SOURCE="${STACIO_SPARKLE_FRAMEWORK_PATH:-$SWIFT_BIN_PATH/Sparkle.framework}"
 
 if [[ ! -x "$EXECUTABLE_SOURCE" ]]; then
@@ -442,6 +493,12 @@ if [[ ! -f "$MONACO_VS_SOURCE/loader.js" ]]; then
   echo "Run 'npm install' or set STACIO_MONACO_VS_PATH to a monaco-editor/min/vs directory." >&2
   exit 1
 fi
+
+verify_expected_native_architecture "Stacio executable" "$EXECUTABLE_SOURCE"
+verify_expected_native_architecture "Stacio CLI" "$CLI_SOURCE"
+verify_expected_native_architecture "Stacio VNC adapter" "$VNC_ADAPTER_SOURCE"
+verify_expected_native_architecture "Stacio Core dylib" "$CORE_DYLIB_SOURCE"
+verify_expected_native_architecture "Sparkle framework" "$SPARKLE_FRAMEWORK_SOURCE/Sparkle"
 
 if [[ "${STACIO_SKIP_ARTIFACT_FRESHNESS:-0}" != "1" ]]; then
   check_prebuilt_artifact_freshness \
