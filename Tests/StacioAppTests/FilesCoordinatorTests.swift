@@ -3698,7 +3698,11 @@ private struct MissingRemoteFileDataError: Error, CustomStringConvertible {
 }
 
 private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebugStringConvertible {
-    var events: [String] = []
+    private let eventLock = NSLock()
+    private var recordedEvents: [String] = []
+    var events: [String] {
+        eventLock.withLock { recordedEvents }
+    }
     var liveHosts: [String] = []
     var readRequests: [(path: String, offset: UInt64, length: UInt64?)] = []
     var writeRequests: [(path: String, contents: Data)] = []
@@ -3726,8 +3730,14 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         self.persistsWrites = persistsWrites
     }
 
+    private func recordEvent(_ event: String) {
+        eventLock.withLock {
+            recordedEvents.append(event)
+        }
+    }
+
     func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
-        events.append("parse")
+        recordEvent("parse")
         if let error {
             throw error
         }
@@ -3740,7 +3750,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         expectedFingerprintSHA256: String,
         remotePath: String
     ) throws -> [RemoteFileEntry] {
-        events.append("live:\(remotePath)")
+        recordEvent("live:\(remotePath)")
         liveHosts.append(config.host)
         if let error {
             throw error
@@ -3756,7 +3766,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         keyword: String,
         depth: UInt32
     ) throws -> [RemoteFileEntry] {
-        events.append("search:\(remotePath):\(keyword):\(depth)")
+        recordEvent("search:\(remotePath):\(keyword):\(depth)")
         liveHosts.append(config.host)
         if let error {
             throw error
@@ -3769,7 +3779,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         secret: FtpAuthSecret,
         remotePath: String
     ) throws -> [RemoteFileEntry] {
-        events.append("ftp:\(remotePath)")
+        recordEvent("ftp:\(remotePath)")
         liveHosts.append(config.host)
         if let error {
             throw error
@@ -3783,7 +3793,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         expectedFingerprintSHA256: String,
         remotePath: String
     ) throws {
-        events.append("mkdir:\(remotePath)")
+        recordEvent("mkdir:\(remotePath)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3797,7 +3807,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         fromPath: String,
         toPath: String
     ) throws {
-        events.append("rename:\(fromPath)->\(toPath)")
+        recordEvent("rename:\(fromPath)->\(toPath)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3811,7 +3821,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         remotePath: String,
         recursive: Bool
     ) throws {
-        events.append("delete:\(remotePath):\(recursive)")
+        recordEvent("delete:\(remotePath):\(recursive)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3825,7 +3835,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         remotePath: String,
         mode: String
     ) throws {
-        events.append("chmod:\(remotePath):\(mode)")
+        recordEvent("chmod:\(remotePath):\(mode)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3839,7 +3849,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         fromPath: String,
         toPath: String
     ) throws {
-        events.append("copy:\(fromPath)->\(toPath)")
+        recordEvent("copy:\(fromPath)->\(toPath)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3854,7 +3864,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         offset: UInt64,
         length: UInt64?
     ) throws -> Data {
-        events.append("read:\(remotePath):\(offset):\(length.map(String.init) ?? "all")")
+        recordEvent("read:\(remotePath):\(offset):\(length.map(String.init) ?? "all")")
         liveHosts.append(config.host)
         readRequests.append((remotePath, offset, length))
         if let operationError {
@@ -3880,7 +3890,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         remotePath: String,
         contents: Data
     ) throws -> UInt64 {
-        events.append("write:\(remotePath):\(contents.count)")
+        recordEvent("write:\(remotePath):\(contents.count)")
         liveHosts.append(config.host)
         writeRequests.append((remotePath, contents))
         if let operationError {
@@ -3898,7 +3908,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         fromPath: String,
         toPath: String
     ) throws {
-        events.append("ftp-copy:\(fromPath)->\(toPath)")
+        recordEvent("ftp-copy:\(fromPath)->\(toPath)")
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
