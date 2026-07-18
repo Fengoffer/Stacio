@@ -34,7 +34,7 @@
   <meta name="theme-color" content="#f4f7fb" />
   <link rel="icon" href="/assets/stacio-logo.png" type="image/png" />
   <link rel="apple-touch-icon" href="/assets/stacio-logo.png" />
-  <link rel="stylesheet" href="styles.css?v=20260718-stable-downloads-0133" />
+  <link rel="stylesheet" href="styles.css?v=20260718-product-screenshots" />
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -193,45 +193,42 @@
 
       <div class="hero-visual" data-od-id="hero-product-visual">
         <div class="icon-orb" aria-hidden="true"><img src="assets/stacio-logo.png" alt="" /></div>
-        <div class="app-window" role="img" aria-label="Stacio 主工作台示意，包含会话侧栏、远程终端、传输队列和设备指标" data-od-id="product-window">
-          <div class="window-bar">
-            <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
-            <div class="window-title">Stacio Workbench</div>
-            <div style="width:56px"></div>
-          </div>
-          <div class="workbench">
-            <aside class="sidebar">
-              <div class="side-label">Sessions</div>
-              <div class="host-list">
-                <div class="host active">prod-api-02</div>
-                <div class="host">staging-web</div>
-                <div class="host">homelab-nas</div>
-                <div class="host">jump-host</div>
-              </div>
-            </aside>
-            <div class="terminal-pane">
-              <div class="tabs"><span class="tab active">SSH</span><span class="tab">Files</span><span class="tab">Tunnels</span></div>
-              <div class="terminal" aria-hidden="true">
-                <div><span class="muted">stacio@prod-api-02</span> ~ % systemctl status api</div>
-                <div class="accent">● api.service - remote operations backend</div>
-                <div>   Loaded: loaded (/etc/systemd/system/api.service)</div>
-                <div>   Active: active (running) since Thu 09:42</div>
-                <div class="warn">   Tasks: 42 · Memory: 1.2G · CPU: 18%</div>
-                <div><span class="muted">AI</span> 建议先检查最近 200 行错误日志，并保留命令确认。</div>
-              </div>
-              <div class="queue">
-                <div class="mini-card"><strong>SCP Queue</strong><span>2 个上传 · 1 个下载正在跟踪</span></div>
-                <div class="mini-card"><strong>Remote Files</strong><span>/var/log 已连接，可直接编辑文本</span></div>
-                <div class="mini-card"><strong>Tunnel</strong><span>localhost:15432 正在转发</span></div>
-              </div>
-            </div>
-            <aside class="inspector">
-              <div class="side-label">Metrics</div>
-              <div class="metric"><div class="metric-row"><span>CPU</span><span>18%</span></div><div class="meter"><b style="width:18%"></b></div></div>
-              <div class="metric"><div class="metric-row"><span>Memory</span><span>64%</span></div><div class="meter"><b style="width:64%"></b></div></div>
-              <div class="metric"><div class="metric-row"><span>Disk I/O</span><span>31%</span></div><div class="meter"><b style="width:31%"></b></div></div>
-              <div class="mini-card"><strong>Keychain</strong><span>凭据留在 macOS 本地</span></div>
-            </aside>
+        <div class="app-window app-window--screenshot" role="img" aria-label="Stacio 主工作台真实界面预览，包含会话侧栏、远程终端和设备看板" data-od-id="product-window">
+          <div class="product-screen" aria-hidden="true">
+            <img class="product-screenshot product-screenshot--dark" src="assets/stacio-workbench-dark.png" alt="" />
+            <img class="product-screenshot product-screenshot--light" src="assets/stacio-workbench-light.png" alt="" />
+
+            <svg class="product-redaction product-redaction--dark" viewBox="0 0 1800 1062" preserveAspectRatio="none" aria-hidden="true">
+              <g class="redaction-side">
+                <rect x="70" y="224" width="230" height="44" fill="#282624" /><text x="76" y="244">192.0.2.48</text><text x="76" y="262">ops@192.0.2.48:22</text>
+                <rect x="70" y="282" width="244" height="25" fill="#3e3a38" /><text x="76" y="300">ops@203.0.113.42:22</text>
+                <rect x="70" y="317" width="230" height="45" fill="#282624" /><text x="76" y="337">198.51.100.27</text><text x="76" y="355">ops@198.51.100.27:22</text>
+              </g>
+              <g class="redaction-terminal">
+                <rect x="868" y="224" width="160" height="18" fill="#202020" /><text class="redaction-ip" x="870" y="238">203.0.113.42</text>
+                <rect x="700" y="514" width="160" height="18" fill="#202020" /><text class="redaction-ip" x="702" y="528">198.51.100.19</text>
+                <rect x="363" y="532" width="250" height="20" fill="#202020" /><text x="364" y="547">ops@demo-ops-01:~#</text>
+              </g>
+              <g class="redaction-panel">
+                <rect x="1450" y="205" width="190" height="24" fill="#202020" /><text x="1452" y="221">demo-ops-01</text>
+              </g>
+            </svg>
+
+            <svg class="product-redaction product-redaction--light" viewBox="0 0 1800 1062" preserveAspectRatio="none" aria-hidden="true">
+              <g class="redaction-side">
+                <rect x="70" y="224" width="230" height="44" fill="#ebe6e3" /><text x="76" y="244">192.0.2.48</text><text x="76" y="262">ops@192.0.2.48:22</text>
+                <rect x="70" y="282" width="244" height="25" fill="#dedad7" /><text x="76" y="300">ops@203.0.113.42:22</text>
+                <rect x="70" y="317" width="230" height="45" fill="#ebe6e3" /><text x="76" y="337">198.51.100.27</text><text x="76" y="355">ops@198.51.100.27:22</text>
+              </g>
+              <g class="redaction-terminal">
+                <rect x="750" y="224" width="160" height="18" fill="#ffffff" /><text class="redaction-ip" x="752" y="238">203.0.113.42</text>
+                <rect x="620" y="514" width="170" height="18" fill="#ffffff" /><text class="redaction-ip" x="622" y="528">198.51.100.19</text>
+                <rect x="262" y="532" width="250" height="20" fill="#ffffff" /><text x="263" y="547">ops@demo-ops-01:~#</text>
+              </g>
+              <g class="redaction-panel">
+                <rect x="1450" y="205" width="190" height="24" fill="#ffffff" /><text x="1452" y="221">demo-ops-01</text>
+              </g>
+            </svg>
           </div>
         </div>
       </div>

@@ -71,6 +71,17 @@ test('homepage hides the FAQ section while retaining FAQ structured data', () =>
   assert.match(indexHTML, /"@type": "FAQPage"/);
 });
 
+test('hero preview uses theme-aware product screenshots with redacted demo connection data', () => {
+  assert.match(indexHTML, /assets\/stacio-workbench-dark\.png/);
+  assert.match(indexHTML, /assets\/stacio-workbench-light\.png/);
+  assert.match(indexHTML, /203\.0\.113\.42/);
+  assert.match(indexHTML, /198\.51\.100\.19/);
+  assert.match(indexHTML, /ops@demo-ops-01:~#/);
+  assert.doesNotMatch(indexHTML, /154\.37\.212\.69|220\.163\.92\.243|172\.16\.10\.250|192\.168\.124\.100/);
+  assert.match(stylesCSS, /html\[data-theme="dark"\] \.product-screenshot--dark/);
+  assert.match(stylesCSS, /\.app-window--screenshot \.product-screen \{ transform: scale\(1\.8\)/);
+});
+
 test('top navigation Gitee link uses the verified repository and telemetry event', () => {
   const navigation = indexHTML.match(/<nav class="nav-links"[\s\S]*?<\/nav>/)?.[0] ?? '';
   const giteeLink = navigation.match(/<a[^>]+data-od-id="nav-gitee"[^>]*>/)?.[0] ?? '';
