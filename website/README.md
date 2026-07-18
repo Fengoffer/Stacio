@@ -72,7 +72,7 @@ docker compose down
 - `nginx.conf` serves `index.html` with `Cache-Control: no-store`.
 - Static assets such as CSS, JS, and images use long-lived immutable cache headers.
 - `/healthz` is provided for container health checks and reverse-proxy probes.
-- `/downloads/latest-macos.dmg` and the architecture-specific compatibility routes redirect to Stacio 0.13.3 Release assets on Gitee.
+- `/downloads/latest-macos.dmg` and the architecture-specific compatibility routes redirect to Stacio 0.13.3 DMG assets in RainS3 object storage.
 - Put TLS, domain routing, and compression beyond gzip at the outer reverse proxy if needed.
 - When deploying behind Nginx, Caddy, 1Panel, or another gateway, forward traffic to the loopback host port, for example `http://127.0.0.1:8080`.
 
@@ -81,8 +81,8 @@ docker compose down
 - `index.html` contains the homepage markup and SEO metadata.
 - `styles.css` contains the Liquid Glass visual system and responsive layout.
 - `main.js` contains language, theme, download selector, GitHub release-note sync, modal, reveal, and event tracking interactions.
-- The macOS selector exposes separate Apple Silicon and Intel packages, with Gitee as the primary download and GitHub as the fallback.
-- DMG binaries are never stored in the website source; the page references Release assets and publishes their file sizes and SHA-256 checksums.
+- The macOS selector exposes separate Apple Silicon/ARM and Intel packages from object storage.
+- DMG binaries are never stored in the website source; the page references object-storage assets and publishes their file sizes and SHA-256 checksums.
 - `robots.txt` allows the static homepage to be indexed.
 - `assets/stacio-logo.png` is copied from `logo/Stacio-logo.png`.
 - `assets/github.svg` provides the GitHub mark used in repository links.
@@ -94,6 +94,5 @@ docker compose down
 
 - Repository: `https://github.com/Fengoffer/Stacio`
 - Releases: `https://github.com/Fengoffer/Stacio/releases`
-- Apple Silicon primary: `https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg`
-- Intel primary: `https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg`
-- GitHub fallback release: `https://github.com/Fengoffer/Stacio/releases/tag/v0.13.3`
+- Apple Silicon/ARM: `https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-arm64.dmg`
+- Intel: `https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-x86_64.dmg`

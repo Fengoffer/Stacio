@@ -1032,7 +1032,7 @@
     .download-console .btn { width: 100%; margin-top: 14px; }
     .download-actions {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 8px;
       margin-top: 14px;
     }

@@ -157,21 +157,19 @@ test('default current-version surfaces no longer recommend a Beta release', () =
   assert.deepEqual(offenders, []);
 });
 
-test('stable download catalog exposes verified Apple Silicon and Intel release assets', () => {
+test('stable download catalog exposes verified Apple Silicon/ARM and Intel object-storage assets', () => {
   const expectedAssets = [
     {
       arch: 'arm64',
       filename: 'Stacio-0.13.3-arm64.dmg',
-      primaryUrl: 'https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg',
-      fallbackUrl: 'https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg',
+      primaryUrl: 'https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-arm64.dmg',
       sha256: '623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5',
       bytes: 15911885
     },
     {
       arch: 'x64',
       filename: 'Stacio-0.13.3-x86_64.dmg',
-      primaryUrl: 'https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg',
-      fallbackUrl: 'https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg',
+      primaryUrl: 'https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-x86_64.dmg',
       sha256: '4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd',
       bytes: 16213214
     }
@@ -181,14 +179,16 @@ test('stable download catalog exposes verified Apple Silicon and Intel release a
     assert.ok(mainJS.includes(`${asset.arch}: {`));
     assert.ok(mainJS.includes(`filename: '${asset.filename}'`));
     assert.ok(mainJS.includes(`primaryUrl: '${asset.primaryUrl}'`));
-    assert.ok(mainJS.includes(`fallbackUrl: '${asset.fallbackUrl}'`));
     assert.ok(mainJS.includes(`sha256: '${asset.sha256}'`));
     assert.ok(mainJS.includes(`bytes: ${asset.bytes}`));
   }
 
   assert.match(mainJS, /statusByArch: \{ arm64: 'available', x64: 'available' \}/);
   assert.match(mainJS, /priceByArch: \{ arm64: 'stable', x64: 'stable' \}/);
-  assert.match(indexHTML, /id="download-fallback-button"/);
+  assert.match(indexHTML, /Apple Silicon\/ARM/);
+  assert.match(indexHTML, /data-event="homepage_download_object_storage_clicked"/);
+  assert.doesNotMatch(indexHTML, /id="download-fallback-button"/);
+  assert.match(stylesCSS, /\.download-actions \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
   assert.match(indexHTML, /id="download-filename"/);
   assert.match(indexHTML, /id="download-filesize"/);
   assert.match(indexHTML, /id="download-checksum"/);
@@ -198,6 +198,7 @@ test('default and architecture download routes no longer point to a Beta package
   const latestRoute = nginxConfig.match(/location = \/downloads\/latest-macos\.dmg \{[\s\S]*?\n    \}/)?.[0] ?? '';
 
   assert.match(latestRoute, /Stacio-0\.13\.3-arm64\.dmg/);
+  assert.match(latestRoute, /miaojing-prod\.cn-nb1\.rains3\.com/);
   assert.doesNotMatch(latestRoute, /Beta/i);
   assert.match(nginxConfig, /location = \/downloads\/Stacio-0\.13\.3-arm64\.dmg \{/);
   assert.match(nginxConfig, /location = \/downloads\/Stacio-0\.13\.3-x86_64\.dmg \{/);
