@@ -38,15 +38,15 @@
       const stableMacosDownloads = {
         arm64: {
           filename: 'Stacio-0.13.3-arm64.dmg',
-          primaryUrl: 'https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-arm64.dmg',
-          sha256: '623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5',
-          bytes: 15911885
+          primaryUrl: 'https://stacio.cn-nb1.rains3.com/products/stacio/releases/stable/0.13.3/arm64/Stacio-0.13.3-arm64.dmg',
+          sha256: 'd51ab1784c6a0d0ad2462111c74875d4045384ae610c2f87f37964ef9be0b49c',
+          bytes: 15900263
         },
         x64: {
           filename: 'Stacio-0.13.3-x86_64.dmg',
-          primaryUrl: 'https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-x86_64.dmg',
-          sha256: '4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd',
-          bytes: 16213214
+          primaryUrl: 'https://stacio.cn-nb1.rains3.com/products/stacio/releases/stable/0.13.3/x86_64/Stacio-0.13.3-x86_64.dmg',
+          sha256: '2adbca74889f840fd7aad854a16137470ddf1b43429b1cf83e86e6b3dea3c885',
+          bytes: 16202365
         }
       };
       const currentStableVersion = '0.13.3';

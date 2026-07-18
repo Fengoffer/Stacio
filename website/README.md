@@ -94,5 +94,5 @@ docker compose down
 
 - Repository: `https://github.com/Fengoffer/Stacio`
 - Releases: `https://github.com/Fengoffer/Stacio/releases`
-- Apple Silicon/ARM: `https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-arm64.dmg`
-- Intel: `https://miaojing-prod.cn-nb1.rains3.com/stacio/releases/v0.13.3/Stacio-0.13.3-x86_64.dmg`
+- Apple Silicon/ARM: `https://stacio.cn-nb1.rains3.com/products/stacio/releases/stable/0.13.3/arm64/Stacio-0.13.3-arm64.dmg`
+- Intel: `https://stacio.cn-nb1.rains3.com/products/stacio/releases/stable/0.13.3/x86_64/Stacio-0.13.3-x86_64.dmg`
