@@ -14,6 +14,13 @@
       const packageMeta = document.getElementById('package-meta');
       const statusLabel = document.getElementById('status-label');
       const downloadButton = document.getElementById('download-button');
+      const downloadButtonLabel = document.getElementById('download-button-label');
+      const downloadFallbackButton = document.getElementById('download-fallback-button');
+      const downloadFallbackLabel = document.getElementById('download-fallback-label');
+      const downloadVerification = document.getElementById('download-verification');
+      const downloadFilename = document.getElementById('download-filename');
+      const downloadFilesize = document.getElementById('download-filesize');
+      const downloadChecksum = document.getElementById('download-checksum');
       const downloadCard = document.querySelector('.download-card');
       const downloadConsole = document.querySelector('.download-console');
       const releaseLinks = Array.from(document.querySelectorAll('[data-event="homepage_release_notes_clicked"]'));
@@ -27,14 +34,24 @@
       const releaseGitHub = document.querySelector('[data-od-id="release-modal-github"]');
       const publicApiBase = (document.documentElement.dataset.publicApiBase || '/api/v1').replace(/\/+$/, '');
       const publicProductId = document.documentElement.dataset.publicProductId || 'stacio';
-      const publicApiOrigin = new URL(publicApiBase, window.location.origin).origin;
       const publicApiUrl = (path) => `${publicApiBase}${path}`;
-      const externalApiUrl = (path) => path.startsWith('/api/v1/') ? `${publicApiOrigin}${path}` : publicApiUrl(path);
       const releasesEndpoint = publicApiUrl(`/public/products/${publicProductId}/releases`);
       const telemetryEndpoint = publicApiUrl(`/public/products/${publicProductId}/telemetry`);
-      const primaryMacosDownload = {
-        url: '/downloads/latest-macos.dmg',
-        name: 'Stacio.dmg'
+      const stableMacosDownloads = {
+        arm64: {
+          filename: 'Stacio-0.13.3-arm64.dmg',
+          primaryUrl: 'https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg',
+          fallbackUrl: 'https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg',
+          sha256: '623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5',
+          bytes: 15911885
+        },
+        x64: {
+          filename: 'Stacio-0.13.3-x86_64.dmg',
+          primaryUrl: 'https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg',
+          fallbackUrl: 'https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg',
+          sha256: '4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd',
+          bytes: 16213214
+        }
       };
       const currentStableVersion = '0.13.3';
       const currentStableBuildNumber = '245';
@@ -55,7 +72,7 @@
           features: { eyebrow: 'CAPABILITIES', title: '不是 SSH 外壳，是完整远程运维工作台。', lead: '终端管理、分屏协作、同步执行、文件编辑、SCP 传输、内置浏览器、设备告警和 AI Agent——所有远程操作能力收进一个原生 macOS 工作台。', terminalTitle: 'SSH 远程终端管理', terminalCopy: '支持 SSH/Telnet/串口连接与会话分组管理，提供图形化界面管理远程终端，告别纯命令行切换。保存的会话可按项目、环境或团队组织，一键连接。', splitSyncTitle: '终端分屏与同步执行', splitSyncCopy: '支持水平/垂直分屏，同时查看多台服务器终端输出。选中多台会话同步输入命令，一次操作批量执行。', transferTitle: 'SCP 文件与文件夹传输', transferCopy: '内置 SCP 文件与文件夹传输引擎，支持拖拽上传下载，传输队列实时跟踪进度。', editorTitle: '远程文件在线编辑器', editorCopy: '在线编辑远程服务器配置文件，支持实时保存和语法高亮。提供本地与远端双端备份恢复机制，误改可回滚。', browserTitle: '内置浏览器', browserCopy: '在 Stacio 中直接访问远端服务器的 Web 服务，无需切换浏览器。适合调试内部 API、Webhook 和管理面板。', tunnelsTitle: 'SSH 隧道管理', tunnelsCopy: '管理 local / remote / dynamic forward，显示连接状态、转发日志和关闭提醒。', dashboardTitle: '设备看板与实时告警', dashboardCopy: '仪表盘实时展示 CPU、内存、磁盘、网络 I/O 等资源指标。支持自定义阈值告警通知，设备异常时及时感知。', aiTitle: 'AI Agent 辅助运维', aiCopy: '内置 AI Agent 读取当前可见终端上下文，生成排查建议和可执行命令卡片。建议命令需用户确认后执行，敏感操作始终受控。', localAgentTitle: '本地 Agent 集成', localAgentCopy: '支持直接调用本地安装的 Codex、Claude、OpenCode、MiMo Code、ZCode、Qwen Code 等 Agent 工具，在 Stacio 中完成 AI 辅助运维与代码分析。', aiCue: '建议命令需确认后执行 · sensitive actions stay controlled' },
           security: { eyebrow: 'SECURITY', title: '本地优先，敏感操作始终由用户确认。', lead: 'Stacio 把远程工作流收进同一个 macOS 应用，但凭据、会话和敏感动作仍遵循本地优先与显式确认。', proof1: '凭据交给 macOS Keychain，会话数据和本地 Agent 调用记录均保存在本地，不默认外传。', proof2: 'AI 建议和本地 Agent 生成的命令均需用户确认后执行，敏感操作始终受控。', proof3: '诊断、日志和设备信息默认脱敏，减少复制粘贴排查时的泄露风险。', proof4: 'Windows / Linux 入口保持预留状态，不写成已开放安装包。' },
           releases: { eyebrow: 'STABLE RELEASE', title: 'Stacio 0.13.3 正式版', lead: '当前稳定版本为构建号 245，支持 macOS 14 及以上。', statusLabel: 'Status', statusValue: '正式版', statusCopy: 'Stacio 0.13.3 · 构建号 245', platformLabel: 'Platform', platformValue: 'macOS 14 及以上', platformCopy: '提供 Apple Silicon 与 Intel Mac 的独立安装包。', distributionLabel: 'Install', distributionValue: '当前安装包未公证', distributionCopy: '首次打开如被 macOS 拦截，请在 Finder 中右键 Stacio.app 并选择“打开”。' },
-          download: { eyebrow: 'DOWNLOAD', title: '下载适合当前设备的 Stacio。', copy: '页面会自动识别你的系统和 CPU 架构，优先显示匹配版本；也可以手动切换到 macOS、Windows 或 Linux。', detectedLabel: '已识别', platformAria: '选择下载平台', archAria: '选择 CPU 架构', github: '查看 GitHub', gitee: '查看 Gitee', releaseNotes: '阅读更新日志', available: '当前可用', planned: '敬请期待', stable: '正式版', pendingPrice: '敬请期待', downloadAction: '下载 Stacio DMG', notifyAction: '敬请期待' },
+          download: { eyebrow: 'DOWNLOAD', title: '下载适合当前设备的 Stacio。', copy: '页面会自动识别你的系统和 CPU 架构，优先显示匹配版本；也可以手动切换到 macOS、Windows 或 Linux。', detectedLabel: '已识别', platformAria: '选择下载平台', archAria: '选择 CPU 架构', github: '查看 GitHub', gitee: '查看 Gitee', releaseNotes: '阅读更新日志', available: '当前可用', planned: '敬请期待', stable: '正式版', pendingPrice: '敬请期待', primaryAction: 'Gitee 主下载', fallbackAction: 'GitHub 备用', fileLabel: '文件名', sizeLabel: '文件大小', checksumLabel: 'SHA-256', notifyAction: '敬请期待' },
           faq: { eyebrow: 'FAQ', title: '关于 Stacio 的常见问题。', lead: '了解连接能力、服务器远程管理方式、Cron 工作流、平台支持和当前下载状态。', sshQuestion: 'Stacio 是 Mac SSH 客户端吗？', sshAnswer: '是。Stacio 面向 macOS，把 SSH 连接、Shell/Terminal、会话、远程文件、SCP 传输、SSH 隧道和设备指标放在同一个本地优先工作台中。', xshellQuestion: 'Stacio 可以作为 Xshell 的 Mac 替代工具吗？', xshellAnswer: '如果你在 Mac 上寻找 Xshell 替代、服务器远程工具或 SSH 客户端，Stacio 提供原生 macOS 体验，并覆盖 SSH 终端、SCP 文件传输、远程文件、隧道和诊断场景。', terminalQuestion: 'Stacio 和 macOS 自带 Terminal 有什么区别？', terminalAnswer: 'Terminal 更偏基础 Shell 入口；Stacio 面向服务器远程管理，把连接、终端上下文、远程文件、传输队列、隧道、设备指标和 AI 辅助排查整合到一个工作流。', cronQuestion: 'Cron 表达式和计划任务怎么用 Stacio 管理？', cronAnswer: '可以通过 Stacio 的 SSH 终端查看 crontab、编辑远程脚本和配置、复用终端宏执行检查命令，并让 AI 辅助解释 Cron 表达式或生成排查步骤。', platformQuestion: 'Stacio 支持 Windows 和 Linux 吗？', platformAnswer: '当前稳定版为 Stacio 0.13.3，构建号 245，支持 macOS 14 及以上，并分别提供 Apple Silicon 与 Intel Mac 安装包。Windows 和 Linux 版本显示为敬请期待。' },
           modal: { eyebrow: 'UPDATE NOTES', title: 'Stacio 0.13.3 更新说明', copy: '正式版 · 构建号 245 · 支持 macOS 14 及以上', close: '关闭更新说明', github: '打开 GitHub Releases', done: '知道了' },
           footer: { tagline: 'Stacio · Native remote operations station for macOS.', download: '下载', releaseNotes: '更新日志', cron: 'Cron 工具', feedback: '反馈问题' }
@@ -71,7 +88,7 @@
           features: { eyebrow: 'CAPABILITIES', title: 'Not an SSH wrapper. A complete remote operations workbench.', lead: 'Terminal management, split views, sync execution, file editing, SCP transfers, a built-in browser, device alerts, and AI Agents—every remote capability in one native macOS workbench.', terminalTitle: 'SSH Remote Terminal Management', terminalCopy: 'Connect through SSH, Telnet, or Serial with session group management. Organize saved sessions by project, environment, or team and connect in one click.', splitSyncTitle: 'Split Terminal & Sync Execution', splitSyncCopy: 'Split views horizontally or vertically to monitor multiple servers simultaneously. Select multiple sessions and broadcast commands for batch operations.', transferTitle: 'SCP File & Folder Transfers', transferCopy: 'Use Stacio’s built-in SCP engine for file and folder uploads and downloads, with drag-and-drop interaction and a real-time transfer queue.', editorTitle: 'Remote File Editor', editorCopy: 'Edit remote server configuration files with real-time save and syntax highlighting. Local and remote backups make changes recoverable.', browserTitle: 'Built-in Browser', browserCopy: 'Access remote web services directly inside Stacio. It is useful for debugging internal APIs, webhooks, and admin panels without changing apps.', tunnelsTitle: 'SSH Tunnel Management', tunnelsCopy: 'Manage local, remote, and dynamic forwarding with connection status, forwarding logs, and shutdown reminders.', dashboardTitle: 'Device Dashboard & Alerts', dashboardCopy: 'Monitor CPU, memory, disk, and network I/O in real time. Custom threshold alerts notify you when a device becomes abnormal.', aiTitle: 'AI Agent Assisted Operations', aiCopy: 'The built-in AI Agent reads visible terminal context and generates troubleshooting suggestions with executable command cards. Commands require user confirmation, keeping sensitive actions controlled.', localAgentTitle: 'Local Agent Integration', localAgentCopy: 'Call locally installed Agent tools directly from Stacio, including Codex, Claude, OpenCode, MiMo Code, ZCode, and Qwen Code, for AI-assisted operations and code analysis.', aiCue: 'Commands require confirmation · sensitive actions stay controlled' },
           security: { eyebrow: 'SECURITY', title: 'Local-first by default, sensitive actions stay confirmed.', lead: 'Stacio brings remote workflows into one macOS app while credentials, sessions, and sensitive actions stay local-first and explicitly controlled.', proof1: 'Credentials use macOS Keychain; session data and local Agent call logs stay local and are not sent out by default.', proof2: 'Commands generated by AI suggestions and local Agents require user confirmation before execution—sensitive actions stay controlled.', proof3: 'Diagnostics, logs, and device data are redacted by default to reduce copy-paste leakage during troubleshooting.', proof4: 'Windows / Linux entries remain planned states, without pretending those packages are available today.' },
           releases: { eyebrow: 'STABLE RELEASE', title: 'Stacio 0.13.3 stable release', lead: 'The current stable build is 245 and supports macOS 14 or later.', statusLabel: 'Status', statusValue: 'Stable', statusCopy: 'Stacio 0.13.3 · Build 245', platformLabel: 'Platform', platformValue: 'macOS 14 or later', platformCopy: 'Separate installers are provided for Apple Silicon and Intel Macs.', distributionLabel: 'Install', distributionValue: 'Not notarized', distributionCopy: 'If macOS blocks the first launch, right-click Stacio.app in Finder and choose Open.' },
-          download: { eyebrow: 'DOWNLOAD', title: 'Download the right Stacio build for this device.', copy: 'The page detects your OS and CPU architecture, shows the matching build first, and still lets you switch between macOS, Windows, and Linux manually.', detectedLabel: 'Detected', platformAria: 'Choose download platform', archAria: 'Choose CPU architecture', github: 'View GitHub', gitee: 'View Gitee', releaseNotes: 'Read release notes', available: 'Available now', planned: 'Coming soon', stable: 'Stable', pendingPrice: 'Coming soon', downloadAction: 'Download Stacio DMG', notifyAction: 'Coming soon' },
+          download: { eyebrow: 'DOWNLOAD', title: 'Download the right Stacio build for this device.', copy: 'The page detects your OS and CPU architecture, shows the matching build first, and still lets you switch between macOS, Windows, and Linux manually.', detectedLabel: 'Detected', platformAria: 'Choose download platform', archAria: 'Choose CPU architecture', github: 'View GitHub', gitee: 'View Gitee', releaseNotes: 'Read release notes', available: 'Available now', planned: 'Coming soon', stable: 'Stable', pendingPrice: 'Coming soon', primaryAction: 'Gitee download', fallbackAction: 'GitHub backup', fileLabel: 'Filename', sizeLabel: 'File size', checksumLabel: 'SHA-256', notifyAction: 'Coming soon' },
           faq: { eyebrow: 'FAQ', title: 'Common questions about Stacio.', lead: 'Learn about connection capabilities, remote server workflows, cron troubleshooting, platform support, and the current download.', sshQuestion: 'Is Stacio a Mac SSH client?', sshAnswer: 'Yes. Stacio is built for macOS and combines SSH connections, Shell/Terminal, sessions, remote files, SCP transfer, SSH tunnels, and device metrics in one local-first workbench.', xshellQuestion: 'Can Stacio be used as an Xshell alternative for Mac?', xshellAnswer: 'If you are looking for an Xshell alternative, remote server tool, or SSH client on Mac, Stacio provides a native macOS experience with SSH terminal, SCP file transfer, remote files, tunnels, and diagnostics.', terminalQuestion: 'How is Stacio different from macOS Terminal?', terminalAnswer: 'Terminal is a basic shell entry point. Stacio is built for remote server management and combines connections, terminal context, remote files, transfer queues, tunnels, device metrics, and AI-assisted troubleshooting into one workflow.', cronQuestion: 'How can Stacio help with cron expressions and scheduled jobs?', cronAnswer: 'You can inspect crontab through SSH terminals, edit remote scripts and config, reuse terminal macros for checks, and ask AI to explain cron expressions or generate troubleshooting steps.', platformQuestion: 'Does Stacio support Windows and Linux?', platformAnswer: 'Stacio 0.13.3 build 245 is the current stable release for macOS 14 or later, with separate Apple Silicon and Intel Mac installers. Windows and Linux builds are marked as coming soon.' },
           modal: { eyebrow: 'UPDATE NOTES', title: 'Stacio 0.13.3 release notes', copy: 'Stable · Build 245 · macOS 14 or later', close: 'Close release notes', github: 'Open GitHub Releases', done: 'Got it' },
           footer: { tagline: 'Stacio · Native remote operations station for macOS.', download: 'Download', releaseNotes: 'Release Notes', cron: 'Cron', feedback: 'Report issue' }
@@ -81,12 +98,11 @@
       const packages = {
         macos: {
           label: 'macOS',
-          formats: { arm64: 'DMG · macOS 14+ · Apple Silicon', x64: 'DMG · macOS 14+ · Intel' },
+          formats: { arm64: 'DMG · macOS 14+ · Apple Silicon', x64: 'DMG · macOS 14+ · Intel Mac' },
           arch: ['arm64', 'x64'],
-          statusByArch: { arm64: 'available', x64: 'planned' },
-          priceByArch: { arm64: 'stable', x64: 'planned' },
-          hrefByArch: { arm64: primaryMacosDownload.url, x64: '#download' },
-          downloadName: primaryMacosDownload.name
+          statusByArch: { arm64: 'available', x64: 'available' },
+          priceByArch: { arm64: 'stable', x64: 'stable' },
+          downloadByArch: stableMacosDownloads
         },
         windows: {
           label: 'Windows',
@@ -232,10 +248,14 @@
           button.setAttribute('aria-selected', String(selected));
           button.setAttribute('tabindex', selected ? '0' : '-1');
         });
-        const archLabel = state.arch === 'x64' ? 'Intel / x64' : 'ARM64';
+        const archLabel = state.platform === 'macos'
+          ? (state.arch === 'x64' ? 'Intel Mac' : 'Apple Silicon')
+          : (state.arch === 'x64' ? 'x64' : 'ARM64');
         archPicker.innerHTML = pkg.arch.map((arch) => {
           const selected = arch === state.arch;
-          const label = arch === 'x64' ? 'Intel / x64' : 'ARM64';
+          const label = state.platform === 'macos'
+            ? (arch === 'x64' ? 'Intel Mac' : 'Apple Silicon')
+            : (arch === 'x64' ? 'x64' : 'ARM64');
           return `<button class="arch-option${selected ? ' is-selected' : ''}" type="button" data-arch="${arch}" aria-pressed="${selected}">${label}</button>`;
         }).join('');
         detectedLabel.textContent = `${pkg.label} · ${archLabel}`;
@@ -243,16 +263,41 @@
         packageMeta.textContent = pkg.formats[state.arch];
         const status = pkg.statusByArch?.[state.arch] || 'planned';
         const price = pkg.priceByArch?.[state.arch] || status;
-        const href = pkg.hrefByArch?.[state.arch] || '#download';
-        const available = status === 'available';
+        const asset = pkg.downloadByArch?.[state.arch] || null;
+        const available = status === 'available' && Boolean(asset);
         downloadCard?.classList.toggle('is-planned', !available);
         statusLabel.textContent = available ? getCopy('download.available') : getCopy('download.planned');
         priceLabel.textContent = price === 'stable' ? getCopy('download.stable') : getCopy('download.pendingPrice');
-        downloadButton.textContent = available ? getCopy('download.downloadAction') : getCopy('download.notifyAction');
-        downloadButton.href = href;
+        if (downloadButtonLabel) downloadButtonLabel.textContent = available ? getCopy('download.primaryAction') : getCopy('download.notifyAction');
+        if (downloadFallbackLabel) downloadFallbackLabel.textContent = getCopy('download.fallbackAction');
+        downloadButton.href = asset?.primaryUrl || '#download';
         downloadButton.dataset.availability = available ? 'available' : 'planned';
         downloadButton.setAttribute('aria-disabled', String(!available));
-        downloadButton.removeAttribute('download');
+        downloadButton.querySelector('.gitee-icon')?.toggleAttribute('hidden', !available);
+        if (available) {
+          downloadButton.setAttribute('download', asset.filename);
+          downloadButton.setAttribute('aria-label', `${getCopy('download.primaryAction')} · ${asset.filename}`);
+        } else {
+          downloadButton.removeAttribute('download');
+          downloadButton.removeAttribute('aria-label');
+        }
+        if (downloadFallbackButton) {
+          downloadFallbackButton.hidden = !available;
+          downloadFallbackButton.href = asset?.fallbackUrl || '#download';
+          downloadFallbackButton.dataset.availability = available ? 'available' : 'planned';
+          downloadFallbackButton.setAttribute('aria-disabled', String(!available));
+          if (available) {
+            downloadFallbackButton.setAttribute('download', asset.filename);
+            downloadFallbackButton.setAttribute('aria-label', `${getCopy('download.fallbackAction')} · ${asset.filename}`);
+          } else {
+            downloadFallbackButton.removeAttribute('download');
+            downloadFallbackButton.removeAttribute('aria-label');
+          }
+        }
+        if (downloadVerification) downloadVerification.hidden = !available;
+        if (downloadFilename) downloadFilename.textContent = asset?.filename || '';
+        if (downloadFilesize) downloadFilesize.textContent = asset ? `${asset.bytes.toLocaleString(state.lang === 'zh' ? 'zh-CN' : 'en-US')} bytes` : '';
+        if (downloadChecksum) downloadChecksum.textContent = asset?.sha256 || '';
       };
 
       const pulseDownload = () => {
@@ -388,16 +433,8 @@
       };
 
       const configureLatestPublicRelease = (release) => {
-        if (!release?.downloadUrl) return;
+        if (!release) return;
         latestPublicRelease = release;
-        packages.macos.hrefByArch.arm64 = `${externalApiUrl(release.downloadUrl)}?${new URLSearchParams({
-          visitorId,
-          sessionId,
-          platform: 'macOS',
-          architecture: 'arm64'
-        })}`;
-        packages.macos.downloadName = release.artifactName || 'Stacio.dmg';
-        renderDownload();
       };
 
       const loadLatestReleaseNotes = () => {
@@ -589,11 +626,13 @@
         pulseDownload();
       });
 
-      downloadButton?.addEventListener('click', (event) => {
-        if (downloadButton.dataset.availability !== 'planned') return;
-        event.preventDefault();
-        event.stopPropagation();
-        pulseDownload();
+      [downloadButton, downloadFallbackButton].forEach((button) => {
+        button?.addEventListener('click', (event) => {
+          if (button.dataset.availability !== 'planned') return;
+          event.preventDefault();
+          event.stopPropagation();
+          pulseDownload();
+        });
       });
 
       releaseLinks.forEach((link) => {

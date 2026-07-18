@@ -1008,7 +1008,7 @@
     .arch-picker {
       margin-top: 13px;
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
 
@@ -1030,6 +1030,49 @@
 
     .arch-option.is-selected { color: var(--fg); background: var(--glass-chip); border-color: oklch(78% 0.04 250); }
     .download-console .btn { width: 100%; margin-top: 14px; }
+    .download-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .download-console .download-actions .btn {
+      min-width: 0;
+      margin-top: 0;
+      padding-inline: 10px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .download-verification {
+      margin: 14px 0 0;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      display: grid;
+      gap: 8px;
+    }
+    .download-verification > div {
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+    }
+    .download-verification dt {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .download-verification dd {
+      min-width: 0;
+      margin: 0;
+      color: var(--fg);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .download-verification code {
+      font: inherit;
+      word-break: break-all;
+    }
     .repository-actions {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -34,7 +34,7 @@
   <meta name="theme-color" content="#f4f7fb" />
   <link rel="icon" href="/assets/stacio-logo.png" type="image/png" />
   <link rel="apple-touch-icon" href="/assets/stacio-logo.png" />
-  <link rel="stylesheet" href="styles.css?v=20260715-gitee-actions" />
+  <link rel="stylesheet" href="styles.css?v=20260718-stable-downloads-0133" />
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -71,7 +71,10 @@
           "operatingSystem": "macOS 14 or later",
           "processorRequirements": "Apple Silicon or Intel",
           "softwareVersion": "0.13.3",
-          "downloadUrl": "https://www.stacio.cn/downloads/latest-macos.dmg",
+          "downloadUrl": [
+            "https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg",
+            "https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg"
+          ],
           "releaseNotes": "https://github.com/Fengoffer/Stacio/releases",
           "isAccessibleForFree": true,
           "publisher": { "@id": "https://www.stacio.cn/#organization" },
@@ -353,7 +356,15 @@
             <span class="price-pill" id="status-label">当前可用</span>
           </div>
           <div class="arch-picker" id="arch-picker" aria-label="选择 CPU 架构" data-i18n-attr="aria-label:download.archAria" data-od-id="arch-picker"></div>
-          <a class="btn primary" id="download-button" href="#download" data-event="homepage_download_selected_clicked" data-od-id="final-download">下载 Stacio DMG</a>
+          <div class="download-actions" data-od-id="download-actions">
+            <a class="btn primary gitee-link" id="download-button" href="https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg" download="Stacio-0.13.3-arm64.dmg" data-availability="available" data-event="homepage_download_gitee_clicked" data-od-id="final-download"><span class="gitee-icon" aria-hidden="true"></span><span id="download-button-label" data-i18n="download.primaryAction">Gitee 主下载</span></a>
+            <a class="btn ghost github-link" id="download-fallback-button" href="https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg" download="Stacio-0.13.3-arm64.dmg" data-availability="available" data-event="homepage_download_github_fallback_clicked" data-od-id="final-download-fallback"><span class="github-icon" aria-hidden="true"></span><span id="download-fallback-label" data-i18n="download.fallbackAction">GitHub 备用</span></a>
+          </div>
+          <dl class="download-verification" id="download-verification" data-od-id="download-verification">
+            <div><dt data-i18n="download.fileLabel">文件名</dt><dd id="download-filename">Stacio-0.13.3-arm64.dmg</dd></div>
+            <div><dt data-i18n="download.sizeLabel">文件大小</dt><dd id="download-filesize">15,911,885 bytes</dd></div>
+            <div><dt data-i18n="download.checksumLabel">SHA-256</dt><dd><code id="download-checksum">623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5</code></dd></div>
+          </dl>
         </div>
         <div class="repository-actions" data-od-id="final-repository-actions">
           <a class="btn github-link" href="https://github.com/Fengoffer/Stacio" data-event="homepage_github_clicked" data-od-id="final-github"><span class="github-icon" aria-hidden="true"></span><span data-i18n="download.github">查看 GitHub</span></a>
@@ -440,6 +451,6 @@
       </div>
     </section>
   </div>
-  <script src="main.js?v=20260718-stable-0133"></script>
+  <script src="main.js?v=20260718-stable-downloads-0133"></script>
 </body>
 </html>

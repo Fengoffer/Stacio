@@ -72,7 +72,7 @@ docker compose down
 - `nginx.conf` serves `index.html` with `Cache-Control: no-store`.
 - Static assets such as CSS, JS, and images use long-lived immutable cache headers.
 - `/healthz` is provided for container health checks and reverse-proxy probes.
-- `/downloads/Stacio-0.13.2-Beta.dmg` redirects to the RainS3 object-storage installer.
+- `/downloads/latest-macos.dmg` and the architecture-specific compatibility routes redirect to Stacio 0.13.3 Release assets on Gitee.
 - Put TLS, domain routing, and compression beyond gzip at the outer reverse proxy if needed.
 - When deploying behind Nginx, Caddy, 1Panel, or another gateway, forward traffic to the loopback host port, for example `http://127.0.0.1:8080`.
 
@@ -81,7 +81,8 @@ docker compose down
 - `index.html` contains the homepage markup and SEO metadata.
 - `styles.css` contains the Liquid Glass visual system and responsive layout.
 - `main.js` contains language, theme, download selector, GitHub release-note sync, modal, reveal, and event tracking interactions.
-- The macOS download button uses the same-origin download route instead of GitHub Release as the primary installer source.
+- The macOS selector exposes separate Apple Silicon and Intel packages, with Gitee as the primary download and GitHub as the fallback.
+- DMG binaries are never stored in the website source; the page references Release assets and publishes their file sizes and SHA-256 checksums.
 - `robots.txt` allows the static homepage to be indexed.
 - `assets/stacio-logo.png` is copied from `logo/Stacio-logo.png`.
 - `assets/github.svg` provides the GitHub mark used in repository links.
@@ -93,4 +94,6 @@ docker compose down
 
 - Repository: `https://github.com/Fengoffer/Stacio`
 - Releases: `https://github.com/Fengoffer/Stacio/releases`
-- Latest release/download: `https://github.com/Fengoffer/Stacio/releases/latest`
+- Apple Silicon primary: `https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg`
+- Intel primary: `https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg`
+- GitHub fallback release: `https://github.com/Fengoffer/Stacio/releases/tag/v0.13.3`

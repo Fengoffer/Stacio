@@ -16,7 +16,12 @@ Canonical URL: https://www.stacio.cn/
 - Notarization: the current package is not notarized. If macOS blocks the first launch, right-click Stacio.app in Finder and choose Open.
 - Repository: https://github.com/Fengoffer/Stacio
 - Release notes: https://github.com/Fengoffer/Stacio/releases
-- Latest public website download route: https://www.stacio.cn/downloads/latest-macos.dmg
+- Apple Silicon package: Stacio-0.13.3-arm64.dmg; 15,911,885 bytes; SHA-256 623fe3b24bfe47937ad39f4f85b321fa42538f266162fa3dabcc7c25a1036ab5
+- Apple Silicon primary download: https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg
+- Apple Silicon GitHub fallback: https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-arm64.dmg
+- Intel package: Stacio-0.13.3-x86_64.dmg; 16,213,214 bytes; SHA-256 4824882e84fe435f0d98f2d8c4f7b967858475c2216667650a2a96b1e973d3bd
+- Intel primary download: https://gitee.com/fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg
+- Intel GitHub fallback: https://github.com/Fengoffer/Stacio/releases/download/v0.13.3/Stacio-0.13.3-x86_64.dmg
 
 ## Core Capabilities
 
