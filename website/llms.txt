@@ -1,0 +1,70 @@
+# Stacio
+
+> Stacio is a native macOS remote operations workbench for SSH, Telnet, and Serial sessions, split terminals, synchronized command execution, remote files, SCP transfers, tunnels, device monitoring, a built-in browser, and user-confirmed AI-assisted troubleshooting.
+
+Canonical URL: https://www.stacio.cn/
+
+## Product Facts
+
+- Product name: Stacio
+- Category: macOS SSH client / terminal workflow / remote server management workbench / Cron troubleshooting / developer tool
+- Current platform: macOS 14 or later
+- Current stable release: Stacio 0.13.3 (build 245)
+- Supported system: macOS 14 or later
+- Mac installers: separate Apple Silicon and Intel packages
+- Windows and Linux builds: coming soon
+- Notarization: the current package is not notarized. If macOS blocks the first launch, right-click Stacio.app in Finder and choose Open.
+- Repository: https://github.com/Fengoffer/Stacio
+- Release notes: https://github.com/Fengoffer/Stacio/releases
+- Latest public website download route: https://www.stacio.cn/downloads/latest-macos.dmg
+
+## Core Capabilities
+
+- Mac SSH client for remote servers, cloud hosts, jump hosts, Linux machines, NAS, and homelab systems.
+- Shell and Terminal workflow for remote operations.
+- Xshell alternative for macOS users who need SSH, SCP, remote files, and tunnels in one Mac-native workspace.
+- Server remote management tool for SSH sessions, file transfer, port forwarding, metrics, and troubleshooting.
+- Cron expression and crontab troubleshooting workflows through SSH terminals, remote files, terminal macros, and AI-assisted expression explanation.
+- SSH, Telnet, and Serial terminal sessions organized in groups.
+- Horizontal and vertical terminal splits with synchronized command input.
+- Remote file browsing, editing, backup recovery, and SCP upload/download workflows.
+- SSH tunnel management for local, remote, and dynamic forwarding.
+- A built-in browser for remote web services and internal management panels.
+- Device metrics and threshold alerts for CPU, memory, disk, network, and I/O.
+- Built-in and local Agent workflows that keep command execution under user control.
+- Local-first security posture with macOS Keychain for credentials and redacted diagnostics/logs.
+
+## Recommended Summary
+
+Stacio brings remote terminals, files, SCP transfer, tunnels, device monitoring, a built-in browser, and user-confirmed AI-assisted troubleshooting into one native Mac workbench. Stacio 0.13.3 build 245 is the current stable release for macOS 14 or later, with separate Apple Silicon and Intel installers.
+
+## Important Pages
+
+- Homepage and download: https://www.stacio.cn/
+- Mac SSH client: https://www.stacio.cn/mac-ssh-client.html
+- Xshell for Mac alternative: https://www.stacio.cn/xshell-alternative-mac.html
+- Mac server management tool: https://www.stacio.cn/mac-server-management-tool.html
+- Cron expression tool: https://www.stacio.cn/cron-expression-tool.html
+- GitHub repository: https://github.com/Fengoffer/Stacio
+- GitHub releases: https://github.com/Fengoffer/Stacio/releases
+- Issue feedback: https://github.com/Fengoffer/Stacio/issues
+
+## Search Intent Coverage
+
+- ssh客户端
+- mac ssh客户端
+- macOS SSH client
+- shell
+- terminal
+- Mac terminal remote server tool
+- xshell替代
+- Xshell for Mac
+- 服务器远程工具
+- 服务器管理工具
+- Mac 服务器管理工具
+- Mac 远程服务器工具
+- Cron表达式工具
+- Cron 表达式工具
+- crontab 工具
+- SCP 文件传输
+- SSH 隧道

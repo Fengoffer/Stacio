@@ -1,0 +1,18 @@
+{
+  "name": "Stacio",
+  "short_name": "Stacio",
+  "description": "Local-first macOS remote operations workbench for SSH terminals, remote files, SCP transfers, tunnels, device metrics, diagnostics, and AI-assisted troubleshooting.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#06101f",
+  "theme_color": "#4f8df8",
+  "icons": [
+    {
+      "src": "/assets/stacio-logo.png",
+      "sizes": "1934x1940",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

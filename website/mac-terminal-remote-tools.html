@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mac终端工具推荐 — 远程服务器管理与 AI 运维利器 Stacio</title>
+  <meta name="description" content="Mac 终端工具推荐：Stacio 是集成 SSH 终端、Telnet、串口、SCP 文件传输、远程文件编辑、设备监控与 AI 运维于一体的 Mac 原生远程工具，支持会话分组管理和本地 Agent 调用。">
+  <meta name="keywords" content="Mac终端工具,Mac远程工具,终端模拟器Mac,Mac运维工具,远程服务器管理Mac,SSH终端,Terminal Mac,Mac 服务器管理,AI运维工具">
+  <link rel="canonical" href="https://www.stacio.cn/mac-terminal-remote-tools.html">
+  <meta property="og:title" content="Mac 终端工具推荐 — 远程服务器管理与 AI 运维利器">
+  <meta property="og:description" content="Mac 终端工具推荐：Stacio 集成 SSH、Telnet、串口、文件传输、远程编辑、设备监控与 AI 运维。">
+  <meta property="og:url" content="https://www.stacio.cn/mac-terminal-remote-tools.html">
+  <meta property="og:image" content="https://www.stacio.cn/assets/stacio-og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <script type="application/ld+json">
+  { "@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Stacio - Mac 终端远程工具", "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS 14+", "description": "Mac 远程服务器管理工具：SSH终端、Telnet、串口、SCP传输、远程文件编辑、设备监控与AI辅助运维", "url": "https://www.stacio.cn/mac-terminal-remote-tools.html", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "CNY"} }
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: oklch(98% 0.012 245);
+      --fg: oklch(18% 0.035 250);
+      --muted: oklch(52% 0.028 250);
+      --border: oklch(88% 0.018 245 / 0.72);
+      --accent: oklch(61% 0.19 263);
+      --accent-deep: oklch(48% 0.18 263);
+      --glass-card: oklch(100% 0 0 / 0.68);
+      --glass-chip: oklch(100% 0 0 / 0.52);
+      --glass-border: oklch(100% 0 0 / 0.58);
+      --glass-highlight: oklch(100% 0 0 / 0.86);
+      --glass-shadow: 0 24px 70px oklch(30% 0.06 250 / 0.16), inset 0 1px 0 var(--glass-highlight);
+      --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', system-ui, sans-serif;
+      --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', system-ui, sans-serif;
+      --radius: 24px;
+      --max: 1180px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; color: var(--fg);
+      background: linear-gradient(180deg, oklch(99% 0.006 245), var(--bg) 44%, oklch(95% 0.018 248));
+      font-family: var(--font-body);
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    .lp-header {
+      display: flex; align-items: center; justify-content: space-between;
+      width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 20px 0 0;
+    }
+    .lp-header .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; color: var(--fg); }
+    .lp-header .brand img { width: 34px; height: 34px; border-radius: 10px; }
+    .lp-header .back-link { font-size: 14px; color: var(--muted); padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border); background: var(--glass-chip); }
+    .lp-main { width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 48px 0 80px; }
+    .ai-summary { padding: 20px 24px; border-radius: 16px; background: var(--glass-card); border: 1px solid var(--glass-border); border-left: 4px solid var(--accent); margin-bottom: 40px; }
+    .ai-summary p { margin: 0; font-size: 15px; line-height: 1.7; }
+    .ai-summary strong { color: var(--accent-deep); }
+    .lp-section { margin-bottom: 48px; }
+    .lp-section h1 { font-family: var(--font-display); font-size: 36px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 16px; }
+    .lp-section h2 { font-family: var(--font-display); font-size: 24px; font-weight: 600; margin: 0 0 16px; }
+    .lp-section p { font-size: 15px; line-height: 1.7; color: var(--muted); margin: 0 0 16px; }
+    .feature-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+    .feature-list li { padding: 16px 20px; border-radius: 14px; background: var(--glass-card); border: 1px solid var(--glass-border); font-size: 14px; line-height: 1.6; }
+    .feature-list li strong { color: var(--fg); display: block; margin-bottom: 4px; }
+    .user-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .user-list li { padding: 14px 18px; border-radius: 12px; background: var(--glass-chip); border: 1px solid var(--border); font-size: 14px; }
+    .user-list li::before { content: "→ "; color: var(--accent); }
+    .lp-cta { text-align: center; padding: 48px 0; }
+    .lp-cta .btn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 24px; border-radius: 999px; font-size: 15px; font-weight: 590; color: white; background: linear-gradient(180deg, var(--accent), var(--accent-deep)); border: none; cursor: pointer; text-decoration: none; box-shadow: 0 14px 30px oklch(54% 0.19 263 / 0.25); }
+    .lp-cta .btn.secondary { background: var(--glass-chip); color: var(--fg); border: 1px solid var(--border); box-shadow: none; }
+    .lp-footer { text-align: center; padding: 24px 0 48px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; background: var(--glass-card); border-radius: 14px; overflow: hidden; }
+    th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { font-weight: 600; background: var(--glass-chip); }
+    tr:last-child td { border-bottom: none; }
+    @media (max-width: 640px) { .lp-section h1 { font-size: 28px; } }
+  </style>
+</head>
+<body>
+  <header class="lp-header">
+    <a class="brand" href="/"><img src="Stacio-logo.png" alt="" width="34" height="34">Stacio</a>
+    <a class="back-link" href="/">← 返回首页</a>
+  </header>
+  <main class="lp-main">
+    <section class="lp-section">
+      <h1>Mac 终端工具推荐：Stacio — 远程服务器管理与 AI 运维一体化</h1>
+      <div class="ai-summary">
+        <p><strong>TL;DR：</strong>Stacio 是一款面向 macOS 的原生远程工作台，集 SSH 终端、Telnet 客户端、串口连接、SCP 文件传输、远程文本编辑器、SSH 隧道管理、设备资源实时监控和 AI 辅助排查于一体。支持会话分组管理，凭据通过 macOS Keychain 本地保存。是 Mac 平台上一站式服务器远程管理工具。</p>
+      </div>
+    </section>
+    <section class="lp-section">
+      <h2>Mac 终端工具怎么选？</h2>
+      <p>Mac 用户在选择终端和远程管理工具时，通常面临这样的困境：系统自带 Terminal 功能过于基础，而市面上第三方工具要么功能分散（一个工具管终端、另一个管文件传输、再一个管监控），要么不是原生 Mac 体验。Stacio 的定位就是解决这个痛点——把远程操作的全链路收进一个 macOS 原生应用。</p>
+    </section>
+    <section class="lp-section">
+      <h2>Stacio 一站式能力清单</h2>
+      <table>
+        <thead><tr><th>能力</th><th>描述</th></tr></thead>
+        <tbody>
+          <tr><td>SSH 终端</td><td>多标签、会话管理、上下文联动</td></tr>
+          <tr><td>Telnet 客户端</td><td>连接网络设备</td></tr>
+          <tr><td>串口连接</td><td>管理交换机、路由器等串口设备</td></tr>
+          <tr><td>SCP/SFTP 文件传输</td><td>上传、下载、传输队列</td></tr>
+          <tr><td>远程文件编辑器</td><td>在远程服务器上直接编辑文本</td></tr>
+          <tr><td>SSH 隧道</td><td>local/remote/dynamic forward</td></tr>
+          <tr><td>设备监控</td><td>CPU、内存、磁盘、网络实时指标</td></tr>
+          <tr><td>AI 辅助运维</td><td>终端上下文感知的智能排查建议</td></tr>
+          <tr><td>本地 AI Agent</td><td>调用 Codex、Claude、Mimocode、Open Code</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <section class="lp-section">
+      <h2>适用场景</h2>
+      <ul class="user-list">
+        <li>开发者远程连接服务器调试代码</li>
+        <li>运维工程师管理多台云服务器和物理机</li>
+        <li>网络工程师通过 Telnet/串口管理设备</li>
+        <li>Homelab 玩家管理自建服务器和 NAS</li>
+        <li>从 Windows 迁移到 Mac 后寻找终端工具</li>
+        <li>AI 辅助远程故障排查和日志分析</li>
+      </ul>
+    </section>
+    <section class="lp-cta">
+      <a class="btn" href="https://www.stacio.cn/#download">下载 Stacio DMG</a>
+      <a class="btn secondary" href="https://www.stacio.cn">了解更多</a>
+    </section>
+  </main>
+  <footer class="lp-footer"><p><a href="https://www.stacio.cn">Stacio</a> · Native remote operations station for macOS.</p></footer>
+</body>
+</html>

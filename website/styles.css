@@ -278,23 +278,34 @@
     }
 
     .btn.ghost { background: transparent; }
-    .github-link {
+    .github-link,
+    .gitee-link {
       display: inline-flex;
       align-items: center;
       gap: 8px;
     }
 
-    .github-icon {
+    .github-icon,
+    .gitee-icon {
       width: 16px;
       height: 16px;
       flex: 0 0 auto;
       display: inline-block;
       background: currentColor;
+    }
+
+    .github-icon {
       -webkit-mask: url("assets/github.svg") center / contain no-repeat;
       mask: url("assets/github.svg") center / contain no-repeat;
     }
 
-    .btn .github-icon { width: 17px; height: 17px; }
+    .gitee-icon {
+      -webkit-mask: url("assets/gitee.svg") center / contain no-repeat;
+      mask: url("assets/gitee.svg") center / contain no-repeat;
+    }
+
+    .btn .github-icon,
+    .btn .gitee-icon { width: 17px; height: 17px; }
 
     main { overflow: hidden; }
     .section {
@@ -360,9 +371,13 @@
       display: flex;
       align-items: center;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 8px;
       margin: 30px 0 0;
     }
+
+    .hero-actions .btn { padding: 0 14px; }
+    html[lang="en"] .hero-actions { gap: 6px; }
+    html[lang="en"] .hero-actions .btn { padding: 0 10px; font-size: 13px; }
 
     .trust-line {
       margin-top: 22px;
@@ -686,6 +701,93 @@
 
     .capability-card h3 { font-size: 22px; line-height: 1.1; letter-spacing: -0.015em; }
     .capability-card p { margin: 14px 0 0; color: var(--muted); line-height: 1.58; font-size: 15px; }
+    .use-case-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .use-case-card,
+    .faq-item {
+      position: relative;
+      overflow: hidden;
+      min-height: 230px;
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: var(--glass-card);
+      box-shadow: inset 0 1px 0 var(--glass-highlight);
+      backdrop-filter: blur(18px) saturate(1.18);
+      -webkit-backdrop-filter: blur(18px) saturate(1.18);
+      transition: transform 220ms var(--ease-glass), border-color 220ms var(--ease-glass), box-shadow 220ms var(--ease-glass), background 220ms var(--ease-glass);
+    }
+
+    .use-case-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      text-decoration: none;
+    }
+
+    .use-case-card::before,
+    .faq-item::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 38%;
+      border-radius: inherit;
+      background: linear-gradient(180deg, var(--glass-highlight), transparent);
+      opacity: 0.34;
+      pointer-events: none;
+    }
+
+    .use-case-card > *,
+    .faq-item > * { position: relative; z-index: 1; }
+
+    .use-case-card:hover,
+    .use-case-card:focus-visible,
+    .faq-item:hover {
+      transform: translateY(-4px);
+      border-color: color-mix(in oklch, var(--accent), var(--border) 70%);
+      box-shadow: 0 22px 60px oklch(28% 0.06 250 / 0.12), inset 0 1px 0 var(--glass-highlight);
+    }
+
+    .use-case-card small {
+      color: var(--accent-deep);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .use-case-card h3,
+    .faq-item h3 {
+      margin-top: 18px;
+      font-size: 24px;
+      line-height: 1.12;
+      letter-spacing: -0.015em;
+    }
+
+    .use-case-card p,
+    .faq-item p {
+      margin: 18px 0 0;
+      color: var(--muted);
+      line-height: 1.62;
+      font-size: 15px;
+    }
+
+    .faq-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+
+    .faq-item {
+      min-height: 210px;
+    }
+
+    .faq-item h3 { margin-top: 0; }
+
     .ui-cue {
       margin-top: 22px;
       padding: 14px;
@@ -928,6 +1030,17 @@
 
     .arch-option.is-selected { color: var(--fg); background: var(--glass-chip); border-color: oklch(78% 0.04 250); }
     .download-console .btn { width: 100%; margin-top: 14px; }
+    .repository-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .download-console .repository-actions .btn {
+      min-width: 0;
+      margin-top: 0;
+      padding-inline: 12px;
+    }
     .download-console .btn[data-availability="planned"] { box-shadow: none; background: var(--ui-subtle); color: var(--fg); border-color: color-mix(in oklch, var(--warn), var(--border) 55%); }
     .download-console .btn[data-availability="planned"]:hover { transform: none; border-color: color-mix(in oklch, var(--warn), var(--border) 55%); }
     .footer {
@@ -945,6 +1058,113 @@
 
     .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
     .footer a { text-decoration: underline; text-underline-offset: 4px; }
+
+    .seo-shell {
+      width: min(var(--max), calc(100% - 40px));
+      margin: 0 auto;
+      padding: 112px 0 72px;
+    }
+
+    .seo-hero {
+      padding: clamp(34px, 6vw, 72px);
+      border: 1px solid var(--border);
+      border-radius: 34px;
+      background:
+        radial-gradient(circle at 84% 18%, var(--glow), transparent 28rem),
+        var(--glass-card);
+      box-shadow: inset 0 1px 0 var(--glass-highlight);
+      backdrop-filter: blur(22px) saturate(1.25);
+      -webkit-backdrop-filter: blur(22px) saturate(1.25);
+    }
+
+    .seo-hero h1 {
+      margin-top: 12px;
+      font-size: clamp(42px, 6vw, 78px);
+      line-height: 1;
+      letter-spacing: -0.025em;
+    }
+
+    .seo-hero .section-lead {
+      margin-top: 22px;
+      max-width: 68ch;
+    }
+
+    .seo-actions {
+      margin-top: 28px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .seo-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 24px;
+      margin-top: 28px;
+      align-items: start;
+    }
+
+    .seo-article,
+    .seo-panel {
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: var(--glass-card);
+      box-shadow: inset 0 1px 0 var(--glass-highlight);
+      backdrop-filter: blur(18px) saturate(1.18);
+      -webkit-backdrop-filter: blur(18px) saturate(1.18);
+    }
+
+    .seo-article {
+      padding: clamp(24px, 4vw, 42px);
+    }
+
+    .seo-article h2 {
+      margin-top: 34px;
+      font-size: clamp(28px, 3.6vw, 44px);
+    }
+
+    .seo-article h2:first-child { margin-top: 0; }
+    .seo-article p,
+    .seo-article li {
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.76;
+    }
+
+    .seo-article p { margin: 16px 0 0; }
+    .seo-article ul { margin: 16px 0 0; padding-left: 1.2rem; }
+    .seo-article li + li { margin-top: 10px; }
+
+    .seo-panel {
+      position: sticky;
+      top: 108px;
+      padding: 20px;
+    }
+
+    .seo-panel h2 {
+      font-size: 22px;
+      line-height: 1.15;
+    }
+
+    .seo-panel ul {
+      margin: 16px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 10px;
+    }
+
+    .seo-panel a {
+      display: block;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--ui-subtle);
+      color: var(--fg);
+      text-decoration: none;
+    }
+
+    .seo-panel a:hover { border-color: color-mix(in oklch, var(--accent), var(--border) 70%); }
 
     .modal-backdrop {
       position: fixed;
@@ -1134,13 +1354,17 @@
       .workflow-step { min-height: auto; gap: 26px; }
       .workflow-step h3 { margin-top: 0; }
       .capability-grid { grid-template-columns: repeat(2, 1fr); }
+      .use-case-grid,
+      .faq-grid { grid-template-columns: 1fr; }
       .section-head, .why-panel, .final-cta { grid-template-columns: 1fr; }
       .final-cta > div:first-child { max-width: 66ch; }
       .download-console { width: min(430px, 100%); }
       .beta-grid { grid-template-columns: 1fr; }
+      .seo-layout { grid-template-columns: 1fr; }
+      .seo-panel { position: static; }
     }
 
-    @media (max-width: 760px) {
+    @media (max-width: 1000px) {
       .site-header { top: 10px; width: min(100% - 24px, var(--max)); }
       .nav-wrap { min-height: 62px; border-radius: 28px; }
       .menu-button {
@@ -1176,6 +1400,9 @@
       .nav-actions .primary { display: none; }
       .language-toggle { min-width: 52px; }
       .theme-toggle { width: 40px; min-width: 40px; padding: 0; }
+    }
+
+    @media (max-width: 760px) {
       .hero { width: min(100% - 28px, var(--max)); padding: 88px 0 34px; gap: 38px; }
       h1 { font-size: clamp(58px, 20vw, 82px); }
       .tagline { font-size: 29px; }
@@ -1189,7 +1416,11 @@
       .section { width: min(100% - 28px, var(--max)); padding: 70px 0; }
       .capability-grid { grid-template-columns: 1fr; }
       .capability-card { min-height: 220px; }
+      .use-case-card,
+      .faq-item { min-height: 0; }
       .footer { width: min(100% - 28px, var(--max)); flex-direction: column; align-items: flex-start; }
+      .seo-shell { width: min(100% - 28px, var(--max)); padding-top: 92px; }
+      .seo-actions .btn { flex: 1 1 150px; }
       .platform-picker { grid-template-columns: 1fr; }
       .arch-picker { grid-template-columns: 1fr; }
       .download-card { min-height: 0; }

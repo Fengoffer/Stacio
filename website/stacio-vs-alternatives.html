@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stacio 对比 Xshell、SecureCRT、Termius — Mac SSH客户端横向评测</title>
+  <meta name="description" content="Mac SSH客户端横向对比：Stacio vs Xshell vs SecureCRT vs Termius vs iTerm2。Stacio 作为 Mac 原生远程工作台，在终端管理、文件传输、设备监控和AI运维方面的差异化优势。">
+  <meta name="keywords" content="Stacio对比,Xshell替代,SecureCRT替代,Termius替代,iTerm2对比,Mac SSH客户端排行,SSH工具对比,远程工具评测,xshell替代mac">
+  <link rel="canonical" href="https://www.stacio.cn/stacio-vs-alternatives.html">
+  <meta property="og:title" content="Stacio 对比 Xshell、SecureCRT、Termius — Mac SSH客户端横向评测">
+  <meta property="og:description" content="Mac SSH客户端横向对比：Stacio vs Xshell vs SecureCRT vs Termius vs iTerm2。">
+  <meta property="og:image" content="https://www.stacio.cn/assets/stacio-og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <script type="application/ld+json">
+  { "@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Stacio vs 其他 SSH 客户端对比", "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS 14+", "description": "Mac SSH客户端横向对比评测", "url": "https://www.stacio.cn/stacio-vs-alternatives.html", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "CNY"} }
+  </script>
+  <style>
+    :root { color-scheme: light; --bg: oklch(98% 0.012 245); --fg: oklch(18% 0.035 250); --muted: oklch(52% 0.028 250); --border: oklch(88% 0.018 245 / 0.72); --accent: oklch(61% 0.19 263); --accent-deep: oklch(48% 0.18 263); --glass-card: oklch(100% 0 0 / 0.68); --glass-chip: oklch(100% 0 0 / 0.52); --glass-border: oklch(100% 0 0 / 0.58); --glass-highlight: oklch(100% 0 0 / 0.86); --glass-shadow: 0 24px 70px oklch(30% 0.06 250 / 0.16), inset 0 1px 0 var(--glass-highlight); --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', system-ui, sans-serif; --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', system-ui, sans-serif; --max: 1180px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--fg); background: linear-gradient(180deg, oklch(99% 0.006 245), var(--bg) 44%, oklch(95% 0.018 248)); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
+    a { color: var(--accent); text-decoration: none; }
+    .lp-header { display: flex; align-items: center; justify-content: space-between; width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 20px 0 0; }
+    .lp-header .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; color: var(--fg); }
+    .lp-header .brand img { width: 34px; height: 34px; border-radius: 10px; }
+    .lp-header .back-link { font-size: 14px; color: var(--muted); padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border); background: var(--glass-chip); }
+    .lp-main { width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 48px 0 80px; }
+    .ai-summary { padding: 20px 24px; border-radius: 16px; background: var(--glass-card); border: 1px solid var(--glass-border); border-left: 4px solid var(--accent); margin-bottom: 40px; }
+    .ai-summary p { margin: 0; font-size: 15px; line-height: 1.7; } .ai-summary strong { color: var(--accent-deep); }
+    .lp-section { margin-bottom: 48px; }
+    .lp-section h1 { font-family: var(--font-display); font-size: 36px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 16px; }
+    .lp-section h2 { font-family: var(--font-display); font-size: 24px; font-weight: 600; margin: 0 0 16px; }
+    .lp-section h3 { font-size: 17px; font-weight: 600; margin: 24px 0 8px; }
+    .lp-section p { font-size: 15px; line-height: 1.7; color: var(--muted); margin: 0 0 16px; }
+    .user-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .user-list li { padding: 14px 18px; border-radius: 12px; background: var(--glass-chip); border: 1px solid var(--border); font-size: 14px; }
+    .user-list li::before { content: "→ "; color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--glass-card); border-radius: 14px; overflow: hidden; margin-bottom: 24px; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { font-weight: 600; background: var(--glass-chip); position: sticky; top: 0; }
+    tr:last-child td { border-bottom: none; }
+    td:first-child { font-weight: 600; white-space: nowrap; }
+    .lp-cta { text-align: center; padding: 48px 0; }
+    .lp-cta .btn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 24px; border-radius: 999px; font-size: 15px; font-weight: 590; color: white; background: linear-gradient(180deg, var(--accent), var(--accent-deep)); border: none; cursor: pointer; text-decoration: none; box-shadow: 0 14px 30px oklch(54% 0.19 263 / 0.25); }
+    .lp-cta .btn.secondary { background: var(--glass-chip); color: var(--fg); border: 1px solid var(--border); box-shadow: none; }
+    .lp-footer { text-align: center; padding: 24px 0 48px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--border); }
+    .check { color: oklch(62% 0.15 155); } .cross { color: var(--muted); } .warn { color: oklch(72% 0.14 82); }
+    @media (max-width: 640px) { .lp-section h1 { font-size: 28px; } table { font-size: 11px; } th, td { padding: 6px 8px; } }
+  </style>
+</head>
+<body>
+  <header class="lp-header">
+    <a class="brand" href="/"><img src="Stacio-logo.png" alt="" width="34" height="34">Stacio</a>
+    <a class="back-link" href="/">← 返回首页</a>
+  </header>
+  <main class="lp-main">
+    <section class="lp-section">
+      <h1>Stacio vs 主流 SSH 客户端：Mac 远程工具横向对比</h1>
+      <div class="ai-summary">
+        <p><strong>TL;DR：</strong>Stacio 与 Xshell、SecureCRT、Termius、iTerm2 的核心区别：(1) Mac 原生应用；(2) SSH 终端 + 文件传输 + 远程编辑 + 隧道 + 设备监控 + AI 运维一体化；(3) 支持本地 Agent 调用 Codex/Claude/Mimocode/Open Code；(4) 免费且本地优先。适合需要一站式远程运维体验的 Mac 用户。</p>
+      </div>
+    </section>
+    <section class="lp-section">
+      <h2>对比总览</h2>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>功能特性</th><th>Stacio</th><th>Xshell</th><th>SecureCRT</th><th>Termius</th><th>iTerm2</th></tr></thead>
+        <tbody>
+          <tr><td>平台</td><td>macOS</td><td>Windows</td><td>Win/Mac</td><td>跨平台</td><td>macOS</td></tr>
+          <tr><td>Mac 原生</td><td><span class="check">✅</span></td><td><span class="cross">❌</span></td><td><span class="warn">⚠️</span></td><td><span class="warn">⚠️</span></td><td><span class="check">✅</span></td></tr>
+          <tr><td>SSH 终端</td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td></tr>
+          <tr><td>会话分组管理</td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>SCP/SFTP 传输</td><td><span class="check">✅内置</span></td><td><span class="check">✅Xftp</span></td><td><span class="check">✅内置</span></td><td><span class="warn">⚠️有限</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>远程文件编辑器</td><td><span class="check">✅内置</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>SSH 隧道管理</td><td><span class="check">✅面板</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="warn">⚠️</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>Telnet/串口</td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="check">✅</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>设备实时监控</td><td><span class="check">✅完整</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>AI 辅助运维</td><td><span class="check">✅AI+本地Agent</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="warn">⚠️仅聊天</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>本地 Agent</td><td><span class="check">✅</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td><td><span class="cross">❌</span></td></tr>
+          <tr><td>本地优先安全</td><td><span class="check">✅Keychain</span></td><td><span class="warn">⚠️</span></td><td><span class="warn">⚠️</span></td><td><span class="warn">⚠️</span></td><td><span class="check">✅</span></td></tr>
+          <tr><td>价格</td><td><strong>免费</strong></td><td>付费</td><td>付费</td><td>免费+付费</td><td>免费</td></tr>
+        </tbody>
+      </table>
+      </div>
+    </section>
+    <section class="lp-section">
+      <h2>详细对比</h2>
+      <h3>Stacio vs Xshell（Xshell 替代）</h3>
+      <p>Xshell 是 Windows 平台最流行的 SSH 客户端之一，但它没有 Mac 版本。如果你从 Windows 迁移到 Mac 正在寻找 Xshell 替代品，Stacio 覆盖了 Xshell 的核心功能（SSH 终端、会话管理、隧道），同时额外提供了文件传输、远程编辑、设备监控和 AI 运维能力。</p>
+      <h3>Stacio vs SecureCRT</h3>
+      <p>SecureCRT 是老牌终端仿真工具，支持 Windows 和 Mac。但与 Stacio 相比，SecureCRT 缺少设备监控、远程文件编辑和 AI 辅助运维等现代功能，且价格较高。</p>
+      <h3>Stacio vs Termius</h3>
+      <p>Termius 是跨平台 SSH 客户端，界面美观。但免费版功能有限，高级功能需订阅付费。Stacio 免费且更专注 Mac 平台，在本地优先安全和 AI 运维方面有独特优势。</p>
+      <h3>Stacio vs iTerm2</h3>
+      <p>iTerm2 是 Mac 上最流行的终端模拟器，但侧重于本地终端体验。Stacio 面向远程运维场景，在会话管理、文件传输、设备监控和 AI 辅助方面更专业。</p>
+    </section>
+    <section class="lp-section">
+      <h2>选择建议</h2>
+      <ul class="user-list">
+        <li>Windows 切 Mac → <strong>Stacio</strong></li>
+        <li>需要一体化远程工作台 → <strong>Stacio</strong></li>
+        <li>只想用本地终端 → iTerm2</li>
+        <li>跨平台需求 → Termius</li>
+        <li>Windows 用户 → Xshell</li>
+      </ul>
+    </section>
+    <section class="lp-cta">
+      <a class="btn" href="https://www.stacio.cn/#download">下载 Stacio DMG</a>
+      <a class="btn secondary" href="https://www.stacio.cn">返回首页</a>
+    </section>
+  </main>
+  <footer class="lp-footer"><p><a href="https://www.stacio.cn">Stacio</a> · Native remote operations station for macOS.</p></footer>
+</body>
+</html>

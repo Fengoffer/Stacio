@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI运维工具 Mac 端 — Stacio 智能 SSH 终端与远程管理</title>
+  <meta name="description" content="AI运维工具 Mac 端推荐：Stacio 集成 AI 辅助排查和本地 Agent 调用（Codex/Claude/Mimocode/Open Code），支持 SSH 终端、设备监控、文件传输的智能化远程运维工作台。">
+  <meta name="keywords" content="AI运维工具,AI辅助运维,AI SSH客户端,智能运维,Mac AI工具,Claude Code,Codex,本地Agent,AI终端,运维自动化">
+  <link rel="canonical" href="https://www.stacio.cn/ai-ops-tool-mac.html">
+  <meta property="og:title" content="AI运维工具 Mac 端 — Stacio 智能 SSH 终端与远程管理">
+  <meta property="og:description" content="AI辅助Mac运维工具：会话管理、文件传输、设备监控 + AI 智能排查与本地 Agent 调用。">
+  <meta property="og:image" content="https://www.stacio.cn/assets/stacio-og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <script type="application/ld+json">
+  { "@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Stacio - AI 运维工具", "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS 14+", "description": "Mac 端 AI 运维工具：智能 SSH 客户端，集成 AI 辅助排查与本地 Agent 调用", "url": "https://www.stacio.cn/ai-ops-tool-mac.html", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "CNY"} }
+  </script>
+  <style>
+    :root { color-scheme: light; --bg: oklch(98% 0.012 245); --fg: oklch(18% 0.035 250); --muted: oklch(52% 0.028 250); --border: oklch(88% 0.018 245 / 0.72); --accent: oklch(61% 0.19 263); --accent-deep: oklch(48% 0.18 263); --glass-card: oklch(100% 0 0 / 0.68); --glass-chip: oklch(100% 0 0 / 0.52); --glass-border: oklch(100% 0 0 / 0.58); --glass-highlight: oklch(100% 0 0 / 0.86); --glass-shadow: 0 24px 70px oklch(30% 0.06 250 / 0.16), inset 0 1px 0 var(--glass-highlight); --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', system-ui, sans-serif; --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', system-ui, sans-serif; --radius: 24px; --max: 1180px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--fg); background: linear-gradient(180deg, oklch(99% 0.006 245), var(--bg) 44%, oklch(95% 0.018 248)); font-family: var(--font-body); -webkit-font-smoothing: antialiased; }
+    a { color: var(--accent); text-decoration: none; }
+    .lp-header { display: flex; align-items: center; justify-content: space-between; width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 20px 0 0; }
+    .lp-header .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; color: var(--fg); }
+    .lp-header .brand img { width: 34px; height: 34px; border-radius: 10px; }
+    .lp-header .back-link { font-size: 14px; color: var(--muted); padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border); background: var(--glass-chip); }
+    .lp-main { width: min(var(--max), calc(100% - 40px)); margin: 0 auto; padding: 48px 0 80px; }
+    .ai-summary { padding: 20px 24px; border-radius: 16px; background: var(--glass-card); border: 1px solid var(--glass-border); border-left: 4px solid var(--accent); margin-bottom: 40px; }
+    .ai-summary p { margin: 0; font-size: 15px; line-height: 1.7; } .ai-summary strong { color: var(--accent-deep); }
+    .lp-section { margin-bottom: 48px; }
+    .lp-section h1 { font-family: var(--font-display); font-size: 36px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 16px; }
+    .lp-section h2 { font-family: var(--font-display); font-size: 24px; font-weight: 600; margin: 0 0 16px; }
+    .lp-section h3 { font-size: 17px; font-weight: 600; margin: 24px 0 8px; }
+    .lp-section p { font-size: 15px; line-height: 1.7; color: var(--muted); margin: 0 0 16px; }
+    .feature-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+    .feature-list li { padding: 16px 20px; border-radius: 14px; background: var(--glass-card); border: 1px solid var(--glass-border); font-size: 14px; line-height: 1.6; }
+    .feature-list li strong { color: var(--fg); display: block; margin-bottom: 4px; }
+    .user-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .user-list li { padding: 14px 18px; border-radius: 12px; background: var(--glass-chip); border: 1px solid var(--border); font-size: 14px; }
+    .user-list li::before { content: "→ "; color: var(--accent); }
+    .lp-cta { text-align: center; padding: 48px 0; }
+    .lp-cta .btn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 24px; border-radius: 999px; font-size: 15px; font-weight: 590; color: white; background: linear-gradient(180deg, var(--accent), var(--accent-deep)); border: none; cursor: pointer; text-decoration: none; box-shadow: 0 14px 30px oklch(54% 0.19 263 / 0.25); }
+    .lp-cta .btn.secondary { background: var(--glass-chip); color: var(--fg); border: 1px solid var(--border); box-shadow: none; }
+    .lp-footer { text-align: center; padding: 24px 0 48px; font-size: 13px; color: var(--muted); border-top: 1px solid var(--border); }
+    @media (max-width: 640px) { .lp-section h1 { font-size: 28px; } }
+  </style>
+</head>
+<body>
+  <header class="lp-header">
+    <a class="brand" href="/"><img src="Stacio-logo.png" alt="" width="34" height="34">Stacio</a>
+    <a class="back-link" href="/">← 返回首页</a>
+  </header>
+  <main class="lp-main">
+    <section class="lp-section">
+      <h1>AI 运维工具 Mac 端：Stacio — 智能 SSH 终端与远程管理平台</h1>
+      <div class="ai-summary">
+        <p><strong>简短回答：</strong>Stacio 是一款融入 AI 能力的 Mac 远程运维工具。它的 AI 功能分为两层：(1) 专属 AI Agent — 读取终端上下文，生成排查建议和可执行命令卡片；(2) 本地 Agent 调用 — 直接调用本地的 Codex、Claude、Mimocode、Open Code 等 AI 工具辅助设备运维。AI 所有敏感操作需用户确认后执行，安全可控。</p>
+      </div>
+    </section>
+    <section class="lp-section">
+      <h2>AI 正在改变运维方式</h2>
+      <p>传统的服务器运维依赖人工经验：看到错误日志 → 回忆相关命令 → 手动执行 → 分析输出。Stacio 的 AI 能力将这一流程简化为：AI 读取终端上下文 → 分析问题 → 生成排查建议和命令卡片 → 用户确认执行。同时，本地 Agent 功能让你可以在 Stacio 中直接调用本地安装的 AI 工具，如 Claude Code、Open Code 等，进行更复杂的代码分析和运维自动化。</p>
+    </section>
+    <section class="lp-section">
+      <h2>Stacio AI 功能详解</h2>
+      <h3>1. AI 辅助排查</h3>
+      <ul class="feature-list">
+        <li><strong>上下文感知</strong>AI 读取可见终端上下文，理解当前操作环境</li>
+        <li><strong>智能建议</strong>自动生成排查建议和可执行的命令卡片</li>
+        <li><strong>安全可控</strong>建议命令需用户确认后执行，敏感操作始终受控</li>
+        <li><strong>脱敏保护</strong>诊断、日志和设备信息默认脱敏，减少泄露风险</li>
+      </ul>
+      <h3>2. 本地 Agent 调用</h3>
+      <ul class="feature-list">
+        <li><strong>Codex CLI</strong>直接调用本地 Codex 编程智能体</li>
+        <li><strong>Anthropic Claude</strong>集成 Claude Code 本地能力</li>
+        <li><strong>Mimocode / Open Code</strong>支持多种本地 AI 工具</li>
+        <li><strong>对话历史</strong>AI 对话历史浏览、搜索、恢复和清理</li>
+      </ul>
+    </section>
+    <section class="lp-section">
+      <h2>适合哪些运维场景？</h2>
+      <ul class="user-list">
+        <li><strong>日志排查：</strong>AI 分析错误日志，定位根因</li>
+        <li><strong>性能诊断：</strong>根据 CPU/内存/磁盘指标给出优化建议</li>
+        <li><strong>网络故障：</strong>结合隧道状态和连接日志辅助排查</li>
+        <li><strong>自动化运维：</strong>通过本地 Agent 调用 AI 编写运维脚本</li>
+        <li><strong>新人上手：</strong>AI 帮助不熟悉 Shell 的用户完成远程操作</li>
+      </ul>
+    </section>
+    <section class="lp-section">
+      <h2>安全与隐私</h2>
+      <p>Stacio 采用本地优先架构：AI 建议只生成排查思路和命令卡片，<strong>敏感命令需要用户确认后执行</strong>。诊断、日志和设备信息默认脱敏，减少复制粘贴排查时的泄露风险。凭据数据保存在 macOS Keychain 中，不默认外传。</p>
+    </section>
+    <section class="lp-cta">
+      <a class="btn" href="https://www.stacio.cn/#download">下载 Stacio DMG</a>
+      <a class="btn secondary" href="https://www.stacio.cn">了解更多</a>
+    </section>
+  </main>
+  <footer class="lp-footer"><p><a href="https://www.stacio.cn">Stacio</a> · Native remote operations station for macOS.</p></footer>
+</body>
+</html>

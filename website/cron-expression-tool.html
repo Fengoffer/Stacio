@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cron表达式工具 - Stacio</title>
+  <meta name="description" content="Stacio 是面向 macOS 的 Cron表达式工具和 crontab 运维辅助工作台，通过 SSH 终端、远程文件、终端宏、设备指标和 AI 辅助解释 Cron 表达式、排查计划任务执行问题。" />
+  <meta name="keywords" content="Cron表达式工具, Cron 表达式工具, crontab 工具, Mac Cron 工具, Cron 表达式解释, crontab 运维, 计划任务排查, SSH cron, Stacio" />
+  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1" />
+  <link rel="canonical" href="https://www.stacio.cn/cron-expression-tool.html" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Stacio" />
+  <meta property="og:title" content="Cron表达式工具 - Stacio" />
+  <meta property="og:description" content="通过 SSH 终端、远程文件、终端宏、设备指标和 AI 辅助解释 Cron 表达式并排查 crontab 计划任务。" />
+  <meta property="og:url" content="https://www.stacio.cn/cron-expression-tool.html" />
+  <meta property="og:image" content="https://www.stacio.cn/assets/og-image.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:image" content="https://www.stacio.cn/assets/og-image.png" />
+  <link rel="icon" href="/assets/stacio-logo.png" type="image/png" />
+  <link rel="stylesheet" href="/styles.css?v=20260715-content-integrity" />
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Article",
+          "headline": "Cron表达式工具 - Stacio",
+          "description": "Stacio 是面向 macOS 的 Cron表达式工具和 crontab 运维辅助工作台。",
+          "url": "https://www.stacio.cn/cron-expression-tool.html",
+          "image": "https://www.stacio.cn/assets/og-image.png",
+          "author": { "@type": "Organization", "name": "Stacio" },
+          "publisher": { "@type": "Organization", "name": "Stacio", "logo": { "@type": "ImageObject", "url": "https://www.stacio.cn/assets/stacio-logo.png" } },
+          "mainEntityOfPage": "https://www.stacio.cn/cron-expression-tool.html"
+        },
+        {
+          "@type": "FAQPage",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "Stacio 是在线 Cron 生成器吗？",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "不是。Stacio 更偏 Mac 端 crontab 运维辅助工具，通过 SSH 终端、远程文件、终端宏和 AI 辅助解释计划任务上下文。"
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Stacio 如何排查 Cron 不执行？",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "可以在 Stacio 中查看 crontab、编辑远程脚本、运行检查命令、查看日志和设备指标，并让 AI 基于可见终端上下文生成排查步骤。"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  </script>
+</head>
+<body>
+  <main class="seo-shell">
+    <section class="seo-hero">
+      <p class="eyebrow">CRON EXPRESSION TOOL</p>
+      <h1>Cron表达式工具：在 Mac 上排查 crontab 和计划任务。</h1>
+      <p class="section-lead">Stacio 不把 Cron 做成孤立的在线生成器，而是放在真实服务器环境里：通过 SSH 终端查看 crontab，编辑远程脚本，复用终端宏，并让 AI 辅助解释表达式和生成排查步骤。</p>
+      <div class="seo-actions">
+        <a class="btn primary" href="/#download">下载 Stacio 0.13.3 正式版</a>
+        <a class="btn ghost" href="/">返回官网首页</a>
+      </div>
+    </section>
+    <div class="seo-layout">
+      <article class="seo-article">
+        <h2>Stacio 能帮你处理哪些 Cron 问题？</h2>
+        <p>计划任务问题往往发生在远程服务器上：表达式写错、环境变量不同、脚本权限不足、路径不一致、日志分散，或者任务其实运行了但结果失败。Stacio 的价值是把这些线索放在同一个 SSH 工作台里。</p>
+        <ul>
+          <li>通过 SSH 终端查看 crontab、systemd timer 或相关计划任务配置。</li>
+          <li>编辑远程脚本、配置文件和日志文件。</li>
+          <li>复用终端宏执行常用检查命令，减少重复输入。</li>
+          <li>结合 CPU、内存、磁盘、网络和 I/O 指标判断任务执行时的机器状态。</li>
+          <li>让 AI 基于可见终端上下文解释 Cron 表达式并生成排查步骤。</li>
+        </ul>
+
+        <h2>Cron 表达式解释与确认</h2>
+        <p>当你看到类似 0 3 * * *、*/5 * * * * 或 30 2 * * 1 的表达式时，Stacio 的 AI 辅助可以帮助解释触发时间、可能的时区问题和排查顺序。生成的命令卡片仍需要用户确认后执行，适合在生产服务器上保持谨慎。</p>
+
+        <h2>适合的 crontab 运维场景</h2>
+        <ul>
+          <li>计划任务没有触发，或者触发时间和预期不一致。</li>
+          <li>脚本在手动运行时正常，但在 Cron 中失败。</li>
+          <li>需要检查环境变量、工作目录、文件权限、日志路径或依赖命令。</li>
+          <li>需要上传、编辑或下载远程脚本和执行日志。</li>
+          <li>需要把同一次计划任务排障的终端输出、文件和建议集中保留。</li>
+        </ul>
+
+        <h2>和在线 Cron 表达式工具的区别</h2>
+        <p>在线 Cron 表达式工具适合快速生成和校验时间规则。Stacio 更适合任务已经在服务器上运行或失败时的真实排障：它把表达式、脚本、日志、SSH 会话、设备指标和 AI 建议放在同一个 macOS 工作流里。</p>
+
+        <h2>当前下载状态</h2>
+        <p>当前稳定版为 Stacio 0.13.3（构建号 245），支持 macOS 14 及以上，并分别提供 Apple Silicon 与 Intel Mac 独立安装包。当前包未公证，首次打开如被 macOS 拦截，请在 Finder 中右键 Stacio.app 并选择“打开”。Windows 和 Linux 版本敬请期待。</p>
+      </article>
+      <aside class="seo-panel">
+        <h2>相关搜索</h2>
+        <ul>
+          <li><a href="/mac-ssh-client.html">Mac SSH 客户端推荐</a></li>
+          <li><a href="/mac-terminal-remote-tools.html">Mac 终端远程工具</a></li>
+          <li><a href="/mac-server-management-tool.html">Mac 服务器远程管理工具</a></li>
+          <li><a href="/ai-ops-tool-mac.html">Mac AI 运维工具</a></li>
+          <li><a href="/#features">查看 Stacio 核心能力</a></li>
+        </ul>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>

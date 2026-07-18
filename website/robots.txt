@@ -1,2 +1,81 @@
+# ============================================================
+# Stacio - Robots.txt 增强版
+# 面向搜索引擎 + AI 爬虫的完整引导配置
+# ============================================================
+
+# --- 通用规则 ---
 User-agent: *
 Allow: /
+Disallow: /assets/private/
+Crawl-Delay: 10
+
+# --- Google 搜索引擎 ---
+User-agent: Googlebot
+Allow: /
+Allow: /mac-ssh-client.html
+Allow: /xshell-alternative-mac.html
+Allow: /mac-server-management-tool.html
+Allow: /cron-expression-tool.html
+Allow: /ssh-client-mac-best.html
+Allow: /mac-terminal-remote-tools.html
+Allow: /ai-ops-tool-mac.html
+Allow: /stacio-vs-alternatives.html
+Disallow: /assets/private/
+
+# --- Google AI 训练爬虫（让AI能读到你的内容）---
+User-agent: Google-Extended
+Allow: /
+
+# --- Baidu 百度搜索引擎 ---
+User-agent: Baiduspider
+Allow: /
+Allow: /mac-ssh-client.html
+Allow: /xshell-alternative-mac.html
+Allow: /mac-server-management-tool.html
+Allow: /cron-expression-tool.html
+Crawl-Delay: 5
+
+# --- Bing 必应 ---
+User-agent: Bingbot
+Allow: /
+Crawl-Delay: 10
+
+# --- 360 搜索 ---
+User-agent: 360Spider
+Allow: /
+Crawl-Delay: 10
+
+# --- 搜狗搜索 ---
+User-agent: Sogou web spider
+Allow: /
+Crawl-Delay: 10
+
+# --- AI / LLM 爬虫 ---
+User-agent: GPTBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: CCBot
+Allow: /
+Crawl-Delay: 30
+
+User-agent: FacebookBot
+Allow: /
+
+# --- 屏蔽占用带宽的爬虫 ---
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: AhrefsBot
+Disallow: /
+
+User-agent: MJ12bot
+Disallow: /
+
+# --- Sitemap ---
+Sitemap: https://www.stacio.cn/sitemap.xml
