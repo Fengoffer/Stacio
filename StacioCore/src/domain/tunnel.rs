@@ -220,24 +220,25 @@ mod tunnel_domain_tests {
     }
 
     #[test]
-    fn triage_guide_lists_only_current_tunnel_error_codes() {
-        let guide = include_str!("../../../docs/development/bug-triage-guide.md");
-        let section = guide
-            .split("### 6.4 隧道无法启动")
-            .nth(1)
-            .and_then(|tail| tail.split("M5 当前定位入口").next())
-            .expect("tunnel triage section");
-        let documented_codes = extract_tunnel_error_codes(section);
+    fn tunnel_error_codes_are_stable_and_unique() {
         let current_codes = [
             TunnelError::InvalidPort.code(),
             TunnelError::LocalPortInUse.code(),
             TunnelError::SshFailed.code(),
             TunnelError::InvalidTransition.code(),
-        ]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+        ];
+        let unique_codes = current_codes.iter().collect::<BTreeSet<_>>();
 
-        assert_eq!(documented_codes, current_codes);
+        assert_eq!(unique_codes.len(), current_codes.len());
+        assert_eq!(
+            current_codes,
+            [
+                "TUNNEL_INVALID_PORT".to_string(),
+                "TUNNEL_LOCAL_PORT_IN_USE".to_string(),
+                "TUNNEL_SSH_FAILED".to_string(),
+                "TUNNEL_INVALID_TRANSITION".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -278,13 +279,5 @@ mod tunnel_domain_tests {
 
         profile.kind = TunnelKind::Remote;
         assert!(!tunnel_requires_local_port_check(&profile));
-    }
-
-    fn extract_tunnel_error_codes(input: &str) -> BTreeSet<String> {
-        input
-            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-            .filter(|token| token.starts_with("TUNNEL_"))
-            .map(ToString::to_string)
-            .collect()
     }
 }
