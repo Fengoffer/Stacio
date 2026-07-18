@@ -30,6 +30,12 @@ test('homepage does not render the SEO search-intent section', () => {
   assert.doesNotMatch(mainJS, /\buseCases\s*:/);
 });
 
+test('security panel does not render platform availability messaging', () => {
+  assert.doesNotMatch(indexHTML, /Windows \/ Linux 入口保持预留状态/);
+  assert.doesNotMatch(mainJS, /Windows \/ Linux entries remain planned states/);
+  assert.doesNotMatch(mainJS, /proof4:/);
+});
+
 test('published website does not claim database or Redis capabilities', () => {
   const unsupportedCapability = /数据库|\bdatabase\b|\bredis(?:-cli)?\b|\bpostgres(?:ql)?\b|\bmysql\b|\bpsql\b/iu;
   const offenders = publishedTextFiles()
