@@ -71,15 +71,26 @@ test('homepage hides the FAQ section while retaining FAQ structured data', () =>
   assert.match(indexHTML, /"@type": "FAQPage"/);
 });
 
-test('hero preview uses theme-aware product screenshots with redacted demo connection data', () => {
-  assert.match(indexHTML, /assets\/stacio-workbench-dark\.png/);
-  assert.match(indexHTML, /assets\/stacio-workbench-light\.png/);
+test('hero preview is a theme-aware HTML and CSS Stacio workbench with demo connection data', () => {
+  assert.match(indexHTML, /class="product-workbench"/);
+  assert.match(indexHTML, /class="product-workbench-body"/);
+  assert.match(indexHTML, /class="product-terminal-code"/);
+  assert.match(indexHTML, /class="product-inspector"/);
+  assert.match(indexHTML, /class="icon-orb"/);
   assert.match(indexHTML, /203\.0\.113\.42/);
   assert.match(indexHTML, /198\.51\.100\.19/);
   assert.match(indexHTML, /ops@demo-ops-01:~#/);
   assert.doesNotMatch(indexHTML, /154\.37\.212\.69|220\.163\.92\.243|172\.16\.10\.250|192\.168\.124\.100/);
-  assert.match(stylesCSS, /html\[data-theme="dark"\] \.product-screenshot--dark/);
-  assert.match(stylesCSS, /\.app-window--screenshot \.product-screen \{ transform: scale\(1\.8\)/);
+  assert.doesNotMatch(indexHTML, /stacio-workbench-(?:dark|light)\.png/);
+  assert.doesNotMatch(stylesCSS, /product-screenshot|product-redaction/);
+  assert.equal(fs.existsSync(path.join(websiteRoot, 'assets', 'stacio-workbench-dark.png')), false);
+  assert.equal(fs.existsSync(path.join(websiteRoot, 'assets', 'stacio-workbench-light.png')), false);
+  assert.match(stylesCSS, /\.app-window--product \{/);
+  assert.match(stylesCSS, /html\[data-theme="light"\] \.app-window--product \{/);
+  assert.match(stylesCSS, /\.product-workbench-body \{/);
+  assert.match(stylesCSS, /\.product-terminal-line \{/);
+  assert.match(stylesCSS, /\.app-window--product \.product-workbench \{ transform: scale\(1\.8\)/);
+  assert.match(stylesCSS, /@media \(max-width: 760px\) \{[\s\S]*?\.hero \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
 });
 
 test('top navigation Gitee link uses the verified repository and telemetry event', () => {

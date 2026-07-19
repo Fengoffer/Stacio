@@ -34,7 +34,7 @@
   <meta name="theme-color" content="#f4f7fb" />
   <link rel="icon" href="/assets/stacio-logo.png" type="image/png" />
   <link rel="apple-touch-icon" href="/assets/stacio-logo.png" />
-  <link rel="stylesheet" href="styles.css?v=20260718-product-screenshots" />
+  <link rel="stylesheet" href="styles.css?v=20260719-product-workbench" />
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -193,42 +193,91 @@
 
       <div class="hero-visual" data-od-id="hero-product-visual">
         <div class="icon-orb" aria-hidden="true"><img src="assets/stacio-logo.png" alt="" /></div>
-        <div class="app-window app-window--screenshot" role="img" aria-label="Stacio 主工作台真实界面预览，包含会话侧栏、远程终端和设备看板" data-od-id="product-window">
-          <div class="product-screen" aria-hidden="true">
-            <img class="product-screenshot product-screenshot--dark" src="assets/stacio-workbench-dark.png" alt="" />
-            <img class="product-screenshot product-screenshot--light" src="assets/stacio-workbench-light.png" alt="" />
+        <div class="app-window app-window--product" role="img" aria-label="Stacio 主工作台代码重绘预览，包含会话侧栏、远程终端和设备看板" data-od-id="product-window">
+          <div class="product-workbench" aria-hidden="true">
+            <div class="product-titlebar">
+              <div class="product-titlebar-left">
+                <span class="product-traffic"><i></i><i></i><i></i></span>
+                <span class="product-sidebar-toggle"><b></b><b></b></span>
+              </div>
+              <div class="product-titlebar-tools">
+                <span class="product-tool">+</span>
+                <span class="product-tool">&#8801;</span>
+                <span class="product-tool">&#9638;</span>
+                <span class="product-tool">&#9678;</span>
+                <span class="product-tool">&#10024;</span>
+                <span class="product-tool product-tool--grid">&#8862;</span>
+              </div>
+            </div>
 
-            <svg class="product-redaction product-redaction--dark" viewBox="0 0 1800 1062" preserveAspectRatio="none" aria-hidden="true">
-              <g class="redaction-side">
-                <rect x="70" y="224" width="230" height="44" fill="#282624" /><text x="76" y="244">192.0.2.48</text><text x="76" y="262">ops@192.0.2.48:22</text>
-                <rect x="70" y="282" width="244" height="25" fill="#3e3a38" /><text x="76" y="300">ops@203.0.113.42:22</text>
-                <rect x="70" y="317" width="230" height="45" fill="#282624" /><text x="76" y="337">198.51.100.27</text><text x="76" y="355">ops@198.51.100.27:22</text>
-              </g>
-              <g class="redaction-terminal">
-                <rect x="868" y="224" width="160" height="18" fill="#202020" /><text class="redaction-ip" x="870" y="238">203.0.113.42</text>
-                <rect x="700" y="514" width="160" height="18" fill="#202020" /><text class="redaction-ip" x="702" y="528">198.51.100.19</text>
-                <rect x="363" y="532" width="250" height="20" fill="#202020" /><text x="364" y="547">ops@demo-ops-01:~#</text>
-              </g>
-              <g class="redaction-panel">
-                <rect x="1450" y="205" width="190" height="24" fill="#202020" /><text x="1452" y="221">demo-ops-01</text>
-              </g>
-            </svg>
+            <div class="product-workbench-body">
+              <aside class="product-sidebar">
+                <div class="product-sidebar-heading"><strong>会话</strong><span>&rsaquo;&nbsp;&nbsp;&#8964;</span></div>
+                <div class="product-search"><i></i><span>搜索会话、主机或标签</span></div>
+                <div class="product-folder product-folder--recent"><span class="product-disclosure">&rsaquo;</span><i></i><strong>最近使用</strong></div>
+                <div class="product-session-group">
+                  <div class="product-folder"><span class="product-disclosure product-disclosure--open">&#8964;</span><i></i><strong>演示环境</strong></div>
+                  <div class="product-session-list">
+                    <div class="product-session"><span class="product-session-icon"></span><div><b>192.0.2.48</b><small>ops@192.0.2.48:22</small></div></div>
+                    <div class="product-session product-session--active"><span class="product-session-icon product-session-icon--cloud"></span><div><b>演示主机</b><small>ops@203.0.113.42:22</small></div></div>
+                    <div class="product-session"><span class="product-session-icon"></span><div><b>198.51.100.19</b><small>ops@198.51.100.19:22</small></div></div>
+                  </div>
+                </div>
+              </aside>
 
-            <svg class="product-redaction product-redaction--light" viewBox="0 0 1800 1062" preserveAspectRatio="none" aria-hidden="true">
-              <g class="redaction-side">
-                <rect x="70" y="224" width="230" height="44" fill="#ebe6e3" /><text x="76" y="244">192.0.2.48</text><text x="76" y="262">ops@192.0.2.48:22</text>
-                <rect x="70" y="282" width="244" height="25" fill="#dedad7" /><text x="76" y="300">ops@203.0.113.42:22</text>
-                <rect x="70" y="317" width="230" height="45" fill="#ebe6e3" /><text x="76" y="337">198.51.100.27</text><text x="76" y="355">ops@198.51.100.27:22</text>
-              </g>
-              <g class="redaction-terminal">
-                <rect x="750" y="224" width="160" height="18" fill="#ffffff" /><text class="redaction-ip" x="752" y="238">203.0.113.42</text>
-                <rect x="620" y="514" width="170" height="18" fill="#ffffff" /><text class="redaction-ip" x="622" y="528">198.51.100.19</text>
-                <rect x="262" y="532" width="250" height="20" fill="#ffffff" /><text x="263" y="547">ops@demo-ops-01:~#</text>
-              </g>
-              <g class="redaction-panel">
-                <rect x="1450" y="205" width="190" height="24" fill="#ffffff" /><text x="1452" y="221">demo-ops-01</text>
-              </g>
-            </svg>
+              <section class="product-terminal-area">
+                <div class="product-terminal-tabs"><span class="product-terminal-tab product-terminal-tab--active"><i></i>演示主机</span><span class="product-tab-add">+</span></div>
+                <div class="product-terminal-code">
+                  <div class="product-terminal-line"><span>1</span><code>Welcome to Ubuntu <b class="term-violet">24.04.1</b> LTS (GNU/Linux <b class="term-violet">6.8.0-124-generic</b> x86_64)</code></div>
+                  <div class="product-terminal-line"><span>2</span><code></code></div>
+                  <div class="product-terminal-line"><span>3</span><code>* Documentation: <b class="term-cyan">https://help.ubuntu.com</b></code></div>
+                  <div class="product-terminal-line"><span>4</span><code>* Management: <b class="term-cyan">https://landscape.canonical.com</b></code></div>
+                  <div class="product-terminal-line"><span>5</span><code>* Support: <b class="term-cyan">https://ubuntu.com/pro</b></code></div>
+                  <div class="product-terminal-line"><span>6</span><code></code></div>
+                  <div class="product-terminal-line"><span>7</span><code><b class="term-cyan">System information</b> as of Sat Jul 19 08:42:16 PM UTC 2026</code></div>
+                  <div class="product-terminal-line"><span>8</span><code></code></div>
+                  <div class="product-terminal-line"><span>9</span><code>System load: <b class="term-violet">0.18</b> &nbsp; Processes: <b class="term-violet">238</b></code></div>
+                  <div class="product-terminal-line"><span>10</span><code>Usage of /: <b class="term-violet">42.1%</b> of <b class="term-violet">48.7GB</b></code></div>
+                  <div class="product-terminal-line"><span>11</span><code>Memory usage: <b class="term-violet">21%</b> &nbsp; IPv4 address: <b class="term-orange">203.0.113.42</b></code></div>
+                  <div class="product-terminal-line"><span>12</span><code>Swap usage: <b class="term-violet">0%</b></code></div>
+                  <div class="product-terminal-line"><span>13</span><code></code></div>
+                  <div class="product-terminal-line"><span>14</span><code>* Security maintenance is not enabled.</code></div>
+                  <div class="product-terminal-line"><span>15</span><code></code></div>
+                  <div class="product-terminal-line"><span>16</span><code><b class="term-violet">7</b> updates can be applied immediately.</code></div>
+                  <div class="product-terminal-line"><span>17</span><code>Last login from <b class="term-orange">198.51.100.19</b></code></div>
+                  <div class="product-terminal-line product-terminal-line--prompt"><span>18</span><code><b>ops@demo-ops-01:~#</b><i></i></code></div>
+                </div>
+              </section>
+
+              <aside class="product-inspector">
+                <div class="product-inspector-heading"><span></span><strong>设备看板</strong></div>
+                <p class="product-inspector-host">演示主机</p>
+                <p class="product-inspector-refresh">实时刷新</p>
+                <section class="product-system-card">
+                  <h3><i></i>系统</h3>
+                  <dl class="product-system-grid">
+                    <div><dt>主机名称</dt><dd>demo-ops-01</dd></div>
+                    <div><dt>登录用户</dt><dd>ops</dd></div>
+                    <div><dt>操作系统</dt><dd>Ubuntu 24.04.1 LTS</dd></div>
+                    <div><dt>系统架构</dt><dd>x86_64</dd></div>
+                    <div><dt>内核版本</dt><dd>6.8.0-124-generic</dd></div>
+                    <div><dt>运行时长</dt><dd>17 天</dd></div>
+                  </dl>
+                </section>
+                <h3 class="product-section-title">概览</h3>
+                <div class="product-metric-grid">
+                  <article class="product-metric-card"><h4>CPU</h4><strong>4%</strong><small>&#8964; 8 CPU</small><span class="product-spark product-spark--blue"><i></i></span></article>
+                  <article class="product-metric-card"><h4>内存</h4><strong>21%</strong><small>3.3 GB / 15.6 GB</small><span class="product-spark product-spark--green"><i></i></span></article>
+                  <article class="product-metric-card"><h4>网络 I/O</h4><strong class="product-metric-flow product-metric-flow--blue">&#8595; 下载 6.6 KB/s</strong><strong class="product-metric-flow product-metric-flow--green">&#8593; 上传 9.9 KB/s</strong><span class="product-spark product-spark--yellow"><i></i></span></article>
+                  <article class="product-metric-card"><h4>磁盘读写</h4><strong class="product-metric-flow product-metric-flow--blue">&#8595; 读 0 B/s</strong><strong class="product-metric-flow product-metric-flow--orange">&#8593; 写 286 KB/s</strong><span class="product-spark product-spark--blue"><i></i></span></article>
+                </div>
+                <h3 class="product-section-title product-section-title--network">网络</h3>
+                <div class="product-network-row"><span>eth0</span><b class="product-metric-flow--blue">&#8595; 6.6 KB/s</b><b class="product-metric-flow--green">&#8593; 9.9 KB/s</b></div>
+                <p class="product-network-note">已自动隐藏 15 个虚拟网卡</p>
+                <h3 class="product-section-title product-section-title--disk">磁盘</h3>
+                <div class="product-disk-row"><span class="product-disk-ring"><i></i></span><div><b>/</b><strong>69%&nbsp; 33.9 GB / 49.1 GB</strong></div></div>
+              </aside>
+            </div>
           </div>
         </div>
       </div>
