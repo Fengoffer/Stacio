@@ -2,19 +2,30 @@ import AppKit
 
 public final class AITargetPickerViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     public var onSelectRuntimeID: ((String) -> Void)?
+    public var onConfirmRuntimeIDs: (([String]) -> Void)?
 
     private let sessions: [AgentTerminalSessionSummary]
+    private let allowsMultipleSelection: Bool
     private var filteredSessions: [AgentTerminalSessionSummary]
+    private var selectedRuntimeIDs: Set<String> = []
     private var searchQuery = ""
     private let searchField = NSSearchField()
     private let summaryLabel = NSTextField(labelWithString: "")
     private let emptyStateLabel = NSTextField(labelWithString: L10n.AI.noMatchingTargets)
     private let tableView = NSTableView()
+    private let doneButton = NSButton(title: "完成", target: nil, action: nil)
 
-    public init(sessions: [AgentTerminalSessionSummary]) {
+    public init(
+        sessions: [AgentTerminalSessionSummary],
+        allowsMultipleSelection: Bool = false,
+        initiallySelectedRuntimeIDs: [String] = []
+    ) {
         let sortedSessions = Self.sortedSessions(sessions)
         self.sessions = sortedSessions
+        self.allowsMultipleSelection = allowsMultipleSelection
         self.filteredSessions = sortedSessions
+        let knownRuntimeIDs = Set(sortedSessions.map(\.runtimeID))
+        self.selectedRuntimeIDs = Set(initiallySelectedRuntimeIDs).intersection(knownRuntimeIDs)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -47,6 +58,7 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         tableView.headerView = nil
         tableView.rowHeight = 48
+        tableView.allowsMultipleSelection = allowsMultipleSelection
         tableView.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("target")))
         tableView.dataSource = self
         tableView.delegate = self
@@ -60,10 +72,22 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
         emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
         emptyStateLabel.setAccessibilityIdentifier("Stacio.AI.targetPicker.empty")
 
+        doneButton.target = self
+        doneButton.action = #selector(doneButtonPressed(_:))
+        doneButton.bezelStyle = .rounded
+        doneButton.controlSize = .small
+        doneButton.isHidden = !allowsMultipleSelection
+        doneButton.setAccessibilityIdentifier("Stacio.AI.targetPicker.done")
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+
         container.addSubview(searchField)
         container.addSubview(summaryLabel)
         container.addSubview(scrollView)
         container.addSubview(emptyStateLabel)
+        container.addSubview(doneButton)
+        let scrollBottomConstraint = allowsMultipleSelection
+            ? scrollView.bottomAnchor.constraint(equalTo: doneButton.topAnchor, constant: -8)
+            : scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         NSLayoutConstraint.activate([
             container.widthAnchor.constraint(equalToConstant: 360),
             container.heightAnchor.constraint(equalToConstant: 320),
@@ -76,11 +100,14 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
             scrollView.topAnchor.constraint(equalTo: summaryLabel.bottomAnchor, constant: 8),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            scrollBottomConstraint,
             emptyStateLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyStateLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
             emptyStateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: scrollView.leadingAnchor, constant: 24),
-            emptyStateLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor, constant: -24)
+            emptyStateLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor, constant: -24),
+            doneButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            doneButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
+            doneButton.heightAnchor.constraint(equalToConstant: 24)
         ])
         view = container
         applyFilter()
@@ -103,11 +130,28 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
     }
 
     public func tableViewSelectionDidChange(_ notification: Notification) {
+        if allowsMultipleSelection {
+            let visibleIDs = Set(filteredSessions.map(\.runtimeID))
+            selectedRuntimeIDs.subtract(visibleIDs)
+            selectedRuntimeIDs.formUnion(
+                tableView.selectedRowIndexes.compactMap { index in
+                    filteredSessions.indices.contains(index) ? filteredSessions[index].runtimeID : nil
+                }
+            )
+            return
+        }
         let row = tableView.selectedRow
         guard filteredSessions.indices.contains(row) else {
             return
         }
+        guard allowsMultipleSelection == false else { return }
         onSelectRuntimeID?(filteredSessions[row].runtimeID)
+    }
+
+    @objc
+    private func doneButtonPressed(_ sender: Any?) {
+        let ids = sessions.compactMap { selectedRuntimeIDs.contains($0.runtimeID) ? $0.runtimeID : nil }
+        onConfirmRuntimeIDs?(ids)
     }
 
     @objc
@@ -124,6 +168,12 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
             filteredSessions = sessions.filter { searchableText(for: $0).contains(query) }
         }
         tableView.reloadData()
+        if allowsMultipleSelection {
+            let indexes = filteredSessions.enumerated().compactMap { index, session in
+                selectedRuntimeIDs.contains(session.runtimeID) ? index : nil
+            }
+            tableView.selectRowIndexes(IndexSet(indexes), byExtendingSelection: false)
+        }
         emptyStateLabel.isHidden = filteredSessions.isEmpty == false
         tableView.isHidden = filteredSessions.isEmpty
         summaryLabel.stringValue = "\(filteredSessions.count)/\(sessions.count) \(L10n.AI.targetSearchSummary)"
@@ -177,8 +227,21 @@ public final class AITargetPickerViewController: NSViewController, NSTableViewDa
         onSelectRuntimeID?(runtimeID)
     }
 
+    func selectRuntimeIDsForTesting(_ runtimeIDs: [String]) {
+        let indexes = runtimeIDs.compactMap { runtimeID in
+            filteredSessions.firstIndex(where: { $0.runtimeID == runtimeID })
+        }
+        tableView.selectRowIndexes(IndexSet(indexes), byExtendingSelection: false)
+        selectedRuntimeIDs = Set(runtimeIDs)
+        onConfirmRuntimeIDs?(indexes.map { filteredSessions[$0].runtimeID })
+    }
+
     var visibleRuntimeIDsForTesting: [String] {
         filteredSessions.map(\.runtimeID)
+    }
+
+    var selectedRuntimeIDsForTesting: [String] {
+        sessions.compactMap { selectedRuntimeIDs.contains($0.runtimeID) ? $0.runtimeID : nil }
     }
 
     var summaryTextForTesting: String {

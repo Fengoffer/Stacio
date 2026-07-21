@@ -1,1 +1,0 @@
-17 3,15 * * * root /opt/stacio-ops/shared/tls/renew-ops-stacio-tls.sh renew >> /var/log/stacio-ops-tls.log 2>&1

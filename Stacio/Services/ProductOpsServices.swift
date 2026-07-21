@@ -1211,15 +1211,19 @@ public enum UpdateVersionComparator {
 }
 
 public struct SparkleUpdateConfiguration: Equatable {
+    public static let scheduledCheckInterval: TimeInterval = 24 * 60 * 60
+
     public var feedURL: URL?
     public var publicEDKey: String
     public var automaticallyChecksForUpdates: Bool
+    public var scheduledCheckInterval: TimeInterval
     public var automaticallyDownloadsUpdates: Bool
 
     public init(configuration: ProductOpsConfiguration) {
         self.feedURL = configuration.effectiveAppcastURL
         self.publicEDKey = configuration.sparklePublicEDKey
-        self.automaticallyChecksForUpdates = false
+        self.automaticallyChecksForUpdates = true
+        self.scheduledCheckInterval = Self.scheduledCheckInterval
         self.automaticallyDownloadsUpdates = false
     }
 }

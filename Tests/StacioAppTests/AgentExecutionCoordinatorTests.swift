@@ -1006,6 +1006,40 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(bridge.closedRuntimeIDs, ["agent_bg_1"])
     }
 
+    func testRemoteSSHBackgroundRunnerDetectsCompletionAfterTrimmingLargeOutput() throws {
+        let largeBatch = Array(repeating: UInt8(ascii: "x"), count: 256 * 1024 + 32)
+            + Array("\n__STACIO_AGENT_DONE__:0\n".utf8)
+        let bridge = RecordingAgentBackgroundRuntimeBridge(
+            outputBatches: [largeBatch],
+            keepRunning: true
+        )
+        let runner = RemoteSSHAgentBackgroundCommandRunner(
+            runtimeBridge: bridge,
+            timeout: 0.12,
+            pollInterval: 0.01
+        )
+        var emitted: [AgentTraceEvent] = []
+
+        try runner.runBackgroundCommand(
+            AgentBackgroundCommandRequest(
+                requestID: "req-background-large-output",
+                command: "generate-large-output",
+                targetRuntimeID: "term_ssh",
+                targetTitle: "dev@example.com",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                redactedCommand: "generate-large-output",
+                liveSessionContext: makeTunnelLiveSessionContext()
+            ),
+            emit: { event in
+                emitted.append(event)
+            }
+        )
+
+        XCTAssertTrue(waitUntil { emitted.contains { $0.state == .completed } })
+        XCTAssertFalse(emitted.contains { $0.state == .failed })
+        XCTAssertEqual(bridge.closedRuntimeIDs, ["agent_bg_1"])
+    }
+
     func testRemoteSSHBackgroundRunnerStreamsOutputBatchesBeforeCompletion() throws {
         let bridge = RecordingAgentBackgroundRuntimeBridge(outputs: [
             "checking disk\n",

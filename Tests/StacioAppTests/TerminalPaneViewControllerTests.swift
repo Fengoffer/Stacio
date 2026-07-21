@@ -65,6 +65,29 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(overlay.closeButtonVisibleForTesting)
     }
 
+    func testAgentTraceOverlayUsesArrowCursorAndConvertsDragToTopLeadingOffset() {
+        let overlay = TerminalAgentTraceOverlayView(frame: NSRect(x: 8, y: 8, width: 520, height: 132))
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-drag",
+                state: .running,
+                message: "执行中",
+                redactedCommand: "uptime"
+            )
+        ])
+
+        overlay.resetCursorRects()
+        XCTAssertTrue(overlay.hitTest(NSPoint(x: 1, y: 1)) === overlay)
+        XCTAssertEqual(
+            overlay.dragOffsetForTesting(
+                from: NSPoint(x: 20, y: 20),
+                to: NSPoint(x: 70, y: 55),
+                superviewIsFlipped: true
+            ),
+            NSPoint(x: 50, y: 35)
+        )
+    }
+
     func testTerminalPaneLoadsSwiftTermView() {
         let sink = RecordingTerminalEventSink()
         let controller = TerminalPaneViewController(
@@ -292,12 +315,14 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         )
 
         XCTAssertTrue(controller.terminalView.superview === controller.view)
+        controller.view.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
+        controller.view.layoutSubtreeIfNeeded()
         let overlay = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay")
                 as? TerminalAgentTraceOverlayView
         )
         XCTAssertTrue(overlay.superview === controller.view)
-        XCTAssertNil(overlay.hitTest(NSPoint(x: 1, y: 1)))
+        XCTAssertTrue(overlay.hitTest(NSPoint(x: 1, y: 1)) === overlay)
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-hit-test"))
     }
 

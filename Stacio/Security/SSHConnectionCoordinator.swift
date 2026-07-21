@@ -300,8 +300,14 @@ public final class SSHConnectionCoordinator {
             }
             return .password(value: secret)
         case let .privateKey(keyPath, _):
+            let privateKeyMaterial: String
+            do {
+                privateKeyMaterial = try privateKeyLoader.loadPrivateKey(at: keyPath)
+            } catch {
+                throw SSHConnectionCoordinatorError.missingPrivateKey(path: keyPath)
+            }
             return .privateKey(
-                privateKeyPem: try privateKeyLoader.loadPrivateKey(at: keyPath),
+                privateKeyPem: privateKeyMaterial,
                 passphrase: credential.primarySecret
             )
         case .agent:

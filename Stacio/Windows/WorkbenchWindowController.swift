@@ -981,14 +981,27 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             ),
             maximumInspectorWidth
         )
-        let targetWidth = min(
-            targetInspectorWidth(
+        // A width captured during the current layout session represents the
+        // user's active panel state (including an expanded files editor). It
+        // must win over a stale persisted width from an earlier, narrower
+        // panel state. Use persisted width only for a fresh layout without a
+        // pending runtime width.
+        let requestedWidth: CGFloat
+        if let pendingInspectorWidth,
+           pendingInspectorWidth > 0
+        {
+            requestedWidth = clampedInspectorWidth(
+                pendingInspectorWidth,
+                splitWidth: splitView.bounds.width
+            )
+        } else {
+            requestedWidth = targetInspectorWidth(
                 storedWidth: storedInspectorWidth,
                 defaultWidth: defaultWidth,
                 splitWidth: splitView.bounds.width
-            ),
-            maximumInspectorWidth
-        )
+            )
+        }
+        let targetWidth = min(requestedWidth, maximumInspectorWidth)
         guard targetWidth > 0 else {
             inspectorSplitViewItem.holdingPriority = .defaultHigh
             return
@@ -1376,7 +1389,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         keepSidebarReadableWithoutResizingWindow()
     }
 
-    private func prepareInspectorWidthForFilesCapabilityOpen() {
+    private func prepareInspectorWidthForFilesCapabilityOpen(
+        restoringCollapsedInspector: Bool = false
+    ) {
         let windowFrame = window?.frame
         defer {
             restoreProgrammaticFrameIfNeeded(windowFrame)
@@ -1393,15 +1408,26 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
               subviews[2].isHidden == false
         else { return }
 
-        let defaultWidth = defaultInspectorWidth(
-            for: splitView.bounds.width,
-            preferredWidth: defaultInspectorPanelWidth
-        )
-        let storedWidth = storedSplitWidth(column: "inspector") ?? 0
-        let targetWidth = clampedInspectorWidth(
-            max(defaultWidth, storedWidth, preferredFilesCapabilityInspectorWidth),
-            splitWidth: splitView.bounds.width
-        )
+        let targetWidth: CGFloat
+        if restoringCollapsedInspector,
+           let pendingInspectorWidth,
+           pendingInspectorWidth > 0
+        {
+            targetWidth = clampedInspectorWidth(
+                pendingInspectorWidth,
+                splitWidth: splitView.bounds.width
+            )
+        } else {
+            let defaultWidth = defaultInspectorWidth(
+                for: splitView.bounds.width,
+                preferredWidth: defaultInspectorPanelWidth
+            )
+            let storedWidth = storedSplitWidth(column: "inspector") ?? 0
+            targetWidth = clampedInspectorWidth(
+                max(defaultWidth, storedWidth, preferredFilesCapabilityInspectorWidth),
+                splitWidth: splitView.bounds.width
+            )
+        }
         guard targetWidth > 0 else { return }
 
         let storedSidebarWidth = storedSplitWidth(column: "sidebar")
@@ -2257,6 +2283,22 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return menu
     }
 
+    private func makeSessionImportMenu() -> NSMenu {
+        let menu = NSMenu(title: L10n.Import.title)
+        for source in AppKitSessionImportSourcePicker.supportedSources {
+            let item = NSMenuItem(
+                title: source.name,
+                action: #selector(performImportSourceFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = source.type.rawValue
+            item.image = SessionImportSourceIconCatalog.image(for: source)
+            menu.addItem(item)
+        }
+        return menu
+    }
+
     private func splitTerminalMenuItem(
         title: String,
         symbolName: String,
@@ -2341,6 +2383,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         identifiers.append(contentsOf: [
             .flexibleSpace,
             ToolbarItem.newSession,
+            ToolbarItem.importSessions,
             .space,
             ToolbarItem.multiExec,
             ToolbarItem.split,
@@ -2379,6 +2422,20 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             item.action = #selector(performSplitTerminalFromToolbar(_:))
             item.menu = makeSplitTerminalToolbarMenu()
             item.showsIndicator = true
+            return item
+        }
+        if itemIdentifier == ToolbarItem.importSessions {
+            let item = NSMenuToolbarItem(itemIdentifier: itemIdentifier)
+            item.target = self
+            item.label = L10n.Workbench.importSessions
+            item.paletteLabel = L10n.Workbench.importSessions
+            item.toolTip = L10n.Workbench.importSessionsTooltip
+            item.image = NSImage(
+                systemSymbolName: "rectangle.stack.badge.plus",
+                accessibilityDescription: L10n.Workbench.importSessionsAccessibilityDescription
+            )
+            item.menu = makeSessionImportMenu()
+            item.showsIndicator = false
             return item
         }
         if itemIdentifier == ToolbarItem.panels {
@@ -2422,10 +2479,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: L10n.Workbench.newSession)
             item.action = #selector(performNewSessionFromToolbar(_:))
         case ToolbarItem.importSessions:
-            item.label = L10n.Sidebar.importSessions
-            item.paletteLabel = L10n.Sidebar.importSessions
-            item.toolTip = L10n.Sidebar.importSessions
-            item.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: L10n.Sidebar.importSessions)
+            item.label = L10n.Workbench.importSessions
+            item.paletteLabel = L10n.Workbench.importSessions
+            item.toolTip = L10n.Workbench.importSessionsTooltip
+            item.image = NSImage(
+                systemSymbolName: "rectangle.stack.badge.plus",
+                accessibilityDescription: L10n.Workbench.importSessionsAccessibilityDescription
+            )
             item.action = #selector(performImportFromToolbar(_:))
         case ToolbarItem.closeTerminal:
             item.label = L10n.Workbench.close
@@ -2438,10 +2498,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             item.paletteLabel = L10n.Workbench.multiExec
             item.toolTip = L10n.Workbench.multiExecTooltip
             item.image = NSImage(
-                systemSymbolName: "square.stack.3d.up",
+                systemSymbolName: "arrow.triangle.branch",
                 accessibilityDescription: L10n.Workbench.multiExecAccessibilityDescription
             ) ?? NSImage(
-                systemSymbolName: "rectangle.stack",
+                systemSymbolName: "point.3.connected.trianglepath.dotted",
                 accessibilityDescription: L10n.Workbench.multiExecAccessibilityDescription
             )
             item.action = #selector(performMultiExecFromToolbar(_:))
@@ -2518,6 +2578,16 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     @objc
+    public func performImportSourceFromMenu(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let rawValue = item.representedObject as? String,
+              let sourceType = SessionImportSourceType(rawValue: rawValue),
+              let sessionSidebarViewController
+        else { return }
+        performImportFromSidebar(sessionSidebarViewController, sourceType: sourceType)
+    }
+
+    @objc
     public func performSplitTerminalFromToolbar(_ sender: Any?) {
         performVerticalSplitTerminalFromToolbar(sender)
     }
@@ -2581,8 +2651,17 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             _ = try? workspaceViewController.openFileSession(path: localPath, title: L10n.Workspace.localFiles)
             return
         }
+        let hasExpandedFilesCapability = inspectorViewController?.filesViewController?
+            .isEmbeddedCapabilityExpandedForInspectorControls == true
+        let wasInspectorCollapsed = inspectorSplitViewItem?.isCollapsed == true
         revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        if hasExpandedFilesCapability {
+            prepareInspectorWidthForFilesCapabilityOpen(
+                restoringCollapsedInspector: wasInspectorCollapsed
+            )
+        } else {
+            applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        }
         keepSidebarReadableWithoutResizingWindow()
         do {
             if let binding = currentRemoteFilesBinding {
@@ -2596,8 +2675,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         scheduleInspectorReadabilityRepair(
             preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
+            preferredDefaultWidth: hasExpandedFilesCapability
+                ? preferredFilesCapabilityInspectorWidth
+                : defaultInspectorPanelWidth,
+            force: hasExpandedFilesCapability == false
         )
         scheduleSidebarReadabilityRepair(preserving: windowFrame)
     }
@@ -2750,7 +2831,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let willRevealInspector = inspectorSplitViewItem.isCollapsed
         if willRevealInspector {
             revealInspector()
-            applyDefaultInspectorWidthIfNeeded()
+            if inspectorViewController?.filesViewController?.isEmbeddedCapabilityExpandedForInspectorControls == true {
+                prepareInspectorWidthForFilesCapabilityOpen(restoringCollapsedInspector: true)
+            } else {
+                applyDefaultInspectorWidthIfNeeded()
+            }
             scheduleInspectorReadabilityRepair(preserving: windowFrame)
         } else {
             if let inspectorWidth = currentInspectorPanelWidth() {
@@ -2930,11 +3015,21 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         title: String,
         automationPolicy: SessionAutomationPolicy,
         proxyJumpSelection: SSHProxyJumpSelection,
-        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?
+        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)? = nil
     ) throws -> LiveShellStatus {
         let starter = try resolvedRemoteSessionStarter()
         let status: LiveShellStatus
-        if let proxyJumpStarter = starter as? RemoteSSHSessionProxyJumpStarting {
+        if let coordinator = starter as? RemoteSSHSessionCoordinator {
+            status = try coordinator.openSessionTab(
+                config: config,
+                title: title,
+                automationPolicy: automationPolicy,
+                proxyJumpSelection: proxyJumpSelection,
+                proxyJumpSessionResolver: proxyJumpSessionResolver,
+                credentialRecovery: credentialRecovery
+            )
+        } else if let proxyJumpStarter = starter as? RemoteSSHSessionProxyJumpStarting {
             status = try proxyJumpStarter.openSessionTab(
                 config: config,
                 title: title,
@@ -2999,9 +3094,35 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return result
     }
 
+    @discardableResult
+    public func importSessionsFromSidebar(
+        _ sidebar: SessionSidebarViewController,
+        sourceType: SessionImportSourceType
+    ) throws -> ImportApplyResult? {
+        let result = try resolvedSessionImportCoordinator().runImport(
+            sourceType: sourceType,
+            parentWindow: window
+        )
+        if result?.report.importedCount ?? 0 > 0 {
+            sidebar.reloadSessions()
+        }
+        return result
+    }
+
     public func performImportFromSidebar(_ sidebar: SessionSidebarViewController) {
         do {
             _ = try importSessionsFromSidebar(sidebar)
+        } catch {
+            sessionImportErrorPresenter.presentSessionImportError(error, parentWindow: window)
+        }
+    }
+
+    public func performImportFromSidebar(
+        _ sidebar: SessionSidebarViewController,
+        sourceType: SessionImportSourceType
+    ) {
+        do {
+            _ = try importSessionsFromSidebar(sidebar, sourceType: sourceType)
         } catch {
             sessionImportErrorPresenter.presentSessionImportError(error, parentWindow: window)
         }
@@ -3193,6 +3314,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             proxyJumpSelection: proxyJumpSelection,
             proxyJumpSessionResolver: { id in
                 try CoreBridge.listAllSessionRecords(databasePath: databasePath).first(where: { $0.id == id })
+            },
+            credentialRecovery: { [weak self] in
+                self?.recoverSavedSessionPasswordAfterAuthenticationFailure(for: session)
             }
         )
         workspaceViewController.setManualSessionIcon(manualIconID, runtimeID: status.runtimeId)
@@ -3268,6 +3392,66 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             replacementCredentialID: credential.id
         )
         return updatedSession
+    }
+
+    private func recoverSavedSessionPasswordAfterAuthenticationFailure(
+        for session: SessionRecord
+    ) -> SshConnectionConfig? {
+        let normalizedProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalizedProtocol == "ssh" || normalizedProtocol == "scp" else {
+            return nil
+        }
+
+        let displayName = optionalTrimmed(session.name) ?? session.host
+        let username = optionalTrimmed(session.username) ?? NSUserName()
+        let request = SavedSessionCredentialPromptRequest(
+            sessionID: session.id,
+            sessionName: displayName,
+            protocolName: normalizedProtocol.uppercased(),
+            host: session.host,
+            account: "\(username)@\(session.host)",
+            kind: .password,
+            label: savedSessionCredentialLabel(displayName: displayName, kind: .password)
+        )
+        guard let secret = savedSessionCredentialPromptPresenter.promptForSavedSessionCredential(
+            request,
+            parentWindow: window
+        ), let databasePath = try? databasePathProvider() else {
+            return nil
+        }
+
+        do {
+            let credentialSaver = resolvedSavedSessionCredentialSaver(databasePath: databasePath)
+            let credential = try credentialSaver.saveCredential(
+                kind: SavedSessionCredentialKind.password.storageKind,
+                label: request.label,
+                account: request.account,
+                secret: secret
+            )
+            let updatedSession = try CoreBridge.updateSessionRecord(
+                databasePath: databasePath,
+                id: session.id,
+                update: SessionUpdate(
+                    name: nil,
+                    protocol: nil,
+                    folderId: nil,
+                    host: nil,
+                    port: nil,
+                    username: nil,
+                    privateKeyPath: session.privateKeyPath == nil ? nil : "",
+                    credentialId: credential.id,
+                    tags: nil,
+                    configJson: nil
+                )
+            )
+            try? (credentialSaver as? SessionSidebarCredentialCleaning)?.cleanupReplacedCredential(
+                previousCredentialID: session.credentialId,
+                replacementCredentialID: credential.id
+            )
+            return try savedSessionSSHConfig(for: updatedSession)
+        } catch {
+            return nil
+        }
     }
 
     private func savedSessionCredentialPromptRequest(
@@ -3492,7 +3676,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 - splitView.dividerThickness * 2
         )
         let initialWidth = min(
-            storedSplitWidth(column: "inspector") ?? defaultWidth,
+            pendingInspectorWidth ?? storedSplitWidth(column: "inspector") ?? defaultWidth,
             maximumInitialWidth
         )
         let needsTemporaryWidthCap = initialWidth > 0

@@ -32,6 +32,7 @@ final class StacioApplicationTests: XCTestCase {
 
         XCTAssertNotNil(createdController)
         XCTAssertTrue(createdController?.showWindowSender as AnyObject === delegate)
+        XCTAssertNil(NSApplication.shared.helpMenu)
         createdController = nil
         XCTAssertNotNil(weakController)
     }
@@ -69,7 +70,7 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.13.3"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.13.5"))
     }
 
     func testApplicationLaunchRevalidatesLicenseAndStartsNetworkMonitoring() async {
@@ -454,7 +455,7 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.13.3")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.13.5")
         XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
         XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")
@@ -492,7 +493,7 @@ final class StacioApplicationTests: XCTestCase {
         let image = NSImage(size: NSSize(width: 32, height: 32))
         let content = StacioAboutContent(
             applicationName: "Stacio",
-            displayVersion: "Stacio-0.13.3",
+            displayVersion: "Stacio-0.13.5",
             websiteURL: URL(string: "https://www.stacio.cn/")!,
             repositoryURL: URL(string: "https://github.com/Fengoffer/Stacio")!,
             giteeRepositoryURL: URL(string: "https://gitee.com/fengoffer/Stacio")!,

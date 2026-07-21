@@ -315,6 +315,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var fileBrowserMinimumWidthConstraint: NSLayoutConstraint?
     private var fileBrowserCurrentWidthConstraint: NSLayoutConstraint?
     private var fileBrowserWidthBeforeCollapse: CGFloat?
+    private var fileBrowserWidthBeforeCapabilityCollapse: CGFloat?
     private var isEmbeddedCapabilityCollapsed = false
     private var lastKnownVisibleFileBrowserWidth: CGFloat?
     private var needsInitialEditorSplitPosition = false
@@ -422,6 +423,10 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
 
     var hasEmbeddedCapabilityForInspectorControls: Bool {
         embeddedEditorViewController != nil || embeddedMediaPreviewViewController != nil
+    }
+
+    var isEmbeddedCapabilityExpandedForInspectorControls: Bool {
+        hasEmbeddedCapabilityForInspectorControls && isEmbeddedCapabilityCollapsed == false
     }
 
     var isEmbeddedCapabilityCollapsedForInspectorControls: Bool {
@@ -546,15 +551,21 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         showHiddenFilesButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         showHiddenFilesButton.setContentHuggingPriority(.required, for: .horizontal)
 
-        tableView.addTableColumn(makeColumn(identifier: "name", title: "名称", width: 100))
-        tableView.addTableColumn(makeColumn(identifier: "size", title: "大小", width: 52))
-        tableView.addTableColumn(makeColumn(identifier: "owner", title: "用户", width: 48))
-        tableView.addTableColumn(makeColumn(identifier: "permissions", title: "权限", width: 50))
-        tableView.addTableColumn(makeColumn(identifier: "time", title: "时间", width: 68))
+        tableView.addTableColumn(makeColumn(
+            identifier: "name",
+            title: "名称",
+            width: 280,
+            minWidth: 180,
+            autoresizes: true
+        ))
+        tableView.addTableColumn(makeColumn(identifier: "size", title: "大小", width: 80, minWidth: 64))
+        tableView.addTableColumn(makeColumn(identifier: "owner", title: "用户", width: 72, minWidth: 56))
+        tableView.addTableColumn(makeColumn(identifier: "permissions", title: "权限", width: 92, minWidth: 72))
+        tableView.addTableColumn(makeColumn(identifier: "time", title: "时间", width: 128, minWidth: 112))
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.allowsColumnResizing = true
         tableView.allowsMultipleSelection = true
-        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         tableView.rowHeight = StacioFileDisplay.tableRowHeight
         tableView.intercellSpacing = NSSize(width: 0, height: 1)
         tableView.dataSource = self
@@ -581,7 +592,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         scrollView.localFileDropHandler = localFileDropHandler
         clipView.localFileDropHandler = localFileDropHandler
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
+        scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
@@ -705,7 +716,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         synchronizeStandaloneFileBrowserFrameIfNeeded()
         updateTransferStatusScrollerVisibility()
         applyInitialEditorSplitPositionIfNeeded()
-        updateTableColumnWidths()
         layoutPathBreadcrumbs()
         scrollPathBreadcrumbsToCurrentDirectory()
         rememberVisibleFileBrowserWidth()
@@ -1336,6 +1346,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         fileBrowserMinimumWidthConstraint = nil
         fileBrowserCurrentWidthConstraint = nil
         fileBrowserWidthBeforeCollapse = nil
+        fileBrowserWidthBeforeCapabilityCollapse = nil
         isEmbeddedCapabilityCollapsed = false
         embeddedCapabilityExpandButton.isHidden = true
         needsInitialEditorSplitPosition = false
@@ -1521,6 +1532,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             return
         }
         let fileBrowserWidth = fileBrowserWidthForRestoredStandaloneMode()
+        fileBrowserWidthBeforeCapabilityCollapse = fileBrowserWidth
         synchronizeEditorSplitFrameWithRootIfNeeded()
         NSLayoutConstraint.deactivate(editorSplitWidthConstraints)
         editorSplitWidthConstraints = []
@@ -1550,9 +1562,15 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         embeddedCapabilityExpandButton.isHidden = true
         installCapabilityViewInSplit(capabilityView)
         installEditorSplitWidthConstraints(editorView: capabilityView)
-        needsInitialEditorSplitPosition = true
+        let restoredBrowserWidth = fileBrowserWidthBeforeCapabilityCollapse
+        fileBrowserWidthBeforeCapabilityCollapse = nil
+        needsInitialEditorSplitPosition = restoredBrowserWidth == nil
         view.layoutSubtreeIfNeeded()
-        applyInitialEditorSplitPositionIfNeeded()
+        if let restoredBrowserWidth {
+            applyEditorSplitPosition(browserWidth: restoredBrowserWidth)
+        } else {
+            applyInitialEditorSplitPositionIfNeeded()
+        }
     }
 
     private func embeddedCapabilityView() -> NSView? {
@@ -1640,6 +1658,35 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         needsInitialEditorSplitPosition = false
         contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
         fileBrowserCurrentWidthConstraint?.constant = browserWidth
+        contentSplitView.adjustSubviews()
+        contentSplitView.layoutSubtreeIfNeeded()
+        view.layoutSubtreeIfNeeded()
+    }
+
+    private func applyEditorSplitPosition(browserWidth: CGFloat) {
+        guard contentSplitView.superview != nil,
+              embeddedCapabilityView() != nil,
+              contentSplitView.arrangedSubviews.count == 2
+        else {
+            return
+        }
+        synchronizeEditorSplitFrameWithRootIfNeeded()
+        let availableWidth = contentSplitView.bounds.width
+        guard availableWidth > 0 else { return }
+        let dividerWidth = contentSplitView.dividerThickness
+        let maximumBrowserWidth = availableWidth
+            - dividerWidth
+            - EditorCapabilityLayout.minimumEditorWidth
+        guard maximumBrowserWidth >= EditorCapabilityLayout.minimumBrowserWidth else {
+            return
+        }
+        let restoredBrowserWidth = min(
+            max(browserWidth, EditorCapabilityLayout.minimumBrowserWidth),
+            maximumBrowserWidth
+        )
+        let editorWidth = availableWidth - dividerWidth - restoredBrowserWidth
+        fileBrowserCurrentWidthConstraint?.constant = restoredBrowserWidth
+        contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
         contentSplitView.adjustSubviews()
         contentSplitView.layoutSubtreeIfNeeded()
         view.layoutSubtreeIfNeeded()
@@ -1855,73 +1902,22 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
-    private func makeColumn(identifier: String, title: String, width: CGFloat) -> NSTableColumn {
+    private func makeColumn(
+        identifier: String,
+        title: String,
+        width: CGFloat,
+        minWidth: CGFloat,
+        autoresizes: Bool = false
+    ) -> NSTableColumn {
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
         column.title = title
         column.width = width
-        column.minWidth = min(width, 32)
-        column.resizingMask = .userResizingMask
+        column.minWidth = minWidth
+        column.resizingMask = autoresizes
+            ? [.userResizingMask, .autoresizingMask]
+            : .userResizingMask
         column.sortDescriptorPrototype = NSSortDescriptor(key: identifier, ascending: true)
         return column
-    }
-
-    private func updateTableColumnWidths() {
-        guard tableView.tableColumns.count >= 5,
-              let nameColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("name")),
-              let sizeColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("size")),
-              let ownerColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("owner")),
-              let permissionsColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("permissions")),
-              let timeColumn = tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("time"))
-        else { return }
-
-        let visibleWidth = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
-        guard visibleWidth.isFinite, visibleWidth > 0 else { return }
-
-        let minimumWidths: [(NSTableColumn, CGFloat)] = [
-            (nameColumn, 72),
-            (sizeColumn, 40),
-            (ownerColumn, 38),
-            (permissionsColumn, 44),
-            (timeColumn, 58)
-        ]
-        let preferredWidths: [(NSTableColumn, CGFloat)] = [
-            (nameColumn, 150),
-            (sizeColumn, 64),
-            (ownerColumn, 58),
-            (permissionsColumn, 64),
-            (timeColumn, 88)
-        ]
-        let minimumTotal = minimumWidths.reduce(CGFloat(0)) { $0 + $1.1 }
-        let preferredTotal = preferredWidths.reduce(CGFloat(0)) { $0 + $1.1 }
-        let targetWidths: [(NSTableColumn, CGFloat)]
-        if visibleWidth <= minimumTotal {
-            let scale = max(0.72, visibleWidth / minimumTotal)
-            targetWidths = minimumWidths.map { column, width in
-                (column, max(32, floor(width * scale)))
-            }
-        } else {
-            let extra = visibleWidth - minimumTotal
-            let preferredExtra = preferredTotal - minimumTotal
-            let progress = preferredExtra > 0 ? min(1, extra / preferredExtra) : 1
-            var widths = zip(minimumWidths, preferredWidths).map { minimumPair, preferredPair in
-                (minimumPair.0, minimumPair.1 + ((preferredPair.1 - minimumPair.1) * progress))
-            }
-            if visibleWidth > preferredTotal,
-               let first = widths.first
-            {
-                widths[0] = (first.0, first.1 + (visibleWidth - preferredTotal))
-            }
-            targetWidths = widths
-        }
-        for (column, width) in targetWidths where abs(column.width - width) > 1 {
-            column.width = width
-        }
-        let totalWidth = tableView.tableColumns.reduce(CGFloat(0)) { partialResult, column in
-            partialResult + column.width
-        }
-        guard totalWidth > visibleWidth + 1 else { return }
-        let overflow = totalWidth - visibleWidth
-        nameColumn.width = max(44, nameColumn.width - overflow)
     }
 
     private func stylePathField() {

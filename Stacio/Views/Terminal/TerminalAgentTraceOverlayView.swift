@@ -26,8 +26,12 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
     private var hoverTrackingArea: NSTrackingArea?
     private var fixedWidthConstraint: NSLayoutConstraint?
     private var fixedHeightConstraint: NSLayoutConstraint?
+    private var dragStartLocationInSuperview: NSPoint?
+    private var dragStartOffset: NSPoint?
+    private var currentDragOffset = NSPoint.zero
 
     public var onControlAction: ((String, TerminalAgentTaskControlAction) -> Void)?
+    public var onDragOffsetChanged: ((NSPoint) -> Void)?
 
     public override convenience init(frame frameRect: NSRect) {
         self.init(frame: frameRect, completedAutoDismissInterval: 10)
@@ -106,6 +110,10 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
             width: fixedWidthConstraint?.constant ?? 0,
             height: fixedHeightConstraint?.constant ?? 0
         )
+    }
+
+    func dragOffsetForTesting(from start: NSPoint, to end: NSPoint, superviewIsFlipped: Bool) -> NSPoint {
+        Self.dragOffset(from: start, to: end, startingAt: .zero, superviewIsFlipped: superviewIsFlipped)
     }
 
     private static func compactDetail(_ text: String, limit: Int = 150) -> String {
@@ -243,7 +251,7 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
         }
         let trackingArea = NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow],
+            options: [.mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow],
             owner: self,
             userInfo: nil
         )
@@ -259,6 +267,54 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
     public override func mouseExited(with event: NSEvent) {
         pointerIsInside = false
         updateCloseButtonVisibility()
+    }
+
+    public override func cursorUpdate(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    public override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    public override func mouseDown(with event: NSEvent) {
+        guard let superview else { return }
+        dragStartLocationInSuperview = superview.convert(event.locationInWindow, from: nil)
+        dragStartOffset = currentDragOffset
+    }
+
+    public override func mouseDragged(with event: NSEvent) {
+        guard let superview,
+              let dragStartLocationInSuperview,
+              let dragStartOffset
+        else { return }
+        let currentLocation = superview.convert(event.locationInWindow, from: nil)
+        let offset = Self.dragOffset(
+            from: dragStartLocationInSuperview,
+            to: currentLocation,
+            startingAt: dragStartOffset,
+            superviewIsFlipped: superview.isFlipped
+        )
+        currentDragOffset = offset
+        onDragOffsetChanged?(offset)
+    }
+
+    public override func mouseUp(with event: NSEvent) {
+        dragStartLocationInSuperview = nil
+        dragStartOffset = nil
+    }
+
+    private static func dragOffset(
+        from start: NSPoint,
+        to end: NSPoint,
+        startingAt offset: NSPoint,
+        superviewIsFlipped: Bool
+    ) -> NSPoint {
+        NSPoint(
+            x: offset.x + end.x - start.x,
+            y: offset.y + (superviewIsFlipped ? end.y - start.y : start.y - end.y)
+        )
     }
 
     private func configureControlButton(_ button: NSButton, action: Selector) {
@@ -393,8 +449,9 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
     }
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
-        guard let hit = super.hitTest(point) else { return nil }
+        guard isHidden == false, bounds.contains(point) else { return nil }
+        guard let hit = super.hitTest(point) else { return self }
         let controls = [pauseButton, cancelButton, takeOverButton, confirmCompleteButton, closeButton]
-        return controls.contains(where: { hit === $0 || hit.isDescendant(of: $0) }) ? hit : nil
+        return controls.contains(where: { hit === $0 || hit.isDescendant(of: $0) }) ? hit : self
     }
 }

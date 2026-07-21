@@ -335,24 +335,76 @@ public final class AIAssistantCoordinator {
         requestID: String = UUID().uuidString,
         emit: ((AgentTraceEvent) -> Void)? = nil
     ) throws -> [AgentTraceEvent] {
-        let request = AgentBridgeRequest(
-            id: requestID,
-            actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
-            action: .runCommand(
-                AgentRunCommandRequest(
-                    target: .runtimeID(context.runtimeID),
-                    command: command,
-                    follow: true
+        try executeProposedCommand(
+            command,
+            contexts: [context],
+            requestID: requestID,
+            emit: emit
+        )
+    }
+
+    @discardableResult
+    @MainActor
+    public func executeProposedCommand(
+        _ command: String,
+        contexts: [AITerminalContext],
+        requestID: String = UUID().uuidString,
+        emit: ((AgentTraceEvent) -> Void)? = nil
+    ) throws -> [AgentTraceEvent] {
+        var seenRuntimeIDs = Set<String>()
+        let normalizedContexts = contexts.filter {
+            $0.runtimeID.isEmpty == false && seenRuntimeIDs.insert($0.runtimeID).inserted
+        }
+        guard normalizedContexts.isEmpty == false else {
+            return []
+        }
+        var allEvents: [AgentTraceEvent] = []
+        for (index, context) in normalizedContexts.enumerated() {
+            let childRequestID = normalizedContexts.count == 1
+                ? requestID
+                : "\(requestID)-\(index + 1)"
+            let request = AgentBridgeRequest(
+                id: childRequestID,
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID(context.runtimeID),
+                        command: command,
+                        follow: true
+                    )
                 )
             )
-        )
-        if let emit,
-           let streamingExecutor = executionCoordinator as? AgentCommandStreamingExecuting {
-            return try streamingExecutor.runCommand(request, emit: emit)
+            let events: [AgentTraceEvent]
+            do {
+                if let emit,
+                   let streamingExecutor = executionCoordinator as? AgentCommandStreamingExecuting {
+                    events = try streamingExecutor.runCommand(request, emit: emit)
+                } else {
+                    events = try executionCoordinator.runCommand(request)
+                    events.forEach { emit?($0) }
+                }
+            } catch {
+                if normalizedContexts.count == 1 {
+                    throw error
+                }
+                let failed = AgentTraceEvent(
+                    requestID: childRequestID,
+                    state: .failed,
+                    message: RuntimeDiagnosticFormatter.userMessage(for: error),
+                    redactedCommand: AgentProtocolRedaction.redact(command),
+                    metadata: [
+                        "sourceRuntimeID": context.runtimeID,
+                        "targetTitle": context.title,
+                        "multiTarget": "true"
+                    ]
+                )
+                emit?(failed)
+                allEvents.append(failed)
+                continue
+            }
+            allEvents.append(contentsOf: events)
         }
-        let events = try executionCoordinator.runCommand(request)
-        events.forEach { emit?($0) }
-        return events
+        return allEvents
     }
 
     @MainActor

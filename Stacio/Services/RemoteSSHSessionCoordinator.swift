@@ -323,12 +323,16 @@ enum RemoteSSHReconnectPolicy {
     static func automaticDelaySeconds(forAttempt attempt: Int) -> TimeInterval {
         switch max(1, attempt) {
         case 1:
-            return 0
+            return 0.25
         case 2:
-            return 3
+            return 0.75
         case 3:
-            return 8
+            return 1.5
         case 4:
+            return 3
+        case 5:
+            return 8
+        case 6:
             return 20
         default:
             return 60
@@ -406,6 +410,24 @@ public final class RemoteSSHSessionCoordinator {
     public func openSessionTab(
         config: SshConnectionConfig,
         title: String,
+        automationPolicy: SessionAutomationPolicy,
+        proxyJumpSelection: SSHProxyJumpSelection,
+        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?
+    ) throws -> LiveShellStatus {
+        try openSessionTab(
+            config: config,
+            title: title,
+            automationPolicy: automationPolicy,
+            proxyJumpSelection: proxyJumpSelection,
+            proxyJumpSessionResolver: proxyJumpSessionResolver,
+            credentialRecovery: nil
+        )
+    }
+
+    @discardableResult
+    public func openSessionTab(
+        config: SshConnectionConfig,
+        title: String,
         automationPolicy: SessionAutomationPolicy = .default
     ) throws -> LiveShellStatus {
         try openSessionTab(
@@ -421,9 +443,26 @@ public final class RemoteSSHSessionCoordinator {
     public func openSessionTab(
         config: SshConnectionConfig,
         title: String,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)?
+    ) throws -> LiveShellStatus {
+        try openSessionTab(
+            config: config,
+            title: title,
+            automationPolicy: .default,
+            proxyJumpSelection: .disabled,
+            proxyJumpSessionResolver: { _ in nil },
+            credentialRecovery: credentialRecovery
+        )
+    }
+
+    @discardableResult
+    public func openSessionTab(
+        config: SshConnectionConfig,
+        title: String,
         automationPolicy: SessionAutomationPolicy = .default,
         proxyJumpSelection: SSHProxyJumpSelection,
-        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?
+        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)? = nil
     ) throws -> LiveShellStatus {
         logSessionStartRequested(config: config, mode: "background")
         guard let workspace else {
@@ -436,7 +475,8 @@ public final class RemoteSSHSessionCoordinator {
             liveSessionContext: nil,
             lastSuccessfulShellElapsedMs: nil,
             proxyJumpSelection: proxyJumpSelection,
-            proxyJumpSessionResolver: proxyJumpSessionResolver
+            proxyJumpSessionResolver: proxyJumpSessionResolver,
+            credentialRecovery: credentialRecovery
         )
         let pane: RemoteTerminalPaneViewController?
         if let workspace = workspace as? RemoteWorkspaceAutomationOpening {
@@ -468,7 +508,8 @@ public final class RemoteSSHSessionCoordinator {
             pane: pane,
             automationPolicy: automationPolicy,
             proxyJumpSelection: proxyJumpSelection,
-            proxyJumpSessionResolver: proxyJumpSessionResolver
+            proxyJumpSessionResolver: proxyJumpSessionResolver,
+            credentialRecovery: credentialRecovery
         )
         return pendingStatus
     }
@@ -490,7 +531,8 @@ public final class RemoteSSHSessionCoordinator {
         pane: RemoteTerminalPaneViewController?,
         automationPolicy: SessionAutomationPolicy,
         proxyJumpSelection: SSHProxyJumpSelection,
-        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?
+        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)?
     ) {
         let liveShellCloser = RemoteSSHUncheckedSendable(value: liveShellStarter as? LiveShellRuntimeClosing)
         let contextBuilder = RemoteSSHUncheckedSendable(value: contextBuilder)
@@ -503,6 +545,17 @@ public final class RemoteSSHSessionCoordinator {
         let databasePath = databasePathProvider()
         let defaultCols = defaultCols
         let defaultRows = defaultRows
+        let credentialRecoveryRequest: (() -> SshConnectionConfig?)?
+        if let credentialRecovery {
+            credentialRecoveryRequest = {
+                DispatchQueue.main.sync { @MainActor in
+                    credentialRecovery()
+                }
+            }
+        } else {
+            credentialRecoveryRequest = nil
+        }
+        let credentialRecovery = RemoteSSHUncheckedSendable(value: credentialRecoveryRequest)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak pane, weak reconnecter] in
             let startDate = Date()
@@ -512,32 +565,29 @@ public final class RemoteSSHSessionCoordinator {
                     category: "SSH",
                     message: "ssh.session.runtime.prepare mode=background \(requestDescription)"
                 )
-                let contextStartDate = Date()
-                let context = try contextBuilder.value.makeTunnelLiveSessionContext(
+                let runtimeStart = try Self.startRuntimeWithCredentialRecovery(
+                    contextBuilder: contextBuilder.value,
+                    liveShellStarter: liveShellStarter.value,
+                    liveShellCloser: liveShellCloser.value,
                     config: config,
                     databasePath: databasePath,
                     proxyJumpSelection: proxyJumpSelection,
-                    proxyJumpSessionResolver: proxyJumpSessionResolver
+                    proxyJumpSessionResolver: proxyJumpSessionResolver,
+                    cols: defaultCols,
+                    rows: defaultRows,
+                    clock: clock.value,
+                    credentialRecovery: credentialRecovery.value
                 )
-                let contextElapsedMs = Self.elapsedMilliseconds(since: contextStartDate)
+                let context = runtimeStart.context
+                let status = runtimeStart.status
+                let contextElapsedMs = runtimeStart.contextElapsedMs
+                let shellElapsedMs = runtimeStart.shellElapsedMs
                 appLog.value?.append(
                     level: .info,
                     category: "SSH",
                     message: "ssh.session.runtime.context.ready mode=background endpoint=\(endpointDescription) context_ms=\(contextElapsedMs)"
                 )
-                let shellStartDate = clock.value()
-                let status = try Self.startLiveShell(
-                    starter: liveShellStarter.value,
-                    context: context,
-                    cols: defaultCols,
-                    rows: defaultRows
-                )
-                let shellElapsedMs = Self.elapsedMilliseconds(since: shellStartDate, now: clock.value())
                 let totalElapsedMs = Self.elapsedMilliseconds(since: startDate)
-                guard status.status == "running" else {
-                    try? liveShellCloser.value?.closeLiveSSHShellRuntime(runtimeID: status.runtimeId)
-                    throw SshRuntimeError.Transport(message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic))
-                }
                 contextStore.value.replace(with: context)
                 appLog.value?.append(
                     level: .info,
@@ -591,10 +641,131 @@ public final class RemoteSSHSessionCoordinator {
         }
     }
 
+    private struct RuntimeStartAttempt {
+        let context: TunnelLiveSessionContext
+        let status: LiveShellStatus
+        let contextElapsedMs: UInt32
+        let shellElapsedMs: UInt32
+    }
+
+    nonisolated private static func startRuntimeWithCredentialRecovery(
+        contextBuilder: TunnelLiveSessionContextBuilding,
+        liveShellStarter: LiveShellStarting,
+        liveShellCloser: LiveShellRuntimeClosing?,
+        config: SshConnectionConfig,
+        databasePath: String,
+        proxyJumpSelection: SSHProxyJumpSelection,
+        proxyJumpSessionResolver: (String) throws -> SessionRecord?,
+        cols: UInt32,
+        rows: UInt32,
+        clock: () -> Date,
+        credentialRecovery: (() -> SshConnectionConfig?)?
+    ) throws -> RuntimeStartAttempt {
+        do {
+            return try startRuntimeAttempt(
+                contextBuilder: contextBuilder,
+                liveShellStarter: liveShellStarter,
+                liveShellCloser: liveShellCloser,
+                config: config,
+                databasePath: databasePath,
+                proxyJumpSelection: proxyJumpSelection,
+                proxyJumpSessionResolver: proxyJumpSessionResolver,
+                cols: cols,
+                rows: rows,
+                clock: clock
+            )
+        } catch {
+            guard shouldOfferCredentialRecovery(after: error) else {
+                throw error
+            }
+            if let credentialRecovery {
+                guard let recoveredConfig = credentialRecovery() else {
+                    throw error
+                }
+                return try startRuntimeAttempt(
+                    contextBuilder: contextBuilder,
+                    liveShellStarter: liveShellStarter,
+                    liveShellCloser: liveShellCloser,
+                    config: recoveredConfig,
+                    databasePath: databasePath,
+                    proxyJumpSelection: proxyJumpSelection,
+                    proxyJumpSessionResolver: proxyJumpSessionResolver,
+                    cols: cols,
+                    rows: rows,
+                    clock: clock
+                )
+            }
+            throw error
+        }
+    }
+
+    nonisolated private static func startRuntimeAttempt(
+        contextBuilder: TunnelLiveSessionContextBuilding,
+        liveShellStarter: LiveShellStarting,
+        liveShellCloser: LiveShellRuntimeClosing?,
+        config: SshConnectionConfig,
+        databasePath: String,
+        proxyJumpSelection: SSHProxyJumpSelection,
+        proxyJumpSessionResolver: (String) throws -> SessionRecord?,
+        cols: UInt32,
+        rows: UInt32,
+        clock: () -> Date
+    ) throws -> RuntimeStartAttempt {
+        let contextStartDate = Date()
+        let context = try contextBuilder.makeTunnelLiveSessionContext(
+            config: config,
+            databasePath: databasePath,
+            proxyJumpSelection: proxyJumpSelection,
+            proxyJumpSessionResolver: proxyJumpSessionResolver
+        )
+        let contextElapsedMs = elapsedMilliseconds(since: contextStartDate)
+        let shellStartDate = clock()
+        let status = try startLiveShell(
+            starter: liveShellStarter,
+            context: context,
+            cols: cols,
+            rows: rows
+        )
+        let shellElapsedMs = elapsedMilliseconds(since: shellStartDate, now: clock())
+        guard status.status == "running" else {
+            try? liveShellCloser?.closeLiveSSHShellRuntime(runtimeID: status.runtimeId)
+            throw SshRuntimeError.Transport(message: diagnosticMessage(forStatusDiagnostic: status.diagnostic))
+        }
+        return RuntimeStartAttempt(
+            context: context,
+            status: status,
+            contextElapsedMs: contextElapsedMs,
+            shellElapsedMs: shellElapsedMs
+        )
+    }
+
+    nonisolated private static func shouldOfferCredentialRecovery(after error: Error) -> Bool {
+        if let coordinatorError = error as? SSHConnectionCoordinatorError {
+            if case .missingPrivateKey = coordinatorError {
+                return true
+            }
+            return coordinatorError == .missingPasswordSecret
+        }
+        if (error as? KeychainCredentialError) == .notFound {
+            return true
+        }
+        if case .AuthFailed = error as? SshRuntimeError {
+            return true
+        }
+        if case let .Transport(message) = error as? SshRuntimeError {
+            let normalized = message.lowercased()
+            return normalized.contains("authentication")
+                || normalized.contains("认证")
+                || normalized.contains("no identities found in the ssh agent")
+        }
+        return false
+    }
+
     fileprivate func reconnectRuntimeInBackground(
         config: SshConnectionConfig,
         proxyJumpSelection: SSHProxyJumpSelection,
         proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)?,
         completion: @escaping @MainActor (Result<RemoteSSHRuntimeStartResult, Error>) -> Void
     ) {
         let liveShellCloser = RemoteSSHUncheckedSendable(value: liveShellStarter as? LiveShellRuntimeClosing)
@@ -604,35 +775,39 @@ public final class RemoteSSHSessionCoordinator {
         let databasePath = databasePathProvider()
         let defaultCols = defaultCols
         let defaultRows = defaultRows
+        let credentialRecoveryRequest: (() -> SshConnectionConfig?)?
+        if let credentialRecovery {
+            credentialRecoveryRequest = {
+                DispatchQueue.main.sync { @MainActor in
+                    credentialRecovery()
+                }
+            }
+        } else {
+            credentialRecoveryRequest = nil
+        }
+        let credentialRecovery = RemoteSSHUncheckedSendable(value: credentialRecoveryRequest)
 
         DispatchQueue.global(qos: .userInitiated).async {
             let result: Result<RemoteSSHRuntimeStartResult, Error>
             do {
-                let context = try contextBuilder.value.makeTunnelLiveSessionContext(
+                let runtimeStart = try Self.startRuntimeWithCredentialRecovery(
+                    contextBuilder: contextBuilder.value,
+                    liveShellStarter: liveShellStarter.value,
+                    liveShellCloser: liveShellCloser.value,
                     config: config,
                     databasePath: databasePath,
                     proxyJumpSelection: proxyJumpSelection,
-                    proxyJumpSessionResolver: proxyJumpSessionResolver
-                )
-                let shellStartDate = clock.value()
-                let status = try Self.startLiveShell(
-                    starter: liveShellStarter.value,
-                    context: context,
+                    proxyJumpSessionResolver: proxyJumpSessionResolver,
                     cols: defaultCols,
-                    rows: defaultRows
+                    rows: defaultRows,
+                    clock: clock.value,
+                    credentialRecovery: credentialRecovery.value
                 )
-                let shellElapsedMs = Self.elapsedMilliseconds(since: shellStartDate, now: clock.value())
-                guard status.status == "running" else {
-                    try? liveShellCloser.value?.closeLiveSSHShellRuntime(runtimeID: status.runtimeId)
-                    throw SshRuntimeError.Transport(
-                        message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic)
-                    )
-                }
                 result = .success(
                     RemoteSSHRuntimeStartResult(
-                        status: status,
-                        context: context,
-                        shellElapsedMs: shellElapsedMs
+                        status: runtimeStart.status,
+                        context: runtimeStart.context,
+                        shellElapsedMs: runtimeStart.shellElapsedMs
                     )
                 )
             } catch {
@@ -826,13 +1001,14 @@ extension RemoteSSHSessionCoordinator: RemoteSSHSessionProxyJumpStarting {}
 @MainActor
 private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconnecting {
     private weak var coordinator: RemoteSSHSessionCoordinator?
-    private let config: SshConnectionConfig
+    private var config: SshConnectionConfig
     private(set) var liveSessionContext: TunnelLiveSessionContext?
     private var lastSuccessfulShellElapsedMs: UInt32?
     private var automaticAttemptCount = 0
     private var reconnectGeneration: UInt64 = 0
     private let proxyJumpSelection: SSHProxyJumpSelection
     private let proxyJumpSessionResolver: (String) throws -> SessionRecord?
+    private let credentialRecovery: (@MainActor () -> SshConnectionConfig?)?
 
     init(
         coordinator: RemoteSSHSessionCoordinator,
@@ -840,7 +1016,8 @@ private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconne
         liveSessionContext: TunnelLiveSessionContext?,
         lastSuccessfulShellElapsedMs: UInt32?,
         proxyJumpSelection: SSHProxyJumpSelection,
-        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?
+        proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
+        credentialRecovery: (@MainActor () -> SshConnectionConfig?)?
     ) {
         self.coordinator = coordinator
         self.config = config
@@ -848,6 +1025,7 @@ private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconne
         self.lastSuccessfulShellElapsedMs = lastSuccessfulShellElapsedMs
         self.proxyJumpSelection = proxyJumpSelection
         self.proxyJumpSessionResolver = proxyJumpSessionResolver
+        self.credentialRecovery = credentialRecovery
     }
 
     func reconnectRemoteTerminal(title: String) throws -> LiveShellStatus {
@@ -883,7 +1061,8 @@ private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconne
         coordinator.reconnectRuntimeInBackground(
             config: reconnectConfig,
             proxyJumpSelection: proxyJumpSelection,
-            proxyJumpSessionResolver: proxyJumpSessionResolver
+            proxyJumpSessionResolver: proxyJumpSessionResolver,
+            credentialRecovery: automatically ? nil : credentialRecovery
         ) { [weak self, weak coordinator] result in
             guard let coordinator else {
                 completion(.failure(RemoteTerminalLifecycleError.reconnectUnavailable))
@@ -911,6 +1090,7 @@ private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconne
                     mode: mode
                 )
                 coordinator.acceptReconnectRuntime(runtimeResult)
+                self.config = runtimeResult.context.config
                 self.liveSessionContext = runtimeResult.context
                 self.lastSuccessfulShellElapsedMs = runtimeResult.shellElapsedMs
                 self.automaticAttemptCount = 0
@@ -930,6 +1110,7 @@ private final class RemoteSSHSessionReconnecter: RemoteTerminalBackgroundReconne
         liveSessionContext: TunnelLiveSessionContext,
         lastSuccessfulShellElapsedMs: UInt32
     ) {
+        config = liveSessionContext.config
         self.liveSessionContext = liveSessionContext
         self.lastSuccessfulShellElapsedMs = lastSuccessfulShellElapsedMs
         self.automaticAttemptCount = 0

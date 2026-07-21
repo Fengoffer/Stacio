@@ -13,6 +13,7 @@ public struct StacioMenuBuilder {
         mainMenu.addItem(fileMenuItem())
         mainMenu.addItem(editMenuItem())
         mainMenu.addItem(terminalMenuItem())
+        mainMenu.addItem(viewMenuItem())
         mainMenu.addItem(helpMenuItem())
         return mainMenu
     }
@@ -47,11 +48,34 @@ public struct StacioMenuBuilder {
         let item = NSMenuItem()
         item.title = L10n.Menu.file
         let submenu = NSMenu(title: L10n.Menu.file)
+        let newSession = menuItem(
+            title: L10n.Menu.newSession,
+            action: #selector(AppDelegate.createSessionFromMenu(_:)),
+            key: "n"
+        )
+        newSession.keyEquivalentModifierMask = [.command, .shift]
+        submenu.addItem(newSession)
         submenu.addItem(menuItem(
             title: L10n.Menu.newLocalTerminal,
             action: #selector(AppDelegate.openLocalShellFromMenu(_:)),
             key: "n"
         ))
+        submenu.addItem(.separator())
+        let importItem = NSMenuItem(title: L10n.Import.title, action: nil, keyEquivalent: "")
+        let importMenu = NSMenu(title: L10n.Import.title)
+        for source in AppKitSessionImportSourcePicker.supportedSources {
+            let sourceItem = menuItem(
+                title: source.name,
+                action: #selector(AppDelegate.importSessionsFromMenu(_:)),
+                key: ""
+            )
+            sourceItem.representedObject = source.type.rawValue
+            sourceItem.image = SessionImportSourceIconCatalog.image(for: source)
+            importMenu.addItem(sourceItem)
+        }
+        importItem.submenu = importMenu
+        submenu.addItem(importItem)
+        submenu.addItem(.separator())
         submenu.addItem(menuItem(
             title: L10n.Menu.closeCurrentTerminal,
             action: #selector(AppDelegate.closeCurrentTerminalFromMenu(_:)),
@@ -103,15 +127,93 @@ public struct StacioMenuBuilder {
             action: #selector(AppDelegate.findInTerminalMenu(_:)),
             key: "f"
         ))
-        submenu.addItem(menuItem(
+        let splitLayoutItem = NSMenuItem(
             title: L10n.Menu.splitTerminal,
-            action: #selector(AppDelegate.splitTerminalFromMenu(_:)),
+            action: nil,
+            keyEquivalent: ""
+        )
+        let splitLayoutMenu = NSMenu(title: L10n.Menu.splitTerminal)
+        splitLayoutMenu.addItem(menuItem(
+            title: L10n.Workbench.splitSingleTerminal,
+            action: #selector(AppDelegate.useSingleTerminalLayoutFromMenu(_:)),
+            key: ""
+        ))
+        splitLayoutMenu.addItem(menuItem(
+            title: L10n.Workbench.splitVertical,
+            action: #selector(AppDelegate.splitTerminalVerticallyFromMenu(_:)),
+            key: ""
+        ))
+        splitLayoutMenu.addItem(menuItem(
+            title: L10n.Workbench.splitHorizontal,
+            action: #selector(AppDelegate.splitTerminalHorizontallyFromMenu(_:)),
+            key: ""
+        ))
+        splitLayoutMenu.addItem(menuItem(
+            title: L10n.Workbench.splitGrid,
+            action: #selector(AppDelegate.splitTerminalAsGridFromMenu(_:)),
+            key: ""
+        ))
+        splitLayoutItem.submenu = splitLayoutMenu
+        submenu.addItem(splitLayoutItem)
+        submenu.addItem(menuItem(
+            title: L10n.Menu.multiExec,
+            action: #selector(AppDelegate.performMultiExecFromMenu(_:)),
             key: "d"
+        ))
+        item.submenu = submenu
+        return item
+    }
+
+    private func viewMenuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        item.title = L10n.Menu.view
+        let submenu = NSMenu(title: L10n.Menu.view)
+        submenu.addItem(menuItem(
+            title: L10n.Menu.toggleSidebar,
+            action: #selector(AppDelegate.toggleSidebarFromMenu(_:)),
+            key: ""
         ))
         submenu.addItem(.separator())
         submenu.addItem(menuItem(
+            title: L10n.Inspector.files,
+            action: #selector(AppDelegate.showFilesFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(menuItem(
+            title: L10n.Inspector.browser,
+            action: #selector(AppDelegate.showBrowserFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(menuItem(
+            title: L10n.Workbench.tunnels,
+            action: #selector(AppDelegate.showTunnelsFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(menuItem(
             title: L10n.Menu.toggleDeviceDashboard,
             action: #selector(AppDelegate.toggleDeviceDashboardFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(.separator())
+        submenu.addItem(menuItem(
+            title: L10n.Inspector.logs,
+            action: #selector(AppDelegate.showDiagnosticsFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(menuItem(
+            title: L10n.Inspector.macros,
+            action: #selector(AppDelegate.showTerminalMacrosFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(menuItem(
+            title: L10n.Inspector.commandHistory,
+            action: #selector(AppDelegate.showCommandHistoryFromMenu(_:)),
+            key: ""
+        ))
+        submenu.addItem(.separator())
+        submenu.addItem(menuItem(
+            title: L10n.AI.assistant,
+            action: #selector(AppDelegate.showAIAssistantFromMenu(_:)),
             key: ""
         ))
         item.submenu = submenu
@@ -122,6 +224,7 @@ public struct StacioMenuBuilder {
         let item = NSMenuItem()
         item.title = L10n.Menu.help
         let submenu = NSMenu(title: L10n.Menu.help)
+        submenu.minimumWidth = 240
         submenu.addItem(menuItem(
             title: L10n.Menu.feedback,
             action: #selector(AppDelegate.showFeedbackWindow(_:)),

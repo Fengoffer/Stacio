@@ -17,7 +17,14 @@ public protocol SessionSidebarStoring {
     func exportSessionsJSON() throws -> String
     func exportSessionFolderJSON(folderID: String) throws -> String
     func getSessionConfigJSON(id: String) throws -> String?
+    func credentialRecord(id: String) throws -> CredentialRecord?
     func deleteSession(id: String) throws
+}
+
+public extension SessionSidebarStoring {
+    func credentialRecord(id: String) throws -> CredentialRecord? {
+        nil
+    }
 }
 
 public final class CoreBridgeSessionSidebarStore: SessionSidebarStoring {
@@ -104,6 +111,12 @@ public final class CoreBridgeSessionSidebarStore: SessionSidebarStoring {
 
     public func getSessionConfigJSON(id: String) throws -> String? {
         try CoreBridge.getSessionConfigJSON(databasePath: databasePath, id: id)
+    }
+
+    public func credentialRecord(id: String) throws -> CredentialRecord? {
+        try CoreBridge
+            .listCredentialRecords(databasePath: databasePath)
+            .first(where: { $0.id == id })
     }
 
     public func deleteSession(id: String) throws {

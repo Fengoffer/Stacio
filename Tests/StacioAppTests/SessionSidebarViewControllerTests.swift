@@ -520,6 +520,64 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(store.deletedFolderIDs, ["folder_prod"])
     }
 
+    func testDeletingFolderAndSessionsDeletesSessionsAcrossNestedGroups() {
+        let root = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let child = SessionFolder(id: "folder_db", parentId: root.id, name: "Database")
+        let direct = makeSession(id: "session_direct", protocolName: "ssh", name: "API", folderID: root.id)
+        let nested = makeSession(id: "session_nested", protocolName: "ssh", name: "Primary DB", folderID: child.id)
+        let store = RecordingSessionSidebarStore(
+            folders: [root, child],
+            sessionsByFolderID: [root.id: [direct], child.id: [nested]]
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(
+            folderDeletionChoice: .deleteFolderAndSessions
+        )
+        let cacheCleaner = RecordingRemoteEditSessionCacheCleaner()
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            remoteEditCacheCleaner: cacheCleaner
+        )
+        controller.loadView()
+
+        controller.performFolderContextMenuActionForTesting(.delete, folderID: root.id)
+
+        XCTAssertEqual(operations.deleteFolderRequestIDs, [root.id])
+        XCTAssertEqual(operations.folderDeletionSessionCounts, [2])
+        XCTAssertEqual(Set(store.deletedIDs), Set([direct.id, nested.id]))
+        XCTAssertEqual(Set(cacheCleaner.clearedSessionIDs), Set([direct.id, nested.id]))
+        XCTAssertEqual(store.deletedFolderIDs, [root.id])
+        XCTAssertFalse(controller.sessionOutlineTextSnapshot.contains("API"))
+        XCTAssertFalse(controller.sessionOutlineTextSnapshot.contains("Primary DB"))
+    }
+
+    func testDeletingFolderOnlyKeepsNestedSessionsAtRoot() {
+        let root = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let child = SessionFolder(id: "folder_db", parentId: root.id, name: "Database")
+        let direct = makeSession(id: "session_direct", protocolName: "ssh", name: "API", folderID: root.id)
+        let nested = makeSession(id: "session_nested", protocolName: "ssh", name: "Primary DB", folderID: child.id)
+        let store = RecordingSessionSidebarStore(
+            folders: [root, child],
+            sessionsByFolderID: [root.id: [direct], child.id: [nested]]
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(
+            folderDeletionChoice: .deleteFolderOnly
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations
+        )
+        controller.loadView()
+
+        controller.performFolderContextMenuActionForTesting(.delete, folderID: root.id)
+
+        XCTAssertEqual(operations.folderDeletionSessionCounts, [2])
+        XCTAssertTrue(store.deletedIDs.isEmpty)
+        XCTAssertEqual(store.deletedFolderIDs, [root.id])
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("API"))
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("Primary DB"))
+    }
+
     func testSidebarShowsFavoritesVirtualGroupWithoutRecentSectionWhenAvailable() {
         let favorite = SessionRecord(
             id: "session_favorite",
@@ -767,7 +825,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
                 "删除会话",
                 "复制会话",
                 "移动会话",
-                "将会话保存到文件",
+            "导出会话",
                 "创建桌面快捷方式",
                 "-",
                 "将会话设置保存为默认预设",
@@ -1256,10 +1314,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "New API\ndeploy@api.example.com:22")
     }
 
-    func testContextMenuSaveSessionToFileWritesSingleSessionJSON() throws {
+    func testContextMenuSaveSessionToFileWritesEncryptedSingleSessionTransfer() throws {
         let destinationURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("json")
+            .appendingPathExtension(SecureSessionTransfer.fileExtension)
         defer { try? FileManager.default.removeItem(at: destinationURL) }
         let session = SessionRecord(
             id: "session_api",
@@ -1269,29 +1327,55 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             host: "api.example.com",
             port: 22,
             username: "deploy",
-            privateKeyPath: "~/.ssh/prod",
+            privateKeyPath: nil,
             credentialId: "cred_api",
             tags: ["prod"],
             lastOpenedAt: "2026-05-28T12:00:00Z"
+        )
+        let credential = CredentialRecord(
+            id: "cred_api",
+            kind: "password",
+            label: "API password",
+            keychainService: KeychainCredentialStore.serviceName,
+            keychainAccount: "deploy@api.example.com"
+        )
+        let keychain = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        try keychain.save(
+            KeychainCredential(
+                id: credential.id,
+                account: credential.keychainAccount,
+                secret: "session-password"
+            )
         )
         let store = RecordingSessionSidebarStore(
             folders: [],
             sessionsByFolderID: [nil: [session]],
             configJSONByID: [
                 "session_api": ##"{"sessionIconID":"ubuntu","tagStyle":{"color":"#2266AA"},"startupCommand":"export TOKEN=hidden","environmentVariables":["PASSWORD=hidden"]}"##
-            ]
+            ],
+            credentialRecordsByID: [credential.id: credential]
         )
         let operations = RecordingSessionSidebarOperationsPresenter(singleSessionExportURL: destinationURL)
         let controller = SessionSidebarViewController(
             sessionStore: store,
-            operationsPresenter: operations
+            operationsPresenter: operations,
+            secureSessionTransferExporter: KeychainSecureSessionTransferExporter(keychainStore: keychain),
+            secureSessionTransferPassphrasePrompter: RecordingSecureSessionTransferPassphrasePrompter(
+                exportPassphrase: "migration-passphrase"
+            )
         )
         controller.loadView()
 
         controller.performContextMenuActionForTesting(.saveToFile, id: "session_api")
 
         let data = try Data(contentsOf: destinationURL)
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let rawTransfer = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertTrue(SecureSessionTransfer.isEncryptedTransfer(rawTransfer))
+        XCTAssertFalse(rawTransfer.contains("session-password"))
+        XCTAssertFalse(rawTransfer.contains("TOKEN"))
+        XCTAssertFalse(rawTransfer.contains("PASSWORD"))
+        let payload = try SecureSessionTransfer.decrypt(rawTransfer, passphrase: "migration-passphrase")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.sessionJSON.utf8)) as? [String: Any])
         let sessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
         XCTAssertEqual(object["format"] as? String, "stacio.sessions.v1")
         XCTAssertEqual(sessions.count, 1)
@@ -1301,8 +1385,9 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessions.first?["config_json"] as? String,
             #"{"sessionIconID":"ubuntu"}"#
         )
-        XCTAssertFalse(String(data: data, encoding: .utf8)?.contains("TOKEN") == true)
-        XCTAssertFalse(String(data: data, encoding: .utf8)?.contains("PASSWORD") == true)
+        XCTAssertEqual(payload.credential, SecureSessionTransferCredential(kind: .password, secret: "session-password"))
+        XCTAssertFalse(payload.sessionJSON.contains("TOKEN"))
+        XCTAssertFalse(payload.sessionJSON.contains("PASSWORD"))
         XCTAssertEqual(operations.singleSessionExportRequestIDs, ["session_api"])
         XCTAssertEqual(operations.completedExportURLs, [destinationURL])
     }
@@ -2339,6 +2424,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     private let exportJSON: String
     private let folderExportJSON: String
     private let configJSONByID: [String: String]
+    private let credentialRecordsByID: [String: CredentialRecord]
     private let createError: Error?
     private let updateError: Error?
     private let deleteError: Error?
@@ -2354,6 +2440,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         exportJSON: String = "{}",
         folderExportJSON: String = "{}",
         configJSONByID: [String: String] = [:],
+        credentialRecordsByID: [String: CredentialRecord] = [:],
         createError: Error? = nil,
         updateError: Error? = nil,
         deleteError: Error? = nil,
@@ -2368,6 +2455,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         self.exportJSON = exportJSON
         self.folderExportJSON = folderExportJSON
         self.configJSONByID = configJSONByID
+        self.credentialRecordsByID = credentialRecordsByID
         self.createError = createError
         self.updateError = updateError
         self.deleteError = deleteError
@@ -2416,10 +2504,41 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     func deleteFolder(id: String) throws {
         events.append("deleteFolder:\(id)")
         deletedFolderIDs.append(id)
-        folders.removeAll { $0.id == id || $0.parentId == id }
-        sidebarOrderByParentID = sidebarOrderByParentID.mapValues { items in
-            items.filter { $0.kind != "folder" || $0.id != id }
+        var deletedFolderIDs: Set<String> = [id]
+        var didAddFolder = true
+        while didAddFolder {
+            didAddFolder = false
+            for folder in folders where folder.parentId.map(deletedFolderIDs.contains) == true {
+                if deletedFolderIDs.insert(folder.id).inserted {
+                    didAddFolder = true
+                }
+            }
         }
+        let movedSessions = sessionsByFolderID.compactMap { folderID, sessions -> [SessionRecord]? in
+            guard let folderID, deletedFolderIDs.contains(folderID) else { return nil }
+            return sessions.map { session in
+                SessionRecord(
+                    id: session.id,
+                    folderId: nil,
+                    name: session.name,
+                    protocol: session.protocol,
+                    host: session.host,
+                    port: session.port,
+                    username: session.username,
+                    privateKeyPath: session.privateKeyPath,
+                    credentialId: session.credentialId,
+                    tags: session.tags,
+                    lastOpenedAt: session.lastOpenedAt
+                )
+            }
+        }
+        folders.removeAll { deletedFolderIDs.contains($0.id) }
+        sessionsByFolderID = sessionsByFolderID.filter { folderID, _ in
+            guard let folderID else { return true }
+            return deletedFolderIDs.contains(folderID) == false
+        }
+        sessionsByFolderID[nil, default: []].append(contentsOf: movedSessions.flatMap { $0 })
+        rebuildSidebarOrder()
     }
 
     func listSessions(folderID: String?) throws -> [SessionRecord] {
@@ -2632,6 +2751,10 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         return configJSONByID[id]
     }
 
+    func credentialRecord(id: String) throws -> CredentialRecord? {
+        credentialRecordsByID[id]
+    }
+
     func deleteSession(id: String) throws {
         if let deleteError {
             throw deleteError
@@ -2745,6 +2868,7 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
     var createFolderParentIDs: [String?] = []
     var renameFolderRequestIDs: [String] = []
     var deleteFolderRequestIDs: [String] = []
+    var folderDeletionSessionCounts: [Int] = []
     var folderExportRequestIDs: [String] = []
     var connectAsRequestSessionIDs: [String] = []
     var pingProgressHosts: [String] = []
@@ -2761,7 +2885,7 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
     private let exportURL: URL?
     private let createFolderName: String?
     private let renameFolderValue: String?
-    private let confirmDeleteFolderValue: Bool
+    private let folderDeletionChoice: SessionSidebarFolderDeletionChoice?
     private let folderExportURL: URL?
     private let connectAsUsername: String?
     private let renameValue: String?
@@ -2773,7 +2897,7 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
         exportURL: URL? = nil,
         createFolderName: String? = nil,
         renameFolderValue: String? = nil,
-        confirmDeleteFolderValue: Bool = true,
+        folderDeletionChoice: SessionSidebarFolderDeletionChoice? = .deleteFolderOnly,
         folderExportURL: URL? = nil,
         connectAsUsername: String? = nil,
         renameValue: String? = nil,
@@ -2784,7 +2908,7 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
         self.exportURL = exportURL
         self.createFolderName = createFolderName
         self.renameFolderValue = renameFolderValue
-        self.confirmDeleteFolderValue = confirmDeleteFolderValue
+        self.folderDeletionChoice = folderDeletionChoice
         self.folderExportURL = folderExportURL
         self.connectAsUsername = connectAsUsername
         self.renameValue = renameValue
@@ -2811,9 +2935,14 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
         return renameFolderValue
     }
 
-    func confirmDeleteFolder(_ folder: SessionFolder, parentWindow: NSWindow?) -> Bool {
+    func chooseFolderDeletion(
+        _ folder: SessionFolder,
+        sessionCount: Int,
+        parentWindow: NSWindow?
+    ) -> SessionSidebarFolderDeletionChoice? {
         deleteFolderRequestIDs.append(folder.id)
-        return confirmDeleteFolderValue
+        folderDeletionSessionCounts.append(sessionCount)
+        return folderDeletionChoice
     }
 
     func chooseFolderExportDestination(folder: SessionFolder, parentWindow: NSWindow?) -> URL? {
@@ -2875,6 +3004,22 @@ private final class RecordingSessionSidebarOperationsPresenter: SessionSidebarOp
 
     func presentSettingsCopied(parentWindow: NSWindow?) {
         settingsCopiedCount += 1
+    }
+}
+
+private final class RecordingSecureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting {
+    private let exportPassphrase: String?
+
+    init(exportPassphrase: String?) {
+        self.exportPassphrase = exportPassphrase
+    }
+
+    func promptForExportPassphrase(sessionName: String, parentWindow: NSWindow?) -> String? {
+        exportPassphrase
+    }
+
+    func promptForImportPassphrase(sourceName: String, parentWindow: NSWindow?) -> String? {
+        nil
     }
 }
 

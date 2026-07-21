@@ -296,6 +296,10 @@ private struct VisibleTerminalOutputUpdate: Equatable {
 
 @MainActor
 private final class VisibleTerminalObservationSession {
+    private static let maximumObservedOutputByteCount = 64 * 1024
+    private static let maximumSummaryCharacterCount = 8_000
+    private static let outputUpdateInterval: TimeInterval = 0.1
+
     private let requestID: String
     private let runtimeID: String
     private let command: String
@@ -320,6 +324,8 @@ private final class VisibleTerminalObservationSession {
     private var lastTerminalOutputTranscript: String
     private var lastTerminalDisplaySnapshot: String
     private var lastTerminalRefreshAt = Date.distantPast
+    private var lastOutputUpdateAt = Date.distantPast
+    private var lastPublishedOutputSummary: String?
     private var subscription: TerminalOutputBroadcastHub.Subscription?
 
     init(
@@ -471,17 +477,14 @@ private final class VisibleTerminalObservationSession {
         case .output:
             guard commandOutputCaptureStarted else { return }
             guard sawUserInput == false else { return }
-            outputBytes.append(contentsOf: event.bytes)
+            appendObservedOutput(event.bytes)
             lastOutputAt = event.createdAt
             sawShellPrompt = TerminalOSC7SequenceParser.currentDirectories(from: outputBytes).isEmpty == false
                 || Self.hasTrailingShellPrompt(in: outputBytes)
             if let markerRange = Self.auditEndMarkerRange(in: outputBytes) {
                 auditCompletionSummary = Self.summary(from: Array(outputBytes[..<markerRange.lowerBound]))
             }
-            let summary = Self.summary(from: outputBytes)
-            if summary.isEmpty == false {
-                onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
-            }
+            publishOutputUpdateIfNeeded()
         case .userInput:
             if Self.isAICommandEcho(event.bytes, command: command) {
                 commandOutputCaptureStarted = true
@@ -573,7 +576,7 @@ private final class VisibleTerminalObservationSession {
         }
         lastTerminalOutputTranscript = currentTranscript
         guard commandTranscript.isEmpty == false else { return }
-        outputBytes = Array(commandTranscript.utf8)
+        replaceObservedOutput(with: Array(commandTranscript.utf8))
         lastOutputAt = Date()
         sawShellPrompt = commandCompletionGeneration() != initialCommandCompletionGeneration
             || TerminalOSC7SequenceParser.currentDirectories(from: outputBytes).isEmpty == false
@@ -581,10 +584,7 @@ private final class VisibleTerminalObservationSession {
         if let markerRange = Self.auditEndMarkerRange(in: outputBytes) {
             auditCompletionSummary = Self.summary(from: Array(outputBytes[..<markerRange.lowerBound]))
         }
-        let summary = Self.summary(from: outputBytes)
-        if summary.isEmpty == false {
-            onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
-        }
+        publishOutputUpdateIfNeeded()
     }
 
     private func captureVisibleTerminalDisplayIfNeeded() {
@@ -609,14 +609,11 @@ private final class VisibleTerminalObservationSession {
         guard displayShowsPrompt else { return }
 
         if outputBytes.isEmpty {
-            outputBytes = visibleBytes
+            replaceObservedOutput(with: visibleBytes)
         }
         lastOutputAt = Date()
         sawShellPrompt = true
-        let summary = Self.summary(from: outputBytes)
-        if summary.isEmpty == false {
-            onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
-        }
+        publishOutputUpdateIfNeeded()
     }
 
     private static func summary(from bytes: [UInt8]) -> String {
@@ -636,7 +633,50 @@ private final class VisibleTerminalObservationSession {
            "STACIO_AUDIT_END".hasPrefix(trailingLine) {
             lines.removeLast()
         }
-        return lines.joined(separator: "\n")
+        let summary = lines.joined(separator: "\n")
+        guard summary.count > maximumSummaryCharacterCount else {
+            return summary
+        }
+        return "...\n" + String(summary.suffix(maximumSummaryCharacterCount))
+    }
+
+    private func appendObservedOutput(_ bytes: [UInt8]) {
+        guard bytes.isEmpty == false else {
+            return
+        }
+        let maximumByteCount = Self.maximumObservedOutputByteCount
+        if bytes.count >= maximumByteCount {
+            outputBytes = Array(bytes.suffix(maximumByteCount))
+            return
+        }
+        let overflow = outputBytes.count + bytes.count - maximumByteCount
+        if overflow > 0 {
+            outputBytes.removeFirst(overflow)
+        }
+        outputBytes.append(contentsOf: bytes)
+    }
+
+    private func replaceObservedOutput(with bytes: [UInt8]) {
+        let maximumByteCount = Self.maximumObservedOutputByteCount
+        outputBytes = bytes.count > maximumByteCount
+            ? Array(bytes.suffix(maximumByteCount))
+            : bytes
+    }
+
+    private func publishOutputUpdateIfNeeded() {
+        let summary = Self.summary(from: outputBytes)
+        guard summary.isEmpty == false,
+              summary != lastPublishedOutputSummary
+        else {
+            return
+        }
+        let now = Date()
+        guard now.timeIntervalSince(lastOutputUpdateAt) >= Self.outputUpdateInterval else {
+            return
+        }
+        lastOutputUpdateAt = now
+        lastPublishedOutputSummary = summary
+        onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
     }
 
     private static func auditEndMarkerRange(in bytes: [UInt8]) -> Range<Int>? {
@@ -970,6 +1010,7 @@ public final class RemoteSSHAgentBackgroundCommandRunner: AgentBackgroundCommand
         let timeout = timeout
         let pollInterval = pollInterval
         let outputLimit = outputLimit
+        let outputCaptureLimit = 256 * 1024
         let activeTaskRegistry = activeTaskRegistry
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1026,7 +1067,11 @@ public final class RemoteSSHAgentBackgroundCommandRunner: AgentBackgroundCommand
                         return
                     }
                     if !batch.bytes.isEmpty {
-                        output.append(batch.bytes)
+                        Self.appendOutputBatch(
+                            batch.bytes,
+                            to: &output,
+                            maximumByteCount: outputCaptureLimit
+                        )
                         let summary = Self.outputSummary(from: batch.bytes, limit: outputLimit)
                         if summary.isEmpty == false {
                             Task { @MainActor in
@@ -1165,6 +1210,25 @@ public final class RemoteSSHAgentBackgroundCommandRunner: AgentBackgroundCommand
 
     nonisolated private static func containsCompletionSentinel(_ output: Data) -> Bool {
         output.range(of: Data("__STACIO_AGENT_DONE__:".utf8)) != nil
+    }
+
+    nonisolated private static func appendOutputBatch(
+        _ batch: Data,
+        to output: inout Data,
+        maximumByteCount: Int
+    ) {
+        guard maximumByteCount > 0, batch.isEmpty == false else {
+            return
+        }
+        if batch.count >= maximumByteCount {
+            output = Data(batch.suffix(maximumByteCount))
+            return
+        }
+        let overflow = output.count + batch.count - maximumByteCount
+        if overflow > 0 {
+            output.removeFirst(overflow)
+        }
+        output.append(batch)
     }
 
     nonisolated private static func shellSingleQuoted(_ value: String) -> String {

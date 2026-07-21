@@ -194,6 +194,10 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
         refreshTimer = nil
     }
 
+    deinit {
+        refreshTimer?.invalidate()
+    }
+
     public func refreshMetricsForTesting() {
         refreshMetrics()
     }

@@ -17,6 +17,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let shortcutCreator: SessionSidebarShortcutCreating
     private let defaultPresetStore: SessionSidebarDefaultPresetStoring
     private let settingsCopier: SessionSidebarSettingsCopying
+    private let secureSessionTransferExporter: SecureSessionTransferExporting
+    private let secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting
     private let quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
     private let settingsStore: AppSettingsStore
@@ -52,6 +54,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         shortcutCreator: SessionSidebarShortcutCreating = WeblocSessionSidebarShortcutCreator(),
         defaultPresetStore: SessionSidebarDefaultPresetStoring = UserDefaultsSessionSidebarDefaultPresetStore(),
         settingsCopier: SessionSidebarSettingsCopying = PasteboardSessionSidebarSettingsCopier(),
+        secureSessionTransferExporter: SecureSessionTransferExporting = KeychainSecureSessionTransferExporter(),
+        secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting = AppKitSecureSessionTransferPassphrasePrompter(),
         quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore = QuickConnectPromptPrefillStore(),
         clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
         settingsStore: AppSettingsStore = .shared
@@ -68,6 +72,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.shortcutCreator = shortcutCreator
         self.defaultPresetStore = defaultPresetStore
         self.settingsCopier = settingsCopier
+        self.secureSessionTransferExporter = secureSessionTransferExporter
+        self.secureSessionTransferPassphrasePrompter = secureSessionTransferPassphrasePrompter
         self.quickConnectPromptPrefillStore = quickConnectPromptPrefillStore
         self.clipboardDismissalStore = clipboardDismissalStore
         self.settingsStore = settingsStore
@@ -1440,17 +1446,48 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     private func deleteFolder(_ folderNode: SessionSidebarFolderNode) {
         guard let sessionStore,
-              let folder = folderNode.folder,
-              operationsPresenter.confirmDeleteFolder(folder, parentWindow: view.window)
+              let folder = folderNode.folder
         else {
             return
         }
 
         do {
+            let snapshot = try sessionStore.loadSnapshot()
+            let sessions = sessionsInFolderSubtree(folder.id, snapshot: snapshot)
+            guard let choice = operationsPresenter.chooseFolderDeletion(
+                folder,
+                sessionCount: sessions.count,
+                parentWindow: view.window
+            ) else {
+                return
+            }
+            if choice == .deleteFolderAndSessions {
+                try deleteSessionRecords(sessions)
+            }
             try sessionStore.deleteFolder(id: folder.id)
             reloadSessionNodes()
         } catch {
             errorPresenter.present(error, context: .deleteFolder, parentWindow: view.window)
+        }
+    }
+
+    private func sessionsInFolderSubtree(
+        _ folderID: String,
+        snapshot: SessionSidebarSnapshot
+    ) -> [SessionRecord] {
+        var folderIDs: Set<String> = [folderID]
+        var didAddFolder = true
+        while didAddFolder {
+            didAddFolder = false
+            for folder in snapshot.folders where folder.parentId.map(folderIDs.contains) == true {
+                if folderIDs.insert(folder.id).inserted {
+                    didAddFolder = true
+                }
+            }
+        }
+        return snapshot.sessions.filter { session in
+            guard let folderID = session.folderId else { return false }
+            return folderIDs.contains(folderID)
         }
     }
 
@@ -1475,7 +1512,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func deleteSessions(_ sessions: [SessionRecord]) {
-        guard let sessionStore,
+        guard sessionStore != nil,
               !sessions.isEmpty,
               sessionDeleteConfirmer.shouldDeleteSessions(sessions, parentWindow: view.window)
         else {
@@ -1483,22 +1520,27 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
 
         do {
-            for session in sessions {
-                try sessionStore.deleteSession(id: session.id)
-                do {
-                    try remoteEditCacheCleaner?.clearSession(sessionID: session.id)
-                } catch {
-                    StacioLogStore.shared.append(
-                        level: .warning,
-                        category: "RemoteEditCache",
-                        message: "Failed to clear remote edit cache for deleted session \(session.id): \(error)",
-                        sensitiveValues: [session.id]
-                    )
-                }
-            }
+            try deleteSessionRecords(sessions)
             reloadSessionNodes()
         } catch {
             errorPresenter.present(error, context: .deleteSession, parentWindow: view.window)
+        }
+    }
+
+    private func deleteSessionRecords(_ sessions: [SessionRecord]) throws {
+        guard let sessionStore else { return }
+        for session in sessions {
+            try sessionStore.deleteSession(id: session.id)
+            do {
+                try remoteEditCacheCleaner?.clearSession(sessionID: session.id)
+            } catch {
+                StacioLogStore.shared.append(
+                    level: .warning,
+                    category: "RemoteEditCache",
+                    message: "Failed to clear remote edit cache for deleted session \(session.id): \(error)",
+                    sensitiveValues: [session.id]
+                )
+            }
         }
     }
 
@@ -1600,13 +1642,30 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
               let destinationURL = operationsPresenter.chooseSingleSessionExportDestination(
                 session: session,
                 parentWindow: view.window
+              ),
+              let passphrase = secureSessionTransferPassphrasePrompter.promptForExportPassphrase(
+                sessionName: session.name,
+                parentWindow: view.window
               )
         else {
             return
         }
         do {
-            let json = try singleSessionJSON(session, store: sessionStore)
-            try json.write(to: destinationURL, atomically: true, encoding: .utf8)
+            let credential: CredentialRecord?
+            if let credentialID = session.credentialId?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               credentialID.isEmpty == false {
+                credential = try sessionStore.credentialRecord(id: credentialID)
+            } else {
+                credential = nil
+            }
+            let transfer = try secureSessionTransferExporter.encryptedTransfer(
+                for: session,
+                configJSON: try sessionStore.getSessionConfigJSON(id: session.id),
+                credential: credential,
+                passphrase: passphrase
+            )
+            try transfer.write(to: destinationURL, atomically: true, encoding: .utf8)
             operationsPresenter.presentExportComplete(destinationURL: destinationURL, parentWindow: view.window)
         } catch {
             errorPresenter.present(error, context: .exportSessions, parentWindow: view.window)

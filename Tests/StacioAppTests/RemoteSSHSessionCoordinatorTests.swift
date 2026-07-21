@@ -63,6 +63,77 @@ final class RemoteSSHSessionCoordinatorTests: XCTestCase {
         XCTAssertFalse(String(describing: contextStore).contains("super-secret"))
     }
 
+    func testStartRemoteSessionDoesNotFallbackToAgentAfterAuthenticationFailure() throws {
+        let context = tunnelContext()
+        let contextStore = TunnelLiveSessionStore()
+        let workspace = RecordingRemoteWorkspaceOpening()
+        let contextBuilder = AgentFallbackTunnelContextBuilder(template: context)
+        let shellBridge = AgentFallbackLiveShellStarter()
+        let coordinator = RemoteSSHSessionCoordinator(
+            contextBuilder: contextBuilder,
+            liveShellStarter: shellBridge,
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" }
+        )
+
+        _ = try coordinator.start(config: context.config, title: "deploy@example.com")
+        let pane = try XCTUnwrap(workspace.openedPanes.first)
+
+        XCTAssertTrue(waitUntil { shellBridge.startedConfigs.count == 1 })
+        XCTAssertEqual(shellBridge.startedConfigs.map(\.authMethod), [context.config.authMethod])
+        XCTAssertEqual(contextBuilder.requestedConfigs.map(\.authMethod), [context.config.authMethod])
+        XCTAssertNil(contextStore.current())
+        XCTAssertEqual(pane.runtimeID, "pending_test")
+    }
+
+    func testStartRemoteSessionUsesPasswordRecoveryWhenSSHAgentHasNoIdentity() throws {
+        let context = tunnelContext()
+        let contextStore = TunnelLiveSessionStore()
+        let workspace = RecordingRemoteWorkspaceOpening()
+        let contextBuilder = AgentFallbackTunnelContextBuilder(template: context)
+        let shellBridge = AgentFallbackLiveShellStarter(
+            firstError: SshRuntimeError.Transport(
+                message: "[Session(-34)] no identities found in the ssh agent"
+            )
+        )
+        let coordinator = RemoteSSHSessionCoordinator(
+            contextBuilder: contextBuilder,
+            liveShellStarter: shellBridge,
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" }
+        )
+        let agentConfig = SshConnectionConfig(
+            host: context.config.host,
+            port: context.config.port,
+            username: context.config.username,
+            authMethod: .agent,
+            connectTimeoutMs: context.config.connectTimeoutMs
+        )
+        let recoveredConfig = SshConnectionConfig(
+            host: context.config.host,
+            port: context.config.port,
+            username: context.config.username,
+            authMethod: .password(credentialRef: "recovered-password"),
+            connectTimeoutMs: context.config.connectTimeoutMs
+        )
+
+        _ = try coordinator.openSessionTab(
+            config: agentConfig,
+            title: "deploy@example.com",
+            credentialRecovery: { recoveredConfig }
+        )
+        let pane = try XCTUnwrap(workspace.openedPanes.first)
+
+        XCTAssertTrue(waitUntil { pane.runtimeID == "term_agent" })
+        XCTAssertEqual(shellBridge.startedConfigs.map(\.authMethod), [
+            agentConfig.authMethod,
+            recoveredConfig.authMethod
+        ])
+        XCTAssertEqual(contextStore.current()?.config.authMethod, recoveredConfig.authMethod)
+    }
+
     func testStartRemoteSessionUsesProxyJumpRuntimeWhenContextHasProxyJump() throws {
         let proxyJump = proxyJumpRuntimeConfig()
         let context = tunnelContext(proxyJump: proxyJump)
@@ -817,12 +888,12 @@ final class RemoteSSHSessionCoordinatorTests: XCTestCase {
         XCTAssertTrue(waitUntil { pane.runtimeID == "term_initial" })
         let reconnecter = try XCTUnwrap(workspace.reconnecters.first ?? nil)
 
-        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 0)
+        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 0.25)
+        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 0.75)
+        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 1.5)
         XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 3)
         XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 8)
         XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 20)
-        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 60)
-        XCTAssertEqual(reconnecter.automaticReconnectDelaySeconds(), 60)
 
         _ = try reconnectInBackground(reconnecter, title: "deploy@example.com")
 
@@ -911,6 +982,27 @@ private final class EchoTunnelContextBuilder: TunnelLiveSessionContextBuilding {
     }
 }
 
+private final class AgentFallbackTunnelContextBuilder: TunnelLiveSessionContextBuilding {
+    private let template: TunnelLiveSessionContext
+    private(set) var requestedConfigs: [SshConnectionConfig] = []
+
+    init(template: TunnelLiveSessionContext) {
+        self.template = template
+    }
+
+    func makeTunnelLiveSessionContext(
+        config: SshConnectionConfig,
+        databasePath: String
+    ) throws -> TunnelLiveSessionContext {
+        requestedConfigs.append(config)
+        return TunnelLiveSessionContext(
+            config: config,
+            secret: config.authMethod == .agent ? .agent : template.secret,
+            expectedFingerprintSHA256: template.expectedFingerprintSHA256
+        )
+    }
+}
+
 private final class RecordingLiveShellStarter: LiveShellStarting {
     var startedConfigs: [SshConnectionConfig] = []
     var expectedFingerprints: [String] = []
@@ -960,6 +1052,45 @@ private final class RecordingLiveShellStarter: LiveShellStarting {
             return statuses.removeFirst()
         }
         return status ?? LiveShellStatus(runtimeId: "term_live", status: "running", diagnostic: "running")
+    }
+}
+
+private final class AgentFallbackLiveShellStarter: LiveShellStarting {
+    private(set) var startedConfigs: [SshConnectionConfig] = []
+    private let firstError: Error
+
+    init(firstError: Error = SshRuntimeError.AuthFailed) {
+        self.firstError = firstError
+    }
+
+    func startLiveSSHShellRuntime(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> LiveShellStatus {
+        startedConfigs.append(config)
+        if startedConfigs.count == 1 {
+            throw firstError
+        }
+        return LiveShellStatus(runtimeId: "term_agent", status: "running", diagnostic: "running")
+    }
+
+    func startLiveSSHShellRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> LiveShellStatus {
+        try startLiveSSHShellRuntime(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: proxyJump.targetExpectedFingerprintSha256,
+            cols: cols,
+            rows: rows
+        )
     }
 }
 

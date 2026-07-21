@@ -313,6 +313,7 @@ check_product_ops_configuration() {
     StacioProductOpsUpdateChannel
     StacioProductOpsBetaUpdatesEnabled
     StacioFeedbackProductAPIKey
+    StacioSparkleArchitecture
     SUFeedURL
     StacioSparkleBetaAppcastURL
     SUPublicEDKey
@@ -353,21 +354,45 @@ check_product_ops_configuration() {
       ;;
   esac
 
-  local automatic_key automatic_value
+  local sparkle_architecture
+  sparkle_architecture="$(plist_value "$plist" StacioSparkleArchitecture)"
+  case "$sparkle_architecture" in
+    arm64|x86_64)
+      pass "${label}StacioSparkleArchitecture=$sparkle_architecture"
+      ;;
+    *)
+      fail "${label}StacioSparkleArchitecture must be arm64 or x86_64"
+      ;;
+  esac
+  local appcast_key appcast_url
+  for appcast_key in SUFeedURL StacioSparkleBetaAppcastURL; do
+    appcast_url="$(plist_value "$plist" "$appcast_key")"
+    if [[ "$appcast_url" == */"$sparkle_architecture"/appcast.xml ]]; then
+      pass "${label}$appcast_key targets $sparkle_architecture"
+    else
+      fail "${label}$appcast_key must target $sparkle_architecture"
+    fi
+  done
+
+  local automatic_key automatic_value expected_automatic_value
   for automatic_key in SUEnableAutomaticChecks SUAutomaticallyUpdate SUAllowsAutomaticUpdates; do
     automatic_value="$(plist_value "$plist" "$automatic_key")"
-    if [[ "$automatic_value" == "false" ]]; then
-      pass "${label}$automatic_key=false"
+    expected_automatic_value="false"
+    if [[ "$automatic_key" == "SUEnableAutomaticChecks" ]]; then
+      expected_automatic_value="true"
+    fi
+    if [[ "$automatic_value" == "$expected_automatic_value" ]]; then
+      pass "${label}$automatic_key=$expected_automatic_value"
     else
-      fail "${label}$automatic_key must be false"
+      fail "${label}$automatic_key must be $expected_automatic_value"
     fi
   done
   local scheduled_interval
   scheduled_interval="$(plist_value "$plist" SUScheduledCheckInterval)"
-  if [[ "$scheduled_interval" == "0" ]]; then
-    pass "${label}SUScheduledCheckInterval=0"
+  if [[ "$scheduled_interval" == "86400" ]]; then
+    pass "${label}SUScheduledCheckInterval=86400"
   else
-    fail "${label}SUScheduledCheckInterval must be 0"
+    fail "${label}SUScheduledCheckInterval must be 86400"
   fi
 
   local sparkle_key license_key

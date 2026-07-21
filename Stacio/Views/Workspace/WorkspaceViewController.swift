@@ -2891,17 +2891,22 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
     var accessoryProvider: (() -> NSView?)?
 
     private let headerView = NSView()
+    private let paneColorView = NSView()
+    private let paneSeparatorView = NSView()
+    private let paneIndexLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let accessoryContainer = NSView()
     private var currentAccessory: NSView?
     private var headerHeightConstraint: NSLayoutConstraint?
     private var installedConstraints: [NSLayoutConstraint] = []
     private var paneIdentifier = ""
+    private var paneIndex = 1
     private var isHeaderVisible = true
 
-    init(pane: NSViewController, title: String, paneIdentifier: String) {
+    init(pane: NSViewController, title: String, paneIdentifier: String, paneIndex: Int = 1) {
         self.pane = pane
         self.paneIdentifier = paneIdentifier
+        self.paneIndex = max(1, paneIndex)
         super.init(nibName: nil, bundle: nil)
         titleLabel.stringValue = title
     }
@@ -2924,9 +2929,27 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
         headerView.isHidden = !isHeaderVisible
         headerView.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.\(paneIdentifier)")
 
+        paneColorView.translatesAutoresizingMaskIntoConstraints = false
+        paneColorView.wantsLayer = true
+        paneColorView.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.color.\(paneIdentifier)")
+        applyPaneAccent()
+
+        paneIndexLabel.translatesAutoresizingMaskIntoConstraints = false
+        paneIndexLabel.stringValue = paneIndexText
+        paneIndexLabel.font = .systemFont(ofSize: 11, weight: .bold)
+        paneIndexLabel.alignment = .center
+        paneIndexLabel.wantsLayer = true
+        paneIndexLabel.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.index.\(paneIdentifier)")
+        paneIndexLabel.setContentHuggingPriority(.required, for: .horizontal)
+        paneIndexLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        paneSeparatorView.translatesAutoresizingMaskIntoConstraints = false
+        paneSeparatorView.wantsLayer = true
+        applyPaneSeparatorAccent()
+
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.textColor = .labelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         titleLabel.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.title.\(paneIdentifier)")
@@ -2940,10 +2963,13 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
 
         container.addSubview(headerView)
         container.addSubview(pane.view)
+        headerView.addSubview(paneColorView)
+        headerView.addSubview(paneSeparatorView)
+        headerView.addSubview(paneIndexLabel)
         headerView.addSubview(titleLabel)
         headerView.addSubview(accessoryContainer)
 
-        let headerHeight = headerView.heightAnchor.constraint(equalToConstant: isHeaderVisible ? 28 : 0)
+        let headerHeight = headerView.heightAnchor.constraint(equalToConstant: isHeaderVisible ? 32 : 0)
         headerHeightConstraint = headerHeight
         let constraints = [
             headerView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -2951,7 +2977,22 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
             headerView.topAnchor.constraint(equalTo: container.topAnchor),
             headerHeight,
 
-            titleLabel.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 10),
+            paneColorView.leadingAnchor.constraint(equalTo: headerView.leadingAnchor),
+            paneColorView.topAnchor.constraint(equalTo: headerView.topAnchor),
+            paneColorView.bottomAnchor.constraint(equalTo: headerView.bottomAnchor),
+            paneColorView.widthAnchor.constraint(equalToConstant: 8),
+
+            paneSeparatorView.leadingAnchor.constraint(equalTo: headerView.leadingAnchor),
+            paneSeparatorView.trailingAnchor.constraint(equalTo: headerView.trailingAnchor),
+            paneSeparatorView.bottomAnchor.constraint(equalTo: headerView.bottomAnchor),
+            paneSeparatorView.heightAnchor.constraint(equalToConstant: 2),
+
+            paneIndexLabel.leadingAnchor.constraint(equalTo: paneColorView.trailingAnchor, constant: 8),
+            paneIndexLabel.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            paneIndexLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 22),
+            paneIndexLabel.heightAnchor.constraint(equalToConstant: 21),
+
+            titleLabel.leadingAnchor.constraint(equalTo: paneIndexLabel.trailingAnchor, constant: 6),
             titleLabel.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: accessoryContainer.leadingAnchor, constant: -8),
 
@@ -2983,13 +3024,23 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
         guard isViewLoaded else { return }
         headerView.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.\(identifier)")
         titleLabel.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.title.\(identifier)")
+        paneColorView.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.color.\(identifier)")
+        paneIndexLabel.setAccessibilityIdentifier("Stacio.Workspace.splitPaneHeader.index.\(identifier)")
+    }
+
+    func updatePaneIndex(_ index: Int) {
+        paneIndex = max(1, index)
+        guard isViewLoaded else { return }
+        paneIndexLabel.stringValue = paneIndexText
+        applyPaneAccent()
+        applyPaneSeparatorAccent()
     }
 
     func setHeaderVisible(_ visible: Bool) {
         isHeaderVisible = visible
         guard isViewLoaded else { return }
         headerView.isHidden = !visible
-        headerHeightConstraint?.constant = visible ? 28 : 0
+        headerHeightConstraint?.constant = visible ? 32 : 0
     }
 
     func refreshAccessory() {
@@ -3015,10 +3066,15 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
         let appearance = view.window?.effectiveAppearance ?? view.effectiveAppearance
         view.appearance = appearance
         headerView.appearance = appearance
+        paneColorView.appearance = appearance
+        paneSeparatorView.appearance = appearance
+        paneIndexLabel.appearance = appearance
         titleLabel.appearance = appearance
         accessoryContainer.appearance = appearance
         StacioDesignSystem.refreshDynamicLayerColors(in: view)
-        titleLabel.textColor = StacioDesignSystem.resolvedColor(.secondaryLabelColor, for: appearance)
+        titleLabel.textColor = StacioDesignSystem.resolvedColor(.labelColor, for: appearance)
+        applyPaneAccent()
+        applyPaneSeparatorAccent()
         if let button = currentAccessory as? NSButton {
             button.appearance = appearance
             button.contentTintColor = StacioDesignSystem.resolvedColor(.secondaryLabelColor, for: appearance)
@@ -3031,6 +3087,42 @@ private final class TerminalSplitPaneContainerViewController: NSViewController, 
         }
         headerView.needsDisplay = true
         view.needsDisplay = true
+    }
+
+    private static func paneColor(for index: Int) -> NSColor {
+        // The golden-ratio step distributes any number of pane accents without
+        // cycling through a short palette when a workspace has many targets.
+        let hue = CGFloat(
+            (Double(max(1, index) - 1) * 0.618_033_988_749_895)
+                .truncatingRemainder(dividingBy: 1)
+        )
+        return NSColor(
+            calibratedHue: hue,
+            saturation: 0.76,
+            brightness: 0.82,
+            alpha: 1
+        )
+    }
+
+    private var paneIndexText: String {
+        paneIndex < 100 ? String(format: "%02d", paneIndex) : "\(paneIndex)"
+    }
+
+    private func applyPaneAccent() {
+        let color = Self.paneColor(for: paneIndex)
+        StacioDesignSystem.setLayerBackgroundColor(paneColorView, color: color)
+        paneIndexLabel.textColor = color
+        paneIndexLabel.layer?.backgroundColor = color.withAlphaComponent(0.20).cgColor
+        paneIndexLabel.layer?.borderColor = color.withAlphaComponent(0.78).cgColor
+        paneIndexLabel.layer?.borderWidth = 1
+        paneIndexLabel.layer?.cornerRadius = 5
+    }
+
+    private func applyPaneSeparatorAccent() {
+        StacioDesignSystem.setLayerBackgroundColor(
+            paneSeparatorView,
+            color: Self.paneColor(for: paneIndex).withAlphaComponent(0.72)
+        )
     }
 
     func detachPane() {
@@ -4029,6 +4121,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
         if let existing = paneContainers[key] {
             existing.updateTitle(titleProvider(pane))
             existing.updatePaneIdentifier(identifierProvider(pane))
+            existing.updatePaneIndex((panes.firstIndex { $0 === pane } ?? 0) + 1)
             existing.setHeaderVisible(shouldShowPaneHeaders)
             existing.refreshAccessory()
             return existing
@@ -4037,7 +4130,8 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
         let container = TerminalSplitPaneContainerViewController(
             pane: pane,
             title: titleProvider(pane),
-            paneIdentifier: identifierProvider(pane)
+            paneIdentifier: identifierProvider(pane),
+            paneIndex: (panes.firstIndex { $0 === pane } ?? 0) + 1
         )
         container.setHeaderVisible(shouldShowPaneHeaders)
         if let remote = pane as? RemoteTerminalPaneViewController {
@@ -4073,6 +4167,7 @@ private final class TerminalSplitWorkspace: NSViewController, StacioEffectiveApp
             let container = containerController(for: pane)
             container.updateTitle(titleProvider(pane))
             container.updatePaneIdentifier(identifierProvider(pane))
+            container.updatePaneIndex((panes.firstIndex { $0 === pane } ?? 0) + 1)
             container.setHeaderVisible(shouldShowPaneHeaders)
             container.refreshAccessory()
         }

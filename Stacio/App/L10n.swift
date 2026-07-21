@@ -15,9 +15,11 @@ enum L10n {
         static let file = "文件"
         static let edit = "编辑"
         static let terminal = "终端"
+        static let view = "视图"
         static let help = "帮助"
-        static let settings = "设置..."
+        static let settings = "设置"
         static let quit = "退出 Stacio"
+        static let newSession = "新建会话"
         static let newLocalTerminal = "新建本地终端"
         static let closeCurrentTerminal = "关闭当前终端"
         static let cut = "剪切"
@@ -25,7 +27,9 @@ enum L10n {
         static let paste = "粘贴"
         static let selectAll = "全选"
         static let find = "查找"
-        static let splitTerminal = "多执行分屏"
+        static let splitTerminal = "分屏布局"
+        static let multiExec = "多执行"
+        static let toggleSidebar = "显示/隐藏会话列表"
         static let toggleDeviceDashboard = "显示/隐藏设备看板"
         static let feedback = "反馈"
         static let checkForUpdates = "检查更新"
@@ -468,9 +472,12 @@ enum L10n {
         static let splitGrid = "网格分屏"
         static let close = "关闭"
         static let closeCurrentTerminal = "关闭当前终端"
+        static let importSessions = "导入会话"
+        static let importSessionsTooltip = "从其他终端工具导入会话"
+        static let importSessionsAccessibilityDescription = "导入外部会话"
         static let multiExec = "多执行"
-        static let multiExecTooltip = "批量同步输入到多个终端"
-        static let multiExecAccessibilityDescription = "批量多执行"
+        static let multiExecTooltip = "将输入同步执行到多个终端"
+        static let multiExecAccessibilityDescription = "向多个终端同步执行"
         static let panels = "面板"
         static let panelsTooltip = "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI"
         static let tunnels = "隧道"
@@ -557,7 +564,7 @@ enum L10n {
         static let pingHost = "Ping 主机"
         static let renameSession = "重命名会话"
         static let renameSessionConfirm = "重命名"
-        static let saveSessionToFile = "将会话保存到文件"
+        static let saveSessionToFile = "导出会话"
         static let createDesktopShortcut = "创建桌面快捷方式"
         static let saveAsDefaultPreset = "将会话设置保存为默认预设"
         static let copySessionSettings = "复制会话设置"
@@ -587,6 +594,32 @@ enum L10n {
         static let settingsCopiedMessage = "已复制为 Stacio 会话 JSON。"
         static let editSession = "编辑会话"
         static let deleteSession = "删除会话"
+    }
+
+    enum SecureSessionTransfer {
+        static let exportTitle = "导出加密会话"
+        static let importTitle = "导入加密会话"
+        static let exportAction = "导出"
+        static let importAction = "导入"
+        static let passphrasePlaceholder = "迁移口令"
+        static let confirmPassphrasePlaceholder = "确认迁移口令"
+        static let emptyPassphrase = "请输入迁移口令。"
+        static let passphraseMismatch = "两次输入的迁移口令不一致。"
+        static let invalidEnvelope = "所选文件不是有效的 Stacio 加密会话文件。"
+        static let unsupportedFormat = "此加密会话文件使用了当前版本不支持的格式。"
+        static let decryptionFailed = "迁移口令不正确，或文件已损坏。"
+        static let invalidPayload = "加密会话文件中的会话数据无效。"
+        static let credentialUnavailable = "无法读取该会话保存的凭据，未创建导出文件。"
+        static let unsupportedCredentialKind = "该会话使用的凭据类型暂不支持安全迁移。"
+        static let privateKeyUnavailable = "无法读取该会话的私钥文件，未创建导出文件。"
+        static let privateKeyInstallFailed = "无法在本机安全保存导入的私钥。"
+        static let keyDerivationFailed = "无法创建加密迁移文件。"
+        static func exportMessage(_ sessionName: String) -> String {
+            "为“\(sessionName)”设置迁移口令。它不会替代 SSH 密码；在另一台 Stacio 导入时需要输入一次。"
+        }
+        static func importMessage(_ sourceName: String) -> String {
+            "输入“\(sourceName)”导出时设置的迁移口令。SSH 密码不会再次要求输入。"
+        }
     }
 
     enum Inspector {
@@ -1263,8 +1296,13 @@ enum L10n {
 
     enum DeleteFolder {
         static let title = "删除分组？"
-        static func message(_ name: String) -> String {
-            "将删除“\(name)”及其子分组结构，里面的会话会保留并移动到根目录。"
+        static let deleteFolderAndSessions = "删除分组和会话"
+        static let deleteFolderOnly = "仅删除分组"
+        static func message(_ name: String, sessionCount: Int) -> String {
+            "“\(name)”及其子分组中有 \(sessionCount) 个会话。是否同时删除这些会话？选择“仅删除分组”会将会话移动到根目录。"
+        }
+        static func emptyMessage(_ name: String) -> String {
+            "将删除“\(name)”及其子分组结构。"
         }
     }
 
@@ -1283,7 +1321,10 @@ enum L10n {
     }
 
     enum Import {
-        static let chooseFile = "选择 CSV 文件或 Legacy INI 会话文件。"
+        static let chooseFile = "选择要导入的会话文件。"
+        static let sourceTitle = "导入配置"
+        static let sourceMessage = "请选择要导入的配置来源"
+        static let chooseSourceAction = "选择文件"
         static let title = "导入会话"
         static let action = "导入"
         static let completeTitle = "导入完成"
@@ -1307,6 +1348,22 @@ enum L10n {
                 return "Legacy INI 导出"
             case .stacioJSON:
                 return "Stacio 会话 JSON"
+            case .xShell:
+                return "Xshell"
+            case .mobaXterm:
+                return "MobaXterm"
+            case .windTerm:
+                return "WindTerm"
+            case .secureCRT:
+                return "SecureCRT"
+            case .finalShell:
+                return "FinalShell"
+            case .termius:
+                return "Termius"
+            case .electerm:
+                return "Electerm"
+            case .genericJSON:
+                return "JSON"
             case .unknown:
                 return "未知格式"
             }

@@ -59,7 +59,8 @@ let package = Package(
                 .process("Resources/About"),
                 .process("Resources/github.svg"),
                 .process("Resources/gitee.svg"),
-                .process("Resources/SessionIcons")
+                .process("Resources/SessionIcons"),
+                .process("Resources/ImportSourceIcons")
             ]
         ),
         .executableTarget(

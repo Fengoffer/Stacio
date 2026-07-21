@@ -656,6 +656,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             detailContainer.trailingAnchor.constraint(equalTo: detailScrollView.contentView.trailingAnchor),
             detailContainer.topAnchor.constraint(equalTo: detailScrollView.contentView.topAnchor),
             detailContainer.widthAnchor.constraint(equalTo: detailScrollView.contentView.widthAnchor),
+            detailContainer.bottomAnchor.constraint(equalTo: proxyJumpView.bottomAnchor, constant: 12),
 
             sshForm.view.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor),
             sshForm.view.topAnchor.constraint(equalTo: detailContainer.topAnchor),

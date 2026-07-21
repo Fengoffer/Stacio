@@ -7,6 +7,18 @@ StacioAdapters/RDPBridge/**/target/
 .worktrees/
 worktrees/
 .DS_Store
+/.sync_temp_dir/
+/Icon?
 dist/
 .superpowers/
 /竞品截图/
+
+# Internal product, research, planning, and deployment material.
+# Keep these paths local; public repositories should contain only the
+# public README and user-facing source/assets.
+/docs/
+/ops-platform/
+/website/
+/官网/
+/后台/
+/操作系统图标/

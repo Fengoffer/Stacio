@@ -3,6 +3,7 @@ import SwiftTerm
 
 struct LocalAgentBridgeContext: Equatable {
     let socketPath: String
+    let targetRuntimeIDs: [String]
     let targetRuntimeID: String?
     let targetTitle: String?
     let remoteCurrentDirectory: String?
@@ -14,6 +15,7 @@ struct LocalAgentBridgeContext: Equatable {
     init(
         socketPath: String,
         targetRuntimeID: String?,
+        targetRuntimeIDs: [String] = [],
         targetTitle: String?,
         remoteCurrentDirectory: String? = nil,
         cliExecutablePath: String,
@@ -22,7 +24,12 @@ struct LocalAgentBridgeContext: Equatable {
         targetFilePath: String? = nil
     ) {
         self.socketPath = socketPath
-        self.targetRuntimeID = targetRuntimeID
+        let normalizedIDs = (targetRuntimeIDs + [targetRuntimeID].compactMap { $0 })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+        var seen = Set<String>()
+        self.targetRuntimeIDs = normalizedIDs.filter { seen.insert($0).inserted }
+        self.targetRuntimeID = self.targetRuntimeIDs.first
         self.targetTitle = targetTitle
         self.remoteCurrentDirectory = remoteCurrentDirectory
         self.cliExecutablePath = cliExecutablePath
@@ -69,8 +76,7 @@ enum LocalAgentBridgeToolInstaller {
             withIntermediateDirectories: true,
             attributes: nil
         )
-        let target = context.targetRuntimeID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        try "\(target)\n".write(
+        try context.targetRuntimeIDs.joined(separator: "\n").appending("\n").write(
             toFile: context.targetFilePath,
             atomically: true,
             encoding: .utf8
@@ -185,25 +191,37 @@ enum LocalAgentBridgeToolInstaller {
           exit 69
         fi
 
-        runtime="${STACIO_AGENT_TARGET_RUNTIME_ID:-}"
+        runtimes="${STACIO_AGENT_TARGET_RUNTIME_IDS:-}"
+        if [ -z "$runtimes" ] && [ -n "${STACIO_AGENT_TARGET_RUNTIME_ID:-}" ]; then
+          runtimes="${STACIO_AGENT_TARGET_RUNTIME_ID}"
+        fi
         target_file="${STACIO_AGENT_TARGET_FILE:-}"
         if [ -n "$target_file" ] && [ -r "$target_file" ]; then
-          file_runtime="$(head -n 1 "$target_file" 2>/dev/null || true)"
-          if [ -n "$file_runtime" ]; then
-            runtime="$file_runtime"
+          file_runtimes="$(awk 'NF { if (out != "") out=out ","; out=out $0 } END { print out }' "$target_file" 2>/dev/null || true)"
+          if [ -n "$file_runtimes" ]; then
+            runtimes="$file_runtimes"
           fi
         fi
 
         socket="${STACIO_AGENT_SOCKET:-}"
-        if [ -n "$socket" ]; then
-          if [ -n "$runtime" ]; then
-            exec "$STACIO_CLI" agent run --socket "$socket" --text --runtime "$runtime" --follow --command "$*"
-          fi
-          exec "$STACIO_CLI" agent run --socket "$socket" --text --target current --follow --command "$*"
+        if [ -n "$runtimes" ]; then
+          old_ifs="$IFS"
+          overall_status=0
+          IFS=','
+          for runtime in $runtimes; do
+            if [ -n "$runtime" ]; then
+              if [ -n "$socket" ]; then
+                "$STACIO_CLI" agent run --socket "$socket" --text --runtime "$runtime" --follow --command "$*" || overall_status=$?
+              else
+                "$STACIO_CLI" agent run --text --runtime "$runtime" --follow --command "$*" || overall_status=$?
+              fi
+            fi
+          done
+          IFS="$old_ifs"
+          exit "$overall_status"
         fi
-
-        if [ -n "$runtime" ]; then
-          exec "$STACIO_CLI" agent run --text --runtime "$runtime" --follow --command "$*"
+        if [ -n "$socket" ]; then
+          exec "$STACIO_CLI" agent run --socket "$socket" --text --target current --follow --command "$*"
         fi
         exec "$STACIO_CLI" agent run --text --target current --follow --command "$*"
         """
@@ -393,6 +411,7 @@ final class LocalAgentSessionViewController: NSViewController, LocalProcessTermi
         if let activeBridgeContext {
             environment["STACIO_AGENT_SOCKET"] = activeBridgeContext.socketPath
             environment["STACIO_AGENT_TARGET_RUNTIME_ID"] = activeBridgeContext.targetRuntimeID
+            environment["STACIO_AGENT_TARGET_RUNTIME_IDS"] = activeBridgeContext.targetRuntimeIDs.joined(separator: ",")
             environment["STACIO_AGENT_TARGET_TITLE"] = activeBridgeContext.targetTitle
             environment["STACIO_REMOTE_CURRENT_DIRECTORY"] = activeBridgeContext.remoteCurrentDirectory
             environment["STACIO_AGENT_TARGET_FILE"] = activeBridgeContext.targetFilePath

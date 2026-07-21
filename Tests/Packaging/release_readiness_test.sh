@@ -27,6 +27,7 @@ mkdir -p \
   "$APP_DIR/Contents/Helpers" \
   "$APP_DIR/Contents/Resources/About" \
   "$APP_DIR/Contents/Resources/MonacoEditor/vs" \
+  "$APP_DIR/Contents/Resources/SwiftTerm_SwiftTerm.bundle" \
   "$APP_DIR/Contents/_CodeSignature" \
   "$APPCAST_FIXTURE_DIR" \
   "$SOURCE_ROOT"
@@ -46,6 +47,7 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.fr
 printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer"
 printf 'loader\n' >"$APP_DIR/Contents/Resources/MonacoEditor/vs/loader.js"
+printf 'shader\n' >"$APP_DIR/Contents/Resources/SwiftTerm_SwiftTerm.bundle/Shaders.metal"
 printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' >"$APP_DIR/Contents/Resources/About/wechat-official-account.svg"
 touch "$APP_DIR/Contents/Helpers/stacio" "$APP_DIR/Contents/Adapters/vnc"
 chmod +x \
@@ -79,14 +81,15 @@ cat >"$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>StacioProductOpsUpdateChannel</key><string>stable</string>
   <key>StacioProductOpsBetaUpdatesEnabled</key><false/>
   <key>StacioFeedbackProductAPIKey</key><string>feedback-public-key</string>
-  <key>SUFeedURL</key><string>https://ops.stacio.cn/updates/stacio/stable/appcast.xml</string>
-  <key>StacioSparkleBetaAppcastURL</key><string>https://ops.stacio.cn/updates/stacio/beta/appcast.xml</string>
+  <key>StacioSparkleArchitecture</key><string>arm64</string>
+  <key>SUFeedURL</key><string>https://ops.stacio.cn/updates/stacio/stable/arm64/appcast.xml</string>
+  <key>StacioSparkleBetaAppcastURL</key><string>https://ops.stacio.cn/updates/stacio/beta/arm64/appcast.xml</string>
   <key>SUPublicEDKey</key><string>PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=</string>
   <key>StacioLicensePublicEd25519Key</key><string>PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=</string>
-  <key>SUEnableAutomaticChecks</key><false/>
+  <key>SUEnableAutomaticChecks</key><true/>
   <key>SUAutomaticallyUpdate</key><false/>
   <key>SUAllowsAutomaticUpdates</key><false/>
-  <key>SUScheduledCheckInterval</key><integer>0</integer>
+  <key>SUScheduledCheckInterval</key><integer>86400</integer>
 </dict>
 </plist>
 PLIST
@@ -372,10 +375,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 mode="${STACIO_RELEASE_TEST_APPCAST_MODE:-valid}"
-stable_url="https://ops.stacio.cn/updates/stacio/stable/appcast.xml"
-beta_url="https://ops.stacio.cn/updates/stacio/beta/appcast.xml"
-enclosure_url="https://ops.stacio.cn/updates/stacio/stable/Stacio-0.13.3.dmg"
-history_url="https://ops.stacio.cn/updates/stacio/stable/removed-history.dmg"
+stable_url="https://ops.stacio.cn/updates/stacio/stable/arm64/appcast.xml"
+beta_url="https://ops.stacio.cn/updates/stacio/beta/arm64/appcast.xml"
+enclosure_url="https://ops.stacio.cn/updates/stacio/stable/arm64/Stacio-0.13.3.dmg"
+history_url="https://ops.stacio.cn/updates/stacio/stable/arm64/removed-history.dmg"
 
 if [[ "$url" == "$stable_url" ]]; then
   case "$mode" in
@@ -496,6 +499,7 @@ expect_missing_product_ops_field_failure "StacioProductOpsProductID"
 expect_missing_product_ops_field_failure "StacioProductOpsAPIBaseURL"
 expect_missing_product_ops_field_failure "StacioProductOpsUpdateChannel"
 expect_missing_product_ops_field_failure "StacioFeedbackProductAPIKey"
+expect_missing_product_ops_field_failure "StacioSparkleArchitecture"
 expect_missing_product_ops_field_failure "SUFeedURL"
 expect_missing_product_ops_field_failure "StacioSparkleBetaAppcastURL"
 expect_missing_product_ops_field_failure "SUPublicEDKey"
@@ -528,10 +532,11 @@ expect_product_ops_value_failure() {
   fi
 }
 
-expect_product_ops_value_failure "SUEnableAutomaticChecks" "true" "SUEnableAutomaticChecks must be false"
+expect_product_ops_value_failure "SUEnableAutomaticChecks" "false" "SUEnableAutomaticChecks must be true"
 expect_product_ops_value_failure "SUAutomaticallyUpdate" "true" "SUAutomaticallyUpdate must be false"
 expect_product_ops_value_failure "SUAllowsAutomaticUpdates" "true" "SUAllowsAutomaticUpdates must be false"
-expect_product_ops_value_failure "SUScheduledCheckInterval" "3600" "SUScheduledCheckInterval must be 0"
+expect_product_ops_value_failure "SUScheduledCheckInterval" "3600" "SUScheduledCheckInterval must be 86400"
+expect_product_ops_value_failure "StacioSparkleArchitecture" "unsupported" "StacioSparkleArchitecture must be arm64 or x86_64"
 expect_product_ops_value_failure "SUPublicEDKey" "not-base64" "SUPublicEDKey must contain a valid Ed25519 public key"
 expect_product_ops_value_failure "StacioLicensePublicEd25519Key" "not-base64" "StacioLicensePublicEd25519Key must contain a valid Ed25519 public key"
 

@@ -4,6 +4,117 @@ import XCTest
 import StacioCoreBindings
 
 final class SessionImportCoordinatorTests: XCTestCase {
+    func testSourcePickerListsRequestedClientsWithoutNyaTerm() {
+        XCTAssertEqual(AppKitSessionImportSourcePicker.supportedSources.map(\.type), [
+            .stacioJSON,
+            .xShell,
+            .mobaXterm,
+            .windTerm,
+            .secureCRT,
+            .finalShell,
+            .termius,
+            .electerm,
+            .genericJSON
+        ])
+        XCTAssertFalse(AppKitSessionImportSourcePicker.supportedSources.map(\.name).contains("NyaTerm"))
+        XCTAssertEqual(
+            AppKitSessionImportSourcePicker.supportedSources.compactMap(\.iconResourceName),
+            [
+                "xshell.svg",
+                "mobaxterm.svg",
+                "windterm.svg",
+                "securecrt.svg",
+                "finalshell.svg",
+                "termius.svg",
+                "electerm.svg"
+            ]
+        )
+    }
+
+    func testImportSourceIconsLoadAtMenuSize() throws {
+        for source in AppKitSessionImportSourcePicker.supportedSources {
+            let image = try XCTUnwrap(SessionImportSourceIconCatalog.image(for: source), source.name)
+            XCTAssertEqual(image.size, NSSize(width: 18, height: 18), source.name)
+            if source.type != .genericJSON {
+                XCTAssertFalse(image.isTemplate, source.name)
+            }
+        }
+    }
+
+    func testCoordinatorRequestsFileForSelectedImportSourceWithoutSourcePicker() throws {
+        let picker = RecordingSourceAwareSessionImportFilePicker(file: nil)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: picker,
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore()
+        )
+
+        _ = try coordinator.runImport(sourceType: .windTerm, parentWindow: nil)
+
+        XCTAssertEqual(picker.requestedSourceTypes, [.windTerm])
+    }
+
+    func testCoordinatorAppliesExternalCredentialsAfterSessionImport() throws {
+        let contents = """
+        [{"session.protocol":"SSH","session.target":"deploy@web.example.com","session.label":"Web","session.password":"pw"}]
+        """
+        let core = RecordingSessionImportCore(
+            applyResult: makeApplyResult(importedNames: ["Web"], importedCount: 1, skippedCount: 0)
+        )
+        let credentialApplier = RecordingExternalSessionCredentialApplier()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(sourceName: "sessions.sessions", sourceType: .windTerm, contents: contents)
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: core,
+            credentialApplier: credentialApplier
+        )
+
+        let result = try coordinator.runImport(parentWindow: nil)
+
+        XCTAssertEqual(result?.report.importedCount, 1)
+        XCTAssertEqual(credentialApplier.appliedSessions.map(\.name), ["Web"])
+        XCTAssertEqual(credentialApplier.appliedPayload?.sessions[0].credential, .password("pw"))
+        XCTAssertEqual(core.events, ["listAll", "apply:windterm:sessions.sessions"])
+    }
+
+    func testCoordinatorAppliesMobaXtermPreviewAndCredentials() throws {
+        let contents = """
+        [Bookmarks]
+        SubRep=Production\\Web
+        Web 01=#109#0%web.example.com%2222%deploy
+        [Passwords]
+        deploy@web.example.com=plain-secret
+        """
+        let core = RecordingSessionImportCore(
+            applyResult: makeApplyResult(importedNames: ["Web 01"], importedCount: 1, skippedCount: 0)
+        )
+        let credentialApplier = RecordingExternalSessionCredentialApplier()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "MobaXterm Sessions.mxtsessions",
+                    sourceType: .mobaXterm,
+                    contents: contents
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: core,
+            credentialApplier: credentialApplier
+        )
+
+        let result = try coordinator.runImport(parentWindow: nil)
+
+        XCTAssertEqual(result?.report.importedCount, 1)
+        XCTAssertEqual(credentialApplier.appliedSessions.map(\.name), ["Web 01"])
+        XCTAssertEqual(credentialApplier.appliedPayload?.sessions[0].credential, .password("plain-secret"))
+        XCTAssertEqual(core.events, ["listAll", "apply:mobaxterm:MobaXterm Sessions.mxtsessions"])
+    }
+
     func testCoordinatorPreviewsConfirmsAppliesAndRefreshesImportedSessions() throws {
         let file = SessionImportFile(
             sourceName: "sessions.csv",
@@ -278,6 +389,100 @@ final class SessionImportCoordinatorTests: XCTestCase {
         ])
     }
 
+    func testCoordinatorImportsEncryptedSingleSessionAndRestoresCredentialAndPrivateKey() throws {
+        let session = makeRecord(name: "API", host: "api.example.com")
+        let sessionJSON = try SessionSidebarSingleSessionExport.jsonString(for: session, configJSON: nil)
+        let transfer = SecureSessionTransferPayload(
+            sessionJSON: sessionJSON,
+            metadata: SecureSessionTransferSessionMetadata(
+                name: "API",
+                protocolName: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy"
+            ),
+            credential: SecureSessionTransferCredential(kind: .privateKeyPassphrase, secret: "key-passphrase"),
+            privateKey: SecureSessionTransferPrivateKey(
+                fileName: "id_ed25519",
+                contents: Data("private-key-material".utf8)
+            )
+        )
+        let encrypted = try SecureSessionTransfer.encrypt(transfer, passphrase: "migration-passphrase")
+        let core = RecordingSessionImportCore(
+            jsonPreview: preview(sessions: [previewSession(name: "API", host: "api.example.com", conflict: false)]),
+            applyResult: makeApplyResult(importedNames: ["API"], importedCount: 1, skippedCount: 0)
+        )
+        let credentialApplier = RecordingExternalSessionCredentialApplier()
+        let privateKeyInstaller = RecordingSecureSessionTransferPrivateKeyInstaller()
+        let passphrasePrompter = RecordingSecureSessionTransferPassphrasePrompter(importPassphrase: "migration-passphrase")
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "API.stacio-session",
+                    sourceType: .stacioJSON,
+                    contents: encrypted
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: core,
+            credentialApplier: credentialApplier,
+            secureSessionTransferPassphrasePrompter: passphrasePrompter,
+            importedPrivateKeyInstaller: privateKeyInstaller
+        )
+
+        let result = try coordinator.runImport(parentWindow: nil)
+
+        XCTAssertEqual(result?.report.importedCount, 1)
+        XCTAssertEqual(passphrasePrompter.importedSourceNames, ["API.stacio-session"])
+        XCTAssertEqual(core.events, [
+            "listAll",
+            "previewStacioJSON:API.stacio-session",
+            "apply:stacio_json:API.stacio-session"
+        ])
+        XCTAssertEqual(core.stacioJSONInputs, [sessionJSON])
+        XCTAssertEqual(credentialApplier.appliedPayload?.sessions.first?.credential, .privateKeyPassphrase("key-passphrase"))
+        XCTAssertEqual(privateKeyInstaller.installedPrivateKeys.map(\.fileName), ["id_ed25519"])
+        XCTAssertEqual(privateKeyInstaller.installedSessionIDs, ["session_api"])
+    }
+
+    func testCoordinatorRejectsEncryptedSessionWithWrongMigrationPassphrase() throws {
+        let transfer = SecureSessionTransferPayload(
+            sessionJSON: "{}",
+            metadata: SecureSessionTransferSessionMetadata(
+                name: "API",
+                protocolName: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy"
+            ),
+            credential: nil,
+            privateKey: nil
+        )
+        let encrypted = try SecureSessionTransfer.encrypt(transfer, passphrase: "correct-passphrase")
+        let core = RecordingSessionImportCore()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "API.stacio-session",
+                    sourceType: .genericJSON,
+                    contents: encrypted
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: core,
+            secureSessionTransferPassphrasePrompter: RecordingSecureSessionTransferPassphrasePrompter(
+                importPassphrase: "wrong-passphrase"
+            )
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(parentWindow: nil)) { error in
+            XCTAssertEqual(error as? SecureSessionTransferError, .decryptionFailed)
+        }
+        XCTAssertEqual(core.events, [])
+    }
+
     func testImportPreviewMessageUsesChineseSourceTypeLabel() {
         let message = L10n.Import.previewMessage(
             sourceName: "sessions.csv",
@@ -390,6 +595,23 @@ private final class RecordingSessionImportFilePicker: SessionImportFilePicking {
     }
 }
 
+private final class RecordingSourceAwareSessionImportFilePicker: SessionImportFilePicking {
+    private let file: SessionImportFile?
+    private(set) var requestedSourceTypes: [SessionImportSourceType] = []
+
+    init(file: SessionImportFile?) { self.file = file }
+
+    func pickImportFile(parentWindow: NSWindow?) throws -> SessionImportFile? { file }
+
+    func pickImportFile(
+        sourceType: SessionImportSourceType,
+        parentWindow: NSWindow?
+    ) throws -> SessionImportFile? {
+        requestedSourceTypes.append(sourceType)
+        return file
+    }
+}
+
 private final class RecordingSessionImportPresenter: SessionImportPreviewPresenting {
     private let confirmImport: Bool
     private(set) var previewedSessionNames: [String] = []
@@ -418,6 +640,7 @@ private final class RecordingSessionImportPresenter: SessionImportPreviewPresent
 
 private final class RecordingSessionImportCore: SessionImportCoreBridging {
     var events: [String] = []
+    private(set) var stacioJSONInputs: [String] = []
     private let existingSessions: [SessionRecord]
     private let csvPreview: ImportPreview
     private let legacyIniPreview: ImportPreview
@@ -467,6 +690,7 @@ private final class RecordingSessionImportCore: SessionImportCoreBridging {
         existingSessionNames: [String]
     ) throws -> ImportPreview {
         events.append("previewStacioJSON:\(sourceName)")
+        stacioJSONInputs.append(input)
         return jsonPreview
     }
 
@@ -478,6 +702,52 @@ private final class RecordingSessionImportCore: SessionImportCoreBridging {
     ) throws -> ImportApplyResult {
         events.append("apply:\(sourceType.rawValue):\(sourceName)")
         return applyResult
+    }
+}
+
+private final class RecordingExternalSessionCredentialApplier: ExternalSessionCredentialApplying {
+    private(set) var appliedPayload: ExternalSessionImportPayload?
+    private(set) var appliedSessions: [SessionRecord] = []
+
+    func applyCredentials(
+        from payload: ExternalSessionImportPayload,
+        to importedSessions: [SessionRecord],
+        databasePath: String
+    ) throws {
+        appliedPayload = payload
+        appliedSessions = importedSessions
+    }
+}
+
+private final class RecordingSecureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting {
+    private let importPassphrase: String?
+    private(set) var importedSourceNames: [String] = []
+
+    init(importPassphrase: String?) {
+        self.importPassphrase = importPassphrase
+    }
+
+    func promptForExportPassphrase(sessionName: String, parentWindow: NSWindow?) -> String? {
+        nil
+    }
+
+    func promptForImportPassphrase(sourceName: String, parentWindow: NSWindow?) -> String? {
+        importedSourceNames.append(sourceName)
+        return importPassphrase
+    }
+}
+
+private final class RecordingSecureSessionTransferPrivateKeyInstaller: SecureSessionTransferPrivateKeyInstalling {
+    private(set) var installedPrivateKeys: [SecureSessionTransferPrivateKey] = []
+    private(set) var installedSessionIDs: [String] = []
+
+    func install(
+        _ privateKey: SecureSessionTransferPrivateKey,
+        for importedSession: SessionRecord,
+        databasePath: String
+    ) throws {
+        installedPrivateKeys.append(privateKey)
+        installedSessionIDs.append(importedSession.id)
     }
 }
 

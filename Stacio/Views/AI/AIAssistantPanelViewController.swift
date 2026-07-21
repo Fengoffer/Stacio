@@ -126,6 +126,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var currentAgentPlan: AgentTaskPlan?
     private var planWorkspaceText = ""
     private var activeTaskRequestID: String?
+    private var taskControlRequestIDsByRequestID: [String: [String]] = [:]
     private var taskControlStatusesByRequestID: [String: String] = [:]
     private var taskControlText = ""
     private var taskHistoryText = ""
@@ -156,6 +157,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var questionTopWithoutAttachmentsConstraint: NSLayoutConstraint?
     private var questionTopWithAttachmentsConstraint: NSLayoutConstraint?
     private var selectedRuntimeID: String?
+    private var selectedRuntimeIDs: [String] = []
     private var surfaceMode: AIAssistantSurfaceMode = .assistant
     private var activeLocalAgentTool: LocalAgentTool?
     private var localAgentSessionsByTool: [LocalAgentTool: LocalAgentSessionViewController] = [:]
@@ -868,6 +870,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     public func followCurrentTerminalContext() {
         selectedRuntimeID = nil
+        selectedRuntimeIDs = []
         refreshForCurrentContext()
     }
 
@@ -1073,11 +1076,13 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         else {
             return nil
         }
-        let context = resolvedTargetContext()
+        let contexts = resolvedTargetContexts()
+        let context = contexts.first
         return LocalAgentBridgeContext(
             socketPath: socketPath,
             targetRuntimeID: context?.runtimeID,
-            targetTitle: context?.title,
+            targetRuntimeIDs: contexts.map(\.runtimeID),
+            targetTitle: contexts.map(\.title).joined(separator: "、"),
             remoteCurrentDirectory: context?.currentDirectory,
             cliExecutablePath: cliPath,
             toolsDirectory: LocalAgentBridgeToolInstaller.defaultToolsDirectory()
@@ -1237,8 +1242,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         activeOrchestrator?.cancel()
         activeOrchestrator = nil
         if let activeTaskRequestID,
-           let event = coordinator.cancelTask(requestID: activeTaskRequestID) {
-            appendTraceEvent(event, runtimeTitle: traceRuntimeTitlesByRequestID[activeTaskRequestID], allEvents: nil)
+           let event = performTaskControl(for: activeTaskRequestID, action: coordinator.cancelTask).first {
             taskControlStatusesByRequestID[activeTaskRequestID] = controlStatusText(forCancelEvent: event)
             renderTaskControls(for: activeTaskRequestID)
         }
@@ -1262,7 +1266,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         attachments: [AIAssistantAttachment]
     ) {
         beginTaskModelSelectionCapture()
-        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator, limits: agentTaskLoopLimits)
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: coordinator,
+            limits: agentTaskLoopLimits,
+            targetContextsProvider: { [weak self] in self?.resolvedTargetContexts() ?? [] }
+        )
         activeOrchestrator = orchestrator
         activeAutonomousTask?.cancel()
         let runID = beginAutonomousRun()
@@ -1320,7 +1328,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         attachments: [AIAssistantAttachment]
     ) {
         beginTaskModelSelectionCapture()
-        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator, limits: agentTaskLoopLimits)
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: coordinator,
+            limits: agentTaskLoopLimits,
+            targetContextsProvider: { [weak self] in self?.resolvedTargetContexts() ?? [] }
+        )
         activeOrchestrator = orchestrator
         activeAutonomousTask?.cancel()
         let runID = beginAutonomousRun()
@@ -1378,7 +1390,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         introduction: String
     ) {
         beginTaskModelSelectionCapture()
-        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator, limits: agentTaskLoopLimits)
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: coordinator,
+            limits: agentTaskLoopLimits,
+            targetContextsProvider: { [weak self] in self?.resolvedTargetContexts() ?? [] }
+        )
         activeOrchestrator = orchestrator
         activeAutonomousTask?.cancel()
         let runID = beginAutonomousRun()
@@ -1962,11 +1978,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     @objc
     private func targetButtonPressed(_ sender: Any?) {
-        let picker = AITargetPickerViewController(sessions: terminalSessionProvider())
+        let picker = AITargetPickerViewController(
+            sessions: terminalSessionProvider(),
+            allowsMultipleSelection: true,
+            initiallySelectedRuntimeIDs: selectedRuntimeIDs
+        )
         picker.onSelectRuntimeID = { [weak self] runtimeID in
             self?.selectedRuntimeID = runtimeID
+            self?.selectedRuntimeIDs = [runtimeID]
             self?.refreshForCurrentContext()
             self?.dismiss(picker)
+        }
+        picker.onConfirmRuntimeIDs = { [weak self] runtimeIDs in
+            guard let self else { return }
+            let normalized = runtimeIDs.filter { $0.isEmpty == false }
+            guard normalized.isEmpty == false else { return }
+            self.selectedRuntimeIDs = normalized
+            self.selectedRuntimeID = normalized.first
+            self.refreshForCurrentContext()
+            self.dismiss(picker)
         }
         present(
             picker,
@@ -2006,8 +2036,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             return
         }
         guard let activeTaskRequestID else { return }
-        if let event = coordinator.pauseTask(requestID: activeTaskRequestID) {
-            appendTraceEvent(event, runtimeTitle: traceRuntimeTitlesByRequestID[activeTaskRequestID], allEvents: nil)
+        if let event = performTaskControl(for: activeTaskRequestID, action: coordinator.pauseTask).first {
             updateStatusFromTrace(event)
             taskControlStatusesByRequestID[activeTaskRequestID] = "AI 后续自动动作已暂停，当前命令仍以目标终端输出为准。"
             renderTaskControls(for: activeTaskRequestID)
@@ -2044,8 +2073,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             return
         }
         guard let activeTaskRequestID else { return }
-        if let event = coordinator.cancelTask(requestID: activeTaskRequestID) {
-            appendTraceEvent(event, runtimeTitle: traceRuntimeTitlesByRequestID[activeTaskRequestID], allEvents: nil)
+        if let event = performTaskControl(for: activeTaskRequestID, action: coordinator.cancelTask).first {
             updateStatusFromTrace(event)
             taskControlStatusesByRequestID[activeTaskRequestID] = controlStatusText(forCancelEvent: event)
             renderTaskControls(for: activeTaskRequestID)
@@ -2089,8 +2117,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             return
         }
         guard let activeTaskRequestID else { return }
-        if let event = coordinator.takeOverTask(requestID: activeTaskRequestID) {
-            appendTraceEvent(event, runtimeTitle: traceRuntimeTitlesByRequestID[activeTaskRequestID], allEvents: nil)
+        if let event = performTaskControl(for: activeTaskRequestID, action: coordinator.takeOverTask).first {
             updateStatusFromTrace(event)
             taskControlStatusesByRequestID[activeTaskRequestID] = controlStatusText(forTakeOverEvent: event)
             renderTaskControls(for: activeTaskRequestID)
@@ -2144,7 +2171,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         guard let continuation = pendingTaskContinuation else { return }
         restoreCapturedTaskModelSelection(continuation.modelSelection)
         clearPendingTaskContinuation()
-        let orchestrator = AgentTaskOrchestrator(coordinator: coordinator, limits: agentTaskLoopLimits)
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: coordinator,
+            limits: agentTaskLoopLimits,
+            targetContextsProvider: { [weak self] in self?.resolvedTargetContexts() ?? [] }
+        )
         activeOrchestrator = orchestrator
         activeAutonomousTask?.cancel()
         let runID = beginAutonomousRun()
@@ -2279,6 +2310,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             statusLabel.stringValue = L10n.AI.noTerminal
             return nil
         }
+        let contexts = resolvedTargetContexts()
         let requestID = currentProposalTaskRequestID ?? UUID().uuidString
         currentProposalTaskRequestID = nil
         finishActiveProcessGroup(collapse: true)
@@ -2302,7 +2334,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             var streamedEvents: [AgentTraceEvent] = []
             let events = try coordinator.executeProposedCommand(
                 command,
-                context: context,
+                contexts: contexts.isEmpty ? [context] : contexts,
                 requestID: requestID,
                 emit: { [weak self] event in
                     guard let self else { return }
@@ -2311,6 +2343,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                     self.updateStatusFromTrace(event)
                 }
             )
+            registerTaskControlRequestIDs(events)
             if let eventRequestID = events.first?.requestID,
                eventRequestID != requestID,
                let pendingConclusion = pendingAssistantConclusionsByRequestID.removeValue(forKey: requestID) {
@@ -2546,23 +2579,45 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func resolvedTargetContext() -> AITerminalContext? {
-        if let selectedRuntimeID {
-            if let selectedContext = contextProvider(selectedRuntimeID) {
-                return selectedContext
-            }
-            self.selectedRuntimeID = nil
+        resolvedTargetContexts().first
+    }
+
+    private func resolvedTargetContexts() -> [AITerminalContext] {
+        let ids = selectedRuntimeIDs.isEmpty
+            ? selectedRuntimeID.map { [$0] } ?? []
+            : selectedRuntimeIDs
+        if ids.isEmpty {
+            return contextProvider(nil).map { [$0] } ?? []
         }
-        return contextProvider(nil)
+        var seen = Set<String>()
+        let contexts = ids.compactMap { contextProvider($0) }.filter {
+            seen.insert($0.runtimeID).inserted
+        }
+        if contexts.isEmpty {
+            selectedRuntimeID = nil
+            selectedRuntimeIDs = []
+            return contextProvider(nil).map { [$0] } ?? []
+        }
+        selectedRuntimeIDs = contexts.map(\.runtimeID)
+        selectedRuntimeID = selectedRuntimeIDs.first
+        return contexts
     }
 
     private func updateTargetButtonTitle(_ title: String?) {
         let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = trimmed?.isEmpty == false ? trimmed! : L10n.AI.targetPicker
-        targetButton.title = displayTitle
+        let selectionCount = selectedRuntimeIDs.count
+        targetButton.title = selectionCount > 1 ? "\(selectionCount) 个终端" : displayTitle
         targetButton.image = nil
-        targetButton.toolTip = displayTitle == L10n.AI.targetPicker
-            ? L10n.AI.targetPicker
-            : "\(L10n.AI.currentTarget)：\(displayTitle)"
+        if selectionCount > 1 {
+            targetButton.toolTip = selectedRuntimeIDs
+                .compactMap { contextProvider($0)?.title }
+                .joined(separator: "、")
+        } else {
+            targetButton.toolTip = displayTitle == L10n.AI.targetPicker
+                ? L10n.AI.targetPicker
+                : "\(L10n.AI.currentTarget)：\(displayTitle)"
+        }
         targetButton.setAccessibilityLabel(targetButton.toolTip)
     }
 
@@ -3585,10 +3640,41 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func shouldDisplayTrace(forRuntimeID runtimeID: String) -> Bool {
+        if selectedRuntimeIDs.isEmpty == false {
+            return selectedRuntimeIDs.contains(runtimeID)
+        }
         if let selectedRuntimeID {
             return selectedRuntimeID == runtimeID
         }
         return contextProvider(nil)?.runtimeID == runtimeID
+    }
+
+    private func registerTaskControlRequestIDs(_ events: [AgentTraceEvent]) {
+        let requestIDs = Array(Set(events.map(\.requestID))).sorted()
+        guard requestIDs.isEmpty == false else { return }
+        for requestID in requestIDs {
+            taskControlRequestIDsByRequestID[requestID] = requestIDs
+        }
+    }
+
+    private func taskControlRequestIDs(for requestID: String) -> [String] {
+        taskControlRequestIDsByRequestID[requestID] ?? [requestID]
+    }
+
+    private func performTaskControl(
+        for requestID: String,
+        action: (String) -> AgentTraceEvent?
+    ) -> [AgentTraceEvent] {
+        taskControlRequestIDs(for: requestID).compactMap { targetRequestID in
+            guard let event = action(targetRequestID) else { return nil }
+            appendTraceEvent(
+                event,
+                runtimeTitle: traceRuntimeTitlesByRequestID[targetRequestID],
+                allEvents: nil
+            )
+            updateStatusFromTrace(event)
+            return event
+        }
     }
 
     private func appendTraceEvent(
@@ -4724,6 +4810,13 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     func selectTargetRuntimeForTesting(_ runtimeID: String) {
         selectedRuntimeID = runtimeID
+        selectedRuntimeIDs = [runtimeID]
+        refreshForCurrentContext()
+    }
+
+    func selectTargetRuntimesForTesting(_ runtimeIDs: [String]) {
+        selectedRuntimeIDs = runtimeIDs
+        selectedRuntimeID = runtimeIDs.first
         refreshForCurrentContext()
     }
 

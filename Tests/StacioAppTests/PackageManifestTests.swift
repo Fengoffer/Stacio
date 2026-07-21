@@ -28,7 +28,7 @@ final class PackageManifestTests: XCTestCase {
         XCTAssertTrue(packageManifest.contains("https://github.com/sparkle-project/Sparkle.git"))
         XCTAssertTrue(packageManifest.contains(".product(name: \"Sparkle\", package: \"Sparkle\")"))
         XCTAssertTrue(script.contains("STACIO_SPARKLE_STABLE_APPCAST_URL"))
-        XCTAssertTrue(script.contains("https://ops.stacio.cn/updates/stacio/stable/appcast.xml"))
+        XCTAssertTrue(script.contains("/stable/$SPARKLE_UPDATE_ARCHITECTURE/appcast.xml"))
         XCTAssertTrue(script.contains("Sparkle.framework"))
         XCTAssertTrue(script.contains("@executable_path/../Frameworks"))
         XCTAssertTrue(script.contains("SUPublicEDKey"))

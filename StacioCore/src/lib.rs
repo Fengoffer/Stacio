@@ -1998,6 +1998,8 @@ fn normalize_import_source_type(source_type: &str) -> Result<String, SessionErro
         "csv" => Ok("csv".to_string()),
         "legacy_ini" => Ok("legacy_ini".to_string()),
         "json" | "stacio_json" => Ok("stacio_json".to_string()),
+        "xshell" | "mobaxterm" | "windterm" | "securecrt" | "finalshell" | "termius"
+        | "electerm" => Ok(source_type.trim().to_ascii_lowercase()),
         _ => Err(SessionError::InvalidQuickConnect),
     }
 }

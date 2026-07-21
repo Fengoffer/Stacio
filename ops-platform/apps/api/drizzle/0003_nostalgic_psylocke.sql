@@ -1,1 +1,0 @@
-ALTER TABLE "api_keys" ADD COLUMN "product_ids" jsonb DEFAULT '[]'::jsonb NOT NULL;

@@ -103,7 +103,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(L10n.DeleteSession.oneMessage, "保存的会话将被移除，并同时清除该会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。")
         XCTAssertEqual(L10n.DeleteSession.manyMessage(2), "2 个保存的会话将被移除，并同时清除这些会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。")
         XCTAssertEqual(L10n.QuickConnect.message, "输入 SSH 目标，例如 用户名@主机:22。")
-        XCTAssertEqual(L10n.Import.chooseFile, "选择 CSV 文件或 Legacy INI 会话文件。")
+        XCTAssertEqual(L10n.Import.chooseFile, "选择要导入的会话文件。")
     }
 
     func testSessionSettingsUsesSystemAdaptiveSheetSurface() {
@@ -159,6 +159,24 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(form.frame.width, 390)
         XCTAssertGreaterThanOrEqual(grid.rowSpacing, 11)
         XCTAssertEqual(grid.columnSpacing, 14)
+    }
+
+    func testSessionSettingsShowsTheEntireNameFieldAtInitialScrollPosition() throws {
+        let controller = makeController()
+        controller.loadView()
+        controller.view.layoutSubtreeIfNeeded()
+
+        let scrollView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.SessionSettings.detailScrollView") as? NSScrollView
+        )
+        let nameField = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.SessionEditor.name") as? NSTextField
+        )
+        let visibleRect = scrollView.contentView.documentVisibleRect
+        let nameRect = nameField.convert(nameField.bounds, to: scrollView.documentView)
+
+        XCTAssertGreaterThanOrEqual(nameRect.minY, visibleRect.minY - 0.5)
+        XCTAssertLessThanOrEqual(nameRect.maxY, visibleRect.maxY + 0.5)
     }
 
     func testSessionSettingsDoesNotLeaveLargeBlankGapBetweenFormAndAutomation() throws {

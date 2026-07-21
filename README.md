@@ -1,57 +1,83 @@
 # Stacio
 
-Stacio 是一款面向 macOS 的本地优先远程运维工作台，适合开发者、运维人员和 Homelab 用户把终端、远程文件、文件传输、隧道、设备看板和 AI 辅助排查放在同一个原生桌面应用里完成。
+Stacio 是原生 macOS SSH客户端与远程运维工作台，用于在一个桌面应用中管理远程会话、终端、文件传输、隧道、设备状态和经用户确认的 AI 辅助排查。
 
-应用由 AppKit 工作台和 Rust Core 组成。远程连接、会话存储、传输、诊断和可审计自动化都尽量由应用自身负责，而不是把核心体验降级成零散 shell 命令包装。
+Stacio is a native macOS SSH client and remote operations workbench for managing terminal sessions, remote files, transfers, tunnels, device visibility, and user-confirmed AI-assisted troubleshooting.
 
-![Stacio 工作台](assets/screenshots/stacio-workbench.png)
+**官方链接**
 
-## 亮点
+- 官网：[https://www.stacio.cn/](https://www.stacio.cn/)
+- 下载：[https://www.stacio.cn/#download](https://www.stacio.cn/#download)
+- GitHub：[https://github.com/Fengoffer/Stacio](https://github.com/Fengoffer/Stacio)
+- Gitee：[https://gitee.com/fengoffer/Stacio](https://gitee.com/fengoffer/Stacio)
+- LLM Context：[https://www.stacio.cn/llms.txt](https://www.stacio.cn/llms.txt)
+- Full Product Context：[https://www.stacio.cn/llms-full.txt](https://www.stacio.cn/llms-full.txt)
 
-- 原生 macOS 桌面体验：会话侧栏、标签页工作区、工具栏操作和右侧检查器。
-- 以应用自身为中心的 SSH / SCP / Files 工作流，覆盖终端、远程文件、传输、隧道、诊断和命令历史。
-- 多协议会话管理：SSH、Telnet、VNC、FTP、SCP、串口和本地终端统一从会话编辑器维护。
-- 本地优先安全模型：会话数据落在本地应用数据库，凭据走 macOS Keychain，诊断与日志默认脱敏。
-- Swift / AppKit 前端加 Rust Core，仓库包含桥接、会话、传输、文件、诊断、AI、终端体验和打包相关测试。
-- AI 助手可读取可见终端上下文，提出排查建议，生成可执行命令卡片，并保留执行审计。
+## 快速事实
 
-![Stacio 会话设置](assets/screenshots/stacio-session-settings.png)
+- **当前稳定版：** Stacio 0.13.5 Stable（构建号 247）
+- **系统要求：** macOS 14 及以上。
+- **安装包：** 下载页分别提供 Apple Silicon 与 Intel Mac 版本，请按设备芯片选择。
+- **首次打开：** 当前安装包尚未经过 Apple 公证。若 macOS 拦截首次启动，请在 Finder 中右键 `Stacio.app`，再选择“打开”。
+- **桌面平台：** 当前仅提供 macOS 客户端，Windows 和 Linux 桌面客户端暂未提供。
 
-## 功能说明
+## Stacio 能做什么
 
-### 会话管理
+- 管理 SSH、Telnet、串口和本地终端会话，并用会话分组整理常用主机。
+- 在终端标签页中分屏，并按需对选定终端进行同步执行。
+- 浏览和操作远程文件，使用 SCP 传输文件并查看传输任务状态。
+- 管理 SSH 隧道、查看设备指标，并通过内置浏览器访问所需网页。
+- 使用 AI 辅助排查和本地 Agent 集成。AI 生成的命令、更新下载、安装和重启均需用户确认，Stacio 不会静默执行这些操作。
 
-Stacio 可以保存常用主机和连接配置，包括协议、主机、端口、用户名、标签、环境变量、启动命令、超时设置和每个会话的 AI 执行策略。侧栏支持已保存会话和分组，让常用主机保持在手边。
+## 不做什么
 
-### 终端工作区
+- 当前不提供 Windows 或 Linux 桌面客户端。
+- 不提供数据库连接或相关管理功能。
+- 不会在用户未确认前执行 AI 生成的命令，也不会在未确认时下载更新、安装或重启。
 
-终端工作区支持本地终端和远程终端标签，包含命令高亮、链接识别、当前目录追踪、终端输出事件和右侧面板联动。终端上下文可以被诊断、命令历史和 AI 助手复用。
+## 适用场景
 
-### 文件与传输
+Stacio 面向希望在 Mac 上集中使用 SSH工具的开发者、运维人员和 Homelab 用户。作为 Mac SSH客户端和 Mac SSH工具，它适合将服务器远程管理工具、Shell 与 Terminal 工作流放进同一个原生工作台。对于正在寻找 Xshell for Mac 替代选择的用户，Stacio 适合需要会话分组、终端分屏、同步执行、远程文件、SCP 传输和 SSH 隧道的日常远程运维场景。
 
-远程文件能力在 Stacio 内部完成。应用支持远程目录浏览、本地/远程文件面板、文本编辑、媒体预览、传输队列状态、取消流程和进度更新稳定性保护。
+## 下载与安装
 
-### 隧道与设备看板
+请通过 [Stacio 官方下载页](https://www.stacio.cn/#download) 获取当前安装包。下载页会分别提供 Apple Silicon 与 Intel Mac 版本。
 
-Stacio 提供 SSH 相关隧道管理和设备看板入口。应用会跟踪运行中的隧道，避免关闭窗口时误中断仍在工作的连接。
+在 Mac 的“关于本机”中查看芯片信息：显示 Apple 芯片时选择 Apple Silicon 版本；显示 Intel 时选择 Intel Mac 版本。当前安装包未公证，首次被拦截时，请在 Finder 中右键 `Stacio.app`，选择“打开”。
 
-### AI 助手
+## 常见问题
 
-AI 助手可以基于当前终端标题、目录和最近输出生成排查建议，也可以返回可发送到终端的命令卡片。执行流程会经过 Stacio 的协调器，便于保留请求标识、操作记录和诊断信息。
+### Stacio 是 Mac SSH客户端吗？
 
-### 诊断与安全
+是。Stacio 是原生 macOS SSH客户端，提供远程会话、终端、远程文件、SCP 传输、SSH 隧道和设备指标等远程运维工作流。
 
-诊断能力围绕脱敏、应用日志、运行时上下文和可复现检查展开。凭据通过 macOS Keychain 路径保存，诊断面默认避免暴露密钥、账号和敏感路径。
+### Stacio 与 macOS Terminal 有何不同？
 
-## 系统要求
+macOS Terminal 是系统自带的终端应用。Stacio 在终端基础上增加会话保存与分组、终端分屏、同步执行、远程文件、SCP 传输、SSH 隧道、设备指标和 AI 辅助排查等能力，便于长期管理多台主机。
 
-- macOS 14 或更新版本
-- Xcode Command Line Tools
-- Swift Package Manager
-- Rust toolchain 和 Cargo
-- Node.js 与 npm，用于应用内 web 资源
+### Stacio 能作为 Xshell for Mac 替代吗？
+
+可以。若你的需求是在 Mac 上管理多个远程会话，并需要会话分组、终端分屏、同步执行、远程文件、SCP 传输和 SSH 隧道，Stacio 可以作为 Xshell for Mac 的替代选择。
+
+### 如何选择 Apple Silicon 与 Intel 安装包？
+
+在 Mac 的“关于本机”中查看芯片信息。显示 Apple 芯片时选择 Apple Silicon 版本；显示 Intel 时选择 Intel Mac 版本。
+
+### Stacio 是否管理数据库？
+
+不管理。Stacio 不提供数据库连接或相关管理功能。
+
+## 截图
+
+![Stacio 主工作台，左侧会话列表与新建连接入口](assets/screenshots/stacio-workbench.png)
+
+![Stacio 会话设置界面，展示连接信息、标签和保存操作](assets/screenshots/stacio-session-settings.png)
 
 ## 从源码构建
+
+以下依赖和命令仅适用于从源码构建；使用官网安装包不需要安装 Xcode、Swift、Rust 或 Node 开发环境。
+
+构建前需要准备 Xcode Command Line Tools、Swift Package Manager、Rust toolchain 和 Cargo，以及 Node.js 与 npm。
 
 安装 JavaScript 依赖：
 
@@ -84,7 +110,7 @@ swift build --product Stacio
 dist/Stacio.app
 ```
 
-## 测试
+## 测试、贡献与许可证
 
 常用本地检查：
 
@@ -94,16 +120,6 @@ cargo test --manifest-path StacioCore/Cargo.toml
 ./scripts/smoke-local-app.sh dist/Stacio.app
 ```
 
-打包和发布辅助脚本位于 `scripts/`，CI 配置位于 `.github/workflows/stacio-ci.yml`。
+欢迎围绕可复现的问题、改进建议和非商业贡献参与项目；提交前请先阅读许可证要求。
 
-## 下载
-
-预编译 DMG 包通过 GitHub Releases 发布：
-
-https://github.com/Fengoffer/Stacio/releases
-
-## 开源协议与商用限制
-
-Stacio 允许个人学习、研究和非商业二次开发。未经书面授权，禁止商用、转售、付费托管、付费分发，或将本项目集成到商业产品中。
-
-完整条款见 [LICENSE](LICENSE)。
+Stacio 使用 [Stacio Source Available Non-Commercial License](LICENSE) 1.0。该许可证允许个人学习、研究、评估和非商业二次开发；商业使用以及官方品牌二进制、安装包或衍生版本的再分发，均需要事先获得书面授权。

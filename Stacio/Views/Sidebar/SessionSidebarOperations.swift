@@ -10,6 +10,11 @@ public struct SessionSidebarMoveDestination: Equatable {
     }
 }
 
+public enum SessionSidebarFolderDeletionChoice: Equatable {
+    case deleteFolderOnly
+    case deleteFolderAndSessions
+}
+
 @MainActor
 public protocol SessionSidebarPingProgressPresenting: AnyObject {
     func setCancelHandler(_ handler: @escaping @MainActor () -> Void)
@@ -29,7 +34,11 @@ public protocol SessionSidebarOperationsPresenting {
 
     func promptCreateFolder(parentFolder: SessionFolder?, parentWindow: NSWindow?) -> String?
     func promptRenameFolder(_ folder: SessionFolder, parentWindow: NSWindow?) -> String?
-    func confirmDeleteFolder(_ folder: SessionFolder, parentWindow: NSWindow?) -> Bool
+    func chooseFolderDeletion(
+        _ folder: SessionFolder,
+        sessionCount: Int,
+        parentWindow: NSWindow?
+    ) -> SessionSidebarFolderDeletionChoice?
     func chooseFolderExportDestination(folder: SessionFolder, parentWindow: NSWindow?) -> URL?
     func chooseExportDestination(suggestedName: String, parentWindow: NSWindow?) -> URL?
     func presentExportComplete(destinationURL: URL, parentWindow: NSWindow?)
@@ -100,14 +109,33 @@ public final class AppKitSessionSidebarOperationsPresenter: SessionSidebarOperat
         )
     }
 
-    public func confirmDeleteFolder(_ folder: SessionFolder, parentWindow: NSWindow?) -> Bool {
+    public func chooseFolderDeletion(
+        _ folder: SessionFolder,
+        sessionCount: Int,
+        parentWindow: NSWindow?
+    ) -> SessionSidebarFolderDeletionChoice? {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = L10n.DeleteFolder.title
-        alert.informativeText = L10n.DeleteFolder.message(folder.name)
-        alert.addButton(withTitle: L10n.Common.delete)
+        if sessionCount == 0 {
+            alert.informativeText = L10n.DeleteFolder.emptyMessage(folder.name)
+            alert.addButton(withTitle: L10n.Common.delete)
+            alert.addButton(withTitle: L10n.Common.cancel)
+            return alert.runModal() == .alertFirstButtonReturn ? .deleteFolderOnly : nil
+        }
+
+        alert.informativeText = L10n.DeleteFolder.message(folder.name, sessionCount: sessionCount)
+        alert.addButton(withTitle: L10n.DeleteFolder.deleteFolderAndSessions)
+        alert.addButton(withTitle: L10n.DeleteFolder.deleteFolderOnly)
         alert.addButton(withTitle: L10n.Common.cancel)
-        return alert.runModal() == .alertFirstButtonReturn
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .deleteFolderAndSessions
+        case .alertSecondButtonReturn:
+            return .deleteFolderOnly
+        default:
+            return nil
+        }
     }
 
     public func chooseFolderExportDestination(folder: SessionFolder, parentWindow: NSWindow?) -> URL? {
@@ -187,8 +215,8 @@ public final class AppKitSessionSidebarOperationsPresenter: SessionSidebarOperat
     }
 
     public func chooseSingleSessionExportDestination(session: SessionRecord, parentWindow: NSWindow?) -> URL? {
-        chooseJSONDestination(
-            suggestedName: "\(safeFileName(session.name, fallback: "Stacio Session")).json",
+        chooseSecureSessionDestination(
+            suggestedName: "\(safeFileName(session.name, fallback: "Stacio Session")).\(SecureSessionTransfer.fileExtension)",
             title: L10n.Sidebar.saveSessionToFile
         )
     }
@@ -235,6 +263,17 @@ public final class AppKitSessionSidebarOperationsPresenter: SessionSidebarOperat
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = suggestedName
         panel.allowedContentTypes = [.json]
+        panel.title = title
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func chooseSecureSessionDestination(suggestedName: String, title: String) -> URL? {
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = suggestedName
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: SecureSessionTransfer.fileExtension) ?? .data
+        ]
         panel.title = title
         return panel.runModal() == .OK ? panel.url : nil
     }

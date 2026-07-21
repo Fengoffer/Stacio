@@ -1644,6 +1644,169 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         assertWindowFrame(window, equals: userFrame)
     }
 
+    func testFilesToolbarRestoresExpandedEditorInspectorWidthAfterCollapse() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FilesEditorToolbarRestore.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        let fileURL = try makeTemporaryWorkbenchFile(name: "service.conf", contents: "enabled=true\n")
+
+        files.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = controller.contentSplitViewController.splitView.arrangedSubviews[2]
+        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
+        let widthBeforeCollapse = inspectorView.frame.width
+        let editorWidthBeforeCollapse = editor.view.convert(editor.view.bounds, to: inspector.view).width
+
+        controller.showFilesFromToolbar(nil)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let restoredEditorWidth = editor.view.convert(editor.view.bounds, to: inspector.view).width
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeCollapse, accuracy: 1)
+        XCTAssertEqual(restoredEditorWidth, editorWidthBeforeCollapse, accuracy: 1)
+
+        // The production path schedules additional split/layout repairs after
+        // the immediate toggle. Keep the run loop alive long enough to catch a
+        // later callback that might overwrite the restored width.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        let delayedEditorWidth = editor.view.convert(editor.view.bounds, to: inspector.view).width
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeCollapse, accuracy: 1)
+        XCTAssertEqual(delayedEditorWidth, editorWidthBeforeCollapse, accuracy: 1)
+    }
+
+    func testInspectorToggleRestoresUserAdjustedEditorPanelWidthAfterCollapse() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FilesEditorInspectorToggleRestore.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        let fileURL = try makeTemporaryWorkbenchFile(name: "service.conf", contents: "enabled=true\n")
+        files.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitView = controller.contentSplitViewController.splitView
+        let requestedInspectorWidth: CGFloat = 720
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - requestedInspectorWidth - splitView.dividerThickness
+        )
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = splitView.arrangedSubviews[2]
+        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
+        let widthBeforeCollapse = inspectorView.frame.width
+        let editorWidthBeforeCollapse = editor.view.convert(editor.view.bounds, to: inspector.view).width
+
+        controller.toggleInspectorFromToolbar(nil)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.toggleInspectorFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let restoredEditorWidth = editor.view.convert(editor.view.bounds, to: inspector.view).width
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeCollapse, accuracy: 1)
+        XCTAssertEqual(restoredEditorWidth, editorWidthBeforeCollapse, accuracy: 1)
+    }
+
+    func testInspectorToggleDoesNotLetPersistedNarrowWidthOverwriteExpandedEditor() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FilesEditorPersistedWidthRestore.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        UserDefaults.standard.set(
+            320.0,
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector")
+        )
+
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        let fileURL = try makeTemporaryWorkbenchFile(name: "service.conf", contents: "enabled=true\n")
+        files.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let inspectorView = splitView.arrangedSubviews[2]
+        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
+        let widthBeforeCollapse = inspectorView.frame.width
+        let editorWidthBeforeCollapse = editor.view.convert(editor.view.bounds, to: inspector.view).width
+        XCTAssertGreaterThan(widthBeforeCollapse, 800)
+
+        controller.toggleInspectorFromToolbar(nil)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        controller.toggleInspectorFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let restoredEditorWidth = editor.view.convert(editor.view.bounds, to: inspector.view).width
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeCollapse, accuracy: 1)
+        XCTAssertEqual(restoredEditorWidth, editorWidthBeforeCollapse, accuracy: 1)
+    }
+
     func testReopeningEmbeddedFilesEditorAfterCloseRestoresWideResizableInspector() throws {
         let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FilesEditorReopen.\(UUID().uuidString)")
         defer {
@@ -2027,15 +2190,15 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertTrue(identifiers.contains("Stacio.Toolbar.deviceDashboard"))
         XCTAssertTrue(identifiers.contains("Stacio.Toolbar.aiAssistant"))
         XCTAssertTrue(identifiers.contains("Stacio.Toolbar.inspector"))
-        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.importSessions"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.importSessions"))
         XCTAssertTrue(identifiers.contains("Stacio.Toolbar.multiExec"))
         let commandItems = items.filter {
             $0.itemIdentifier != .flexibleSpace && $0.itemIdentifier != .space
         }
-        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "新建会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
+        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
         XCTAssertEqual(
             commandItems.map(\.toolTip),
-            ["显示或隐藏侧边栏", "新建会话", "批量同步输入到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
+            ["显示或隐藏侧边栏", "新建会话", "从其他终端工具导入会话", "将输入同步执行到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
         )
         XCTAssertNil(items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.closeTerminal" })
         XCTAssertEqual(
@@ -2058,6 +2221,15 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.aiAssistant" }?.action,
             #selector(WorkbenchWindowController.showAIAssistantFromToolbar(_:))
         )
+        let importItem = try XCTUnwrap(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.importSessions" } as? NSMenuToolbarItem
+        )
+        XCTAssertEqual(importItem.menu.items.map(\.title), [
+            "Stacio", "Xshell", "MobaXterm", "WindTerm", "SecureCRT",
+            "FinalShell", "Termius", "Electerm", "JSON"
+        ])
+        XCTAssertEqual(importItem.image?.accessibilityDescription, "导入外部会话")
+        XCTAssertFalse(importItem.showsIndicator)
         let panelsItem = try XCTUnwrap(
             items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem
         )
@@ -2093,6 +2265,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
                 "Stacio.Toolbar.sidebar",
                 NSToolbarItem.Identifier.flexibleSpace.rawValue,
                 "Stacio.Toolbar.newSession",
+                "Stacio.Toolbar.importSessions",
                 NSToolbarItem.Identifier.space.rawValue,
                 "Stacio.Toolbar.multiExec",
                 "Stacio.Toolbar.split",
@@ -2107,7 +2280,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
                 "Stacio.Toolbar.inspector"
             ]
         )
-        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.importSessions"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.importSessions"))
         XCTAssertFalse(identifiers.contains("Stacio.Toolbar.closeTerminal"))
     }
 
@@ -3035,8 +3208,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
 
         XCTAssertEqual(item.action, #selector(WorkbenchWindowController.performMultiExecFromToolbar(_:)))
-        XCTAssertEqual(item.toolTip, "批量同步输入到多个终端")
-        XCTAssertEqual(item.image?.accessibilityDescription, "批量多执行")
+        XCTAssertEqual(item.toolTip, "将输入同步执行到多个终端")
+        XCTAssertEqual(item.image?.accessibilityDescription, "向多个终端同步执行")
 
         controller.performMultiExecFromToolbar(nil)
 

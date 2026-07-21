@@ -333,6 +333,10 @@ public final class TransferQueueCoordinator {
         }
     }
 
+    deinit {
+        progressPollTimer?.invalidate()
+    }
+
     public func enqueueTransfer(job: ScpTransferJob) {
         enqueueTransfer(runtimeID: nil, job: job)
     }

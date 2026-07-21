@@ -409,6 +409,25 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.terminalOutputTranscript.contains("\r\nroot@host:~# "))
     }
 
+    func testImmediateOutputDrainPollsBridgeOffMainThread() {
+        let bridge = ThreadRecordingRemoteTerminalBridge()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_remote",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            bridge: bridge
+        )
+
+        controller.loadView()
+        controller.viewDidAppear()
+        defer { controller.viewWillDisappear() }
+        controller.sendInput([UInt8(ascii: "\n")])
+
+        XCTAssertTrue(waitForRemoteTerminalCondition { bridge.didPoll })
+        XCTAssertTrue(bridge.allPollsWereOffMainThread)
+        XCTAssertTrue(controller.terminalOutputTranscript.contains("root@host:~#"))
+    }
+
     func testImmediateOutputDrainConsumesSplitPromptBatchesInOneBurst() {
         let bridge = RecordingRemoteTerminalBridge(
             statuses: [
@@ -2416,6 +2435,79 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.terminalOutputTranscript.contains("FengLee@FengStor:~$ "))
     }
 
+    func testTransientInitialSSHFailureStaysConnectingWhileAutomaticRetryIsPending() {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "pending_ssh_transient",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            reconnecter: RecordingRemoteTerminalReconnecter(
+                status: LiveShellStatus(runtimeId: "term_recovered", status: "running", diagnostic: "running")
+            ),
+            startsPollingAutomatically: true
+        )
+
+        controller.loadView()
+        controller.displayConnectionStarting()
+        controller.displayConnectionFailure("SSH 无法到达主机 (os error 65)")
+
+        XCTAssertEqual(controller.lifecycleState, .connecting)
+        XCTAssertEqual(controller.lifecycleMessageForTesting, L10n.TerminalLifecycle.connecting)
+        XCTAssertFalse(controller.lifecycleMessageForTesting.contains(L10n.TerminalLifecycle.connectionFailed))
+        XCTAssertFalse(controller.terminalOutputTranscript.contains("SSH 无法到达主机"))
+    }
+
+    func testInitialSSHAuthenticationFailureShowsImmediatelyWithoutAutomaticRetry() {
+        let reconnecter = RecordingRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_should_not_start", status: "running", diagnostic: "running")
+        )
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "pending_ssh_auth",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            reconnecter: reconnecter,
+            startsPollingAutomatically: true
+        )
+
+        controller.loadView()
+        controller.displayConnectionStarting()
+        controller.displayConnectionFailure("SSH 认证失败")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(controller.lifecycleState, .disconnected)
+        XCTAssertEqual(controller.lifecycleMessageForTesting, "连接失败：SSH 认证失败")
+        XCTAssertEqual(reconnecter.reconnectedTitles, [])
+    }
+
+    func testInitialTransientSSHFailureShowsFailureAfterThreeAutomaticRetries() {
+        let reconnecter = ControlledBackgroundRemoteTerminalReconnecter()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "pending_ssh_exhausted",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            reconnecter: reconnecter,
+            startsPollingAutomatically: true
+        )
+
+        controller.loadView()
+        controller.displayConnectionStarting()
+        controller.displayConnectionFailure("SSH 无法到达主机 (os error 65)")
+
+        for completionIndex in 0..<3 {
+            let deadline = Date().addingTimeInterval(1)
+            while reconnecter.pendingCompletionCount != 1, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            }
+            XCTAssertEqual(reconnecter.pendingCompletionCount, 1)
+            reconnecter.complete(
+                at: completionIndex,
+                with: .failure(SshRuntimeError.Transport(message: "SSH 无法到达主机 (os error 65)"))
+            )
+        }
+
+        XCTAssertEqual(controller.lifecycleState, .disconnected)
+        XCTAssertEqual(controller.lifecycleMessageForTesting, "连接失败：无法到达主机")
+    }
+
     func testAutomaticallyPolledInitialSSHFailureRunsAutomaticReconnectImmediately() throws {
         let reconnecter = RecordingRemoteTerminalReconnecter(
             status: LiveShellStatus(runtimeId: "term_auto_initial", status: "running", diagnostic: "running")
@@ -3363,6 +3455,72 @@ private final class RecordingRemoteTerminalBridge: RemoteTerminalBridging {
     func closeLiveSSHShell(runtimeID: String) throws -> LiveShellStatus {
         closedRuntimeIDs.append(runtimeID)
         return LiveShellStatus(runtimeId: runtimeID, status: "closed", diagnostic: "closed")
+    }
+}
+
+private final class ThreadRecordingRemoteTerminalBridge: RemoteTerminalBridging {
+    private let lock = NSLock()
+    private var pollThreadIsMain: [Bool] = []
+    private var didReturnPrompt = false
+
+    var didPoll: Bool {
+        withLock { pollThreadIsMain.isEmpty == false }
+    }
+
+    var allPollsWereOffMainThread: Bool {
+        withLock {
+            pollThreadIsMain.isEmpty == false && pollThreadIsMain.allSatisfy { $0 == false }
+        }
+    }
+
+    func pollLiveSSHShell(runtimeID: String) throws -> LiveShellStatus {
+        withLock {
+            pollThreadIsMain.append(Thread.isMainThread)
+        }
+        return LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: "running")
+    }
+
+    func takeTerminalOutputBatch(runtimeID: String) throws -> TerminalOutputBatch {
+        let shouldReturnPrompt = withLock { () -> Bool in
+            guard didReturnPrompt == false else {
+                return false
+            }
+            didReturnPrompt = true
+            return true
+        }
+        return TerminalOutputBatch(
+            runtimeId: runtimeID,
+            bytes: shouldReturnPrompt ? Data("\r\nroot@host:~# ".utf8) : Data(),
+            droppedByteCount: 0
+        )
+    }
+
+    func setTerminalOutputPaused(runtimeID: String, paused: Bool) throws -> TerminalRuntime {
+        TerminalRuntime(
+            id: runtimeID,
+            kind: "remote_ssh",
+            shellPath: "",
+            remoteHost: "example.com",
+            remotePort: 22,
+            username: "deploy",
+            cols: 80,
+            rows: 24,
+            resizeRevision: 0,
+            status: "running",
+            outputPaused: paused
+        )
+    }
+
+    func setLiveShellKeepaliveInterval(runtimeID: String, seconds: UInt32) throws {}
+
+    func closeLiveSSHShell(runtimeID: String) throws -> LiveShellStatus {
+        LiveShellStatus(runtimeId: runtimeID, status: "closed", diagnostic: "closed")
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 

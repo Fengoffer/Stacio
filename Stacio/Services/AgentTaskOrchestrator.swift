@@ -5,7 +5,8 @@ import StacioAgentBridge
 public final class AgentTaskOrchestrator {
     private let coordinator: AIAssistantCoordinator
     private let limits: AgentTaskLoopLimits
-    private var activeRequestID: String?
+    private let targetContextsProvider: () -> [AITerminalContext]
+    private var activeRequestIDs: [String] = []
     private var activeAIRequest: AIAssistantRequestCancelling?
     private var stopState: AgentTaskRunState?
     private var onUpdate: ((AgentTaskUpdate) -> Void)?
@@ -13,10 +14,12 @@ public final class AgentTaskOrchestrator {
 
     public init(
         coordinator: AIAssistantCoordinator,
-        limits: AgentTaskLoopLimits = AgentTaskLoopLimits()
+        limits: AgentTaskLoopLimits = AgentTaskLoopLimits(),
+        targetContextsProvider: @escaping () -> [AITerminalContext] = { [] }
     ) {
         self.coordinator = coordinator
         self.limits = limits
+        self.targetContextsProvider = targetContextsProvider
     }
 
     @discardableResult
@@ -31,7 +34,7 @@ public final class AgentTaskOrchestrator {
     ) async throws -> AgentTaskRunResult {
         self.onUpdate = onUpdate
         stopState = nil
-        activeRequestID = nil
+        activeRequestIDs = []
         activeAIRequest = nil
         activeTraceContinuation?.finish()
         activeTraceContinuation = nil
@@ -41,6 +44,7 @@ public final class AgentTaskOrchestrator {
         let startedAt = Date()
         let stepLimit = steps.count + limits.maxSteps
         let runNamespace = UUID().uuidString.lowercased()
+        let selectedTargetContexts = targetContextsProvider()
 
         while steps.count < stepLimit {
             if let stopState {
@@ -93,7 +97,6 @@ public final class AgentTaskOrchestrator {
             }
 
             let requestID = "agent-step-\(runNamespace)-\(steps.count + 1)"
-            activeRequestID = requestID
             onUpdate(.init(
                 kind: .step,
                 message: stepPreparationText(for: proposal, stepIndex: steps.count + 1)
@@ -104,17 +107,19 @@ public final class AgentTaskOrchestrator {
                 traceContinuation = continuation
             }
             activeTraceContinuation = traceContinuation
+            let executionContexts = selectedTargetContexts
+            activeRequestIDs = Self.childRequestIDs(
+                for: requestID,
+                targetCount: executionContexts.isEmpty ? 1 : executionContexts.count
+            )
             let executedEvents = try coordinator.executeProposedCommand(
                 proposal.command,
-                context: context,
+                contexts: executionContexts.isEmpty ? [context] : executionContexts,
                 requestID: requestID,
                 emit: { [weak self] event in
                     events.append(event)
                     traceContinuation?.yield(event)
                     self?.onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
-                    if Self.isTerminalTraceState(event.state) {
-                        traceContinuation?.finish()
-                    }
                 }
             )
             if events.isEmpty {
@@ -125,13 +130,22 @@ public final class AgentTaskOrchestrator {
                 }
             }
 
+            let expectedTargetIDs = Set((executionContexts.isEmpty ? [context] : executionContexts).map(\.runtimeID))
             if events.contains(where: { $0.metadata?["executionMode"] == "backgroundTask" }),
-               events.last.map({ Self.isTerminalTraceState($0.state) }) != true {
+               Self.hasCompletedAllTargets(
+                   events: events,
+                   targetIDs: expectedTargetIDs,
+                   expectedTargetCount: executionContexts.isEmpty ? 1 : executionContexts.count
+               ) == false {
                 for await event in traceStream {
                     if events.contains(event) == false {
                         events.append(event)
                     }
-                    if Self.isTerminalTraceState(event.state) {
+                    if Self.hasCompletedAllTargets(
+                        events: events,
+                        targetIDs: expectedTargetIDs,
+                        expectedTargetCount: executionContexts.isEmpty ? 1 : executionContexts.count
+                    ) {
                         break
                     }
                 }
@@ -208,15 +222,17 @@ public final class AgentTaskOrchestrator {
     }
 
     public func pause() {
-        guard let activeRequestID else {
+        guard activeRequestIDs.isEmpty == false else {
             activeAIRequest?.cancel()
             activeAIRequest = nil
             stopState = .paused
             return
         }
-        if let event = coordinator.pauseTask(requestID: activeRequestID) {
-            onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
-            activeTraceContinuation?.yield(event)
+        for requestID in activeRequestIDs {
+            if let event = coordinator.pauseTask(requestID: requestID) {
+                onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+                activeTraceContinuation?.yield(event)
+            }
         }
         activeTraceContinuation?.finish()
         activeTraceContinuation = nil
@@ -226,15 +242,17 @@ public final class AgentTaskOrchestrator {
     }
 
     public func cancel() {
-        guard let activeRequestID else {
+        guard activeRequestIDs.isEmpty == false else {
             activeAIRequest?.cancel()
             activeAIRequest = nil
             stopState = .cancelled
             return
         }
-        if let event = coordinator.cancelTask(requestID: activeRequestID) {
-            onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
-            activeTraceContinuation?.yield(event)
+        for requestID in activeRequestIDs {
+            if let event = coordinator.cancelTask(requestID: requestID) {
+                onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+                activeTraceContinuation?.yield(event)
+            }
         }
         activeTraceContinuation?.finish()
         activeTraceContinuation = nil
@@ -244,15 +262,17 @@ public final class AgentTaskOrchestrator {
     }
 
     public func takeOver() {
-        guard let activeRequestID else {
+        guard activeRequestIDs.isEmpty == false else {
             activeAIRequest?.cancel()
             activeAIRequest = nil
             stopState = .takenOver
             return
         }
-        if let event = coordinator.takeOverTask(requestID: activeRequestID) {
-            onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
-            activeTraceContinuation?.yield(event)
+        for requestID in activeRequestIDs {
+            if let event = coordinator.takeOverTask(requestID: requestID) {
+                onUpdate?(.init(kind: .trace, message: event.message, traceEvent: event))
+                activeTraceContinuation?.yield(event)
+            }
         }
         activeTraceContinuation?.finish()
         activeTraceContinuation = nil
@@ -453,5 +473,26 @@ public final class AgentTaskOrchestrator {
         case .queued, .awaitingApproval, .approved, .typing, .running, .waitingForOutput:
             return false
         }
+    }
+
+    private static func hasCompletedAllTargets(
+        events: [AgentTraceEvent],
+        targetIDs: Set<String>,
+        expectedTargetCount: Int
+    ) -> Bool {
+        let terminalEvents = events.filter { isTerminalTraceState($0.state) }
+        guard targetIDs.isEmpty == false else {
+            return terminalEvents.count >= max(1, expectedTargetCount)
+        }
+        let completedTargets = Set(
+            terminalEvents.compactMap { $0.metadata?["sourceRuntimeID"] }
+        )
+        return targetIDs.isSubset(of: completedTargets)
+            || (completedTargets.isEmpty && terminalEvents.count >= max(1, expectedTargetCount))
+    }
+
+    private static func childRequestIDs(for requestID: String, targetCount: Int) -> [String] {
+        guard targetCount > 1 else { return [requestID] }
+        return (1...targetCount).map { "\(requestID)-\($0)" }
     }
 }

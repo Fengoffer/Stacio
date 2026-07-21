@@ -906,11 +906,28 @@ final class WorkspaceLocalShellTests: XCTestCase {
         let secondTitle = try XCTUnwrap(
             workspace.view.firstSubview(withIdentifier: "Stacio.Workspace.splitPaneHeader.title.\(secondRuntimeID)") as? NSTextField
         )
+        let firstIndex = try XCTUnwrap(
+            workspace.view.firstSubview(withIdentifier: "Stacio.Workspace.splitPaneHeader.index.\(firstRuntimeID)") as? NSTextField
+        )
+        let secondIndex = try XCTUnwrap(
+            workspace.view.firstSubview(withIdentifier: "Stacio.Workspace.splitPaneHeader.index.\(secondRuntimeID)") as? NSTextField
+        )
+        let firstColor = try XCTUnwrap(
+            workspace.view.firstSubview(withIdentifier: "Stacio.Workspace.splitPaneHeader.color.\(firstRuntimeID)")
+        )
+        let secondColor = try XCTUnwrap(
+            workspace.view.firstSubview(withIdentifier: "Stacio.Workspace.splitPaneHeader.color.\(secondRuntimeID)")
+        )
 
         XCTAssertFalse(firstHeader.isHidden)
         XCTAssertFalse(secondHeader.isHidden)
         XCTAssertEqual(firstTitle.stringValue, "本地")
         XCTAssertEqual(secondTitle.stringValue, "本地")
+        XCTAssertEqual(firstIndex.stringValue, "01")
+        XCTAssertEqual(secondIndex.stringValue, "02")
+        XCTAssertNotNil(firstColor.layer?.backgroundColor)
+        XCTAssertNotNil(secondColor.layer?.backgroundColor)
+        XCTAssertNotEqual(firstColor.layer?.backgroundColor, secondColor.layer?.backgroundColor)
     }
 
     func testWorkspaceChromeRefreshesResolvedColorsWhenAppearanceChanges() throws {
@@ -956,7 +973,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
                 for: header
             )
         )
-        XCTAssertEqual(lightTitleColor, StacioDesignSystem.resolvedColor(.secondaryLabelColor, for: workspace.view))
+        XCTAssertEqual(lightTitleColor, StacioDesignSystem.resolvedColor(.labelColor, for: workspace.view))
         XCTAssertEqual(lightCloseColor, StacioDesignSystem.resolvedColor(.secondaryLabelColor, for: workspace.view))
         XCTAssertNotEqual(darkTitleColor, lightTitleColor)
         XCTAssertNotEqual(darkCloseColor, lightCloseColor)

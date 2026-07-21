@@ -207,6 +207,15 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         let commandHintWidth = commandHintOverlay.widthAnchor.constraint(
             equalToConstant: TerminalCommandHintOverlayLayout.completionPreferredWidth
         )
+        let agentTraceLeading = agentTraceOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8)
+        let agentTraceTop = agentTraceOverlay.topAnchor.constraint(equalTo: container.topAnchor, constant: 8)
+        agentTraceOverlay.onDragOffsetChanged = { [weak container, weak agentTraceOverlay] offset in
+            guard let container, let agentTraceOverlay else { return }
+            let maximumX = max(8, container.bounds.width - agentTraceOverlay.bounds.width - 8)
+            let maximumY = max(8, container.bounds.height - agentTraceOverlay.bounds.height - 8)
+            agentTraceLeading.constant = min(max(8, 8 + offset.x), maximumX)
+            agentTraceTop.constant = min(max(8, 8 + offset.y), maximumY)
+        }
         terminalBottomToContainerConstraint = terminalBottomToContainer
         terminalBottomToCommandHintConstraint = terminalBottomToCommandHint
         terminalLeadingToContainerConstraint = terminalLeadingToContainer
@@ -238,9 +247,9 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             commandHintOverlay.widthAnchor.constraint(
                 lessThanOrEqualToConstant: TerminalCommandHintOverlayLayout.submittedPreferredMaxWidth
             ),
-            agentTraceOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            agentTraceLeading,
             agentTraceOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
-            agentTraceOverlay.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            agentTraceTop,
             agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
         ])
         applyTerminalRuntimeSettings(settingsStore.snapshot())

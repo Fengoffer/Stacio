@@ -121,6 +121,8 @@ public final class InspectorViewController: NSViewController {
     private var sectionViewControllers: [Section: NSViewController] = [:]
     private var currentSection: Section = .files
     private var didFinishInitialSectionSetup = false
+    private var isSynchronizingSelectedSectionLayout = false
+    private var isHeaderHorizontalLayoutSynchronizationScheduled = false
     public private(set) var filesViewController: FilesViewController?
     private var filesCoordinator: FilesCoordinator?
     private var remoteFilesBinding: RemoteFilesBinding?
@@ -270,7 +272,7 @@ public final class InspectorViewController: NSViewController {
             self?.synchronizeHeaderHorizontalLayout()
         }
         files.onFileBrowserPaneFrameChanged = { [weak self] in
-            self?.synchronizeHeaderHorizontalLayout()
+            self?.scheduleHeaderHorizontalLayoutSynchronization()
         }
         transferQueueViewController = transferQueue
         diagnosticsViewController = diagnostics
@@ -1072,6 +1074,10 @@ public final class InspectorViewController: NSViewController {
     }
 
     private func synchronizeSelectedSectionLayout() {
+        guard isSynchronizingSelectedSectionLayout == false else { return }
+        isSynchronizingSelectedSectionLayout = true
+        defer { isSynchronizingSelectedSectionLayout = false }
+
         synchronizeSectionControlDocumentSize()
         layoutContentContainerFrameManuallyIfNeeded()
         guard let childView = sectionViews[currentSection],
@@ -1080,11 +1086,29 @@ public final class InspectorViewController: NSViewController {
               contentContainer.bounds.height > 0
         else { return }
 
-        if childView.frame != contentContainer.bounds {
+        if framesDiffer(childView.frame, contentContainer.bounds) {
             childView.frame = contentContainer.bounds
             childView.needsLayout = true
         }
-        childView.layoutSubtreeIfNeeded()
+    }
+
+    private func framesDiffer(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.minX - rhs.minX) > 0.5
+            || abs(lhs.minY - rhs.minY) > 0.5
+            || abs(lhs.width - rhs.width) > 0.5
+            || abs(lhs.height - rhs.height) > 0.5
+    }
+
+    private func scheduleHeaderHorizontalLayoutSynchronization() {
+        guard isHeaderHorizontalLayoutSynchronizationScheduled == false else { return }
+        isHeaderHorizontalLayoutSynchronizationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isHeaderHorizontalLayoutSynchronizationScheduled = false
+            if self.synchronizeHeaderHorizontalLayout() {
+                self.view.needsLayout = true
+            }
+        }
     }
 
     @discardableResult

@@ -23,7 +23,7 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.13.3"
+    private static let fallbackDisplayVersion = "Stacio-0.13.5"
     public static var displayVersion: String { displayVersion(in: .main) }
     public static let websiteURL = "https://www.stacio.cn/"
     public static let repositoryURL = "https://github.com/Fengoffer/Stacio"
@@ -386,6 +386,7 @@ protocol SparkleUpdaterDriving: AnyObject {
     var sessionInProgress: Bool { get }
     var canCheckForUpdates: Bool { get }
     var automaticallyChecksForUpdates: Bool { get set }
+    var updateCheckInterval: TimeInterval { get set }
     var automaticallyDownloadsUpdates: Bool { get set }
     var sendsSystemProfile: Bool { get set }
 
@@ -526,7 +527,7 @@ final class StacioSparkleUserDriver: NSObject, SPUUserDriver {
         reply: @escaping (SUUpdatePermissionResponse) -> Void
     ) {
         reply(SUUpdatePermissionResponse(
-            automaticUpdateChecks: false,
+            automaticUpdateChecks: true,
             automaticUpdateDownloading: NSNumber(value: false),
             sendSystemProfile: false
         ))
@@ -1107,7 +1108,8 @@ public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControl
             return false
         }
         hasStartedUpdater = true
-        updater.automaticallyChecksForUpdates = false
+        updater.automaticallyChecksForUpdates = true
+        updater.updateCheckInterval = SparkleUpdateConfiguration.scheduledCheckInterval
         updater.automaticallyDownloadsUpdates = false
         updater.sendsSystemProfile = false
         return true
@@ -1143,11 +1145,13 @@ public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControl
         _ updater: SPUUpdater,
         mayPerform updateCheck: SPUUpdateCheck
     ) throws {
-        guard updateCheck == .updates || updateCheck == .updateInformation else {
+        guard updateCheck == .updates ||
+                updateCheck == .updatesInBackground ||
+                updateCheck == .updateInformation else {
             throw NSError(
                 domain: "Stacio.SparkleUpdateController",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Stacio 仅允许前台手动更新和无下载的版本探测。"]
+                userInfo: [NSLocalizedDescriptionKey: "Stacio 仅允许用户确认后的更新，以及无下载的后台版本探测。"]
             )
         }
     }
@@ -1471,6 +1475,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             andEventID: AEEventID(kAEGetURL)
         )
         NSApplication.shared.mainMenu = StacioMenuBuilder(target: self).makeMainMenu()
+        // Stacio has no searchable Help Book. Leaving the system Help menu unset
+        // avoids its oversized, non-functional search field while retaining support actions.
+        NSApplication.shared.helpMenu = nil
         let controller = workbenchWindowControllerFactory()
         controller.showWindow(self)
         workbenchWindowController = controller
@@ -1650,8 +1657,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc
+    public func createSessionFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performNewSessionFromToolbar(sender)
+    }
+
+    @objc
     public func openLocalShellFromMenu(_ sender: Any?) {
         _ = try? (workbenchWindowController as? WorkbenchWindowController)?.openLocalShellFromToolbar(sender)
+    }
+
+    @objc
+    public func importSessionsFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performImportSourceFromMenu(sender)
     }
 
     @objc
@@ -1682,6 +1699,71 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc
     public func splitTerminalFromMenu(_ sender: Any?) {
         (workbenchWindowController as? WorkbenchWindowController)?.performMultiExecFromToolbar(sender)
+    }
+
+    @objc
+    public func useSingleTerminalLayoutFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performSingleTerminalLayoutFromToolbar(sender)
+    }
+
+    @objc
+    public func splitTerminalVerticallyFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performVerticalSplitTerminalFromToolbar(sender)
+    }
+
+    @objc
+    public func splitTerminalHorizontallyFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performHorizontalSplitTerminalFromToolbar(sender)
+    }
+
+    @objc
+    public func splitTerminalAsGridFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performGridSplitTerminalFromToolbar(sender)
+    }
+
+    @objc
+    public func performMultiExecFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.performMultiExecFromToolbar(sender)
+    }
+
+    @objc
+    public func toggleSidebarFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.toggleSidebarFromToolbar(sender)
+    }
+
+    @objc
+    public func showFilesFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showFilesFromToolbar(sender)
+    }
+
+    @objc
+    public func showBrowserFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showBrowserFromToolbar(sender)
+    }
+
+    @objc
+    public func showTunnelsFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showTunnelsFromToolbar(sender)
+    }
+
+    @objc
+    public func showDiagnosticsFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showDiagnosticsFromToolbar(sender)
+    }
+
+    @objc
+    public func showTerminalMacrosFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showTerminalMacrosFromToolbar(sender)
+    }
+
+    @objc
+    public func showCommandHistoryFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showCommandHistoryFromToolbar(sender)
+    }
+
+    @objc
+    public func showAIAssistantFromMenu(_ sender: Any?) {
+        (workbenchWindowController as? WorkbenchWindowController)?.showAIAssistantFromToolbar(sender)
     }
 
     @objc

@@ -84,5 +84,6 @@ jobs:
           STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG: "1"
           STACIO_BUILD_NUMBER: "${{ github.run_number }}"
           STACIO_DMG_SKIP_FINDER_LAYOUT: "1"
+          STACIO_DMG_ALLOW_UNBRANDED_ARTIFACT: "1"
           STACIO_RELEASE_LOCAL_SMOKE: "1"
         run: ./scripts/release-readiness.sh

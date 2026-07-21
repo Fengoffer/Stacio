@@ -507,7 +507,7 @@ final class FilesViewControllerTests: XCTestCase {
         )
     }
 
-    func testFilesInspectorTableFitsNarrowPanelWithoutNestedHorizontalScrolling() {
+    func testFilesInspectorTablePreservesReadableColumnsWithHorizontalScrolling() {
         let controller = FilesViewController()
         controller.loadView()
 
@@ -516,13 +516,13 @@ final class FilesViewControllerTests: XCTestCase {
             partialResult + column.width
         }
 
-        XCTAssertEqual(scrollView?.hasHorizontalScroller, false)
-        XCTAssertLessThanOrEqual(totalColumnWidth, 318)
+        XCTAssertEqual(scrollView?.hasHorizontalScroller, true)
+        XCTAssertGreaterThanOrEqual(totalColumnWidth, 480)
         XCTAssertEqual(scrollView?.layer?.borderWidth ?? 0, 0)
         XCTAssertLessThanOrEqual(scrollView?.layer?.cornerRadius ?? 0, 0)
     }
 
-    func testFilesInspectorKeepsMetadataColumnsVisibleInCompactPanel() throws {
+    func testFilesInspectorKeepsColumnsReadableInCompactPanel() throws {
         let controller = FilesViewController()
         controller.loadView()
         controller.view.frame = NSRect(x: 0, y: 0, width: 284, height: 520)
@@ -540,12 +540,29 @@ final class FilesViewControllerTests: XCTestCase {
         }
 
         XCTAssertGreaterThan(visibleTableWidth, 0)
-        XCTAssertGreaterThanOrEqual(nameColumn.width, 72)
-        XCTAssertGreaterThanOrEqual(sizeColumn.width, 40)
-        XCTAssertGreaterThanOrEqual(ownerColumn.width, 38)
-        XCTAssertGreaterThanOrEqual(permissionsColumn.width, 44)
-        XCTAssertGreaterThanOrEqual(timeColumn.width, 58)
-        XCTAssertLessThanOrEqual(totalColumnWidth, visibleTableWidth + 1)
+        XCTAssertGreaterThanOrEqual(nameColumn.width, 180)
+        XCTAssertGreaterThanOrEqual(sizeColumn.width, 64)
+        XCTAssertGreaterThanOrEqual(ownerColumn.width, 56)
+        XCTAssertGreaterThanOrEqual(permissionsColumn.width, 72)
+        XCTAssertGreaterThanOrEqual(timeColumn.width, 112)
+        XCTAssertGreaterThan(totalColumnWidth, visibleTableWidth)
+        XCTAssertTrue(scrollView.hasHorizontalScroller)
+    }
+
+    func testFilesInspectorPreservesUserResizedMetadataColumnAfterLayout() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
+        controller.view.layoutSubtreeIfNeeded()
+
+        let sizeColumn = try XCTUnwrap(
+            controller.tableView.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("size"))
+        )
+        sizeColumn.width = 144
+        controller.view.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(controller.tableView.columnAutoresizingStyle, .firstColumnOnlyAutoresizingStyle)
+        XCTAssertEqual(sizeColumn.width, 144)
     }
 
     func testFilesInspectorUsesCompactHeaderAndReadablePathRow() throws {
@@ -830,6 +847,39 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertFalse(editor.view.isHidden)
         XCTAssertTrue(expandButton.isHidden)
         XCTAssertEqual(editor.activeFileNameForTesting, "service.conf")
+    }
+
+    func testCollapsedEmbeddedEditorRestoresUserAdjustedFileBrowserWidth() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 640)
+        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
+
+        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
+        controller.view.layoutSubtreeIfNeeded()
+        let splitView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.editorSplit") as? NSSplitView
+        )
+        splitView.setPosition(650, ofDividerAt: 0)
+        splitView.layoutSubtreeIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
+        let browserWidthBeforeCollapse = controller.fileBrowserPaneViewForTesting.convert(
+            controller.fileBrowserPaneViewForTesting.bounds,
+            to: controller.view
+        ).width
+
+        controller.collapseEmbeddedCapabilityForTesting()
+        let expandButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.expandEmbeddedCapability") as? NSButton
+        )
+        expandButton.performClick(nil as Any?)
+        controller.view.layoutSubtreeIfNeeded()
+
+        let restoredBrowserWidth = controller.fileBrowserPaneViewForTesting.convert(
+            controller.fileBrowserPaneViewForTesting.bounds,
+            to: controller.view
+        ).width
+        XCTAssertEqual(restoredBrowserWidth, browserWidthBeforeCollapse, accuracy: 1)
     }
 
     func testEmbeddedMediaPreviewUsesEditorTabsInsteadOfReplacingTheEditor() throws {

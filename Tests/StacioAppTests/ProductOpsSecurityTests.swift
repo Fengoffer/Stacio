@@ -1288,7 +1288,7 @@ final class ProductOpsSecurityTests: XCTestCase {
         XCTAssertFalse(verifier.validate(token))
     }
 
-    func testSparkleConfigurationUsesManualChecksAndChannelSpecificAppcasts() throws {
+    func testSparkleConfigurationUsesScheduledChecksWithoutAutomaticDownloads() throws {
         let configuration = ProductOpsConfiguration(
             apiBaseURL: try XCTUnwrap(URL(string: "https://ops.example.test")),
             updateChannel: .beta,
@@ -1300,7 +1300,9 @@ final class ProductOpsSecurityTests: XCTestCase {
 
         let sparkle = SparkleUpdateConfiguration(configuration: configuration)
 
-        XCTAssertFalse(sparkle.automaticallyChecksForUpdates)
+        XCTAssertTrue(sparkle.automaticallyChecksForUpdates)
+        XCTAssertEqual(sparkle.scheduledCheckInterval, 24 * 60 * 60)
+        XCTAssertFalse(sparkle.automaticallyDownloadsUpdates)
         XCTAssertEqual(sparkle.feedURL?.absoluteString, "https://ops.stacio.cn/updates/stacio/beta/appcast.xml")
         XCTAssertEqual(sparkle.publicEDKey, "public-ed-key")
     }
@@ -1583,6 +1585,26 @@ final class ProductOpsSecurityTests: XCTestCase {
 
         XCTAssertEqual(updater.startCount, 2)
         XCTAssertEqual(updater.informationCheckCount, 1)
+    }
+
+    @MainActor
+    func testLaunchProbeConfiguresSparkleForDailyChecksWithoutDownloads() throws {
+        let defaults = try makeProductOpsSecurityDefaults()
+        let updater = RecordingSparkleUpdaterDriver()
+        let controller = SparkleUpdateController(
+            configurationStore: ProductOpsConfigurationStore(defaults: defaults, environment: [:], bundleInfo: [:]),
+            releaseNotesStore: InstalledUpdateReleaseNotesStore(defaults: defaults),
+            updaterFactory: { _, _, _ in updater }
+        )
+
+        controller.probeForAvailableUpdate()
+
+        XCTAssertTrue(updater.automaticallyChecksForUpdates)
+        XCTAssertEqual(updater.updateCheckInterval, 24 * 60 * 60)
+        XCTAssertFalse(updater.automaticallyDownloadsUpdates)
+        XCTAssertFalse(updater.sendsSystemProfile)
+        XCTAssertEqual(updater.informationCheckCount, 1)
+        XCTAssertEqual(updater.installCheckCount, 0)
     }
 
     @MainActor
@@ -2199,8 +2221,9 @@ private func makeSparkleNoUpdateError(
 private final class RecordingSparkleUpdaterDriver: SparkleUpdaterDriving {
     var sessionInProgress = false
     var canCheckForUpdates = true
-    var automaticallyChecksForUpdates = true
+    var automaticallyChecksForUpdates = false
     var automaticallyDownloadsUpdates = true
+    var updateCheckInterval: TimeInterval = 0
     var sendsSystemProfile = true
     var startError: Error?
     private(set) var startCount = 0

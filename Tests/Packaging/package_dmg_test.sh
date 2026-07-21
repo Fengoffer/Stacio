@@ -161,6 +161,7 @@ STACIO_DMG_TEST_MOUNT_DIR="$MOUNT_DIR" \
 STACIO_DMG_TEST_EXISTING_IMAGE_PATH="$TMP_DIR/existing-mounted.dmg" \
 STACIO_DMG_TEST_EXISTING_DEV_ENTRY="/dev/disk-test" \
 STACIO_DMG_SKIP_FINDER_LAYOUT=1 \
+STACIO_DMG_ALLOW_UNBRANDED_ARTIFACT=1 \
 "$ROOT_DIR/scripts/package-dmg.sh" "$APP_DIR" "$TMP_DIR/existing-mounted.dmg" >"$TMP_DIR/existing-mounted.out"
 
 grep -Fq -- "hdiutil detach /dev/disk-test" "$EXISTING_LOG_FILE"
@@ -173,6 +174,7 @@ STACIO_DMG_TEST_MOUNT_DIR="$MOUNT_DIR" \
 STACIO_DMG_BACKGROUND_PATH="$CUSTOM_BACKGROUND" \
 STACIO_DMG_EXPECT_BACKGROUND_SIZE=960x720 \
 STACIO_DMG_SKIP_FINDER_LAYOUT=1 \
+STACIO_DMG_ALLOW_UNBRANDED_ARTIFACT=1 \
 "$ROOT_DIR/scripts/package-dmg.sh" "$APP_DIR" "$TMP_DIR/custom-background.dmg" >"$TMP_DIR/custom-background.out"
 
 test -f "$TMP_DIR/custom-background.dmg"
@@ -184,6 +186,7 @@ PATH="$FAKE_BIN_DIR:$PATH" \
 STACIO_DMG_TEST_LOG="$SKIP_LOG_FILE" \
 STACIO_DMG_TEST_MOUNT_DIR="$MOUNT_DIR" \
 STACIO_DMG_SKIP_FINDER_LAYOUT=1 \
+STACIO_DMG_ALLOW_UNBRANDED_ARTIFACT=1 \
 "$ROOT_DIR/scripts/package-dmg.sh" "$APP_DIR" "$TMP_DIR/skip-layout.dmg" >"$TMP_DIR/skip-layout.out"
 
 test -f "$TMP_DIR/skip-layout.dmg"
@@ -197,6 +200,16 @@ if [[ -f "$MOUNT_DIR/.DS_Store" ]]; then
   exit 1
 fi
 grep -Fq -- "hdiutil verify $TMP_DIR/skip-layout.dmg" "$SKIP_LOG_FILE"
+
+if PATH="$FAKE_BIN_DIR:$PATH" \
+  STACIO_DMG_TEST_LOG="$LOG_FILE" \
+  STACIO_DMG_TEST_MOUNT_DIR="$MOUNT_DIR" \
+  STACIO_DMG_SKIP_FINDER_LAYOUT=1 \
+  "$ROOT_DIR/scripts/package-dmg.sh" "$APP_DIR" "$TMP_DIR/unbranded-without-approval.dmg" >"$TMP_DIR/unbranded-without-approval.out" 2>&1; then
+  echo "expected unbranded DMG packaging without explicit approval to fail" >&2
+  exit 1
+fi
+grep -Fq -- "STACIO_DMG_SKIP_FINDER_LAYOUT is CI/test-only" "$TMP_DIR/unbranded-without-approval.out"
 
 if PATH="$FAKE_BIN_DIR:$PATH" \
   STACIO_DMG_TEST_LOG="$LOG_FILE" \

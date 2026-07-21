@@ -5,7 +5,7 @@ SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="${STACIO_PACKAGE_ROOT_OVERRIDE:-$SCRIPT_ROOT_DIR}"
 APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"
-VERSION="${STACIO_VERSION:-0.13.3}"
+VERSION="${STACIO_VERSION:-0.13.5}"
 BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
 SWIFT_BUILD_TRIPLE="${STACIO_SWIFT_BUILD_TRIPLE:-}"
 CARGO_BUILD_TARGET="${STACIO_CARGO_BUILD_TARGET:-}"
@@ -23,8 +23,9 @@ PRODUCT_OPS_API_BASE_URL="${STACIO_PRODUCT_OPS_API_BASE_URL:-}"
 PRODUCT_OPS_UPDATE_CHANNEL="${STACIO_PRODUCT_OPS_UPDATE_CHANNEL:-stable}"
 PRODUCT_OPS_BETA_UPDATES_ENABLED="${STACIO_PRODUCT_OPS_BETA_UPDATES_ENABLED:-0}"
 FEEDBACK_PRODUCT_API_KEY="${STACIO_FEEDBACK_PRODUCT_API_KEY:-}"
-SPARKLE_STABLE_APPCAST_URL="${STACIO_SPARKLE_STABLE_APPCAST_URL:-https://ops.stacio.cn/updates/stacio/stable/appcast.xml}"
-SPARKLE_BETA_APPCAST_URL="${STACIO_SPARKLE_BETA_APPCAST_URL:-https://ops.stacio.cn/updates/stacio/beta/appcast.xml}"
+SPARKLE_STABLE_APPCAST_URL="${STACIO_SPARKLE_STABLE_APPCAST_URL:-}"
+SPARKLE_BETA_APPCAST_URL="${STACIO_SPARKLE_BETA_APPCAST_URL:-}"
+SPARKLE_UPDATE_ARCHITECTURE="${STACIO_SPARKLE_ARCHITECTURE:-}"
 SPARKLE_PUBLIC_ED_KEY="${STACIO_SPARKLE_PUBLIC_ED_KEY:-}"
 LICENSE_PUBLIC_ED25519_KEY="${STACIO_LICENSE_PUBLIC_ED25519_KEY:-}"
 ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG="${STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG:-0}"
@@ -51,6 +52,8 @@ GITEE_ICON_SOURCE="$ROOT_DIR/Stacio/Resources/gitee.svg"
 GITEE_ICON_OUTPUT="$RESOURCES_DIR/gitee.svg"
 SESSION_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/SessionIcons"
 SESSION_ICONS_OUTPUT="$RESOURCES_DIR/SessionIcons"
+IMPORT_SOURCE_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/ImportSourceIcons"
+IMPORT_SOURCE_ICONS_OUTPUT="$RESOURCES_DIR/ImportSourceIcons"
 MONACO_VS_SOURCE="${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}"
 MONACO_OUTPUT="$RESOURCES_DIR/MonacoEditor/vs"
 VNC_ADAPTER_PRODUCT="StacioVNCAdapter"
@@ -121,6 +124,7 @@ source_snapshot() {
     "$GITHUB_ICON_SOURCE" \
     "$GITEE_ICON_SOURCE" \
     "$SESSION_ICONS_SOURCE" \
+    "$IMPORT_SOURCE_ICONS_SOURCE" \
     "$ABOUT_RESOURCES_SOURCE" \
     "$MONACO_VS_SOURCE" \
     "$ROOT_DIR/scripts/package-app.sh"
@@ -297,9 +301,40 @@ if [[ -n "$SWIFT_BUILD_TRIPLE" ]]; then
   CORE_LOAD_PATH_DEFAULT="$CORE_TARGET_DIR/release/deps/libstacio_core.dylib"
 fi
 
+if [[ -z "$SPARKLE_UPDATE_ARCHITECTURE" ]]; then
+  SPARKLE_UPDATE_ARCHITECTURE="${EXPECTED_NATIVE_ARCH:-$(uname -m)}"
+fi
+case "$SPARKLE_UPDATE_ARCHITECTURE" in
+  arm64|x86_64)
+    ;;
+  *)
+    echo "STACIO_SPARKLE_ARCHITECTURE must be arm64 or x86_64: $SPARKLE_UPDATE_ARCHITECTURE" >&2
+    exit 1
+    ;;
+esac
+if [[ -z "$SPARKLE_STABLE_APPCAST_URL" ]]; then
+  SPARKLE_STABLE_APPCAST_URL="https://ops.stacio.cn/updates/stacio/stable/$SPARKLE_UPDATE_ARCHITECTURE/appcast.xml"
+fi
+if [[ -z "$SPARKLE_BETA_APPCAST_URL" ]]; then
+  SPARKLE_BETA_APPCAST_URL="https://ops.stacio.cn/updates/stacio/beta/$SPARKLE_UPDATE_ARCHITECTURE/appcast.xml"
+fi
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
+  for appcast_url in "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL"; do
+    if [[ "$appcast_url" != */"$SPARKLE_UPDATE_ARCHITECTURE"/appcast.xml ]]; then
+      echo "Sparkle appcast URLs must target $SPARKLE_UPDATE_ARCHITECTURE packages: $appcast_url" >&2
+      exit 1
+    fi
+  done
+fi
+
 swift_release_build() {
-  STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
-    swift build -c release "${SWIFT_BUILD_TARGET_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
+  if (( ${#SWIFT_BUILD_TARGET_ARGS[@]} == 0 )); then
+    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+      swift build -c release --package-path "$ROOT_DIR" "$@"
+  else
+    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+      swift build -c release "${SWIFT_BUILD_TARGET_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
+  fi
 }
 
 verify_expected_native_architecture() {
@@ -397,7 +432,11 @@ if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
     swift package resolve --package-path "$ROOT_DIR"
   fi
   "$SWIFTTERM_RESOURCE_PATCHER" "$SWIFTTERM_CHECKOUT_PATH"
-  cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release "${CARGO_BUILD_TARGET_ARGS[@]}"
+  if (( ${#CARGO_BUILD_TARGET_ARGS[@]} == 0 )); then
+    cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
+  else
+    cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release "${CARGO_BUILD_TARGET_ARGS[@]}"
+  fi
   swift_release_build --product "$APP_NAME"
   swift_release_build --product "$CLI_PRODUCT"
   swift_release_build --product "$VNC_ADAPTER_PRODUCT"
@@ -552,6 +591,9 @@ cp "$GITEE_ICON_SOURCE" "$GITEE_ICON_OUTPUT"
 mkdir -p "$SESSION_ICONS_OUTPUT"
 cp -R "$SESSION_ICONS_SOURCE/." "$SESSION_ICONS_OUTPUT/"
 /usr/bin/xattr -cr "$SESSION_ICONS_OUTPUT"
+mkdir -p "$IMPORT_SOURCE_ICONS_OUTPUT"
+cp -R "$IMPORT_SOURCE_ICONS_SOURCE/." "$IMPORT_SOURCE_ICONS_OUTPUT/"
+/usr/bin/xattr -cr "$IMPORT_SOURCE_ICONS_OUTPUT"
 mkdir -p "$(dirname "$MONACO_OUTPUT")"
 cp -R "$MONACO_VS_SOURCE" "$MONACO_OUTPUT"
 chmod 755 "$MACOS_DIR/$APP_NAME" "$HELPERS_DIR/$CLI_HELPER_NAME" "$FRAMEWORKS_DIR/libstacio_core.dylib" "$ADAPTERS_DIR/vnc"
@@ -612,7 +654,7 @@ cat >"$PLIST_PATH" <<PLIST
 </plist>
 PLIST
 
-python3 - "$PLIST_PATH" "$PRODUCT_OPS_PRODUCT_ID" "$PRODUCT_OPS_API_BASE_URL" "$PRODUCT_OPS_UPDATE_CHANNEL" "$PRODUCT_OPS_BETA_UPDATES_ENABLED" "$FEEDBACK_PRODUCT_API_KEY" "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL" "$SPARKLE_PUBLIC_ED_KEY" "$LICENSE_PUBLIC_ED25519_KEY" <<'PY'
+python3 - "$PLIST_PATH" "$PRODUCT_OPS_PRODUCT_ID" "$PRODUCT_OPS_API_BASE_URL" "$PRODUCT_OPS_UPDATE_CHANNEL" "$PRODUCT_OPS_BETA_UPDATES_ENABLED" "$FEEDBACK_PRODUCT_API_KEY" "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL" "$SPARKLE_PUBLIC_ED_KEY" "$LICENSE_PUBLIC_ED25519_KEY" "$SPARKLE_UPDATE_ARCHITECTURE" <<'PY'
 import plistlib
 import sys
 from urllib.parse import urlparse
@@ -628,15 +670,16 @@ from urllib.parse import urlparse
     beta_appcast_url,
     sparkle_public_ed_key,
     license_public_ed25519_key,
-) = sys.argv[1:11]
+    sparkle_architecture,
+) = sys.argv[1:12]
 product_id = (product_id or "stacio").strip() or "stacio"
 api_base_url = (api_base_url or "").strip()
 update_channel = (update_channel or "stable").strip().lower() or "stable"
 feedback_product_api_key = (feedback_product_api_key or "").strip()
 stable_appcast_url = (stable_appcast_url or "").strip()
 beta_appcast_url = (beta_appcast_url or "").strip()
-sparkle_public_ed_key = (sparkle_public_ed_key or "").strip()
 license_public_ed25519_key = (license_public_ed25519_key or "").strip()
+sparkle_architecture = (sparkle_architecture or "").strip()
 if update_channel not in {"stable", "beta"}:
     raise SystemExit(f"Invalid STACIO_PRODUCT_OPS_UPDATE_CHANNEL: {update_channel}")
 
@@ -665,14 +708,15 @@ with open(plist_path, "rb") as handle:
 payload["StacioProductOpsProductID"] = product_id
 payload["StacioProductOpsUpdateChannel"] = update_channel
 payload["StacioProductOpsBetaUpdatesEnabled"] = beta_enabled
+payload["StacioSparkleArchitecture"] = sparkle_architecture
 validate_url("STACIO_SPARKLE_STABLE_APPCAST_URL", stable_appcast_url)
 validate_url("STACIO_SPARKLE_BETA_APPCAST_URL", beta_appcast_url)
 payload["SUFeedURL"] = stable_appcast_url
 payload["StacioSparkleBetaAppcastURL"] = beta_appcast_url
-payload["SUEnableAutomaticChecks"] = False
+payload["SUEnableAutomaticChecks"] = True
 payload["SUAutomaticallyUpdate"] = False
 payload["SUAllowsAutomaticUpdates"] = False
-payload["SUScheduledCheckInterval"] = 0
+payload["SUScheduledCheckInterval"] = 86400
 
 if api_base_url:
     validate_url("STACIO_PRODUCT_OPS_API_BASE_URL", api_base_url)
