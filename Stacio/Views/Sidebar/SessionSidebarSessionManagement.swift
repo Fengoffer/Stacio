@@ -82,10 +82,19 @@ enum SerialConnectionSupport {
     }
 
     static func preferredDevicePaths(from devicePaths: [String]) -> [String] {
+        let availablePaths = Set(devicePaths)
         var uniquePaths: [String] = []
         var seen = Set<String>()
         for path in devicePaths where seen.insert(path).inserted {
-            guard path.hasPrefix("/dev/cu.") else {
+            if isNBEESPPDevice(path) {
+                if path.hasPrefix("/dev/cu."),
+                   availablePaths.contains(ttyCounterpart(for: path)) {
+                    continue
+                }
+                guard path.hasPrefix("/dev/cu.") || path.hasPrefix("/dev/tty.") else {
+                    continue
+                }
+            } else if !path.hasPrefix("/dev/cu.") {
                 continue
             }
             uniquePaths.append(path)
@@ -109,13 +118,27 @@ enum SerialConnectionSupport {
             || lowercased.contains("usb") {
             return 0
         }
-        if lowercased.contains("bluetooth-incoming-port") {
-            return 2
-        }
-        if lowercased.contains("bluetooth") {
+        if isNBEESPPDevice(devicePath) {
             return 1
         }
-        return 3
+        if lowercased.contains("bluetooth-incoming-port") {
+            return 3
+        }
+        if lowercased.contains("bluetooth") {
+            return 2
+        }
+        return 4
+    }
+
+    private static func isNBEESPPDevice(_ devicePath: String) -> Bool {
+        devicePath.lowercased().contains("nbee_spp_")
+    }
+
+    private static func ttyCounterpart(for devicePath: String) -> String {
+        guard devicePath.hasPrefix("/dev/cu.") else {
+            return devicePath
+        }
+        return "/dev/tty." + devicePath.dropFirst("/dev/cu.".count)
     }
 }
 
@@ -469,14 +492,17 @@ public final class AppKitSessionSidebarSessionEditor: SessionSidebarSessionEditi
     private let draftFactory: SessionSidebarSessionDraftFactory
     private let errorPresenter: SessionSidebarErrorPresenting
     private let sessionConfigJSONProvider: (SessionRecord) -> String?
+    private let licenseAccess: any LicenseFeatureAccessProviding
 
     public init(
         credentialSaver: SessionSidebarCredentialSaving? = nil,
         errorPresenter: SessionSidebarErrorPresenting? = nil,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         sessionConfigJSONProvider: @escaping (SessionRecord) -> String? = { _ in nil }
     ) {
         draftFactory = SessionSidebarSessionDraftFactory(credentialSaver: credentialSaver)
         self.errorPresenter = errorPresenter ?? AppKitSessionSidebarErrorPresenter()
+        self.licenseAccess = licenseAccess
         self.sessionConfigJSONProvider = sessionConfigJSONProvider
     }
 
@@ -491,6 +517,7 @@ public final class AppKitSessionSidebarSessionEditor: SessionSidebarSessionEditi
             draftFactory: draftFactory,
             errorPresenter: errorPresenter,
             existingSerialConfigJSON: existingSession.flatMap(sessionConfigJSONProvider),
+            licenseAccess: licenseAccess,
             parentWindowProvider: { parentWindow }
         )
         return controller.runModal(parentWindow: parentWindow)

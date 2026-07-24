@@ -627,16 +627,35 @@ public final class LicenseWindowController: NSWindowController {
     private let onlineValidator: LicenseOnlineValidating
     private let activationStore: LicenseActivationRecordStoring
     private let deviceIDStore: AnonymousDeviceIdentifierStore
+    private let fingerprintProvider: StacioDeviceFingerprintProvider
+    private let offlineConfigurationStore: OfflineLicenseConfigurationStore
+    private let offlineStatusRefresher: OfflineLicenseStatusRefreshing
     private let nowProvider: () -> Date
+    private let persistedStateProvider: (() -> LicenseState)?
     private let statusLabel = NSTextField(labelWithString: "")
+    private let statusNoteLabel = NSTextField(labelWithString: "")
+    private let statusHeadlineLabel = NSTextField(labelWithString: "")
+    private let planBadgeLabel = NSTextField(labelWithString: "")
+    private let userValueLabel = NSTextField(labelWithString: "-")
+    private let emailValueLabel = NSTextField(labelWithString: "-")
+    private let expiresValueLabel = NSTextField(labelWithString: "-")
     private let licenseKeyField = NSSecureTextField()
     private let usernameField = NSTextField()
     private let emailField = NSTextField()
-    private let tokenTextView = NSTextView()
     private let actionStatusLabel = NSTextField(labelWithString: "")
     private let validateButton = NSButton(title: L10n.ProductOps.validateOnline, target: nil, action: nil)
+    private let activationFormStack = NSStackView()
+    private let licenseActionStack = NSStackView()
+    private let managementActionStack = NSStackView()
+    private let refreshLicenseButton = NSButton(title: "同步许可", target: nil, action: nil)
+    private let reimportLicenseButton = NSButton(title: "重新导入许可", target: nil, action: nil)
+    private weak var contentStack: NSStackView?
     private var onlineValidationTask: Task<Void, Never>?
     private var onlineValidationRunID: UUID?
+    private var activationRecordPresenceTask: Task<Void, Never>?
+    private var licenseAuthorizationObserver: NSObjectProtocol?
+    private var hasPersistedActivationRecord = false
+    private var isReimporting = false
 
     public init(
         configuration: ProductOpsConfiguration = ProductOpsConfigurationStore().load(),
@@ -644,6 +663,10 @@ public final class LicenseWindowController: NSWindowController {
         onlineValidator: LicenseOnlineValidating? = nil,
         activationStore: LicenseActivationRecordStoring = LicenseKeychainStore(),
         deviceIDStore: AnonymousDeviceIdentifierStore = .shared,
+        fingerprintProvider: StacioDeviceFingerprintProvider = StacioDeviceFingerprintProvider(),
+        offlineConfigurationStore: OfflineLicenseConfigurationStore = OfflineLicenseConfigurationStore(),
+        offlineStatusRefresher: OfflineLicenseStatusRefreshing? = nil,
+        persistedStateProvider: (() -> LicenseState)? = nil,
         nowProvider: @escaping () -> Date = Date.init
     ) {
         self.configuration = configuration
@@ -651,6 +674,11 @@ public final class LicenseWindowController: NSWindowController {
         self.onlineValidator = onlineValidator ?? LicenseOnlineValidationService(configuration: configuration)
         self.activationStore = activationStore
         self.deviceIDStore = deviceIDStore
+        self.fingerprintProvider = fingerprintProvider
+        self.offlineConfigurationStore = offlineConfigurationStore
+        self.offlineStatusRefresher = offlineStatusRefresher
+            ?? OfflineLicenseStatusService(configuration: configuration)
+        self.persistedStateProvider = persistedStateProvider
         self.nowProvider = nowProvider
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 600),
@@ -660,31 +688,20 @@ public final class LicenseWindowController: NSWindowController {
         )
         window.title = L10n.ProductOps.licenseTitle
         window.isReleasedWhenClosed = false
+        window.contentMinSize = NSSize(width: 520, height: 340)
         window.center()
         super.init(window: window)
         window.delegate = self
         window.contentView = makeContentView()
+        observePersistedAuthorizationIfNeeded()
+        loadActivationRecordPresenceIfNeeded()
         refreshStatus()
+        resizeWindowToContent()
     }
 
     @available(*, unavailable)
     public required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
-    }
-
-    @objc private func applyOfflineTokenPressed(_ sender: Any?) {
-        guard let data = tokenTextView.string.data(using: .utf8) else {
-            renderLicenseActionFailure(ProductOpsError.invalidOfflineLicenseToken.localizedDescription)
-            return
-        }
-        do {
-            _ = try applyOfflineLicenseData(data)
-            actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
-            actionStatusLabel.stringValue = L10n.ProductOps.licenseTokenApplied
-            refreshStatus()
-        } catch {
-            renderLicenseActionFailure(error.localizedDescription)
-        }
     }
 
     @objc private func importOfflineLicenseFilePressed(_ sender: Any?) {
@@ -694,15 +711,44 @@ public final class LicenseWindowController: NSWindowController {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.json, .plainText]
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             self?.importOfflineLicenseFile(at: url)
         }
     }
 
-    func importOfflineLicenseFileForTesting(_ data: Data) {
-        importOfflineLicenseData(data)
+    func importOfflineLicenseFileForTesting(_ data: Data) async {
+        await importOfflineLicenseData(data)
+    }
+
+    @objc private func exportDeviceFingerprintPressed(_ sender: Any?) {
+        guard let window else { return }
+        let panel = NSSavePanel()
+        panel.title = L10n.ProductOps.exportDeviceFingerprint
+        panel.nameFieldStringValue = "Stacio-offline-request.stacio-offline-request"
+        panel.canCreateDirectories = true
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url, let self else { return }
+            Task { @MainActor in
+                do {
+                    let configuration = try await OfflineLicenseConfigurationService(
+                        apiBaseURL: self.configuration.apiBaseURL,
+                        store: self.offlineConfigurationStore
+                    ).fetch()
+                    let exported = try OfflineLicenseFileCodec.exportDeviceFingerprint(
+                        configuration: configuration,
+                        fingerprintProvider: self.fingerprintProvider,
+                        now: self.nowProvider()
+                    )
+                    try exported.data.write(to: url, options: .atomic)
+                    StacioLogStore.shared.append(level: .info, category: "License",
+                        message: "offline.fingerprint.exported fingerprintSource=\(exported.fingerprint.source.rawValue)")
+                    self.actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
+                    self.actionStatusLabel.stringValue = L10n.ProductOps.deviceFingerprintExported(
+                        source: exported.fingerprint.source.displayName)
+                } catch { self.renderLicenseActionFailure(error.localizedDescription) }
+            }
+        }
     }
 
     @objc private func validateOnlinePressed(_ sender: Any?) {
@@ -713,9 +759,12 @@ public final class LicenseWindowController: NSWindowController {
             renderOnlineValidationFailure(L10n.ProductOps.licenseMissingIdentity)
             return
         }
+        actionStatusLabel.isHidden = false
         actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         actionStatusLabel.stringValue = L10n.ProductOps.licenseValidatingOnline
         validateButton.isEnabled = false
+        refreshLicenseButton.isEnabled = false
+        resizeWindowToContent(hasAuthorization: managementActionStack.isHidden == false)
         let request = LicenseValidationRequest(
             licenseKey: licenseKey,
             username: username,
@@ -737,23 +786,24 @@ public final class LicenseWindowController: NSWindowController {
                 let response = try await onlineValidator.validate(request)
                 try Task.checkCancellation()
                 guard isCurrentOnlineValidationRun(runID) else { return }
-                let state = try service.state(
-                    applyingOnlineValidation: response,
-                    expected: request,
-                    activationStore: activationStore,
-                    now: nowProvider()
-                )
+                let state = try await persistOnlineValidation(response, request: request)
                 guard isCurrentOnlineValidationRun(runID) else { return }
+                let completionColor: NSColor
+                let completionMessage: String
                 if state.status == .active || state.status == .trial {
-                    actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
-                    actionStatusLabel.stringValue = L10n.ProductOps.licenseOnlineValidated
+                    completionColor = StacioDesignSystem.theme.successColor
+                    completionMessage = L10n.ProductOps.licenseOnlineValidated
                 } else {
-                    actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
-                    actionStatusLabel.stringValue = L10n.ProductOps.licenseOnlineCompleted(
+                    completionColor = StacioDesignSystem.theme.dangerColor
+                    completionMessage = L10n.ProductOps.licenseOnlineCompleted(
                         status: state.status.displayName
                     )
                 }
-                refreshStatus()
+                renderStatus(state)
+                actionStatusLabel.isHidden = false
+                actionStatusLabel.textColor = completionColor
+                actionStatusLabel.stringValue = completionMessage
+                resizeWindowToContent(hasAuthorization: shouldShowManagement(for: state))
             } catch is CancellationError {
                 return
             } catch {
@@ -761,6 +811,192 @@ public final class LicenseWindowController: NSWindowController {
                 renderOnlineValidationFailure(error.localizedDescription)
             }
         }
+    }
+
+    @objc private func refreshLicensePressed(_ sender: Any?) {
+        let state = persistedStateProvider?() ?? service.loadState(now: nowProvider())
+        if let errorCode = state.lastAuthorizationSyncErrorCode,
+           errorCode.isEmpty == false {
+            actionStatusLabel.isHidden = false
+            actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+            actionStatusLabel.stringValue = "授权已停止（\(errorCode)），请重新导入许可。"
+            return
+        }
+        if let authorization = state.offlineDeviceAuthorization {
+            refreshOfflineAuthorization(authorization)
+            return
+        }
+        loadOnlineActivationForRefresh()
+    }
+
+    private func loadOnlineActivationForRefresh() {
+        actionStatusLabel.isHidden = false
+        actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        actionStatusLabel.stringValue = "正在读取本机许可..."
+        refreshLicenseButton.isEnabled = false
+        onlineValidationTask?.cancel()
+
+        let activationStore = self.activationStore
+        onlineValidationTask = Task { [weak self] in
+            let readTask = Task.detached(priority: .userInitiated) {
+                try activationStore.loadActivationRecord()
+            }
+            do {
+                let record = try await withTaskCancellationHandler {
+                    try await readTask.value
+                } onCancel: {
+                    readTask.cancel()
+                }
+                try Task.checkCancellation()
+                guard let self else { return }
+                onlineValidationTask = nil
+                refreshLicenseButton.isEnabled = true
+                guard let record else {
+                    actionStatusLabel.textColor = StacioDesignSystem.theme.warningColor
+                    actionStatusLabel.stringValue = "当前没有可同步的许可，请重新导入许可。"
+                    return
+                }
+                licenseKeyField.stringValue = record.licenseKey
+                usernameField.stringValue = record.username
+                emailField.stringValue = record.email
+                validateOnlinePressed(nil)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self else { return }
+                onlineValidationTask = nil
+                refreshLicenseButton.isEnabled = true
+                actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+                actionStatusLabel.stringValue = "许可读取失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func persistOnlineValidation(
+        _ response: LicenseValidationResponse,
+        request: LicenseValidationRequest
+    ) async throws -> LicenseState {
+        let service = self.service
+        let activationStore = self.activationStore
+        let now = nowProvider()
+        let persistenceTask = Task.detached(priority: .userInitiated) {
+            try service.state(
+                applyingOnlineValidation: response,
+                expected: request,
+                activationStore: activationStore,
+                now: now
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await persistenceTask.value
+        } onCancel: {
+            persistenceTask.cancel()
+        }
+    }
+
+    private func persistOfflineAuthorization(
+        _ authorization: OfflineDeviceAuthorization,
+        expectedUsername: String,
+        expectedEmail: String
+    ) async throws -> LicenseState {
+        let service = self.service
+        let activationStore = self.activationStore
+        let now = nowProvider()
+        let persistenceTask = Task.detached(priority: .userInitiated) {
+            try service.state(
+                applyingOfflineDeviceAuthorization: authorization,
+                expectedUsername: expectedUsername,
+                expectedEmail: expectedEmail,
+                activationStore: activationStore,
+                now: now
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await persistenceTask.value
+        } onCancel: {
+            persistenceTask.cancel()
+        }
+    }
+
+    private func refreshOfflineAuthorization(_ authorization: OfflineDeviceAuthorization) {
+        actionStatusLabel.isHidden = false
+        actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        actionStatusLabel.stringValue = "正在同步离线授权状态..."
+        refreshLicenseButton.isEnabled = false
+        onlineValidationTask?.cancel()
+        onlineValidationTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                refreshLicenseButton.isEnabled = true
+                onlineValidationTask = nil
+            }
+            do {
+                let refreshed = try await offlineStatusRefresher.refresh(
+                    authorization: authorization,
+                    appVersion: StacioAppMetadata.displayVersion,
+                    buildNumber: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "dev"
+                )
+                try Task.checkCancellation()
+                let state = try await persistOfflineAuthorization(
+                    refreshed,
+                    expectedUsername: authorization.username,
+                    expectedEmail: authorization.email
+                )
+                renderStatus(state)
+                actionStatusLabel.isHidden = false
+                actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
+                actionStatusLabel.stringValue = "离线授权状态已同步。"
+                resizeWindowToContent(hasAuthorization: true)
+            } catch is CancellationError {
+                return
+            } catch {
+                let classified = ProductOpsError.classify(error)
+                if classified.offlineLicenseStatusErrorCode != nil {
+                    do {
+                        let state = try await persistOfflineStatusFailure(classified)
+                        renderStatus(state)
+                        actionStatusLabel.isHidden = false
+                        actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+                        actionStatusLabel.stringValue = "离线授权已停止：\(state.status.displayName)。请重新导入许可。"
+                        resizeWindowToContent(hasAuthorization: false)
+                        return
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        actionStatusLabel.isHidden = false
+                        actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+                        actionStatusLabel.stringValue = "离线授权同步失败：\(error.localizedDescription)"
+                        return
+                    }
+                }
+                actionStatusLabel.isHidden = false
+                actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+                actionStatusLabel.stringValue = "离线授权同步失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func persistOfflineStatusFailure(_ error: ProductOpsError) async throws -> LicenseState {
+        let service = self.service
+        let now = nowProvider()
+        let persistenceTask = Task.detached(priority: .userInitiated) {
+            try service.state(applyingOfflineStatusError: error, now: now)
+        }
+        return try await withTaskCancellationHandler {
+            try await persistenceTask.value
+        } onCancel: {
+            persistenceTask.cancel()
+        }
+    }
+
+    @objc private func reimportLicensePressed(_ sender: Any?) {
+        cancelOnlineValidation()
+        isReimporting = true
+        refreshStatus()
+        licenseKeyField.stringValue = ""
+        actionStatusLabel.isHidden = false
+        actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        actionStatusLabel.stringValue = "请输入在线 License，或选择离线授权文件导入。"
     }
 
     private func isCurrentOnlineValidationRun(_ runID: UUID) -> Bool {
@@ -772,6 +1008,7 @@ public final class LicenseWindowController: NSWindowController {
         onlineValidationRunID = nil
         onlineValidationTask = nil
         validateButton.isEnabled = true
+        refreshLicenseButton.isEnabled = true
     }
 
     private func cancelOnlineValidation() {
@@ -779,11 +1016,14 @@ public final class LicenseWindowController: NSWindowController {
         onlineValidationTask?.cancel()
         onlineValidationTask = nil
         validateButton.isEnabled = true
+        refreshLicenseButton.isEnabled = true
     }
 
     private func renderOnlineValidationFailure(_ message: String) {
+        actionStatusLabel.isHidden = false
         actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
         actionStatusLabel.stringValue = L10n.ProductOps.licenseOnlineFailedPrefix + message
+        resizeWindowToContent(hasAuthorization: managementActionStack.isHidden == false)
     }
 
     private func renderLicenseActionFailure(_ message: String) {
@@ -797,86 +1037,190 @@ public final class LicenseWindowController: NSWindowController {
     }
 
     private func importOfflineLicenseFile(at url: URL) {
+        actionStatusLabel.isHidden = false
+        actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        actionStatusLabel.stringValue = "正在导入离线授权..."
+        onlineValidationTask?.cancel()
+        onlineValidationTask = Task { [weak self] in
+            let readTask = Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: url, options: [.mappedIfSafe])
+            }
+            do {
+                let data = try await withTaskCancellationHandler {
+                    try await readTask.value
+                } onCancel: {
+                    readTask.cancel()
+                }
+                guard let self else { return }
+                await importOfflineLicenseData(data)
+                onlineValidationTask = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self else { return }
+                onlineValidationTask = nil
+                renderLicenseFileImportFailure(error.localizedDescription)
+            }
+        }
+    }
+
+    private func importOfflineLicenseData(_ data: Data) async {
         do {
-            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-            importOfflineLicenseData(data)
+            let state = try await applyOfflineLicenseData(data)
+            if state.status == .revoked {
+                actionStatusLabel.textColor = StacioDesignSystem.theme.dangerColor
+                actionStatusLabel.stringValue = L10n.ProductOps.licenseRevocationApplied
+            } else {
+                actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
+                actionStatusLabel.stringValue = L10n.ProductOps.licenseTokenApplied
+            }
+            renderStatus(state)
         } catch {
             renderLicenseFileImportFailure(error.localizedDescription)
         }
     }
 
-    private func importOfflineLicenseData(_ data: Data) {
-        do {
-            _ = try applyOfflineLicenseData(data)
-            tokenTextView.string = String(data: data, encoding: .utf8) ?? ""
-            actionStatusLabel.textColor = StacioDesignSystem.theme.successColor
-            actionStatusLabel.stringValue = L10n.ProductOps.licenseTokenApplied
-            refreshStatus()
-        } catch {
-            renderLicenseFileImportFailure(error.localizedDescription)
-        }
-    }
-
-    private func applyOfflineLicenseData(_ data: Data) throws -> LicenseState {
-        if let token = try? JSONDecoder.productOps.decode(OfflineLicenseToken.self, from: data) {
-            return try service.state(
-                applyingOfflineToken: token,
-                expectedUsername: usernameField.stringValue,
-                expectedEmail: emailField.stringValue,
-                activationStore: activationStore,
-                now: nowProvider()
+    private func applyOfflineLicenseData(_ data: Data) async throws -> LicenseState {
+        let configuration = self.configuration
+        let offlineConfigurationStore = self.offlineConfigurationStore
+        let fingerprintProvider = self.fingerprintProvider
+        let now = nowProvider()
+        let expectedUsername = usernameField.stringValue
+        let expectedEmail = emailField.stringValue
+        let verificationTask = Task.detached(priority: .userInitiated) {
+            let protocolConfiguration = OfflineLicenseConfigurationService(
+                apiBaseURL: configuration.apiBaseURL,
+                store: offlineConfigurationStore
+            ).cachedOrBundled(configuration.offlineLicenseProtocolConfiguration)
+            return try OfflineLicenseFileCodec.importAuthorization(
+                data,
+                configuration: protocolConfiguration,
+                fingerprintProvider: fingerprintProvider,
+                now: now
             )
         }
-        guard let signedLicenseToken = Self.signedOfflineLicenseToken(from: data) else {
-            throw ProductOpsError.invalidOfflineLicenseToken
+        let authorization = try await withTaskCancellationHandler {
+            try await verificationTask.value
+        } onCancel: {
+            verificationTask.cancel()
         }
-        return try service.state(
-            applyingOfflineSignedToken: signedLicenseToken,
-            expectedUsername: usernameField.stringValue,
-            expectedEmail: emailField.stringValue,
-            activationStore: activationStore,
-            now: nowProvider()
+        return try await persistOfflineAuthorization(
+            authorization,
+            expectedUsername: expectedUsername,
+            expectedEmail: expectedEmail
         )
     }
 
-    private static func signedOfflineLicenseToken(from data: Data) -> String? {
-        if let envelope = try? JSONDecoder.productOps.decode(SignedOfflineLicenseFileEnvelope.self, from: data) {
-            let candidate = envelope.signedLicenseToken
-                ?? envelope.token
-                ?? envelope.data?.signedLicenseToken
-                ?? envelope.data?.token
-            let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if trimmed.isEmpty == false {
-                return trimmed
-            }
-        }
-        let raw = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return raw.hasPrefix("v1.") ? raw : nil
+    private func refreshStatus() {
+        let state = persistedStateProvider?() ?? service.loadState(now: nowProvider())
+        renderStatus(state)
     }
 
-    private func refreshStatus() {
-        let state = service.loadState(now: nowProvider())
-        var lines = [
+    private func renderStatus(_ state: LicenseState) {
+        let hasAuthorization = [.active, .trial, .offlineActive, .offlineGrace].contains(state.status)
+        let showsManagement = shouldShowManagement(for: state)
+        let planDisplay = Self.displayPlan(state.plan)
+        statusHeadlineLabel.stringValue = state.status.displayName
+        statusHeadlineLabel.textColor = hasAuthorization
+            ? StacioDesignSystem.theme.successColor
+            : StacioDesignSystem.theme.dangerColor
+        planBadgeLabel.stringValue = planDisplay
+        userValueLabel.stringValue = state.username.isEmpty ? "-" : state.username
+        emailValueLabel.stringValue = state.email.isEmpty ? "-" : state.email
+        expiresValueLabel.stringValue = state.expiresAt.map(Self.dateFormatter.string(from:)) ?? "-"
+        var accessibilityLines = [
             "\(L10n.ProductOps.licenseStatus)：\(state.status.displayName)",
             "\(L10n.ProductOps.licenseUser)：\(state.username.isEmpty ? "-" : state.username)",
             "\(L10n.ProductOps.licenseEmail)：\(state.email.isEmpty ? "-" : state.email)",
-            "\(L10n.ProductOps.licensePlan)：\(state.plan.isEmpty ? "-" : state.plan)"
+            "\(L10n.ProductOps.licensePlan)：\(planDisplay)"
         ]
         if let expiresAt = state.expiresAt {
-            lines.append("\(L10n.ProductOps.licenseExpires)：\(Self.dateFormatter.string(from: expiresAt))")
+            accessibilityLines.append("\(L10n.ProductOps.licenseExpires)：\(Self.dateFormatter.string(from: expiresAt))")
         }
         if let graceUntil = state.graceUntil {
-            lines.append("\(L10n.ProductOps.licenseGraceUntil)：\(Self.dateFormatter.string(from: graceUntil))")
+            accessibilityLines.append("\(L10n.ProductOps.licenseGraceUntil)：\(Self.dateFormatter.string(from: graceUntil))")
         }
-        lines.append(L10n.ProductOps.licenseNoPrivateKey)
-        statusLabel.stringValue = lines.joined(separator: "\n")
+        statusLabel.stringValue = accessibilityLines.joined(separator: "\n")
+        if hasAuthorization {
+            statusNoteLabel.stringValue = "授权信息已在本机验证；后台私钥不会进入客户端。"
+        } else if showsManagement {
+            statusNoteLabel.stringValue = "许可信息已保存在本机，可更新状态或重新导入。"
+        } else {
+            statusNoteLabel.stringValue = "尚未激活 License；可选择在线激活或导入离线授权文件。"
+        }
+        activationFormStack.isHidden = showsManagement
+        licenseActionStack.isHidden = showsManagement
+        actionStatusLabel.isHidden = showsManagement
+        managementActionStack.isHidden = !showsManagement
         if usernameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             usernameField.stringValue = state.username
         }
         if emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             emailField.stringValue = state.email
         }
+        resizeWindowToContent(hasAuthorization: showsManagement)
+    }
+
+    private func shouldShowManagement(for state: LicenseState) -> Bool {
+        guard isReimporting == false else { return false }
+        if [.active, .trial, .offlineActive, .offlineGrace].contains(state.status) {
+            return true
+        }
+        if state.offlineDeviceAuthorization != nil {
+            return true
+        }
+        if persistedStateProvider != nil {
+            return hasPersistedActivationRecord
+        }
+        return (try? activationStore.loadActivationRecord()) != nil
+    }
+
+    private func observePersistedAuthorizationIfNeeded() {
+        guard persistedStateProvider != nil else { return }
+        licenseAuthorizationObserver = NotificationCenter.default.addObserver(
+            forName: .stacioLicenseAuthorizationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshStatus()
+            }
+        }
+    }
+
+    private func loadActivationRecordPresenceIfNeeded() {
+        guard persistedStateProvider != nil else { return }
+        let activationStore = self.activationStore
+        activationRecordPresenceTask = Task { [weak self] in
+            let readTask = Task.detached(priority: .utility) {
+                try activationStore.loadActivationRecord() != nil
+            }
+            let hasActivation = (try? await readTask.value) ?? false
+            guard Task.isCancelled == false, let self else { return }
+            hasPersistedActivationRecord = hasActivation
+            refreshStatus()
+        }
+    }
+
+    private static func displayPlan(_ plan: String) -> String {
+        switch plan.lowercased() {
+        case "enterprise", "team", "internal": return "企业版"
+        case "professional", "pro": return "专业版"
+        case "trial": return "试用版"
+        default: return plan.isEmpty ? "免费版" : plan
+        }
+    }
+
+    private func resizeWindowToContent(hasAuthorization: Bool = false) {
+        guard let window else { return }
+        window.contentView?.layoutSubtreeIfNeeded()
+        let measuredHeight = contentStack?.fittingSize.height ?? (hasAuthorization ? 280 : 500)
+        let titlebarHeight = max(0, window.frame.height - window.contentLayoutRect.height)
+        let targetHeight = ceil(measuredHeight + 52 + titlebarHeight)
+        var frame = window.frame
+        frame.size = NSSize(width: 600, height: targetHeight)
+        frame.origin.y = window.frame.maxY - targetHeight
+        window.setFrame(frame, display: true, animate: false)
     }
 
     private static let dateFormatter: ISO8601DateFormatter = {
@@ -895,44 +1239,87 @@ public final class LicenseWindowController: NSWindowController {
         stack.alignment = .leading
         stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack = stack
         root.addSubview(stack)
 
-        stack.addArrangedSubview(header(title: L10n.ProductOps.licenseTitle, subtitle: L10n.ProductOps.licenseSubtitle))
+        stack.addArrangedSubview(licenseHeader())
         statusLabel.setAccessibilityIdentifier("Stacio.License.status")
         statusLabel.maximumNumberOfLines = 0
-        statusLabel.textColor = StacioDesignSystem.theme.primaryTextColor
-        stack.addArrangedSubview(labeledBlock(label: L10n.ProductOps.licenseStatus, control: statusLabel))
+        statusLabel.isHidden = true
+        statusNoteLabel.maximumNumberOfLines = 1
+        statusNoteLabel.font = .systemFont(ofSize: 11)
+        statusNoteLabel.lineBreakMode = .byTruncatingTail
+        statusNoteLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+
+        statusHeadlineLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+        statusHeadlineLabel.setAccessibilityIdentifier("Stacio.License.statusHeadline")
+        planBadgeLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        planBadgeLabel.alignment = .center
+        planBadgeLabel.wantsLayer = true
+        planBadgeLabel.layer?.cornerRadius = 6
+        planBadgeLabel.layer?.cornerCurve = .continuous
+        planBadgeLabel.layer?.backgroundColor = StacioDesignSystem.theme.accentColor.withAlphaComponent(0.14).cgColor
+        planBadgeLabel.textColor = StacioDesignSystem.theme.accentColor
+        planBadgeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        planBadgeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let statusRow = NSStackView(views: [statusHeadlineLabel, planBadgeLabel])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 10
+        let detailGrid = NSGridView(views: [
+            [formLabel("用户名"), userValueLabel, formLabel("邮箱"), emailValueLabel],
+            [formLabel("到期时间"), expiresValueLabel, NSView(), NSView()]
+        ])
+        detailGrid.column(at: 0).width = 70
+        detailGrid.column(at: 2).width = 55
+        detailGrid.column(at: 1).xPlacement = .leading
+        detailGrid.column(at: 3).xPlacement = .leading
+        detailGrid.row(at: 0).yPlacement = .center
+        detailGrid.row(at: 1).yPlacement = .center
+        for label in [userValueLabel, emailValueLabel, expiresValueLabel] {
+            label.font = .systemFont(ofSize: 13)
+            label.textColor = StacioDesignSystem.theme.primaryTextColor
+            label.lineBreakMode = .byTruncatingTail
+        }
+        let statusStack = NSStackView(views: [statusRow, detailGrid, statusNoteLabel, statusLabel])
+        statusStack.orientation = .vertical
+        statusStack.alignment = .leading
+        statusStack.spacing = 10
+        let statusCard = roundedLicensePanel(content: statusStack)
+        statusCard.setAccessibilityIdentifier("Stacio.License.statusCard")
+        stack.addArrangedSubview(statusCard)
+        statusCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        activationFormStack.orientation = .vertical
+        activationFormStack.alignment = .leading
+        activationFormStack.spacing = 14
+        activationFormStack.translatesAutoresizingMaskIntoConstraints = false
+        activationFormStack.setAccessibilityIdentifier("Stacio.License.activationForm")
+        stack.addArrangedSubview(activationFormStack)
+        activationFormStack.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         licenseKeyField.placeholderString = "STACIO-..."
         licenseKeyField.setAccessibilityIdentifier("Stacio.License.licenseKey")
         StacioDesignSystem.styleTextField(licenseKeyField)
-        stack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseKey, control: licenseKeyField))
+        activationFormStack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseKey, control: licenseKeyField))
 
         usernameField.placeholderString = "用户名"
         usernameField.setAccessibilityIdentifier("Stacio.License.username")
         StacioDesignSystem.styleTextField(usernameField)
-        stack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseUser, control: usernameField))
+        activationFormStack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseUser, control: usernameField))
 
         emailField.placeholderString = "name@example.com"
         emailField.setAccessibilityIdentifier("Stacio.License.email")
         StacioDesignSystem.styleTextField(emailField)
-        stack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseEmail, control: emailField))
+        activationFormStack.addArrangedSubview(formRow(label: L10n.ProductOps.licenseEmail, control: emailField))
 
-        let tokenScroll = NSScrollView()
-        tokenScroll.hasVerticalScroller = true
-        tokenScroll.borderType = .bezelBorder
-        tokenScroll.translatesAutoresizingMaskIntoConstraints = false
-        tokenScroll.setAccessibilityIdentifier("Stacio.License.offlineToken")
-        tokenTextView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        tokenTextView.textColor = StacioDesignSystem.theme.primaryTextColor
-        tokenTextView.isHorizontallyResizable = false
-        tokenTextView.textContainer?.widthTracksTextView = true
-        tokenScroll.documentView = tokenTextView
-        stack.addArrangedSubview(labeledBlock(label: L10n.ProductOps.licenseOfflineToken, control: tokenScroll))
-        NSLayoutConstraint.activate([
-            tokenScroll.widthAnchor.constraint(equalToConstant: 540),
-            tokenScroll.heightAnchor.constraint(equalToConstant: 160)
-        ])
+        let exchangeAddress = configuration.offlineLicenseExchangeURL?.absoluteString
+            ?? L10n.ProductOps.offlineExchangeAddressPlaceholder
+        let exchangeAddressLabel = NSTextField(wrappingLabelWithString: "\(L10n.ProductOps.offlineExchangeAddress)：\(exchangeAddress)")
+        exchangeAddressLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        exchangeAddressLabel.maximumNumberOfLines = 0
+        activationFormStack.addArrangedSubview(exchangeAddressLabel)
 
         actionStatusLabel.setAccessibilityIdentifier("Stacio.License.actionStatus")
         actionStatusLabel.maximumNumberOfLines = 0
@@ -940,17 +1327,21 @@ public final class LicenseWindowController: NSWindowController {
         actionStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         stack.addArrangedSubview(actionStatusLabel)
 
-        let buttons = NSStackView()
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        buttons.alignment = .centerY
+        licenseActionStack.orientation = .horizontal
+        licenseActionStack.spacing = 8
+        licenseActionStack.alignment = .centerY
+        licenseActionStack.setAccessibilityIdentifier("Stacio.License.actions")
         validateButton.target = self
         validateButton.action = #selector(validateOnlinePressed(_:))
         validateButton.setAccessibilityIdentifier("Stacio.License.validateOnline")
         StacioDesignSystem.styleSheetButton(validateButton)
-        let applyButton = NSButton(title: L10n.ProductOps.applyOfflineToken, target: self, action: #selector(applyOfflineTokenPressed(_:)))
-        applyButton.setAccessibilityIdentifier("Stacio.License.applyOfflineToken")
-        StacioDesignSystem.styleSheetButton(applyButton, isDefault: true)
+        let exportButton = NSButton(
+            title: L10n.ProductOps.exportDeviceFingerprint,
+            target: self,
+            action: #selector(exportDeviceFingerprintPressed(_:))
+        )
+        exportButton.setAccessibilityIdentifier("Stacio.License.exportDeviceFingerprint")
+        StacioDesignSystem.styleSheetButton(exportButton)
         let importButton = NSButton(
             title: L10n.ProductOps.importOfflineLicenseFile,
             target: self,
@@ -958,12 +1349,36 @@ public final class LicenseWindowController: NSWindowController {
         )
         importButton.setAccessibilityIdentifier("Stacio.License.importOfflineLicenseFile")
         StacioDesignSystem.styleSheetButton(importButton)
-        buttons.addArrangedSubview(NSView())
-        buttons.addArrangedSubview(validateButton)
-        buttons.addArrangedSubview(importButton)
-        buttons.addArrangedSubview(applyButton)
-        stack.addArrangedSubview(buttons)
-        buttons.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        licenseActionStack.addArrangedSubview(NSView())
+        licenseActionStack.addArrangedSubview(validateButton)
+        licenseActionStack.addArrangedSubview(exportButton)
+        licenseActionStack.addArrangedSubview(importButton)
+        stack.addArrangedSubview(licenseActionStack)
+        licenseActionStack.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        managementActionStack.orientation = .horizontal
+        managementActionStack.spacing = 10
+        managementActionStack.alignment = .centerY
+        refreshLicenseButton.target = self
+        refreshLicenseButton.action = #selector(refreshLicensePressed(_:))
+        reimportLicenseButton.target = self
+        reimportLicenseButton.action = #selector(reimportLicensePressed(_:))
+        refreshLicenseButton.setAccessibilityIdentifier("Stacio.License.refresh")
+        reimportLicenseButton.setAccessibilityIdentifier("Stacio.License.reimport")
+        configureManagementButton(
+            refreshLicenseButton,
+            symbolName: "arrow.triangle.2.circlepath",
+            minimumWidth: 140,
+            isDefault: true
+        )
+        configureManagementButton(
+            reimportLicenseButton,
+            symbolName: "arrow.down.doc",
+            minimumWidth: 168
+        )
+        managementActionStack.addArrangedSubview(refreshLicenseButton)
+        managementActionStack.addArrangedSubview(reimportLicenseButton)
+        stack.addArrangedSubview(managementActionStack)
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 28),
@@ -973,23 +1388,525 @@ public final class LicenseWindowController: NSWindowController {
         ])
         return root
     }
-}
 
-extension LicenseWindowController: NSWindowDelegate {
-    public func windowWillClose(_ notification: Notification) {
-        cancelOnlineValidation()
+    private func configureManagementButton(
+        _ button: NSButton,
+        symbolName: String,
+        minimumWidth: CGFloat,
+        isDefault: Bool = false
+    ) {
+        StacioDesignSystem.styleSheetButton(button, isDefault: isDefault)
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: button.title)
+        button.imagePosition = .imageLeading
+        button.controlSize = .large
+        button.cell?.controlSize = .large
+        button.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: minimumWidth),
+            button.heightAnchor.constraint(equalToConstant: 36)
+        ])
     }
 }
 
-private struct SignedOfflineLicenseFileEnvelope: Decodable {
-    var signedLicenseToken: String?
-    var token: String?
-    var data: SignedOfflineLicenseFilePayload?
+extension LicenseWindowController: NSWindowDelegate {
+    public func windowDidBecomeKey(_ notification: Notification) {
+        let state = persistedStateProvider?() ?? service.loadState(now: nowProvider())
+        resizeWindowToContent(hasAuthorization: shouldShowManagement(for: state))
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        cancelOnlineValidation()
+        activationRecordPresenceTask?.cancel()
+        activationRecordPresenceTask = nil
+        if let licenseAuthorizationObserver {
+            NotificationCenter.default.removeObserver(licenseAuthorizationObserver)
+            self.licenseAuthorizationObserver = nil
+        }
+    }
 }
 
-private struct SignedOfflineLicenseFilePayload: Decodable {
-    var signedLicenseToken: String?
-    var token: String?
+private struct FreePlanFeatureRow {
+    let group: String?
+    let feature: String
+    let freeIncluded: Bool
+    let professionalIncluded: Bool
+
+    static func group(_ title: String) -> FreePlanFeatureRow {
+        FreePlanFeatureRow(group: title, feature: title, freeIncluded: false, professionalIncluded: false)
+    }
+
+    static func feature(
+        _ title: String,
+        freeIncluded: Bool,
+        professionalIncluded: Bool
+    ) -> FreePlanFeatureRow {
+        FreePlanFeatureRow(
+            group: nil,
+            feature: title,
+            freeIncluded: freeIncluded,
+            professionalIncluded: professionalIncluded
+        )
+    }
+}
+
+private final class FreePlanNoticeTableRowView: NSTableRowView {
+    private let isGroup: Bool
+
+    init(isGroup: Bool) {
+        self.isGroup = isGroup
+        super.init(frame: .zero)
+        selectionHighlightStyle = .none
+        isEmphasized = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard isGroup else { return }
+
+        // macOS 27 uses a low-contrast section wash instead of a boxed group.
+        NSColor.controlBackgroundColor.withAlphaComponent(0.28).setFill()
+        bounds.fill()
+    }
+}
+
+@MainActor
+public final class FreePlanNoticeWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    public static let pricingURL = URL(string: "https://www.stacio.cn/pricing.html")!
+
+    // Keep this snapshot aligned with the feature table on stacio.cn/pricing.html.
+    private static let featureRows: [FreePlanFeatureRow] = [
+        .group("基础远程工作流"),
+        .feature("SSH、Telnet、VNC、FTP、SCP、串口和本地终端", freeIncluded: true, professionalIncluded: true),
+        .feature("会话保存、分组、标签页和基础分屏", freeIncluded: true, professionalIncluded: true),
+        .feature("Keychain 凭据保存与敏感信息脱敏", freeIncluded: true, professionalIncluded: true),
+        .feature("远程目录浏览、单文件上传下载、文本编辑和预览", freeIncluded: true, professionalIncluded: true),
+        .feature("基础终端查找、命令历史和输出保存", freeIncluded: true, professionalIncluded: true),
+        .feature("基础 AI 对话、终端上下文解释和命令建议", freeIncluded: true, professionalIncluded: true),
+        .group("协作、自动化与连接"),
+        .feature("多终端批量执行与输入广播", freeIncluded: false, professionalIncluded: true),
+        .feature("AI Agent 多步骤计划、Goal 模式和连续执行", freeIncluded: false, professionalIncluded: true),
+        .feature("SSH 隧道管理与端口转发", freeIncluded: false, professionalIncluded: true),
+        .feature("堡垒机/跳板机导入", freeIncluded: false, professionalIncluded: true),
+        .feature("ProxyJump 多级跳转", freeIncluded: false, professionalIncluded: true),
+        .group("监控、文件与工作区"),
+        .feature("设备监控历史曲线、阈值告警和通知", freeIncluded: false, professionalIncluded: true),
+        .feature("远程文件比较、编辑同步、批量传输和断点恢复", freeIncluded: false, professionalIncluded: true),
+        .feature("会话批量导入、导出、迁移和去重", freeIncluded: false, professionalIncluded: true),
+        .feature("AI 执行审计、长期归档和报告导出", freeIncluded: false, professionalIncluded: true),
+        .feature("高级网格工作区、独立窗口和工作区模板", freeIncluded: false, professionalIncluded: true)
+    ]
+
+    private let urlOpener: ProductOpsURLOpening
+    private let tableView = NSTableView()
+    private let rows = FreePlanNoticeWindowController.featureRows
+    private let getLicenseButton = NSButton(title: L10n.ProductOps.freePlanNoticeGetLicense, target: nil, action: nil)
+
+    public init(urlOpener: ProductOpsURLOpening? = nil) {
+        self.urlOpener = urlOpener ?? WorkspaceProductOpsURLOpener()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 720),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        // The visible title lives in the content header. An empty native title
+        // prevents AppKit from drawing a second copy in the titlebar.
+        window.title = ""
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 680, height: 620)
+        window.appearance = nil
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unifiedCompact
+        let titlebarToolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.FreePlan.titlebar"))
+        titlebarToolbar.displayMode = .iconOnly
+        titlebarToolbar.showsBaselineSeparator = false
+        window.toolbar = titlebarToolbar
+        window.backgroundColor = .windowBackgroundColor
+        window.isOpaque = true
+        window.hasShadow = true
+        window.isMovableByWindowBackground = false
+        window.center()
+        super.init(window: window)
+        // AppKit may restore the titlebar's default visibility during setup.
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unifiedCompact
+        window.contentView = makeContentView()
+    }
+
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    public override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        window?.titleVisibility = .hidden
+        window?.titlebarAppearsTransparent = true
+        window?.toolbarStyle = .unifiedCompact
+    }
+
+    public func numberOfRows(in tableView: NSTableView) -> Int {
+        rows.count
+    }
+
+    public func tableView(
+        _ tableView: NSTableView,
+        viewFor tableColumn: NSTableColumn?,
+        row: Int
+    ) -> NSView? {
+        guard rows.indices.contains(row), let tableColumn else {
+            return nil
+        }
+        let item = rows[row]
+        let columnID = tableColumn.identifier.rawValue
+        if item.group != nil {
+            return makeTableCell(
+                text: columnID == "feature" ? item.feature : "",
+                alignment: columnID == "feature" ? .left : .center,
+                font: .systemFont(ofSize: 13, weight: .semibold),
+                textColor: StacioDesignSystem.theme.secondaryTextColor,
+                accessibilityIdentifier: columnID == "feature" ? "Stacio.FreePlan.featureGroup.\(row)" : nil
+            )
+        }
+
+        return makeTableCell(
+            text: statusText(for: item, columnID: columnID),
+            alignment: columnID == "feature" ? .left : .center,
+            font: .systemFont(ofSize: 13, weight: columnID == "feature" ? .medium : .regular),
+            textColor: columnID == "feature"
+            ? StacioDesignSystem.theme.primaryTextColor
+            : statusColor(for: item, columnID: columnID),
+            accessibilityIdentifier: "Stacio.FreePlan.feature.\(row).\(columnID)"
+        )
+    }
+
+    public func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        // Render section rows as normal view-based rows for current AppKit.
+        false
+    }
+
+    public func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        rows.indices.contains(row) && rows[row].group != nil ? 26 : 30
+    }
+
+    public func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        FreePlanNoticeTableRowView(isGroup: rows.indices.contains(row) && rows[row].group != nil)
+    }
+
+    @objc
+    private func getLicensePressed(_ sender: Any?) {
+        urlOpener.open(Self.pricingURL)
+    }
+
+    private func statusText(for row: FreePlanFeatureRow, columnID: String) -> String {
+        switch columnID {
+        case "free":
+            return row.freeIncluded ? L10n.ProductOps.freePlanNoticeIncluded : L10n.ProductOps.freePlanNoticeUnavailable
+        case "professional":
+            return row.professionalIncluded ? L10n.ProductOps.freePlanNoticeIncluded : L10n.ProductOps.freePlanNoticeUnavailable
+        default:
+            return row.feature
+        }
+    }
+
+    private func statusColor(for row: FreePlanFeatureRow, columnID: String) -> NSColor {
+        let included = columnID == "free" ? row.freeIncluded : row.professionalIncluded
+        return included ? StacioDesignSystem.theme.successColor : StacioDesignSystem.theme.secondaryTextColor
+    }
+
+    private func makeTableCell(
+        text: String,
+        alignment: NSTextAlignment,
+        font: NSFont,
+        textColor: NSColor,
+        accessibilityIdentifier: String?
+    ) -> NSTableCellView {
+        let cell = NSTableCellView()
+        let label = NSTextField(labelWithString: text)
+        label.alignment = alignment
+        label.font = font
+        label.textColor = textColor
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = alignment == .left ? .byTruncatingTail : .byClipping
+        label.usesSingleLineMode = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        if let accessibilityIdentifier {
+            label.setAccessibilityIdentifier(accessibilityIdentifier)
+        }
+
+        cell.textField = label
+        cell.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            label.topAnchor.constraint(greaterThanOrEqualTo: cell.topAnchor),
+            label.bottomAnchor.constraint(lessThanOrEqualTo: cell.bottomAnchor)
+        ])
+        return cell
+    }
+
+    private func makeContentView() -> NSView {
+        let root = StacioAppearanceRefreshView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.clear.cgColor
+
+        let materialView = NSVisualEffectView()
+        materialView.material = .popover
+        materialView.blendingMode = .behindWindow
+        materialView.state = .active
+        materialView.isEmphasized = false
+        materialView.wantsLayer = true
+        materialView.layer?.cornerRadius = 16
+        materialView.layer?.cornerCurve = .continuous
+        materialView.layer?.masksToBounds = true
+        materialView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(materialView)
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        materialView.addSubview(stack)
+
+        let planHeader = freePlanHeader()
+        stack.addArrangedSubview(planHeader)
+        planHeader.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let comparisonHelp = NSTextField(labelWithString: L10n.ProductOps.freePlanNoticeComparisonHelp)
+        comparisonHelp.font = .systemFont(ofSize: 13)
+        comparisonHelp.textColor = StacioDesignSystem.theme.secondaryTextColor
+        comparisonHelp.maximumNumberOfLines = 0
+        comparisonHelp.lineBreakMode = .byWordWrapping
+        comparisonHelp.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(comparisonHelp)
+        comparisonHelp.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let comparisonTitle = NSTextField(labelWithString: L10n.ProductOps.freePlanNoticeComparisonTitle)
+        comparisonTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        comparisonTitle.textColor = StacioDesignSystem.theme.primaryTextColor
+        comparisonTitle.setContentCompressionResistancePriority(.required, for: .vertical)
+        stack.addArrangedSubview(comparisonTitle)
+
+        let tableSurface = NSVisualEffectView()
+        tableSurface.material = .underWindowBackground
+        tableSurface.blendingMode = .withinWindow
+        tableSurface.state = .active
+        tableSurface.wantsLayer = true
+        tableSurface.layer?.cornerRadius = 12
+        tableSurface.layer?.cornerCurve = .continuous
+        tableSurface.layer?.masksToBounds = true
+        tableSurface.translatesAutoresizingMaskIntoConstraints = false
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.scrollerStyle = .overlay
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        configureTableView()
+        scrollView.documentView = tableView
+        tableSurface.addSubview(scrollView)
+        stack.addArrangedSubview(tableSurface)
+
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
+        buttons.alignment = .centerY
+        buttons.spacing = 8
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+        getLicenseButton.target = self
+        getLicenseButton.action = #selector(getLicensePressed(_:))
+        getLicenseButton.setAccessibilityIdentifier("Stacio.FreePlan.getLicense")
+        StacioDesignSystem.styleSheetButton(getLicenseButton, isDefault: true)
+        getLicenseButton.setContentHuggingPriority(.required, for: .horizontal)
+        let closeButton = NSButton(title: L10n.ProductOps.freePlanNoticeClose, target: self, action: #selector(closeWindowPressed(_:)))
+        closeButton.setAccessibilityIdentifier("Stacio.FreePlan.close")
+        StacioDesignSystem.styleSheetButton(closeButton)
+        closeButton.keyEquivalent = "\u{1b}"
+        closeButton.setContentHuggingPriority(.required, for: .horizontal)
+        let buttonSpacer = NSView()
+        buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        buttons.addArrangedSubview(buttonSpacer)
+        buttons.addArrangedSubview(closeButton)
+        buttons.addArrangedSubview(getLicenseButton)
+        stack.addArrangedSubview(buttons)
+        buttons.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            materialView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            materialView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            materialView.topAnchor.constraint(equalTo: root.topAnchor),
+            materialView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: materialView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: materialView.trailingAnchor, constant: -24),
+            // Keep the content below the traffic-light controls in full-size mode.
+            stack.topAnchor.constraint(equalTo: materialView.topAnchor, constant: 56),
+            stack.bottomAnchor.constraint(equalTo: materialView.bottomAnchor, constant: -18),
+            scrollView.leadingAnchor.constraint(equalTo: tableSurface.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: tableSurface.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: tableSurface.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: tableSurface.bottomAnchor),
+            tableSurface.heightAnchor.constraint(equalToConstant: 438)
+        ])
+        return root
+    }
+
+    private func configureTableView() {
+        tableView.headerView = NSTableHeaderView()
+        tableView.rowHeight = 30
+        tableView.intercellSpacing = NSSize(width: 8, height: 0)
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.usesAlternatingRowBackgroundColors = false
+        tableView.selectionHighlightStyle = .none
+        tableView.gridStyleMask = [.solidHorizontalGridLineMask]
+        tableView.gridColor = StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.22)
+        tableView.backgroundColor = .clear
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.setAccessibilityIdentifier("Stacio.FreePlan.comparison")
+
+        let featureColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("feature"))
+        featureColumn.title = L10n.ProductOps.freePlanNoticeFeature
+        featureColumn.width = 430
+        featureColumn.headerCell = freePlanHeaderCell(title: featureColumn.title, alignment: .left)
+        let freeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("free"))
+        freeColumn.title = L10n.ProductOps.freePlanNoticeFree
+        freeColumn.width = 96
+        freeColumn.headerCell = freePlanHeaderCell(title: freeColumn.title, alignment: .center)
+        let professionalColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("professional"))
+        professionalColumn.title = L10n.ProductOps.freePlanNoticeProfessional
+        professionalColumn.width = 112
+        professionalColumn.headerCell = freePlanHeaderCell(title: professionalColumn.title, alignment: .center)
+        tableView.addTableColumn(featureColumn)
+        tableView.addTableColumn(freeColumn)
+        tableView.addTableColumn(professionalColumn)
+    }
+
+    private func freePlanHeader() -> NSView {
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let iconView = NSImageView()
+        iconView.image = NSImage(
+            systemSymbolName: "lock.open.fill",
+            accessibilityDescription: L10n.ProductOps.freePlanNoticeTitle
+        )
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .medium)
+        iconView.contentTintColor = StacioDesignSystem.theme.accentColor
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: L10n.ProductOps.freePlanNoticeTitle)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
+        titleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        titleLabel.alignment = .left
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setAccessibilityIdentifier("Stacio.FreePlan.title")
+
+        let subtitleLabel = NSTextField(labelWithString: L10n.ProductOps.freePlanNoticeSubtitle)
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = .systemFont(ofSize: 13)
+        subtitleLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        subtitleLabel.alignment = .left
+        subtitleLabel.maximumNumberOfLines = 0
+        subtitleLabel.lineBreakMode = .byWordWrapping
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        header.addSubview(iconView)
+        header.addSubview(titleLabel)
+        header.addSubview(subtitleLabel)
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            iconView.topAnchor.constraint(equalTo: header.topAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 32),
+            iconView.heightAnchor.constraint(equalToConstant: 32),
+
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 12),
+            titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            titleLabel.topAnchor.constraint(equalTo: header.topAnchor),
+
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            subtitleLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            header.heightAnchor.constraint(greaterThanOrEqualToConstant: 59)
+        ])
+        return header
+    }
+
+    private func freePlanHeaderCell(title: String, alignment: NSTextAlignment) -> NSTableHeaderCell {
+        let cell = NSTableHeaderCell(textCell: title)
+        cell.font = .systemFont(ofSize: 13, weight: .semibold)
+        cell.textColor = StacioDesignSystem.theme.primaryTextColor
+        cell.alignment = alignment
+        return cell
+    }
+
+    @objc
+    private func closeWindowPressed(_ sender: Any?) {
+        close()
+    }
+}
+
+private func licenseHeader() -> NSView {
+    let icon = NSImageView()
+    icon.image = NSImage(systemSymbolName: "checkmark.seal.fill", accessibilityDescription: "License")
+    icon.contentTintColor = StacioDesignSystem.theme.accentColor
+    icon.imageScaling = .scaleProportionallyUpOrDown
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    icon.widthAnchor.constraint(equalToConstant: 30).isActive = true
+    icon.heightAnchor.constraint(equalToConstant: 30).isActive = true
+
+    let title = NSTextField(labelWithString: "License")
+    title.font = .systemFont(ofSize: 24, weight: .bold)
+    title.textColor = StacioDesignSystem.theme.primaryTextColor
+    let subtitle = NSTextField(labelWithString: "管理在线激活与离线授权")
+    subtitle.font = .systemFont(ofSize: 13)
+    subtitle.textColor = StacioDesignSystem.theme.secondaryTextColor
+    let text = NSStackView(views: [title, subtitle])
+    text.orientation = .vertical
+    text.alignment = .leading
+    text.spacing = 3
+
+    let header = NSStackView(views: [icon, text])
+    header.orientation = .horizontal
+    header.alignment = .centerY
+    header.spacing = 12
+    return header
+}
+
+private func roundedLicensePanel(content: NSView) -> NSView {
+    let panel = NSView()
+    panel.wantsLayer = true
+    panel.layer?.cornerRadius = 10
+    panel.layer?.cornerCurve = .continuous
+    panel.layer?.backgroundColor = StacioDesignSystem.theme.panelBackgroundColor.cgColor
+    panel.layer?.borderColor = StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.55).cgColor
+    panel.layer?.borderWidth = 1
+    content.translatesAutoresizingMaskIntoConstraints = false
+    panel.addSubview(content)
+    NSLayoutConstraint.activate([
+        content.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+        content.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
+        content.topAnchor.constraint(equalTo: panel.topAnchor, constant: 14),
+        content.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -14)
+    ])
+    return panel
 }
 
 private func header(title: String, subtitle: String) -> NSView {

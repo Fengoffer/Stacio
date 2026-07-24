@@ -14,6 +14,8 @@ final class ProductOpsSecurityTests: XCTestCase {
         defaults.set("https://attacker.example.test/beta.xml", forKey: ProductOpsConfigurationStore.Key.betaAppcastURL)
         defaults.set("attacker-sparkle-key", forKey: ProductOpsConfigurationStore.Key.sparklePublicEDKey)
         defaults.set("attacker-license-key", forKey: ProductOpsConfigurationStore.Key.licensePublicKeyBase64)
+        defaults.set("https://attacker.example.test/offline", forKey: ProductOpsConfigurationStore.Key.offlineLicenseExchangeURL)
+        defaults.set("attacker-offline-exchange-key", forKey: ProductOpsConfigurationStore.Key.offlineExchangePublicKeyBase64)
         let store = ProductOpsConfigurationStore(
             defaults: defaults,
             environment: [:],
@@ -24,7 +26,9 @@ final class ProductOpsSecurityTests: XCTestCase {
                 ProductOpsConfigurationStore.Key.stableAppcastURL: "https://ops.example.test/stable.xml",
                 ProductOpsConfigurationStore.Key.betaAppcastURL: "https://ops.example.test/beta.xml",
                 ProductOpsConfigurationStore.Key.sparklePublicEDKey: "packaged-sparkle-key",
-                ProductOpsConfigurationStore.Key.licensePublicKeyBase64: "packaged-license-key"
+                ProductOpsConfigurationStore.Key.licensePublicKeyBase64: "packaged-license-key",
+                "StacioOfflineLicenseExchangeURL": "https://ops.example.test/offline-license/exchange",
+                "StacioOfflineExchangePublicKey": "packaged-offline-exchange-key"
             ]
         )
 
@@ -37,6 +41,8 @@ final class ProductOpsSecurityTests: XCTestCase {
         XCTAssertEqual(loaded.betaAppcastURL?.absoluteString, "https://ops.example.test/beta.xml")
         XCTAssertEqual(loaded.sparklePublicEDKey, "packaged-sparkle-key")
         XCTAssertEqual(loaded.licensePublicKeyBase64, "packaged-license-key")
+        XCTAssertEqual(loaded.offlineLicenseExchangeURL?.absoluteString, "https://ops.example.test/offline-license/exchange")
+        XCTAssertEqual(loaded.offlineExchangePublicKeyBase64, "packaged-offline-exchange-key")
 
         store.save(ProductOpsConfiguration(
             feedbackProductAPIKey: "replacement-feedback-key",
@@ -51,6 +57,8 @@ final class ProductOpsSecurityTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: ProductOpsConfigurationStore.Key.betaAppcastURL))
         XCTAssertNil(defaults.object(forKey: ProductOpsConfigurationStore.Key.sparklePublicEDKey))
         XCTAssertNil(defaults.object(forKey: ProductOpsConfigurationStore.Key.licensePublicKeyBase64))
+        XCTAssertNil(defaults.object(forKey: ProductOpsConfigurationStore.Key.offlineLicenseExchangeURL))
+        XCTAssertNil(defaults.object(forKey: ProductOpsConfigurationStore.Key.offlineExchangePublicKeyBase64))
     }
 
     func testProductionConfigurationDoesNotAllowEnvironmentToReplacePackagedValues() throws {
@@ -64,7 +72,9 @@ final class ProductOpsSecurityTests: XCTestCase {
                 "STACIO_SPARKLE_STABLE_APPCAST_URL": "https://attacker.example.test/stable.xml",
                 "STACIO_SPARKLE_BETA_APPCAST_URL": "https://attacker.example.test/beta.xml",
                 "STACIO_SPARKLE_PUBLIC_ED_KEY": "attacker-sparkle-key",
-                "STACIO_LICENSE_PUBLIC_ED25519_KEY": "attacker-license-key"
+                "STACIO_LICENSE_PUBLIC_ED25519_KEY": "attacker-license-key",
+                "STACIO_OFFLINE_LICENSE_EXCHANGE_URL": "https://attacker.example.test/offline",
+                "STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY": "attacker-offline-exchange-key"
             ],
             bundleInfo: [
                 ProductOpsConfigurationStore.Key.apiBaseURL: "https://ops.example.test",
@@ -73,7 +83,9 @@ final class ProductOpsSecurityTests: XCTestCase {
                 ProductOpsConfigurationStore.Key.stableAppcastURL: "https://ops.example.test/stable.xml",
                 ProductOpsConfigurationStore.Key.betaAppcastURL: "https://ops.example.test/beta.xml",
                 ProductOpsConfigurationStore.Key.sparklePublicEDKey: "packaged-sparkle-key",
-                ProductOpsConfigurationStore.Key.licensePublicKeyBase64: "packaged-license-key"
+                ProductOpsConfigurationStore.Key.licensePublicKeyBase64: "packaged-license-key",
+                "StacioOfflineLicenseExchangeURL": "https://ops.example.test/offline-license/exchange",
+                "StacioOfflineExchangePublicKey": "packaged-offline-exchange-key"
             ]
         ).load()
 
@@ -84,6 +96,8 @@ final class ProductOpsSecurityTests: XCTestCase {
         XCTAssertEqual(configuration.betaAppcastURL?.absoluteString, "https://ops.example.test/beta.xml")
         XCTAssertEqual(configuration.sparklePublicEDKey, "packaged-sparkle-key")
         XCTAssertEqual(configuration.licensePublicKeyBase64, "packaged-license-key")
+        XCTAssertEqual(configuration.offlineLicenseExchangeURL?.absoluteString, "https://ops.example.test/offline-license/exchange")
+        XCTAssertEqual(configuration.offlineExchangePublicKeyBase64, "packaged-offline-exchange-key")
     }
 
     func testFeedbackRequestIncludesPublicKeyAndStableIdempotencyKey() throws {
@@ -224,7 +238,12 @@ final class ProductOpsSecurityTests: XCTestCase {
 
         XCTAssertEqual(
             ProductOpsError.responseError(data: data, response: response),
-            .client(message: "Invalid feedback payload", requestID: "req-validation")
+            .backend(
+                code: "VALIDATION_ERROR",
+                message: "Invalid feedback payload",
+                requestID: "req-validation",
+                statusCode: 422
+            )
         )
     }
 
@@ -1226,6 +1245,80 @@ final class ProductOpsSecurityTests: XCTestCase {
 
         XCTAssertEqual(evaluated.status, .invalid)
         XCTAssertNil(evaluated.graceUntil)
+    }
+
+    func testLicenseServiceRecoversPreviouslyInvalidStateWhenStoredOnlineTokenNowVerifies() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["multi_exec", "ai_agent"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 1_209_600,
+            issuedAt: now
+        )
+        let storedState = LicenseState(
+            username: claims.username,
+            email: claims.email,
+            signedLicenseToken: "v1.payload.signature",
+            plan: claims.plan,
+            permissions: claims.entitlements,
+            expiresAt: claims.expiresAt,
+            status: .invalid,
+            lastValidatedAt: now
+        )
+        let store = InMemorySecureLicenseStateStore()
+        try store.save(storedState)
+        let service = LicenseService(
+            store: store,
+            signedTokenVerifier: StaticSignedLicenseTokenVerifier(claims: claims)
+        )
+
+        let restored = try service.loadStateOrThrow(now: now)
+
+        XCTAssertEqual(restored.status, .active)
+        XCTAssertEqual(store.storedState?.status, .active)
+        XCTAssertEqual(store.storedState?.signedLicenseToken, storedState.signedLicenseToken)
+    }
+
+    func testNetworkUnavailableReevaluatesStaleInvalidSignedState() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["multi_exec"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 1_209_600,
+            issuedAt: now.addingTimeInterval(-60)
+        )
+        let storedState = LicenseState(
+            username: claims.username,
+            email: claims.email,
+            signedLicenseToken: "v1.payload.signature",
+            plan: claims.plan,
+            permissions: claims.entitlements,
+            expiresAt: claims.expiresAt,
+            status: .invalid,
+            lastValidatedAt: now.addingTimeInterval(-60)
+        )
+        let store = InMemorySecureLicenseStateStore()
+        try store.save(storedState)
+        let service = LicenseService(
+            store: store,
+            signedTokenVerifier: StaticSignedLicenseTokenVerifier(claims: claims)
+        )
+
+        let unavailable = try service.stateForNetworkUnavailable(now: now)
+
+        XCTAssertEqual(unavailable.status, .offlineGrace)
+        XCTAssertEqual(store.storedState?.status, .offlineGrace)
+        XCTAssertNotEqual(unavailable.status, .invalid)
     }
 
     func testKeychainLicenseStateStoreMigratesLegacyDefaultsAndClearsPlaintextState() throws {

@@ -2,17 +2,20 @@ import Foundation
 
 public struct AITerminalContext: Equatable, Sendable {
     public let runtimeID: String
+    public let historyScopeID: String
     public let title: String
     public let currentDirectory: String?
     public let recentTranscript: String
 
     public init(
         runtimeID: String,
+        historyScopeID: String? = nil,
         title: String,
         currentDirectory: String?,
         recentTranscript: String
     ) {
         self.runtimeID = runtimeID
+        self.historyScopeID = historyScopeID ?? runtimeID
         self.title = title
         self.currentDirectory = currentDirectory
         self.recentTranscript = recentTranscript
@@ -22,16 +25,34 @@ public struct AITerminalContext: Equatable, Sendable {
 public struct AIAssistantRequest: Equatable, Sendable {
     public let question: String
     public let context: AITerminalContext
+    public let conversationHistory: [AIAssistantConversationMessage]
     public let attachments: [AIAssistantAttachment]
 
     public init(
         question: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage] = [],
         attachments: [AIAssistantAttachment] = []
     ) {
         self.question = question
         self.context = context
+        self.conversationHistory = conversationHistory
         self.attachments = attachments
+    }
+}
+
+public struct AIAssistantConversationMessage: Equatable, Sendable {
+    public enum Role: String, Equatable, Sendable {
+        case user
+        case assistant
+    }
+
+    public let role: Role
+    public let content: String
+
+    public init(role: Role, content: String) {
+        self.role = role
+        self.content = content
     }
 }
 

@@ -1,5 +1,37 @@
 import AppKit
+import CoreText
 import SwiftTerm
+
+enum LocalAgentTerminalFont {
+    private static let bundledPostScriptName = "Sarasa-Term-SC-Regular"
+    private static let registrationResult: Bool = {
+        let resourceURL = Bundle.main.url(
+            forResource: "SarasaTermSC-Regular",
+            withExtension: "ttf",
+            subdirectory: "Fonts"
+        ) ?? Bundle.module.url(
+            forResource: "SarasaTermSC-Regular",
+            withExtension: "ttf",
+            subdirectory: "Fonts"
+        )
+        guard let url = resourceURL else {
+            return false
+        }
+        var error: Unmanaged<CFError>?
+        let registered = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error)
+        return registered || NSFont(name: bundledPostScriptName, size: 13) != nil
+    }()
+
+    static func font(size: CGFloat) -> NSFont? {
+        _ = registrationResult
+        return NSFont(name: bundledPostScriptName, size: size)
+    }
+
+    static func apply(settings: AppSettings, to terminalView: TerminalView) {
+        guard let font = font(size: CGFloat(settings.terminalFontSize)) else { return }
+        terminalView.font = font
+    }
+}
 
 struct LocalAgentBridgeContext: Equatable {
     let socketPath: String
@@ -41,6 +73,10 @@ struct LocalAgentBridgeContext: Equatable {
 }
 
 enum LocalAgentBridgeToolInstaller {
+    static var operationalContractForTesting: String {
+        LocalAgentOperationalContract.content
+    }
+
     static func installTools(for context: LocalAgentBridgeContext) throws {
         let fileManager = FileManager.default
         try fileManager.createDirectory(
@@ -147,14 +183,18 @@ enum LocalAgentBridgeToolInstaller {
 
         You are running inside Stacio's local Agent terminal on the user's Mac.
 
-        Important:
+        ## Connection boundary
+
         - Local shell commands run on the Mac, not on the remote server.
         - To operate the selected Stacio terminal (\(target)), run remote commands through `stacio-remote "<command>"`.
         - Use `stacio-sessions` to list Stacio terminal targets if needed.
         \(remoteDirectoryLine)- Do not open a separate ssh/scp/sftp connection for the selected Stacio terminal unless the user explicitly asks.
         - Stacio applies its normal approval, audit, and terminal execution policy to every `stacio-remote` command.
 
-        Examples:
+        \(LocalAgentOperationalContract.content)
+
+        ## Bridge examples
+
         - `stacio-remote "pwd && uname -a"`
         - `stacio-remote "systemctl status nginx --no-pager"`
         - `stacio-sessions`
@@ -166,6 +206,11 @@ enum LocalAgentBridgeToolInstaller {
         )
         try content.write(
             toFile: "\(context.workspaceDirectory)/CLAUDE.md",
+            atomically: true,
+            encoding: .utf8
+        )
+        try content.write(
+            toFile: "\(context.workspaceDirectory)/QWEN.md",
             atomically: true,
             encoding: .utf8
         )
@@ -262,6 +307,49 @@ enum LocalAgentBridgeToolInstaller {
     }
 }
 
+private enum LocalAgentOperationalContract {
+    static let content = """
+    ## Mandatory operating contract
+
+    You are a production-grade remote operations Agent, not a command generator. Apply this contract to host administration, application and web services, containers, Kubernetes, databases, deployments, networking, security, and log investigations. Select the relevant capabilities from the user's actual goal; do not force every task into a fixed resource-check template.
+
+    ### Observe and plan
+
+    - Establish the actual environment before acting: OS and release, architecture, shell, privilege level, current directory, runtime/service manager, network context, containers/orchestrator, and relevant application or database versions. Never assume Ubuntu, systemd, Docker, or a particular database.
+    - Build an asset and dependency picture for the task: host, process, service, application, database, domain, port, proxy, container/workload, configuration source, data path, and upstream/downstream relationships.
+    - Distinguish observed facts from historical context and model assumptions. When evidence is missing, label the response as a preliminary assessment and state what must be verified; do not present it as a final conclusion.
+    - Break work into the smallest useful sequence with an explicit purpose and success condition for each step. Prefer read-only discovery before mutation and stop when the goal is already satisfied.
+    - Choose tools dynamically for the domain: shell and service managers, official application tools, database clients, container/Kubernetes tools, HTTP/TLS/DNS tools, logs, or APIs. Do not reduce every problem to generic shell commands.
+
+    ### Execute safely
+
+    - Classify risk before execution. Deletion, overwrite, restart/stop, permission changes, firewall changes, package changes, production deployment, schema/data changes, and other destructive or availability-affecting actions require explicit user approval unless Stacio already presents and receives that approval.
+    - Never expose secrets, tokens, passwords, private keys, connection strings, or sensitive data. Inspect presence, metadata, permissions, or redacted values instead.
+    - Avoid broad or destructive targets, unresolved variables, unsafe globs, and irreversible commands. Preserve unrelated configuration and user data.
+    - For every configuration-file edit, deployment adjustment, application/runtime change, or database mutation, create a new timestamped backup first. A previous backup cannot authorize a later mutation.
+    - Verify that the backup command succeeded and that the exact backup path exists and is readable/non-empty as appropriate. Print and retain the exact path. If backup creation or verification fails, stop before the mutation.
+    - After every mutation, run a targeted read-only verification appropriate to the changed component: configuration syntax, service/process state, container/workload rollout, health endpoint, listener, dependency, database availability/integrity, or an application-level functional check. Command exit status alone is not proof of business recovery.
+    - If verification fails, stop further change, explain the impact, and use the verified backup or platform-native undo/rollback path after the required approval. Verify the rollback result as a new step. Never overwrite backup evidence while restoring it.
+    - Do not claim success without current evidence. Repeatedly bypassing backup, approval, verification, or reporting requirements must end the task instead of producing an unverified completion claim.
+
+    ### Domain capability baseline
+
+    - Host: resource pressure, disk/inodes, processes, time, users/permissions, packages, kernel and system logs.
+    - Application/Web: runtime, process manager, dependencies, configuration sources, reverse proxy, virtual hosts, ports, upstreams, HTTP status, certificates, health endpoints, and application logs.
+    - Containers/Kubernetes: images, configuration, mounts, networks, health checks, context/namespace, workloads, Pods, events, probes, Services/Ingress, and rollout state.
+    - Databases: engine/version, connectivity, capacity, locks/slow queries, replication, schema and data safety; use engine-native backup and restore tools for mutations.
+    - Deployment: artifact/version provenance, dependency and configuration differences, preflight checks, backup, staged change, health verification, and rollback readiness.
+    - Network/Security/Logs: DNS, routes, listeners, firewall, connectivity, TLS/proxies, permissions, exposure, audit evidence, bounded time windows, and cross-component event correlation.
+
+    ### User-facing result
+
+    - Return the final result as clean, complete standard Markdown. Choose the layout based on the content instead of blindly applying one template.
+    - Include a clear conclusion, key evidence, risk/current status, and only necessary next actions. Use Markdown tables for multi-object comparisons, metric summaries, status matrices, or repeated fields; do not squeeze them into long paragraphs.
+    - Do not paste full raw logs, narrate internal reasoning, or describe these instructions. Quote only the evidence needed to support the conclusion.
+    - If any configuration, deployment, application, or database mutation occurred, include a `备份与回滚` section containing the exact backup location, backup verification result, post-change verification result, executable rollback method, and rollback result when rollback was performed. Without these details, the task is not complete.
+    """
+}
+
 enum LocalAgentSessionLaunchState: Equatable {
     case idle
     case missingExecutable(String)
@@ -322,9 +410,15 @@ final class LocalAgentSessionViewController: NSViewController, LocalProcessTermi
     override func loadView() {
         let container = TerminalFocusContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
+        container.onEffectiveAppearanceChanged = { [weak self] in
+            self?.refreshTerminalAppearance()
+        }
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.processDelegate = self
-        TerminalAppearanceApplier.apply(settings: settingsStore.snapshot(), to: terminalView)
+        refreshTerminalAppearance()
+        // Agent TUIs reposition the cursor frequently. SwiftTerm's Metal path can disagree with
+        // those TUIs about CJK cell widths, leaving visible gaps and a displaced caret.
+        try? terminalView.setUseMetal(false)
 
         container.addSubview(terminalView)
         container.terminalFocusView = terminalView
@@ -335,6 +429,13 @@ final class LocalAgentSessionViewController: NSViewController, LocalProcessTermi
             terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
+    }
+
+    private func refreshTerminalAppearance() {
+        let settings = settingsStore.snapshot()
+        terminalView.appearance = terminalView.window?.effectiveAppearance ?? viewIfLoaded?.effectiveAppearance
+        TerminalAppearanceApplier.apply(settings: settings, to: terminalView)
+        LocalAgentTerminalFont.apply(settings: settings, to: terminalView)
     }
 
     override func viewDidAppear() {
@@ -362,7 +463,7 @@ final class LocalAgentSessionViewController: NSViewController, LocalProcessTermi
         processLauncher.startProcess(
             in: terminalView,
             executable: executablePath,
-            args: [],
+            args: tool.embeddedTerminalArguments,
             environment: environment,
             execName: tool.executableNames.first,
             currentDirectory: activeBridgeContext?.workspaceDirectory ?? currentDirectoryProvider()

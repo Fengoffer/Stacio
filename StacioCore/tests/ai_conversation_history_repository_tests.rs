@@ -53,7 +53,7 @@ fn ai_conversation_history_persists_by_runtime_across_repository_instances() {
 }
 
 #[test]
-fn ai_conversation_history_keeps_recent_thirty_and_truncates_large_entries() {
+fn ai_conversation_history_keeps_all_items_and_truncates_large_entries() {
     let database_path = temp_database_path();
     let oversized = "密".repeat(900);
 
@@ -77,11 +77,11 @@ fn ai_conversation_history_keeps_recent_thirty_and_truncates_large_entries() {
     let restored = list_ai_conversation_history(database_path, "runtime-a".to_string())
         .expect("list runtime history");
 
-    assert_eq!(restored.len(), 30);
-    assert_eq!(restored[0].content, "message-5");
-    assert_eq!(restored[29].request_id.as_deref(), Some("req-34"));
-    assert!(restored[29].content.len() < oversized.len());
-    assert!(restored[29].content.len() <= 2_048);
+    assert_eq!(restored.len(), 35);
+    assert_eq!(restored[0].content, "message-0");
+    assert_eq!(restored[34].request_id.as_deref(), Some("req-34"));
+    assert!(restored[34].content.len() < oversized.len());
+    assert!(restored[34].content.len() <= 2_048);
 }
 
 #[test]

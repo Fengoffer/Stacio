@@ -214,7 +214,16 @@ private struct SavedSerialSessionConfig: Decodable {
 }
 
 @MainActor
-public final class WorkbenchWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate {
+private final class WorkbenchLicensedFeatureMenuDelegate: NSObject, NSMenuDelegate {
+    weak var controller: WorkbenchWindowController?
+
+    func menuWillOpen(_ menu: NSMenu) {
+        controller?.refreshLicensedFeatureMenu(menu)
+    }
+}
+
+@MainActor
+public final class WorkbenchWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation {
     private static let defaultFrameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.v4")
     private static let legacyFrameAutosaveKeys = [
         "NSWindow Frame Stacio.WorkbenchWindow",
@@ -235,9 +244,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let tunnelLiveSessionContextProvider: () -> TunnelLiveSessionContext?
     private let tunnelLiveBridge: LiveTunnelCoreBridging
     private let remoteFilesBridge: RemoteFilesBridging
+    private let licenseAccess: any LicenseFeatureAccessProviding
     private var remoteSessionStarter: RemoteSSHSessionStarting?
     private var telnetSessionStarter: TelnetSessionStarting?
     private var systemAppearanceObserver: NSObjectProtocol?
+    private var licenseAuthorizationObserver: NSObjectProtocol?
+    private let licensedFeatureMenuDelegate = WorkbenchLicensedFeatureMenuDelegate()
     private var serialSessionStarter: SerialSessionStarting?
     private var savedSessionContextBuilder: TunnelLiveSessionContextBuilding?
     private var ftpCredentialResolver: FTPCredentialResolving?
@@ -346,6 +358,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         tunnelLiveSessionContextProvider: (() -> TunnelLiveSessionContext?)? = nil,
         tunnelLiveBridge: LiveTunnelCoreBridging = CoreLiveTunnelBridge(),
         remoteFilesBridge: RemoteFilesBridging = CoreBridgeRemoteFilesBridge(),
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         remoteSessionStarter: RemoteSSHSessionStarting? = nil,
         telnetSessionStarter: TelnetSessionStarting? = nil,
         serialSessionStarter: SerialSessionStarting? = nil,
@@ -403,6 +416,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             }
         self.tunnelLiveBridge = tunnelLiveBridge
         self.remoteFilesBridge = remoteFilesBridge
+        self.licenseAccess = licenseAccess
         self.remoteSessionStarter = remoteSessionStarter
         self.telnetSessionStarter = telnetSessionStarter
         self.serialSessionStarter = serialSessionStarter
@@ -438,6 +452,16 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         self.graphicsAdapterPathProvider = graphicsAdapterPathProvider
         self.frameAutosaveName = frameAutosaveName
         super.init(window: nil)
+        licensedFeatureMenuDelegate.controller = self
+        licenseAuthorizationObserver = NotificationCenter.default.addObserver(
+            forName: .stacioLicenseAuthorizationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshLicensedToolbarItems()
+            }
+        }
         workspaceViewController.onRequestNewSession = { [weak self] in
             self?.performNewSessionFromToolbar(nil)
         }
@@ -454,6 +478,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         if let systemAppearanceObserver {
             DistributedNotificationCenter.default().removeObserver(systemAppearanceObserver)
+        }
+        if let licenseAuthorizationObserver {
+            NotificationCenter.default.removeObserver(licenseAuthorizationObserver)
         }
     }
 
@@ -525,6 +552,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         bindUpdatePromptControllerIfNeeded()
         sparkleUpdateController?.probeForAvailableUpdate()
         refreshWorkbenchAppearance()
+        refreshLicensedToolbarItems()
         updateInspectorToolbarTopInset(in: window)
     }
 
@@ -1707,7 +1735,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             },
             sessionEditor: makeDefaultSessionSidebarSessionEditor(credentialSaver: credentialManager),
             credentialCleaner: credentialManager,
-            settingsStore: settingsStore
+            onDeleteSessionHistory: { [weak self] sessionID in
+                try? self?.makeAIConversationHistoryStore()?.deleteConversationHistory(
+                    runtimeID: "session:\(sessionID)"
+                )
+            },
+            settingsStore: settingsStore,
+            licenseAccess: licenseAccess
         )
         _ = sidebarController.view
         let readableSidebarWidth = sidebarController.view.widthAnchor.constraint(
@@ -1816,6 +1850,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 }
             },
             settingsStore: settingsStore,
+            licenseAccess: licenseAccess,
             transferCompletionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
             transferQueueCoordinatorFactory: transferQueueCoordinatorFactory
         )
@@ -1964,6 +1999,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             taskRecorder: makeAgentTaskStore(),
             taskLister: makeAgentTaskStore(),
             conversationHistoryStore: makeAIConversationHistoryStore(),
+            internalBrowserOpener: { [weak workspaceViewController] url in
+                _ = try? workspaceViewController?.openBrowserSession(
+                    urlString: url.absoluteString,
+                    title: url.host ?? url.absoluteString
+                )
+            },
             localAgentToolResolver: aiLocalAgentToolResolver,
             localAgentProcessLauncherFactory: aiLocalAgentProcessLauncherFactory
         )
@@ -2198,6 +2239,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func refreshUpdatePromptButton(_ state: SparkleUpdateButtonState) {
+        sessionSidebarViewController?.updateUpdateStatus(state)
         guard let button = updatePromptButton else {
             return
         }
@@ -2285,6 +2327,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     private func makeSessionImportMenu() -> NSMenu {
         let menu = NSMenu(title: L10n.Import.title)
+        menu.autoenablesItems = false
+        menu.delegate = SessionImportMenuAvailabilityDelegate.shared
         for source in AppKitSessionImportSourcePicker.supportedSources {
             let item = NSMenuItem(
                 title: source.name,
@@ -2294,6 +2338,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             item.target = self
             item.representedObject = source.type.rawValue
             item.image = SessionImportSourceIconCatalog.image(for: source)
+            SessionImportSourceAvailability.configure(item, for: source)
             menu.addItem(item)
         }
         return menu
@@ -2312,6 +2357,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     private func makePanelsToolbarMenu() -> NSMenu {
         let menu = NSMenu(title: L10n.Workbench.panels)
+        menu.autoenablesItems = false
+        menu.delegate = licensedFeatureMenuDelegate
         menu.addItem(panelToolbarMenuItem(
             title: L10n.Inspector.files,
             symbolName: "folder",
@@ -2372,14 +2419,40 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         item.target = self
         item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
             ?? fallbackSymbolName.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: title) }
+        if let feature = licensedFeature(for: action) {
+            configureLicenseAvailability(item, feature: feature)
+        }
         return item
+    }
+
+    private func licensedFeature(for action: Selector?) -> StacioLicensedFeature? {
+        switch action {
+        case #selector(performMultiExecFromToolbar(_:)): .multiExec
+        case #selector(showTunnelsFromToolbar(_:)): .sshTunnel
+        case #selector(toggleDeviceDashboardFromToolbar(_:)): .advancedMetrics
+        case #selector(showAIAssistantFromToolbar(_:)): .aiAgent
+        default: nil
+        }
+    }
+
+    private func configureLicenseAvailability(_ item: NSMenuItem, feature: StacioLicensedFeature) {
+        item.isEnabled = licenseAccess.isEnabled(feature)
+        item.toolTip = item.isEnabled ? nil : L10n.Import.licenseUnavailableTooltip
+    }
+
+    fileprivate func refreshLicensedFeatureMenu(_ menu: NSMenu) {
+        for item in menu.items {
+            guard let feature = licensedFeature(for: item.action) else { continue }
+            configureLicenseAvailability(item, feature: feature)
+        }
+    }
+
+    private func isLicensed(_ feature: StacioLicensedFeature) -> Bool {
+        licenseAccess.isEnabled(feature)
     }
 
     public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = [ToolbarItem.sidebar]
-        if sparkleUpdateController != nil {
-            identifiers.append(ToolbarItem.updatePrompt)
-        }
         identifiers.append(contentsOf: [
             .flexibleSpace,
             ToolbarItem.newSession,
@@ -2554,6 +2627,40 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return item
     }
 
+    public func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        let feature: StacioLicensedFeature?
+        switch item.itemIdentifier {
+        case ToolbarItem.multiExec: feature = .multiExec
+        case ToolbarItem.tunnels: feature = .sshTunnel
+        case ToolbarItem.deviceDashboard: feature = .advancedMetrics
+        case ToolbarItem.aiAssistant: feature = .aiAgent
+        default: feature = nil
+        }
+        guard let feature else { return true }
+        let enabled = isLicensed(feature)
+        item.toolTip = enabled ? licensedToolbarDefaultToolTip(for: item.itemIdentifier) : L10n.Import.licenseUnavailableTooltip
+        return enabled
+    }
+
+    private func refreshLicensedToolbarItems() {
+        guard let toolbar = window?.toolbar else { return }
+        for item in toolbar.items {
+            guard licensedToolbarDefaultToolTip(for: item.itemIdentifier) != nil else { continue }
+            item.isEnabled = validateToolbarItem(item)
+        }
+        toolbar.validateVisibleItems()
+    }
+
+    private func licensedToolbarDefaultToolTip(for identifier: NSToolbarItem.Identifier) -> String? {
+        switch identifier {
+        case ToolbarItem.multiExec: L10n.Workbench.multiExecTooltip
+        case ToolbarItem.tunnels: L10n.Workbench.tunnels
+        case ToolbarItem.deviceDashboard: L10n.Workbench.toggleDeviceDashboard
+        case ToolbarItem.aiAssistant: L10n.AI.assistant
+        default: nil
+        }
+    }
+
     @objc
     public func openLocalShellFromToolbar(_ sender: Any?) throws {
         try workspaceViewController.openLocalShell()
@@ -2685,6 +2792,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showTunnelsFromToolbar(_ sender: Any?) {
+        guard isLicensed(.sshTunnel) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
         defer {
@@ -2796,6 +2904,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func toggleDeviceDashboardFromToolbar(_ sender: Any?) {
+        guard isLicensed(.advancedMetrics) else { return }
         preserveProgrammaticWindowFrame(window?.frame)
         workspaceViewController.toggleDeviceMetricsDashboardVisibility()
     }
@@ -2807,6 +2916,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showAIAssistantFromToolbar(_ sender: Any?) {
+        guard isLicensed(.aiAgent) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
         defer {
@@ -2900,6 +3010,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func startMultiExecFromToolbar(_ sender: Any?) throws {
+        guard isLicensed(.multiExec) else {
+            throw LicensedFeatureAccessError.licenseRequired(.multiExec)
+        }
         let targets = workspaceViewController.multiExecTargets()
         guard targets.count >= 2 else {
             let error = WorkspaceTerminalError.multiExecRequiresMultipleTargets
@@ -3018,6 +3131,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         proxyJumpSessionResolver: @escaping (String) throws -> SessionRecord?,
         credentialRecovery: (@MainActor () -> SshConnectionConfig?)? = nil
     ) throws -> LiveShellStatus {
+        if proxyJumpSelection != .disabled,
+           isLicensed(.proxyJump) == false {
+            throw LicensedFeatureAccessError.licenseRequired(.proxyJump)
+        }
         let starter = try resolvedRemoteSessionStarter()
         let status: LiveShellStatus
         if let coordinator = starter as? RemoteSSHSessionCoordinator {
@@ -3128,9 +3245,59 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
     }
 
+    public func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {
+        do {
+            try LicenseBastionHostFeatureAuthorizer().authorizeBastionHostAccess()
+            guard confirmBastionHostConnection(request) else { return }
+            try UserDefaultsBastionHostRequestReplayProtector().consume(request)
+
+            var metadata: [String: Any] = [
+                "bastionVendor": request.vendor,
+                "bastionRequestId": request.requestID
+            ]
+            if let value = request.targetHost { metadata["bastionTargetHost"] = value }
+            if let value = request.targetPort { metadata["bastionTargetPort"] = value }
+            if let value = request.targetUsername { metadata["bastionTargetUsername"] = value }
+            if let value = request.assetID { metadata["bastionAssetId"] = value }
+            if let value = request.accountID { metadata["bastionAccountId"] = value }
+            let configJSON = try String(
+                data: JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]),
+                encoding: .utf8
+            )
+            let target = "\(request.gatewayUsername)@\(request.gatewayHost):\(request.gatewayPort)"
+            _ = try connectQuickConnectRequest(
+                QuickConnectRequest(
+                    target: target,
+                    authMode: .agent,
+                    saveAsSession: false,
+                    sessionName: "\(request.vendor) · \(request.targetHost ?? request.gatewayHost)",
+                    configJSON: configJSON
+                )
+            )
+        } catch {
+            quickConnectErrorPresenter.presentQuickConnectError(error, parentWindow: window)
+        }
+    }
+
+    private func confirmBastionHostConnection(_ request: BastionHostDeepLinkRequest) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "允许堡垒机调起 Stacio？"
+        let target = request.targetHost ?? request.assetID ?? "未提供目标资产"
+        alert.informativeText = "来源：\(request.vendor)\n堡垒机：\(request.gatewayHost):\(request.gatewayPort)\n目标：\(target)\n账号：\(request.gatewayUsername)"
+        alert.addButton(withTitle: "连接")
+        alert.addButton(withTitle: L10n.Common.cancel)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     @discardableResult
     public func openSavedSession(_ session: SessionRecord) throws -> LiveShellStatus {
-        try openSavedSession(session, allowMissingCredentialRepair: true)
+        let status = try openSavedSession(session, allowMissingCredentialRepair: true)
+        workspaceViewController.setAIHistoryScopeID(
+            "session:\(session.id)",
+            runtimeID: status.runtimeId
+        )
+        return status
     }
 
     @discardableResult
@@ -3648,7 +3815,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if let sessionImportCoordinator {
             return sessionImportCoordinator
         }
-        let coordinator = SessionImportCoordinator(databasePath: try databasePathProvider())
+        let coordinator = SessionImportCoordinator(
+            databasePath: try databasePathProvider(),
+            bastionHostAuthorizer: LicenseBastionHostFeatureAuthorizer(accessProvider: licenseAccess),
+            licensedFeatureAuthorizer: LicenseFeatureAuthorizer(accessProvider: licenseAccess)
+        )
         sessionImportCoordinator = coordinator
         return coordinator
     }
@@ -3795,6 +3966,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     ) -> SessionSidebarSessionEditing? {
         return AppKitSessionSidebarSessionEditor(
             credentialSaver: credentialSaver,
+            licenseAccess: licenseAccess,
             sessionConfigJSONProvider: { [databasePathProvider] session in
                 guard let databasePath = try? databasePathProvider() else {
                     return nil

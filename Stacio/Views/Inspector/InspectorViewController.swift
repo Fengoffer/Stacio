@@ -112,6 +112,7 @@ public final class InspectorViewController: NSViewController {
     private let tunnelEndpointContextBuilder: TunnelLiveSessionContextBuilding?
     private let databasePathProvider: () throws -> String
     private let settingsStore: AppSettingsStore
+    private let licenseAccess: any LicenseFeatureAccessProviding
     private let transferCompletionNotificationPresenter: TransferCompletionNotificationPresenting
     private let transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)?
     private let multiExecAuditStore: MultiExecAuditListing?
@@ -167,6 +168,7 @@ public final class InspectorViewController: NSViewController {
         tunnelEndpointContextBuilder: TunnelLiveSessionContextBuilding? = nil,
         databasePathProvider: @escaping () throws -> String = { try StacioPaths().databaseURL.path },
         settingsStore: AppSettingsStore = .shared,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         transferCompletionNotificationPresenter: TransferCompletionNotificationPresenting? = nil,
         transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)? = nil
     ) {
@@ -196,6 +198,7 @@ public final class InspectorViewController: NSViewController {
         self.tunnelEndpointContextBuilder = tunnelEndpointContextBuilder
         self.databasePathProvider = databasePathProvider
         self.settingsStore = settingsStore
+        self.licenseAccess = licenseAccess
         self.transferCompletionNotificationPresenter = transferCompletionNotificationPresenter
             ?? NoopTransferCompletionNotificationPresenter()
         self.transferQueueCoordinatorFactory = transferQueueCoordinatorFactory
@@ -246,7 +249,7 @@ public final class InspectorViewController: NSViewController {
         contentContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         contentContainer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let files = FilesViewController(settingsStore: settingsStore)
+        let files = FilesViewController(settingsStore: settingsStore, licenseAccess: licenseAccess)
         let transferQueue = TransferQueueViewController()
         let diagnostics = DiagnosticsViewController(
             auditStore: multiExecAuditStore ?? makeDefaultMultiExecAuditStore(),

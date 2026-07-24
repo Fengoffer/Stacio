@@ -60,7 +60,11 @@ let package = Package(
                 .process("Resources/github.svg"),
                 .process("Resources/gitee.svg"),
                 .process("Resources/SessionIcons"),
-                .process("Resources/ImportSourceIcons")
+                .process("Resources/ImportSourceIcons"),
+                .copy("Resources/Fonts")
+            ],
+            linkerSettings: [
+                .linkedFramework("IOKit")
             ]
         ),
         .executableTarget(

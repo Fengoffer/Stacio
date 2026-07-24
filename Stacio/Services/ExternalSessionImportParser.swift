@@ -14,6 +14,29 @@ public struct ExternalImportedSession: Equatable, Sendable {
     public let username: String?
     public let privateKeyPath: String?
     public let credential: ExternalImportedCredential?
+    public let configJSON: String?
+
+    public init(
+        name: String,
+        folderPath: String?,
+        protocolName: String,
+        host: String,
+        port: UInt16,
+        username: String?,
+        privateKeyPath: String?,
+        credential: ExternalImportedCredential?,
+        configJSON: String? = nil
+    ) {
+        self.name = name
+        self.folderPath = folderPath
+        self.protocolName = protocolName
+        self.host = host
+        self.port = port
+        self.username = username
+        self.privateKeyPath = privateKeyPath
+        self.credential = credential
+        self.configJSON = configJSON
+    }
 }
 
 public struct ExternalSessionImportPayload: Equatable, Sendable {

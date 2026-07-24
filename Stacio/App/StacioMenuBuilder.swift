@@ -2,9 +2,14 @@ import AppKit
 
 public struct StacioMenuBuilder {
     private weak var target: AppDelegate?
+    private let licenseAccess: any LicenseFeatureAccessProviding
 
-    public init(target: AppDelegate) {
+    public init(
+        target: AppDelegate,
+        licenseAccess: any LicenseFeatureAccessProviding = LocalLicenseFeatureAccessProvider()
+    ) {
         self.target = target
+        self.licenseAccess = licenseAccess
     }
 
     public func makeMainMenu() -> NSMenu {
@@ -63,6 +68,8 @@ public struct StacioMenuBuilder {
         submenu.addItem(.separator())
         let importItem = NSMenuItem(title: L10n.Import.title, action: nil, keyEquivalent: "")
         let importMenu = NSMenu(title: L10n.Import.title)
+        importMenu.autoenablesItems = false
+        importMenu.delegate = SessionImportMenuAvailabilityDelegate.shared
         for source in AppKitSessionImportSourcePicker.supportedSources {
             let sourceItem = menuItem(
                 title: source.name,
@@ -71,6 +78,11 @@ public struct StacioMenuBuilder {
             )
             sourceItem.representedObject = source.type.rawValue
             sourceItem.image = SessionImportSourceIconCatalog.image(for: source)
+            SessionImportSourceAvailability.configure(
+                sourceItem,
+                for: source,
+                licenseAccess: licenseAccess
+            )
             importMenu.addItem(sourceItem)
         }
         importItem.submenu = importMenu
@@ -225,6 +237,12 @@ public struct StacioMenuBuilder {
         item.title = L10n.Menu.help
         let submenu = NSMenu(title: L10n.Menu.help)
         submenu.minimumWidth = 240
+        submenu.addItem(menuItem(
+            title: L10n.Menu.documentation,
+            action: #selector(AppDelegate.openDocumentation(_:)),
+            key: ""
+        ))
+        submenu.addItem(.separator())
         submenu.addItem(menuItem(
             title: L10n.Menu.feedback,
             action: #selector(AppDelegate.showFeedbackWindow(_:)),

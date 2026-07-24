@@ -1,4 +1,5 @@
 import AppKit
+import Network
 import StacioAgentBridge
 import StacioCoreBindings
 
@@ -30,7 +31,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private static let maxAttachmentTextPreviewCharacters = 8_000
     private static let taskHistoryDisplayLimit = 3
     private static let taskHistoryScanLimit = 24
-    private static let conversationHistoryLimit = 30
     private static let unconfiguredProviderMessage = "请先在设置中配置供应商模型"
 
     public var onCollapse: (() -> Void)?
@@ -45,6 +45,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let taskLister: AgentTaskListing?
     private let conversationHistoryStore: AIAssistantConversationHistoryStoring?
     private let attachmentPicker: () -> [URL]
+    private let internalBrowserOpener: (URL) -> Void
+    private let externalBrowserOpener: (URL) -> Void
     public var currentRemoteFileAttachmentProvider: (() throws -> AIAssistantAttachment)?
     public var currentRemoteFileAttachmentAvailabilityProvider: (() -> Bool)?
     private let localAgentToolResolver: LocalAgentToolResolving
@@ -58,6 +60,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let contextLabel = NSTextField(labelWithString: "")
     private let targetButton = NSButton(title: L10n.AI.targetPicker, target: nil, action: nil)
     private let collapseButton = NSButton(title: L10n.AI.collapse, target: nil, action: nil)
+    private let conversationPopUpButton = NSPopUpButton()
+    private let newConversationButton = NSButton()
+    private let conversationControlsStack = NSStackView()
+    private let conversationControlsLabel = NSTextField(labelWithString: "排查会话")
     private let questionField = NSTextField()
     private let composer = AIComposerDropPasteView()
     private let composerAttachmentStack = NSStackView()
@@ -133,6 +139,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var recentTaskRecords: [AgentTaskSessionRecord] = []
     private var currentProposalTaskRequestID: String?
     private var loadedConversationHistoryRuntimeID: String?
+    private var activeConversationIDs: [String: String] = [:]
     private var pendingAssistantConclusionsByRequestID: [String: String] = [:]
     private var terminalBlocksByRequestID: [String: String] = [:]
     private var collapsedTraceRequestIDs: Set<String> = []
@@ -170,6 +177,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var contextUsageLabel = "上下文 0%"
     private var isAsking = false
     private var isExecuting = false
+    private var lastAppliedTranscriptTextWidth: CGFloat?
 
     public init(
         coordinator: AIAssistantCoordinator,
@@ -182,6 +190,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         taskLister: AgentTaskListing? = nil,
         conversationHistoryStore: AIAssistantConversationHistoryStoring? = nil,
         attachmentPicker: (() -> [URL])? = nil,
+        internalBrowserOpener: @escaping (URL) -> Void = { _ in },
+        externalBrowserOpener: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         currentRemoteFileAttachmentProvider: (() throws -> AIAssistantAttachment)? = nil,
         currentRemoteFileAttachmentAvailabilityProvider: (() -> Bool)? = nil,
         localAgentToolResolver: LocalAgentToolResolving = LocalAgentToolResolver(),
@@ -199,6 +209,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         self.taskLister = taskLister
         self.conversationHistoryStore = conversationHistoryStore
         self.attachmentPicker = attachmentPicker ?? Self.pickAttachmentURLs
+        self.internalBrowserOpener = internalBrowserOpener
+        self.externalBrowserOpener = externalBrowserOpener
         self.currentRemoteFileAttachmentProvider = currentRemoteFileAttachmentProvider
         self.currentRemoteFileAttachmentAvailabilityProvider = currentRemoteFileAttachmentAvailabilityProvider
         self.localAgentToolResolver = localAgentToolResolver
@@ -309,6 +321,31 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         collapseButton.setAccessibilityIdentifier("Stacio.AI.collapse")
         collapseButton.translatesAutoresizingMaskIntoConstraints = false
         configureIconButton(collapseButton, symbolName: "chevron.down", accessibilityLabel: L10n.AI.collapse)
+        conversationPopUpButton.target = self
+        conversationPopUpButton.action = #selector(conversationSelectionChanged(_:))
+        conversationPopUpButton.setAccessibilityIdentifier("Stacio.AI.conversationPicker")
+        conversationPopUpButton.translatesAutoresizingMaskIntoConstraints = false
+        newConversationButton.target = self
+        newConversationButton.action = #selector(newConversationButtonPressed(_:))
+        newConversationButton.setAccessibilityIdentifier("Stacio.AI.newConversation")
+        newConversationButton.translatesAutoresizingMaskIntoConstraints = false
+        configureIconButton(newConversationButton, symbolName: "plus", accessibilityLabel: "新建排查会话")
+        conversationControlsStack.orientation = .horizontal
+        conversationControlsStack.alignment = .centerY
+        conversationControlsStack.spacing = 6
+        conversationControlsStack.translatesAutoresizingMaskIntoConstraints = false
+        conversationControlsStack.setAccessibilityIdentifier("Stacio.AI.conversationControls")
+        conversationControlsLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        conversationControlsLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        let conversationControlsSpacer = NSView()
+        conversationControlsSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        conversationControlsSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        [
+            conversationControlsLabel,
+            conversationControlsSpacer,
+            conversationPopUpButton,
+            newConversationButton
+        ].forEach(conversationControlsStack.addArrangedSubview)
 
         conversationContainer.setAccessibilityIdentifier("Stacio.AI.conversation")
         conversationContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -560,6 +597,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         headerContainer.addSubview(targetButton)
         headerContainer.addSubview(collapseButton)
         conversationContainer.addSubview(surfaceModeSegmentedControl)
+        conversationContainer.addSubview(conversationControlsStack)
         conversationContainer.addSubview(contextLabel)
         conversationContainer.addSubview(transcriptScrollView)
         conversationContainer.addSubview(localAgentContainer)
@@ -757,6 +795,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             targetButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
             targetButton.widthAnchor.constraint(lessThanOrEqualToConstant: 148),
 
+            conversationPopUpButton.widthAnchor.constraint(equalToConstant: 108),
+            conversationPopUpButton.heightAnchor.constraint(equalToConstant: 24),
+
+            newConversationButton.widthAnchor.constraint(equalToConstant: 24),
+            newConversationButton.heightAnchor.constraint(equalToConstant: 24),
+
             collapseButton.trailingAnchor.constraint(equalTo: headerContainer.trailingAnchor, constant: -10),
             collapseButton.centerYAnchor.constraint(equalTo: headerTitleLabel.centerYAnchor),
             collapseButton.widthAnchor.constraint(equalToConstant: 28),
@@ -764,7 +808,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
             contextLabel.leadingAnchor.constraint(equalTo: conversationContainer.leadingAnchor, constant: 4),
             contextLabel.trailingAnchor.constraint(equalTo: conversationContainer.trailingAnchor, constant: -4),
-            contextLabel.topAnchor.constraint(equalTo: surfaceModeSegmentedControl.bottomAnchor, constant: 8),
+            conversationControlsStack.leadingAnchor.constraint(equalTo: conversationContainer.leadingAnchor),
+            conversationControlsStack.trailingAnchor.constraint(equalTo: conversationContainer.trailingAnchor),
+            conversationControlsStack.topAnchor.constraint(equalTo: surfaceModeSegmentedControl.bottomAnchor, constant: 8),
+            conversationControlsStack.heightAnchor.constraint(equalToConstant: 26),
+
+            contextLabel.topAnchor.constraint(equalTo: conversationControlsStack.bottomAnchor, constant: 8),
 
             surfaceModeSegmentedControl.leadingAnchor.constraint(equalTo: conversationContainer.leadingAnchor),
             surfaceModeSegmentedControl.trailingAnchor.constraint(equalTo: conversationContainer.trailingAnchor),
@@ -807,6 +856,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         super.viewDidLayout()
         updateSurfaceModeSegmentWidths()
         let textWidth = max(80, transcriptContentStack.bounds.width)
+        guard lastAppliedTranscriptTextWidth.map({ abs($0 - textWidth) > 0.5 }) ?? true else {
+            return
+        }
+        lastAppliedTranscriptTextWidth = textWidth
         messageLabel.preferredMaxLayoutWidth = textWidth
         statusLabel.preferredMaxLayoutWidth = textWidth
         taskControlLabel.preferredMaxLayoutWidth = textWidth
@@ -899,6 +952,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func updateSurfaceMode() {
         surfaceModeSegmentedControl.selectedSegment = surfaceMode.rawValue
         let showsLocalAgent = surfaceMode == .localAgent
+        conversationControlsStack.isHidden = showsLocalAgent
         contextLabel.isHidden = showsLocalAgent
         transcriptScrollView.isHidden = showsLocalAgent
         localAgentContainer.isHidden = showsLocalAgent == false
@@ -1147,6 +1201,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         if isReplacingPendingTaskContinuation {
             endTaskModelSelectionCapture()
         }
+        let requestConversationHistory = assistantConversationContext()
         questionField.stringValue = ""
         questionField.currentEditor()?.string = ""
         isAsking = true
@@ -1161,11 +1216,23 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let requestAttachments = composerAttachments
         activeStreamingAssistantIndex = nil
         if planModeEnabled {
-            startPlanMode(question: question, requestQuestion: requestQuestion, context: context, attachments: requestAttachments)
+            startPlanMode(
+                question: question,
+                requestQuestion: requestQuestion,
+                context: context,
+                conversationHistory: requestConversationHistory,
+                attachments: requestAttachments
+            )
             return
         }
         if goalModeEnabled {
-            startAutonomousGoal(question: question, requestQuestion: requestQuestion, context: context, attachments: requestAttachments)
+            startAutonomousGoal(
+                question: question,
+                requestQuestion: requestQuestion,
+                context: context,
+                conversationHistory: requestConversationHistory,
+                attachments: requestAttachments
+            )
             return
         }
         let askID = UUID()
@@ -1173,6 +1240,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         activeAskCancellation = coordinator.askInBackground(
             question: requestQuestion,
             context: context,
+            conversationHistory: requestConversationHistory,
             attachments: requestAttachments,
             progress: { [weak self] message in
                 self?.appendAssistantProgress(message)
@@ -1230,6 +1298,19 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         updateQuestionControlState()
     }
 
+    private func assistantConversationContext() -> [AIAssistantConversationMessage] {
+        transcriptEntries.compactMap { entry in
+            switch entry.role {
+            case .user:
+                return AIAssistantConversationMessage(role: .user, content: entry.text)
+            case .assistant:
+                return AIAssistantConversationMessage(role: .assistant, content: entry.text)
+            case .system, .command, .terminal, .plan, .step:
+                return nil
+            }
+        }
+    }
+
     @objc
     private func stopButtonPressed(_ sender: Any?) {
         stopCurrentAIRequest()
@@ -1263,6 +1344,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         question: String,
         requestQuestion: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage],
         attachments: [AIAssistantAttachment]
     ) {
         beginTaskModelSelectionCapture()
@@ -1279,6 +1361,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 let plan = try await orchestrator.makePlan(
                     goal: requestQuestion,
                     context: context,
+                    conversationHistory: conversationHistory,
                     attachments: attachments
                 )
                 guard Task.isCancelled == false else { return }
@@ -1325,6 +1408,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         question: String,
         requestQuestion: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage],
         attachments: [AIAssistantAttachment]
     ) {
         beginTaskModelSelectionCapture()
@@ -1348,6 +1432,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                     contextProvider: { [weak self] in
                         self?.contextProvider(context.runtimeID) ?? context
                     },
+                    conversationHistory: conversationHistory,
                     attachments: attachments,
                     onUpdate: { [weak self] update in
                         guard let self, self.isActiveAutonomousRun(runID) else { return }
@@ -1805,19 +1890,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             renderTranscriptEntries()
             return
         }
-        guard loadedConversationHistoryRuntimeID != context.runtimeID else {
+        let historyScopeID = context.historyScopeID
+        let threads = (try? conversationHistoryStore.listConversationThreads(runtimeID: historyScopeID)) ?? []
+        let activeID = activeConversationIDs[historyScopeID] ?? threads.first?.id ?? "legacy"
+        activeConversationIDs[historyScopeID] = activeID
+        refreshConversationPicker(threads: threads, activeID: activeID)
+        let storageID = CoreBridgeAIAssistantConversationHistoryStore.threadStorageID(
+            runtimeID: historyScopeID,
+            threadID: activeID
+        )
+        guard loadedConversationHistoryRuntimeID != storageID else {
             return
         }
-        loadedConversationHistoryRuntimeID = context.runtimeID
+        loadedConversationHistoryRuntimeID = storageID
         do {
             processGroupTimings = [:]
             transcriptEntries = restoredTranscriptEntries(
-                from: try conversationHistoryStore.listConversationHistory(runtimeID: context.runtimeID),
+                from: try conversationHistoryStore.listConversationHistory(runtimeID: storageID),
                 runtimeID: context.runtimeID
             )
-            if transcriptEntries.count > Self.conversationHistoryLimit {
-                transcriptEntries.removeFirst(transcriptEntries.count - Self.conversationHistoryLimit)
-            }
             if transcriptEntries.isEmpty == false {
                 messageLabel.isHidden = true
             }
@@ -1826,6 +1917,43 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptEntries = []
             renderTranscriptEntries()
         }
+    }
+
+    private func refreshConversationPicker(
+        threads: [AIAssistantConversationThreadSummary],
+        activeID: String
+    ) {
+        conversationPopUpButton.removeAllItems()
+        let visibleThreads = threads.isEmpty
+            ? [AIAssistantConversationThreadSummary(id: activeID, title: "新排查会话", latestMessageAt: "")]
+            : threads
+        for (index, thread) in visibleThreads.enumerated() {
+            conversationPopUpButton.addItem(withTitle: thread.title.isEmpty ? "排查会话 \(index + 1)" : thread.title)
+            conversationPopUpButton.lastItem?.representedObject = thread.id
+        }
+        if let index = visibleThreads.firstIndex(where: { $0.id == activeID }) {
+            conversationPopUpButton.selectItem(at: index)
+        }
+    }
+
+    @objc private func newConversationButtonPressed(_ sender: Any?) {
+        guard let historyScopeID = resolvedTargetContext()?.historyScopeID else { return }
+        activeConversationIDs[historyScopeID] = UUID().uuidString.lowercased()
+        loadedConversationHistoryRuntimeID = nil
+        activeStreamingAssistantIndex = nil
+        transcriptEntries = []
+        processGroupTimings = [:]
+        messageLabel.isHidden = false
+        loadConversationHistory(for: resolvedTargetContext())
+    }
+
+    @objc private func conversationSelectionChanged(_ sender: Any?) {
+        guard let historyScopeID = resolvedTargetContext()?.historyScopeID,
+              let threadID = conversationPopUpButton.selectedItem?.representedObject as? String
+        else { return }
+        activeConversationIDs[historyScopeID] = threadID
+        loadedConversationHistoryRuntimeID = nil
+        loadConversationHistory(for: resolvedTargetContext())
     }
 
     private func transcriptEntry(for record: AIConversationHistoryItemRecord) -> AITranscriptEntry? {
@@ -3985,9 +4113,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         )
         transcriptEntries.append(entry)
         messageLabel.isHidden = true
-        if transcriptEntries.count > Self.conversationHistoryLimit {
-            transcriptEntries.removeFirst(transcriptEntries.count - Self.conversationHistoryLimit)
-        }
         if persistHistory,
            let historyRole = role.persistedHistoryRole {
             persistConversationHistory(role: historyRole, content: trimmed, requestID: requestID)
@@ -4032,11 +4157,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptEntries.append(entry)
             activeStreamingAssistantIndex = transcriptEntries.count - 1
             messageLabel.isHidden = true
-            if transcriptEntries.count > Self.conversationHistoryLimit {
-                let overflow = transcriptEntries.count - Self.conversationHistoryLimit
-                transcriptEntries.removeFirst(overflow)
-                activeStreamingAssistantIndex = max(0, (activeStreamingAssistantIndex ?? 0) - overflow)
-            }
         }
         renderTranscriptEntries()
     }
@@ -4160,17 +4280,21 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         requestID: String?
     ) {
         guard let conversationHistoryStore,
-              let runtimeID = resolvedTargetContext()?.runtimeID
+              let context = resolvedTargetContext()
         else {
             return
         }
         do {
             _ = try conversationHistoryStore.appendConversationHistoryItem(
-                runtimeID: runtimeID,
+                runtimeID: CoreBridgeAIAssistantConversationHistoryStore.threadStorageID(
+                    runtimeID: context.historyScopeID,
+                    threadID: activeConversationIDs[context.historyScopeID] ?? "legacy"
+                ),
                 role: role,
                 content: content,
                 requestID: requestID
             )
+            loadedConversationHistoryRuntimeID = nil
         } catch {
             return
         }
@@ -4233,11 +4357,22 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func makeTranscriptBubble(for entry: AITranscriptEntry) -> AITranscriptBubbleView {
-        let bubble = AITranscriptBubbleView(entry: entry) { [weak self] in
-            self?.toggleTranscriptEntry(entry)
-        }
+        let bubble = AITranscriptBubbleView(
+            entry: entry,
+            onOpenLink: { [weak self] url in self?.openAssistantLink(url) },
+            onToggle: { [weak self] in self?.toggleTranscriptEntry(entry) }
+        )
         bubble.preferredTextWidth = max(80, conversationContainer.bounds.width)
         return bubble
+    }
+
+    private func openAssistantLink(_ url: URL) {
+        switch AIAssistantLinkRouter.destination(for: url) {
+        case .stacioBrowser:
+            internalBrowserOpener(url)
+        case .systemBrowser:
+            externalBrowserOpener(url)
+        }
     }
 
     private func toggleTranscriptEntry(_ entry: AITranscriptEntry) {
@@ -4476,6 +4611,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
+    var processGroupDetailAttributedStringsForTesting: [NSAttributedString] {
+        transcriptStack.arrangedSubviews.compactMap { view in
+            (view as? AITranscriptProcessGroupView)?.detailAttributedStringForTesting
+        }
+    }
+
     var collapsedThinkingEntryCountForTesting: Int {
         transcriptEntries.filter { $0.role == .assistant && $0.isProcessEntry && $0.isCollapsed }.count
     }
@@ -4506,6 +4647,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             .filter { $0.role == .assistant }
             .map(\.displayText)
             .joined(separator: "\n")
+    }
+
+    var assistantAttributedStringsForTesting: [NSAttributedString] {
+        transcriptStack.arrangedSubviews.compactMap { view in
+            guard let bubble = view as? AITranscriptBubbleView,
+                  bubble.isAssistantForTesting
+            else {
+                return nil
+            }
+            return bubble.attributedStringForTesting
+        }
     }
 
     var assistantConclusionTextsForTesting: [String] {
@@ -4931,12 +5083,26 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         askButtonPressed(nil)
     }
 
+    func createNewConversationForTesting() {
+        newConversationButtonPressed(nil)
+    }
+
+    var conversationPickerTitlesForTesting: [String] {
+        conversationPopUpButton.itemArray.map(\.title)
+    }
+
     func submitQuestionFromFieldForTesting() {
         questionField.sendAction(questionField.action, to: questionField.target)
     }
 
     func performExecuteForTesting() {
         runCommandCardForTesting(at: 0)
+    }
+
+    func resetAssistantAttributedStringsForTesting() {
+        for case let bubble as AITranscriptBubbleView in transcriptStack.arrangedSubviews {
+            bubble.resetAssistantAttributedStringForTesting()
+        }
     }
 
     private func scrollTranscriptToBottom() {
@@ -4998,6 +5164,10 @@ private final class AITranscriptProcessGroupView: NSView {
         disclosureButton.title
     }
 
+    var detailAttributedStringForTesting: NSAttributedString {
+        detailLabel.attributedStringValue
+    }
+
     private func configure() {
         setAccessibilityIdentifier("Stacio.AI.transcript.processGroup")
         translatesAutoresizingMaskIntoConstraints = false
@@ -5020,9 +5190,12 @@ private final class AITranscriptProcessGroupView: NSView {
         disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
         disclosureButton.translatesAutoresizingMaskIntoConstraints = false
 
-        detailLabel.stringValue = entries.map(\.text).joined(separator: "\n\n")
-        detailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        detailLabel.textColor = .secondaryLabelColor
+        let detailMarkdown = entries.map(\.text).joined(separator: "\n\n")
+        detailLabel.attributedStringValue = AIAssistantMarkdownRenderer.attributedString(
+            from: detailMarkdown,
+            baseFont: .systemFont(ofSize: 11),
+            textColor: .secondaryLabelColor
+        )
         detailLabel.maximumNumberOfLines = 0
         detailLabel.lineBreakMode = .byCharWrapping
         detailLabel.cell?.wraps = true
@@ -5062,24 +5235,122 @@ private final class AITranscriptProcessGroupView: NSView {
     }
 }
 
+enum AIAssistantLinkDestination: Equatable {
+    case stacioBrowser
+    case systemBrowser
+}
+
+enum AIAssistantLinkRouter {
+    static func destination(for url: URL) -> AIAssistantLinkDestination {
+        guard let host = url.host?.lowercased() else {
+            return .systemBrowser
+        }
+        if host == "localhost" || IPv4Address(host) != nil || IPv6Address(host) != nil {
+            return .stacioBrowser
+        }
+        return .systemBrowser
+    }
+}
+
+private final class AITranscriptLinkLabel: NSTextField {
+    var onOpenLink: ((URL) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureAsLabel()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureAsLabel()
+    }
+
+    private func configureAsLabel() {
+        isEditable = false
+        isSelectable = true
+        isBordered = false
+        isBezeled = false
+        drawsBackground = false
+        focusRingType = .none
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let url = link(at: convert(event.locationInWindow, from: nil)) else {
+            super.mouseDown(with: event)
+            return
+        }
+        onOpenLink?(url)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        var containsLink = false
+        attributedStringValue.enumerateAttribute(
+            .link,
+            in: NSRange(location: 0, length: attributedStringValue.length)
+        ) { value, _, stop in
+            if value != nil {
+                containsLink = true
+                stop.pointee = true
+            }
+        }
+        guard containsLink else { return }
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    private func link(at point: NSPoint) -> URL? {
+        guard attributedStringValue.length > 0 else { return nil }
+        let textRect = cell?.drawingRect(forBounds: bounds) ?? bounds
+        guard textRect.contains(point) else { return nil }
+        let storage = NSTextStorage(attributedString: attributedStringValue)
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(containerSize: textRect.size)
+        container.lineFragmentPadding = 0
+        storage.addLayoutManager(layoutManager)
+        layoutManager.addTextContainer(container)
+        let localPoint = NSPoint(
+            x: point.x - textRect.minX,
+            y: isFlipped ? point.y - textRect.minY : textRect.maxY - point.y
+        )
+        let glyphIndex = layoutManager.glyphIndex(for: localPoint, in: container)
+        guard layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIndex, length: 1), in: container)
+            .insetBy(dx: -2, dy: -2).contains(localPoint)
+        else { return nil }
+        let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        let value = attributedStringValue.attribute(.link, at: characterIndex, effectiveRange: nil)
+        if let url = value as? URL { return url }
+        if let string = value as? String { return URL(string: string) }
+        return nil
+    }
+}
+
 private final class AITranscriptBubbleView: NSView {
     private let entry: AITranscriptEntry
     private let onToggle: () -> Void
     private let bubbleView = NSView()
-    private let label = NSTextField(labelWithString: "")
+    private let label = AITranscriptLinkLabel(frame: .zero)
     private let disclosureButton = NSButton()
+    private var renderedAssistantString: NSAttributedString?
     private var bubbleWidthConstraint: NSLayoutConstraint?
+    private var lastAppliedBubbleWidth: CGFloat?
+    private var lastAppliedLabelWidth: CGFloat?
 
     var preferredTextWidth: CGFloat = 240 {
         didSet {
+            guard abs(preferredTextWidth - oldValue) > 0.5 else { return }
             updatePreferredWidth()
         }
     }
 
-    init(entry: AITranscriptEntry, onToggle: @escaping () -> Void = {}) {
+    init(
+        entry: AITranscriptEntry,
+        onOpenLink: @escaping (URL) -> Void = { _ in },
+        onToggle: @escaping () -> Void = {}
+    ) {
         self.entry = entry
         self.onToggle = onToggle
         super.init(frame: .zero)
+        label.onOpenLink = onOpenLink
         configure()
     }
 
@@ -5088,9 +5359,28 @@ private final class AITranscriptBubbleView: NSView {
         nil
     }
 
+    var isAssistantForTesting: Bool {
+        entry.role == .assistant
+    }
+
+    var attributedStringForTesting: NSAttributedString {
+        label.attributedStringValue
+    }
+
     override func layout() {
+        restoreAssistantFormattingIfNeeded()
         super.layout()
         updatePreferredWidth()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        restoreAssistantFormattingIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        restoreAssistantFormattingIfNeeded()
     }
 
     private func configure() {
@@ -5116,11 +5406,13 @@ private final class AITranscriptBubbleView: NSView {
         label.font = entry.font
         label.textColor = entry.textColor
         if entry.role == .assistant {
-            label.attributedStringValue = AIAssistantMarkdownRenderer.attributedString(
+            let renderedString = AIAssistantMarkdownRenderer.attributedString(
                 from: entry.displayText,
                 baseFont: entry.font,
                 textColor: entry.textColor
             )
+            renderedAssistantString = renderedString
+            label.attributedStringValue = renderedString
         }
         label.preferredMaxLayoutWidth = preferredTextWidth
         label.cell?.wraps = true
@@ -5201,6 +5493,20 @@ private final class AITranscriptBubbleView: NSView {
         onToggle()
     }
 
+    func resetAssistantAttributedStringForTesting() {
+        guard let renderedAssistantString else { return }
+        label.stringValue = renderedAssistantString.string
+    }
+
+    private func restoreAssistantFormattingIfNeeded() {
+        guard let renderedAssistantString,
+              label.attributedStringValue.isEqual(to: renderedAssistantString) == false
+        else {
+            return
+        }
+        label.attributedStringValue = renderedAssistantString
+    }
+
     private func updatePreferredWidth() {
         let width = max(80, preferredTextWidth)
         let maxBubbleWidth: CGFloat
@@ -5214,9 +5520,16 @@ private final class AITranscriptBubbleView: NSView {
         case .command, .terminal, .plan, .step:
             maxBubbleWidth = width
         }
-        bubbleWidthConstraint?.constant = maxBubbleWidth
         let disclosureWidth: CGFloat = entry.isProcessEntry ? 28 : 0
-        label.preferredMaxLayoutWidth = max(40, maxBubbleWidth - entry.horizontalPadding * 2 - disclosureWidth)
+        let labelWidth = max(40, maxBubbleWidth - entry.horizontalPadding * 2 - disclosureWidth)
+        if lastAppliedBubbleWidth.map({ abs($0 - maxBubbleWidth) > 0.5 }) ?? true {
+            bubbleWidthConstraint?.constant = maxBubbleWidth
+            lastAppliedBubbleWidth = maxBubbleWidth
+        }
+        if lastAppliedLabelWidth.map({ abs($0 - labelWidth) > 0.5 }) ?? true {
+            label.preferredMaxLayoutWidth = labelWidth
+            lastAppliedLabelWidth = labelWidth
+        }
     }
 }
 
@@ -6273,7 +6586,11 @@ enum AIAssistantMarkdownRenderer {
         codeParagraph.lineSpacing = 2
         codeParagraph.paragraphSpacing = 6
         var isInCodeBlock = false
-        for rawLine in markdown.components(separatedBy: .newlines) {
+        let rawLines = markdown.components(separatedBy: .newlines)
+        var lineIndex = 0
+        while lineIndex < rawLines.count {
+            let rawLine = rawLines[lineIndex]
+            lineIndex += 1
             let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") {
                 isInCodeBlock.toggle()
@@ -6292,6 +6609,27 @@ enum AIAssistantMarkdownRenderer {
                 )
                 continue
             }
+            if lineIndex < rawLines.count,
+               isTableSeparator(rawLines[lineIndex]),
+               tableCells(rawLine).count >= 2
+            {
+                let rowsStartIndex = lineIndex + 1
+                var rows = [tableCells(rawLine)]
+                lineIndex = rowsStartIndex
+                while lineIndex < rawLines.count {
+                    let cells = tableCells(rawLines[lineIndex])
+                    guard cells.count >= 2 else { break }
+                    rows.append(cells)
+                    lineIndex += 1
+                }
+                appendTable(
+                    rows,
+                    to: result,
+                    baseFont: baseFont,
+                    textColor: textColor
+                )
+                continue
+            }
             let lineStyle = styledLine(rawLine, baseFont: baseFont)
             let line = inlineMarkdown(lineStyle.text, baseFont: lineStyle.font, textColor: textColor)
             line.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: line.length))
@@ -6306,6 +6644,81 @@ enum AIAssistantMarkdownRenderer {
             result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
         }
         return result
+    }
+
+    private static func appendTable(
+        _ rows: [[String]],
+        to result: NSMutableAttributedString,
+        baseFont: NSFont,
+        textColor: NSColor
+    ) {
+        guard let columnCount = rows.map(\.count).max(), columnCount > 0 else { return }
+        let table = NSTextTable()
+        table.numberOfColumns = columnCount
+        table.collapsesBorders = true
+        table.hidesEmptyCells = false
+
+        for (rowIndex, cells) in rows.enumerated() {
+            for columnIndex in 0..<columnCount {
+                let block = NSTextTableBlock(
+                    table: table,
+                    startingRow: rowIndex,
+                    rowSpan: 1,
+                    startingColumn: columnIndex,
+                    columnSpan: 1
+                )
+                block.setContentWidth(
+                    100 / CGFloat(columnCount),
+                    type: .percentageValueType
+                )
+                block.setWidth(6, type: .absoluteValueType, for: .padding)
+                block.setWidth(0.5, type: .absoluteValueType, for: .border)
+                block.setBorderColor(StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.65))
+                if rowIndex == 0 {
+                    block.backgroundColor = StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.7)
+                }
+
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineSpacing = 2
+                paragraph.paragraphSpacing = 0
+                paragraph.textBlocks = [block]
+                let font = NSFont.systemFont(
+                    ofSize: max(11, baseFont.pointSize - 1),
+                    weight: rowIndex == 0 ? .semibold : .regular
+                )
+                let cellText = columnIndex < cells.count ? cells[columnIndex] : ""
+                let renderedCell = inlineMarkdown(cellText, baseFont: font, textColor: textColor)
+                renderedCell.addAttribute(
+                    .paragraphStyle,
+                    value: paragraph,
+                    range: NSRange(location: 0, length: renderedCell.length)
+                )
+                result.append(renderedCell)
+                result.append(NSAttributedString(string: "\n", attributes: [
+                    .font: font,
+                    .foregroundColor: textColor,
+                    .paragraphStyle: paragraph
+                ]))
+            }
+        }
+    }
+
+    private static func tableCells(_ line: String) -> [String] {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|") else { return [] }
+        return trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = tableCells(line)
+        guard cells.count >= 2 else { return false }
+        return cells.allSatisfy { cell in
+            let marker = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return marker.count >= 3 && marker.allSatisfy { $0 == "-" }
+        }
     }
 
     private static func styledLine(_ line: String, baseFont: NSFont) -> (text: String, font: NSFont) {
@@ -6333,11 +6746,37 @@ enum AIAssistantMarkdownRenderer {
 
         func flushPlain() {
             guard plainBuffer.isEmpty == false else { return }
-            append(plainBuffer, to: output, attributes: [.font: baseFont, .foregroundColor: textColor])
+            output.append(linkedPlainText(plainBuffer, baseFont: baseFont, textColor: textColor))
             plainBuffer = ""
         }
 
         while index < line.endIndex {
+            if line[index] == "[",
+               let labelEnd = line[line.index(after: index)...].firstIndex(of: "]"),
+               line.index(after: labelEnd) < line.endIndex,
+               line[line.index(after: labelEnd)] == "(",
+               let urlEnd = line[line.index(labelEnd, offsetBy: 2)...].firstIndex(of: ")"),
+               urlEnd > line.index(labelEnd, offsetBy: 2)
+            {
+                let urlStart = line.index(labelEnd, offsetBy: 2)
+                let title = String(line[line.index(after: index)..<labelEnd])
+                let rawURL = String(line[urlStart..<urlEnd])
+                if let url = URL(string: rawURL), url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https" {
+                    flushPlain()
+                    append(
+                        title,
+                        to: output,
+                        attributes: [
+                            .font: baseFont,
+                            .foregroundColor: NSColor.linkColor,
+                            .underlineStyle: NSUnderlineStyle.single.rawValue,
+                            .link: url
+                        ]
+                    )
+                    index = line.index(after: urlEnd)
+                    continue
+                }
+            }
             if line[index...].hasPrefix("**"),
                let end = line[line.index(index, offsetBy: 2)...].range(of: "**") {
                 flushPlain()
@@ -6375,6 +6814,35 @@ enum AIAssistantMarkdownRenderer {
             index = line.index(after: index)
         }
         flushPlain()
+        return output
+    }
+
+    private static func linkedPlainText(
+        _ text: String,
+        baseFont: NSFont,
+        textColor: NSColor
+    ) -> NSAttributedString {
+        let output = NSMutableAttributedString(
+            string: text,
+            attributes: [.font: baseFont, .foregroundColor: textColor]
+        )
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+            return output
+        }
+        let fullRange = NSRange(location: 0, length: (text as NSString).length)
+        for match in detector.matches(in: text, range: fullRange) {
+            guard let url = match.url,
+                  url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https"
+            else { continue }
+            output.addAttributes(
+                [
+                    .link: url,
+                    .foregroundColor: NSColor.linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ],
+                range: match.range
+            )
+        }
         return output
     }
 

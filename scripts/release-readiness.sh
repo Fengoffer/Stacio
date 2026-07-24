@@ -209,6 +209,22 @@ raise SystemExit(0 if valid else 1)
 PY
 }
 
+valid_x25519_public_key() {
+  local value="$1"
+  python3 - "$value" <<'PY'
+import base64
+import binascii
+import sys
+
+try:
+    decoded = base64.b64decode("".join(sys.argv[1].split()), validate=True)
+    valid = len(decoded) == 32
+except (ValueError, binascii.Error):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+}
+
 developer_id_identity() {
   security find-identity -p codesigning -v 2>/dev/null \
     | awk '/Developer ID Application:/ { sub(/^[[:space:]]*[0-9]+\) [[:xdigit:]]+ "/, ""); sub(/"$/, ""); print; exit }'
@@ -318,6 +334,14 @@ check_product_ops_configuration() {
     StacioSparkleBetaAppcastURL
     SUPublicEDKey
     StacioLicensePublicEd25519Key
+    StacioOnlineLicenseSignatureKeyID
+    StacioOfflineLicenseExchangeURL
+    StacioOfflineExchangePublicKey
+    StacioOfflineRequestKeyID
+    StacioOfflineSignatureKeyID
+    StacioOfflineLicensePublicKey
+    StacioLicenseStorageContractID
+    StacioLicenseStorageSchemaVersion
     SUEnableAutomaticChecks
     SUAutomaticallyUpdate
     SUAllowsAutomaticUpdates
@@ -395,9 +419,10 @@ check_product_ops_configuration() {
     fail "${label}SUScheduledCheckInterval must be 86400"
   fi
 
-  local sparkle_key license_key
+  local sparkle_key license_key offline_license_key
   sparkle_key="$(plist_value "$plist" SUPublicEDKey)"
   license_key="$(plist_value "$plist" StacioLicensePublicEd25519Key)"
+  offline_license_key="$(plist_value "$plist" StacioOfflineLicensePublicKey)"
   if valid_ed25519_public_key "$sparkle_key" sparkle; then
     pass "${label}SUPublicEDKey is a valid Ed25519 public key"
   else
@@ -407,6 +432,27 @@ check_product_ops_configuration() {
     pass "${label}StacioLicensePublicEd25519Key is a valid Ed25519 public key"
   else
     fail "${label}StacioLicensePublicEd25519Key must contain a valid Ed25519 public key"
+  fi
+  if valid_ed25519_public_key "$offline_license_key" license; then
+    pass "${label}StacioOfflineLicensePublicKey is a valid Ed25519 public key"
+  else
+    fail "${label}StacioOfflineLicensePublicKey must contain a valid Ed25519 public key"
+  fi
+
+  local offline_exchange_key
+  offline_exchange_key="$(plist_value "$plist" StacioOfflineExchangePublicKey)"
+  if valid_x25519_public_key "$offline_exchange_key"; then
+    pass "${label}StacioOfflineExchangePublicKey is a valid X25519 public key"
+  else
+    fail "${label}StacioOfflineExchangePublicKey must contain a valid X25519 public key"
+  fi
+
+  if [[ "$LOCAL_SMOKE" == "1" ]]; then
+    skip "${label}License package trust-anchor verifier by explicit local-smoke mode"
+  elif "$ROOT_DIR/scripts/verify-license-package.sh" "$app_path" "$ROOT_DIR/config/license-trust-anchors.json"; then
+    pass "${label}License package trust anchors and storage contract verified"
+  else
+    fail "${label}License package trust-anchor verification failed"
   fi
 }
 

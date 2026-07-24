@@ -4,6 +4,294 @@ import XCTest
 
 @MainActor
 final class AgentTaskOrchestratorTests: XCTestCase {
+    func testOperationalDomainClassifierSelectsRelevantCapabilityProfiles() {
+        XCTAssertEqual(AgentOperationalDomainClassifier.domains(for: "排查 Kubernetes 中 PostgreSQL 连接超时"), [.kubernetes, .database])
+        XCTAssertEqual(AgentOperationalDomainClassifier.domains(for: "部署 Docker Compose 应用并检查健康接口"), [.application, .container, .deployment])
+        XCTAssertEqual(AgentOperationalDomainClassifier.domains(for: "检查服务器 CPU、磁盘和网络端口"), [.host, .network])
+        XCTAssertEqual(AgentOperationalDomainClassifier.domains(for: "检查 nginx TLS 证书和访问日志"), [.web, .security, .logs])
+    }
+
+    func testBackupPolicyRecognizesConfigurationAndDeploymentMutations() {
+        XCTAssertTrue(AgentBackupPolicy.requiresBackup(command: "sudo sed -i 's/80/8080/' /etc/nginx/nginx.conf"))
+        XCTAssertTrue(AgentBackupPolicy.requiresBackup(command: "systemctl restart nginx"))
+        XCTAssertTrue(AgentBackupPolicy.requiresBackup(command: "docker compose up -d"))
+        XCTAssertTrue(AgentBackupPolicy.requiresBackup(command: "kubectl apply -f deployment.yaml"))
+        XCTAssertTrue(AgentBackupPolicy.requiresBackup(command: "psql app -f migration.sql"))
+        XCTAssertFalse(AgentBackupPolicy.requiresBackup(command: "cat /etc/nginx/nginx.conf"))
+        XCTAssertFalse(AgentBackupPolicy.requiresBackup(command: "systemctl status nginx"))
+    }
+
+    func testBackupPolicyRequiresSuccessfulBackupWithExplicitPath() {
+        let valid = AgentTaskStepResult(
+            requestID: "backup-1",
+            command: "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.20260721-120000",
+            intent: "备份配置",
+            state: .completed,
+            events: [],
+            observation: "/var/backups/stacio/nginx.conf.20260721-120000"
+        )
+        let failed = AgentTaskStepResult(
+            requestID: "backup-2",
+            command: "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.failed",
+            intent: "备份配置",
+            state: .failed,
+            events: [],
+            observation: "permission denied"
+        )
+        let noEvidence = AgentTaskStepResult(
+            requestID: "backup-3",
+            command: "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.no-evidence",
+            intent: "备份配置",
+            state: .completed,
+            events: [],
+            observation: "command completed"
+        )
+
+        XCTAssertEqual(
+            AgentBackupPolicy.latestVerifiedBackup(in: [valid])?.path,
+            "/var/backups/stacio/nginx.conf.20260721-120000"
+        )
+        XCTAssertNil(AgentBackupPolicy.latestVerifiedBackup(in: [failed]))
+        XCTAssertNil(AgentBackupPolicy.latestVerifiedBackup(in: [noEvidence]))
+
+        let databaseBackup = AgentTaskStepResult(
+            requestID: "backup-4",
+            command: "pg_dump app > /tmp/app-20260721.sql",
+            intent: "备份数据库",
+            state: .completed,
+            events: [],
+            observation: "verified /tmp/app-20260721.sql"
+        )
+        XCTAssertEqual(AgentBackupPolicy.latestVerifiedBackup(in: [databaseBackup])?.path, "/tmp/app-20260721.sql")
+
+        let mutation = AgentTaskStepResult(
+            requestID: "mutation-1",
+            command: "systemctl restart nginx",
+            intent: "重启服务",
+            state: .completed,
+            events: [],
+            observation: "restarted"
+        )
+        XCTAssertNil(AgentBackupPolicy.verifiedBackupForNextMutation(in: [valid, mutation]))
+        XCTAssertEqual(AgentBackupPolicy.verifiedBackupForNextMutation(in: [mutation, valid])?.path, valid.observation)
+
+        let rollback = AgentTaskStepResult(
+            requestID: "rollback-1",
+            command: "cp -a /var/backups/stacio/nginx.conf.20260721-120000 /etc/nginx/nginx.conf",
+            intent: "恢复配置",
+            state: .completed,
+            events: [],
+            observation: "restored /etc/nginx/nginx.conf"
+        )
+        XCTAssertEqual(AgentBackupPolicy.latestVerifiedBackup(in: [valid, rollback])?.path, valid.observation)
+    }
+
+    func testAutonomousLoopBlocksMutationUntilVerifiedBackupCompletes() async throws {
+        let mutation = "systemctl restart nginx"
+        let backup = "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.20260721-120000"
+        let verification = "systemctl is-active nginx"
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "重启服务使配置生效。",
+                commandProposals: [AgentCommandProposal(command: mutation, explanation: "重启 nginx。", risk: .write)]
+            ),
+            AIAssistantResponse(
+                message: "先创建配置备份。",
+                commandProposals: [AgentCommandProposal(command: backup, explanation: "备份 nginx 配置。", risk: .write)]
+            ),
+            AIAssistantResponse(
+                message: "备份已验证，继续重启。",
+                commandProposals: [AgentCommandProposal(command: mutation, explanation: "重启 nginx。", risk: .write)]
+            ),
+            AIAssistantResponse(
+                message: "执行状态验证。",
+                commandProposals: [AgentCommandProposal(command: verification, explanation: "验证 nginx 状态。", risk: .readOnly)]
+            ),
+            AIAssistantResponse(
+                message: "## 结果\n\n变更完成。\n\n## 备份与回滚\n\n备份位置：`/var/backups/stacio/nginx.conf.20260721-120000`。验证结果：服务为 active。可使用该备份回滚。",
+                commandProposals: []
+            )
+        ])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            backup: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "备份完成",
+                redactedCommand: backup,
+                metadata: ["terminalOutputSummary": "/var/backups/stacio/nginx.conf.20260721-120000"]
+            )],
+            mutation: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "nginx restarted",
+                redactedCommand: mutation,
+                metadata: ["terminalOutputSummary": "nginx restarted"]
+            )],
+            verification: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "active",
+                redactedCommand: verification,
+                metadata: ["terminalOutputSummary": "active"]
+            )]
+        ])
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: AIAssistantCoordinator(provider: provider, executionCoordinator: execution),
+            limits: AgentTaskLoopLimits(maxSteps: 4, maxDuration: 60)
+        )
+
+        let result = try await orchestrator.run(
+            goal: "更新 nginx 配置并重启",
+            context: AITerminalContext(runtimeID: "term_1", title: "prod", currentDirectory: "/srv/app", recentTranscript: "")
+        )
+
+        XCTAssertEqual(execution.commands, [backup, mutation, verification])
+        XCTAssertTrue(provider.requests[1].question.contains("禁止执行该变更"))
+        XCTAssertTrue(provider.requests[3].question.contains("备份位置：/var/backups/stacio/nginx.conf.20260721-120000"))
+        XCTAssertTrue(provider.requests[3].question.contains("备份与回滚"))
+        XCTAssertEqual(result.state, .completed)
+    }
+
+    func testVerificationPolicyRecognizesOperationalHealthChecks() {
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("systemctl is-active nginx"))
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("nginx -t"))
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("docker compose ps"))
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("kubectl rollout status deployment/api"))
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("curl -fsS http://127.0.0.1:8080/health"))
+        XCTAssertTrue(AgentVerificationPolicy.isVerificationCommand("psql app -c 'select 1'"))
+        XCTAssertFalse(AgentVerificationPolicy.isVerificationCommand("pwd"))
+        XCTAssertFalse(AgentVerificationPolicy.isVerificationCommand("systemctl restart nginx"))
+    }
+
+    func testFinalReportPolicyRequiresBackupPathRollbackAndVerificationForMutations() {
+        let steps = [AgentTaskStepResult(
+            requestID: "backup",
+            command: "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.20260721",
+            intent: "备份",
+            state: .completed,
+            events: [],
+            observation: "/var/backups/stacio/nginx.conf.20260721"
+        ), AgentTaskStepResult(
+            requestID: "mutation",
+            command: "systemctl restart nginx",
+            intent: "重启",
+            state: .completed,
+            events: [],
+            observation: "restarted"
+        ), AgentTaskStepResult(
+            requestID: "verify",
+            command: "systemctl is-active nginx",
+            intent: "验证",
+            state: .completed,
+            events: [],
+            observation: "active"
+        )]
+
+        XCTAssertFalse(AgentFinalReportPolicy.isCompliant(message: "nginx 已恢复。", steps: steps))
+        XCTAssertTrue(AgentFinalReportPolicy.isCompliant(
+            message: "## 备份与回滚\n\n备份位置：`/var/backups/stacio/nginx.conf.20260721`。验证结果：nginx 为 active。可使用该备份回滚。",
+            steps: steps
+        ))
+    }
+
+    func testAutonomousLoopRequiresVerificationEvidenceAfterMutationBeforeCompletion() async throws {
+        let backup = "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.20260721-130000"
+        let mutation = "systemctl restart nginx"
+        let verification = "systemctl is-active nginx"
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(
+                message: "先备份。",
+                commandProposals: [AgentCommandProposal(command: backup, explanation: "备份配置。", risk: .write)]
+            ),
+            AIAssistantResponse(
+                message: "执行重启。",
+                commandProposals: [AgentCommandProposal(command: mutation, explanation: "重启 nginx。", risk: .write)]
+            ),
+            AIAssistantResponse(message: "变更完成。", commandProposals: []),
+            AIAssistantResponse(
+                message: "验证服务状态。",
+                commandProposals: [AgentCommandProposal(command: verification, explanation: "确认 nginx 正常运行。", risk: .readOnly)]
+            ),
+            AIAssistantResponse(
+                message: "## 结果\n\nnginx 已恢复运行。\n\n## 备份与回滚\n\n备份位置：`/var/backups/stacio/nginx.conf.20260721-130000`。验证结果：服务为 active。可使用该备份回滚。",
+                commandProposals: []
+            )
+        ])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            backup: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "backup complete",
+                redactedCommand: backup,
+                metadata: ["terminalOutputSummary": "/var/backups/stacio/nginx.conf.20260721-130000"]
+            )],
+            mutation: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "restarted",
+                redactedCommand: mutation,
+                metadata: ["terminalOutputSummary": "restarted"]
+            )],
+            verification: [AgentTraceEvent(
+                requestID: "ignored",
+                state: .completed,
+                message: "active",
+                redactedCommand: verification,
+                metadata: ["terminalOutputSummary": "active"]
+            )]
+        ])
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: AIAssistantCoordinator(provider: provider, executionCoordinator: execution),
+            limits: AgentTaskLoopLimits(maxSteps: 5, maxDuration: 60)
+        )
+
+        let result = try await orchestrator.run(
+            goal: "重启 nginx 并确认服务正常",
+            context: AITerminalContext(runtimeID: "term_1", title: "prod", currentDirectory: "/srv/app", recentTranscript: "")
+        )
+
+        XCTAssertEqual(execution.commands, [backup, mutation, verification])
+        XCTAssertTrue(provider.requests[3].question.contains("变更后验证门禁"))
+        XCTAssertEqual(result.state, .completed)
+    }
+
+    func testAutonomousLoopRequestsRollbackWhenPostChangeVerificationFails() async throws {
+        let backup = "cp -a /etc/nginx/nginx.conf /var/backups/stacio/nginx.conf.20260721-140000"
+        let mutation = "systemctl restart nginx"
+        let verification = "systemctl is-active nginx"
+        let rollback = "cp -a /var/backups/stacio/nginx.conf.20260721-140000 /etc/nginx/nginx.conf"
+        let provider = SequencedAgentTaskProvider(responses: [
+            AIAssistantResponse(message: "创建备份。", commandProposals: [AgentCommandProposal(command: backup, explanation: "备份配置。", risk: .write)]),
+            AIAssistantResponse(message: "重启服务。", commandProposals: [AgentCommandProposal(command: mutation, explanation: "重启 nginx。", risk: .write)]),
+            AIAssistantResponse(message: "验证服务。", commandProposals: [AgentCommandProposal(command: verification, explanation: "检查状态。", risk: .readOnly)]),
+            AIAssistantResponse(message: "验证失败，恢复备份。", commandProposals: [AgentCommandProposal(command: rollback, explanation: "从备份恢复配置。", risk: .write)]),
+            AIAssistantResponse(message: "验证回滚结果。", commandProposals: [AgentCommandProposal(command: verification, explanation: "再次检查状态。", risk: .readOnly)]),
+            AIAssistantResponse(
+                message: "## 结果\n\n变更验证失败，已回滚。\n\n## 备份与回滚\n\n备份位置：`/var/backups/stacio/nginx.conf.20260721-140000`。回滚结果：已恢复。验证结果：服务为 active。",
+                commandProposals: []
+            )
+        ])
+        let execution = SequentialOutcomeAgentCommandExecutor(outcomes: [
+            backup: [.completed("/var/backups/stacio/nginx.conf.20260721-140000")],
+            mutation: [.completed("restarted")],
+            verification: [.failed("inactive"), .completed("active")],
+            rollback: [.completed("restored")]
+        ])
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: AIAssistantCoordinator(provider: provider, executionCoordinator: execution),
+            limits: AgentTaskLoopLimits(maxSteps: 7, maxDuration: 60)
+        )
+
+        let result = try await orchestrator.run(
+            goal: "更新 nginx 并确保失败时恢复",
+            context: AITerminalContext(runtimeID: "term_1", title: "prod", currentDirectory: "/srv/app", recentTranscript: "")
+        )
+
+        XCTAssertEqual(execution.commands, [backup, mutation, verification, rollback, verification])
+        XCTAssertTrue(provider.requests[3].question.contains("进入回滚流程"))
+        XCTAssertEqual(result.state, .completed)
+    }
+
     func testDefaultLoopLimitsAllowLongerStepwiseDiagnostics() {
         let limits = AgentTaskLoopLimits()
 
@@ -70,8 +358,11 @@ final class AgentTaskOrchestratorTests: XCTestCase {
         XCTAssertEqual(execution.commands, ["uptime"])
         XCTAssertEqual(provider.requests.count, 2)
         XCTAssertTrue(provider.requests[1].question.contains("load average: 0.08"))
-        XCTAssertTrue(provider.requests[1].question.contains("默认使用 1 至 3 个短句"))
-        XCTAssertTrue(provider.requests[1].question.contains("不要重复命令、执行步骤、完整日志或思考过程"))
+        XCTAssertFalse(provider.requests[1].question.contains("默认使用 1 至 3 个短句"))
+        XCTAssertTrue(provider.requests[1].question.contains("标准 Markdown 报告"))
+        XCTAssertTrue(provider.requests[1].question.contains("至少包含结论、关键证据和风险/状态"))
+        XCTAssertTrue(provider.requests[1].question.contains("适合表格时应主动使用 Markdown 表格"))
+        XCTAssertTrue(provider.requests[0].question.contains("只能写“初步判断”和“待验证项”"))
         XCTAssertEqual(result.state, .completed)
         XCTAssertEqual(result.steps.count, 1)
         XCTAssertEqual(result.steps.first?.state, .completed)
@@ -613,6 +904,48 @@ final class AgentTaskOrchestratorTests: XCTestCase {
         XCTAssertEqual(plan.steps.map(\.command), ["uptime", "df -h"])
         XCTAssertEqual(plan.steps.map(\.intent), ["判断是否 CPU 压力。", "判断是否 IO 或空间问题。"])
         XCTAssertTrue(provider.requests.first?.question.contains("先产出一个多步计划") == true)
+        XCTAssertTrue(provider.requests.first?.question.contains("环境与依赖识别") == true)
+        XCTAssertTrue(provider.requests.first?.question.contains("备份 → 变更 → 验证 → 失败回滚") == true)
+    }
+
+    func testAutonomousLoopStopsBeforeThirdIdenticalCommand() async throws {
+        let repeated = AIAssistantResponse(
+            message: "继续重复检查。",
+            commandProposals: [
+                AgentCommandProposal(command: "uptime", explanation: "再次查看负载。", risk: .readOnly)
+            ]
+        )
+        let provider = SequencedAgentTaskProvider(responses: [repeated, repeated, repeated])
+        let execution = RequestRoutedAgentCommandExecutor(eventsByCommand: [
+            "uptime": [
+                AgentTraceEvent(
+                    requestID: "ignored",
+                    state: .completed,
+                    message: "load average: 0.08",
+                    redactedCommand: "uptime",
+                    metadata: ["terminalOutputSummary": "load average: 0.08"]
+                )
+            ]
+        ])
+        let orchestrator = AgentTaskOrchestrator(
+            coordinator: AIAssistantCoordinator(provider: provider, executionCoordinator: execution),
+            limits: AgentTaskLoopLimits(maxSteps: 10, maxDuration: 60)
+        )
+
+        let result = try await orchestrator.run(
+            goal: "检查负载",
+            context: AITerminalContext(
+                runtimeID: "term_1",
+                title: "dev@example.com",
+                currentDirectory: nil,
+                recentTranscript: ""
+            )
+        )
+
+        XCTAssertEqual(execution.commands, ["uptime", "uptime"])
+        XCTAssertEqual(provider.requests.count, 3)
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertTrue(result.summary.contains("连续重复同一条命令"))
     }
 }
 
@@ -685,6 +1018,57 @@ private final class SequencedAgentTaskProvider: AIAssistantProviding {
         requests.append(request)
         let index = min(requests.count - 1, responses.count - 1)
         return responses[index]
+    }
+}
+
+@MainActor
+private final class SequentialOutcomeAgentCommandExecutor: AgentCommandStreamingExecuting {
+    enum Outcome {
+        case completed(String)
+        case failed(String)
+    }
+
+    private var outcomes: [String: [Outcome]]
+    private(set) var commands: [String] = []
+
+    init(outcomes: [String: [Outcome]]) {
+        self.outcomes = outcomes
+    }
+
+    func runCommand(_ request: AgentBridgeRequest) throws -> [AgentTraceEvent] {
+        try runCommand(request, emit: { _ in })
+    }
+
+    func runCommand(
+        _ request: AgentBridgeRequest,
+        emit: @escaping (AgentTraceEvent) -> Void
+    ) throws -> [AgentTraceEvent] {
+        guard case .runCommand(let run) = request.action else { return [] }
+        commands.append(run.command)
+        var queued = outcomes[run.command] ?? []
+        let outcome = queued.isEmpty ? .failed("missing outcome") : queued.removeFirst()
+        outcomes[run.command] = queued
+        let event: AgentTraceEvent
+        switch outcome {
+        case .completed(let output):
+            event = AgentTraceEvent(
+                requestID: request.id,
+                state: .completed,
+                message: output,
+                redactedCommand: run.command,
+                metadata: ["terminalOutputSummary": output]
+            )
+        case .failed(let output):
+            event = AgentTraceEvent(
+                requestID: request.id,
+                state: .failed,
+                message: output,
+                redactedCommand: run.command,
+                metadata: ["terminalOutputSummary": output]
+            )
+        }
+        emit(event)
+        return [event]
     }
 }
 

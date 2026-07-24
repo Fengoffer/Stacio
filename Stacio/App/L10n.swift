@@ -31,6 +31,7 @@ enum L10n {
         static let multiExec = "多执行"
         static let toggleSidebar = "显示/隐藏会话列表"
         static let toggleDeviceDashboard = "显示/隐藏设备看板"
+        static let documentation = "文档"
         static let feedback = "反馈"
         static let checkForUpdates = "检查更新"
         static let license = "License"
@@ -84,19 +85,20 @@ enum L10n {
         static let releaseNotes = "Release Notes"
 
         static let licenseTitle = "License"
-        static let licenseSubtitle = "在线验证 License 状态，离线授权文件会在本机完成签名与身份校验。"
+        static let licenseSubtitle = "在线激活 License；离线授权使用加密设备申请并在本机完成签名、设备和身份校验。"
         static let licenseStatus = "授权状态"
         static let licenseKey = "License Key"
         static let licenseUser = "用户名"
         static let licenseEmail = "邮箱"
-        static let licensePlan = "套餐"
+        static let licensePlan = "版本"
         static let licenseExpires = "到期"
         static let licenseGraceUntil = "宽限至"
-        static let licenseOfflineToken = "离线授权 token"
-        static let applyOfflineToken = "应用离线 token"
+        static let offlineExchangeAddress = "离线授权兑换地址"
+        static let offlineExchangeAddressPlaceholder = "待补充"
+        static let exportDeviceFingerprint = "导出设备指纹..."
         static let importOfflineLicenseFile = "导入离线授权文件..."
-        static let validateOnline = "在线校验"
-        static let licenseOnlineReserved = "在线校验将连接 Stacio 授权服务；设备指纹只作为激活/风险信号。"
+        static let validateOnline = "在线激活"
+        static let licenseOnlineReserved = "在线激活将连接 Stacio 授权服务；设备指纹只作为激活/风险信号。"
         static let licenseMissingIdentity = "请填写 License Key、用户名和邮箱。"
         static let licenseValidatingOnline = "正在在线校验 License..."
         static let licenseOnlineValidated = "在线授权校验完成。"
@@ -104,10 +106,26 @@ enum L10n {
             "在线校验完成，当前状态：\(status)。"
         }
         static let licenseTokenApplied = "离线授权已应用。"
+        static let licenseRevocationApplied = "离线授权已撤销。"
+        static func deviceFingerprintExported(source: String) -> String {
+            "设备指纹已导出（来源：\(source)）。请上传至离线授权兑换地址。"
+        }
         static let licenseFileImportFailedPrefix = "离线授权文件导入失败："
         static let licenseOnlineFailedPrefix = "在线校验失败："
         static let licenseTokenFailedPrefix = "离线授权失败："
-        static let licenseNoPrivateKey = "客户端不会保存私钥；签发、撤销和套餐权限由后端决定。"
+        static let licenseNoPrivateKey = "设备申请文件已加密；离线授权文件仅包含可公开验签的签名数据，后台私钥不会进入客户端。"
+
+        static let freePlanNoticeTitle = "当前使用的是免费版"
+        static let freePlanNoticeSubtitle = "当前未检测到有效的专业版或企业版 License，Stacio 将以免费版运行，部分功能不可用。导入有效授权后即可解锁完整功能。"
+        static let freePlanNoticeComparisonTitle = "免费版与专业版功能对比"
+        static let freePlanNoticeComparisonHelp = "免费版覆盖日常连接、终端、文件和基础 AI 工作流；专业版和企业版 License 可解锁批量执行、AI Agent、连接编排、监控和高级工作区。"
+        static let freePlanNoticeFeature = "功能"
+        static let freePlanNoticeFree = "免费版"
+        static let freePlanNoticeProfessional = "专业版"
+        static let freePlanNoticeIncluded = "支持"
+        static let freePlanNoticeUnavailable = "不支持"
+        static let freePlanNoticeGetLicense = "获取 License"
+        static let freePlanNoticeClose = "稍后处理"
     }
 
     enum Settings {
@@ -1329,6 +1347,7 @@ enum L10n {
         static let action = "导入"
         static let completeTitle = "导入完成"
         static let failedTitle = "导入失败"
+        static let licenseUnavailableTooltip = "该功能模块无有效授权，请升级授权。"
         static let header = "名称\t文件夹\t协议\t目标\t状态"
         static let nameColumn = "名称"
         static let folderColumn = "文件夹"
@@ -1342,6 +1361,8 @@ enum L10n {
         static let new = "新增"
         static func sourceTypeLabel(_ sourceType: SessionImportSourceType) -> String {
             switch sourceType {
+            case .bastionHost:
+                return "堡垒机"
             case .csv:
                 return "CSV 文件"
             case .legacyINI:

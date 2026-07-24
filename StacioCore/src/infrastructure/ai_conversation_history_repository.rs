@@ -4,7 +4,6 @@ use uuid::Uuid;
 
 use crate::domain::agent::AIConversationHistoryItemDraft;
 
-const MAX_HISTORY_ITEMS_PER_RUNTIME: i64 = 30;
 const MAX_HISTORY_CONTENT_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -51,7 +50,6 @@ impl AIConversationHistoryRepository {
                 record.created_at
             ],
         )?;
-        self.prune_runtime(&draft.runtime_id)?;
         Ok(record)
     }
 
@@ -77,21 +75,6 @@ impl AIConversationHistoryRepository {
         Ok(())
     }
 
-    fn prune_runtime(&self, runtime_id: &str) -> Result<(), rusqlite::Error> {
-        self.connection.execute(
-            "DELETE FROM ai_conversation_history
-             WHERE runtime_id = ?1
-               AND rowid NOT IN (
-                 SELECT rowid
-                 FROM ai_conversation_history
-                 WHERE runtime_id = ?1
-                 ORDER BY rowid DESC
-                 LIMIT ?2
-               )",
-            params![runtime_id, MAX_HISTORY_ITEMS_PER_RUNTIME],
-        )?;
-        Ok(())
-    }
 }
 
 fn read_ai_conversation_history_item(

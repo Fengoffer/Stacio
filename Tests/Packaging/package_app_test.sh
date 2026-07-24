@@ -20,6 +20,41 @@ MONACO_VS_DIR="$TMP_DIR/monaco-vs"
 OUT_DIR="$TMP_DIR/out"
 LOG_FILE="$TMP_DIR/tool-calls.log"
 ED25519_TEST_PUBLIC_KEY="PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw="
+TRUST_CONFIG="$TMP_DIR/license-trust-anchors.json"
+export STACIO_OFFLINE_LICENSE_EXCHANGE_URL="https://ops.example.test/offline-license/exchange"
+
+cat >"$TRUST_CONFIG" <<JSON
+{
+  "schemaVersion": 1,
+  "productID": "stacio",
+  "apiBaseURL": "https://ops.example.test",
+  "onlineAuthorization": {
+    "algorithm": "Ed25519",
+    "signatureKeyID": "online-test",
+    "publicKeyBase64": "$ED25519_TEST_PUBLIC_KEY"
+  },
+  "offlineLicense": {
+    "exchangeURL": "https://ops.example.test/offline-license/exchange",
+    "request": {
+      "protocol": "stacio-offline-request",
+      "version": 1,
+      "keyID": "offline-request-test",
+      "publicKeyBase64": "$ED25519_TEST_PUBLIC_KEY"
+    },
+    "authorization": {
+      "algorithm": "Ed25519",
+      "signatureKeyID": "offline-signing-test",
+      "publicKeyBase64": "$ED25519_TEST_PUBLIC_KEY"
+    }
+  },
+  "storage": {
+    "contractID": "stacio-license-vault-v1",
+    "schemaVersion": 1
+  }
+}
+JSON
+export STACIO_LICENSE_TRUST_ANCHORS_PATH="$TRUST_CONFIG"
+export STACIO_ALLOW_CUSTOM_LICENSE_TRUST_ANCHORS=1
 
 unset GITHUB_RUN_NUMBER
 
@@ -62,6 +97,7 @@ test ! -e "$SWIFTTERM_PATCH_TEST_SOURCE.orig"
 cat >"$SWIFT_BIN_DIR/Stacio" <<'EOF'
 #!/usr/bin/env bash
 echo "fake Stacio"
+echo "cn.stacio.product-ops.license stacio.product-ops.license. stacio-license-vault-v1 credentials.vault.json credentials.vault.key"
 EOF
 chmod +x "$SWIFT_BIN_DIR/Stacio"
 
@@ -192,10 +228,8 @@ expect_missing_product_ops_config_failure() {
   grep -Fq "STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG=1" "$failure_log"
 }
 
-expect_missing_product_ops_config_failure "STACIO_PRODUCT_OPS_API_BASE_URL"
 expect_missing_product_ops_config_failure "STACIO_FEEDBACK_PRODUCT_API_KEY"
 expect_missing_product_ops_config_failure "STACIO_SPARKLE_PUBLIC_ED_KEY"
-expect_missing_product_ops_config_failure "STACIO_LICENSE_PUBLIC_ED25519_KEY"
 
 expect_invalid_public_key_failure() {
   local invalid_name="$1"
@@ -362,6 +396,8 @@ IMPORT_ICON_SECURECRT="$APP_DIR/Contents/Resources/ImportSourceIcons/securecrt.s
 IMPORT_ICON_FINALSHELL="$APP_DIR/Contents/Resources/ImportSourceIcons/finalshell.svg"
 IMPORT_ICON_TERMIUS="$APP_DIR/Contents/Resources/ImportSourceIcons/termius.svg"
 IMPORT_ICON_ELECTERM="$APP_DIR/Contents/Resources/ImportSourceIcons/electerm.svg"
+LOCAL_AGENT_FONT="$APP_DIR/Contents/Resources/Fonts/SarasaTermSC-Regular.ttf"
+LOCAL_AGENT_FONT_LICENSE="$APP_DIR/Contents/Resources/Fonts/LICENSE.txt"
 MONACO_LOADER="$APP_DIR/Contents/Resources/MonacoEditor/vs/loader.js"
 ABOUT_QR="$APP_DIR/Contents/Resources/About/wechat-qrcode.jpg"
 ABOUT_WECHAT_ICON="$APP_DIR/Contents/Resources/About/wechat-official-account.svg"
@@ -404,6 +440,9 @@ test -s "$IMPORT_ICON_SECURECRT"
 test -s "$IMPORT_ICON_FINALSHELL"
 test -s "$IMPORT_ICON_TERMIUS"
 test -s "$IMPORT_ICON_ELECTERM"
+test -s "$LOCAL_AGENT_FONT"
+test -s "$LOCAL_AGENT_FONT_LICENSE"
+cmp -s "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf" "$LOCAL_AGENT_FONT"
 if /usr/bin/xattr -lr "$APP_DIR/Contents/Resources/ImportSourceIcons" \
   | grep -Eq 'com\.apple\.(FinderInfo|ResourceFork)'; then
   echo "import source icon resources contain signing-incompatible extended attributes" >&2
@@ -452,6 +491,14 @@ grep -q '<string>0.13.3</string>' "$PLIST"
 /usr/libexec/PlistBuddy -c "Print :StacioSparkleBetaAppcastURL" "$PLIST" | grep -Fq "/beta/arm64/appcast.xml"
 /usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$PLIST" | grep -Fq "$ED25519_TEST_PUBLIC_KEY"
 /usr/libexec/PlistBuddy -c "Print :StacioLicensePublicEd25519Key" "$PLIST" | grep -Fq "$ED25519_TEST_PUBLIC_KEY"
+/usr/libexec/PlistBuddy -c "Print :StacioOnlineLicenseSignatureKeyID" "$PLIST" | grep -Fq "online-test"
+/usr/libexec/PlistBuddy -c "Print :StacioOfflineLicenseExchangeURL" "$PLIST" | grep -Fq "https://ops.example.test/offline-license/exchange"
+/usr/libexec/PlistBuddy -c "Print :StacioOfflineRequestKeyID" "$PLIST" | grep -Fq "offline-request-test"
+/usr/libexec/PlistBuddy -c "Print :StacioOfflineExchangePublicKey" "$PLIST" | grep -Fq "$ED25519_TEST_PUBLIC_KEY"
+/usr/libexec/PlistBuddy -c "Print :StacioOfflineSignatureKeyID" "$PLIST" | grep -Fq "offline-signing-test"
+/usr/libexec/PlistBuddy -c "Print :StacioOfflineLicensePublicKey" "$PLIST" | grep -Fq "$ED25519_TEST_PUBLIC_KEY"
+/usr/libexec/PlistBuddy -c "Print :StacioLicenseStorageContractID" "$PLIST" | grep -Fq "stacio-license-vault-v1"
+/usr/libexec/PlistBuddy -c "Print :StacioLicenseStorageSchemaVersion" "$PLIST" | grep -Fxq "1"
 /usr/libexec/PlistBuddy -c "Print :SUEnableAutomaticChecks" "$PLIST" | grep -Fq "true"
 /usr/libexec/PlistBuddy -c "Print :SUAutomaticallyUpdate" "$PLIST" | grep -Fq "false"
 /usr/libexec/PlistBuddy -c "Print :SUAllowsAutomaticUpdates" "$PLIST" | grep -Fq "false"
@@ -490,10 +537,8 @@ STACIO_CORE_LOAD_PATH="/old/build/libstacio_core.dylib" \
 STACIO_MONACO_VS_PATH="$MONACO_VS_DIR" \
 STACIO_OUTPUT_DIR="$OUT_DIR" \
 GITHUB_RUN_NUMBER="4321" \
-STACIO_PRODUCT_OPS_API_BASE_URL="https://ops.example.test" \
 STACIO_FEEDBACK_PRODUCT_API_KEY="public-feedback-key" \
 STACIO_SPARKLE_PUBLIC_ED_KEY="$ED25519_TEST_PUBLIC_KEY" \
-STACIO_LICENSE_PUBLIC_ED25519_KEY="$ED25519_TEST_PUBLIC_KEY" \
 "$ROOT_DIR/scripts/package-app.sh"
 /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST" | grep -Fxq "4321"
 

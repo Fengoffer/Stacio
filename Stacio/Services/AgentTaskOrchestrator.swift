@@ -27,6 +27,7 @@ public final class AgentTaskOrchestrator {
         goal: String,
         context: AITerminalContext,
         contextProvider: (() -> AITerminalContext?)? = nil,
+        conversationHistory: [AIAssistantConversationMessage] = [],
         attachments: [AIAssistantAttachment] = [],
         initialResponse: AIAssistantResponse? = nil,
         continuingFrom previousSteps: [AgentTaskStepResult] = [],
@@ -45,6 +46,9 @@ public final class AgentTaskOrchestrator {
         let stepLimit = steps.count + limits.maxSteps
         let runNamespace = UUID().uuidString.lowercased()
         let selectedTargetContexts = targetContextsProvider()
+        var rejectedMutationCount = 0
+        var rejectedCompletionCount = 0
+        var rejectedReportCount = 0
 
         while steps.count < stepLimit {
             if let stopState {
@@ -71,6 +75,7 @@ public final class AgentTaskOrchestrator {
                 response = try await ask(
                     question: loopQuestion(goal: goal, observations: observations, stepIndex: steps.count + 1),
                     context: currentContext,
+                    conversationHistory: conversationHistory,
                     attachments: attachments
                 )
             }
@@ -84,6 +89,48 @@ public final class AgentTaskOrchestrator {
                 onUpdate(.init(kind: .thinking, message: thought))
             }
             guard let proposal = response.commandProposals.first else {
+                if AgentVerificationPolicy.requiresVerification(in: steps) {
+                    rejectedCompletionCount += 1
+                    let guardrailObservation = [
+                        "变更后验证门禁：禁止结束任务，因为最后一次配置、部署或数据库变更之后还没有成功的专项验证证据。",
+                        "请返回一条最小只读验证命令，检查配置语法、服务状态、容器/工作负载状态、健康端点或数据库可用性，并以终端输出作为事实依据。",
+                        "验证失败时必须报告失败和回滚建议，不得宣称变更完成。"
+                    ].joined(separator: "\n")
+                    observations.append(guardrailObservation)
+                    onUpdate(.init(kind: .thinking, message: guardrailObservation))
+                    if rejectedCompletionCount >= 2 {
+                        let runResult = result(
+                            goal: goal,
+                            state: .failed,
+                            summary: "变更后验证门禁已连续阻止无证据完成，Stacio 已停止自动执行。",
+                            steps: steps
+                        )
+                        onUpdate(.init(kind: .failed, message: runResult.summary, result: runResult))
+                        return runResult
+                    }
+                    continue
+                }
+                if AgentFinalReportPolicy.isCompliant(message: response.message, steps: steps) == false {
+                    rejectedReportCount += 1
+                    let backupPath = AgentBackupPolicy.latestVerifiedBackup(in: steps)?.path ?? "未找到"
+                    let guardrailObservation = [
+                        "最终报告门禁：变更已经执行并验证，但当前答复缺少完整的备份与回滚信息。",
+                        "请重新输出标准 Markdown 最终报告，必须包含“备份与回滚”章节、准确备份位置 `\(backupPath)`、备份验证结果、变更后验证结果和可执行的回滚方法；commands 返回空数组。"
+                    ].joined(separator: "\n")
+                    observations.append(guardrailObservation)
+                    onUpdate(.init(kind: .thinking, message: guardrailObservation))
+                    if rejectedReportCount >= 2 {
+                        let runResult = result(
+                            goal: goal,
+                            state: .failed,
+                            summary: "最终报告连续缺少备份与回滚信息，Stacio 已停止自动执行。",
+                            steps: steps
+                        )
+                        onUpdate(.init(kind: .failed, message: runResult.summary, result: runResult))
+                        return runResult
+                    }
+                    continue
+                }
                 let runResult = result(
                     goal: goal,
                     state: .completed,
@@ -93,6 +140,39 @@ public final class AgentTaskOrchestrator {
                     steps: steps
                 )
                 onUpdate(.init(kind: .completed, message: runResult.summary, result: runResult))
+                return runResult
+            }
+            if AgentBackupPolicy.requiresBackup(command: proposal.command),
+               AgentRollbackPolicy.isRollbackCommand(proposal.command) == false,
+               AgentBackupPolicy.verifiedBackupForNextMutation(in: steps) == nil {
+                rejectedMutationCount += 1
+                let guardrailObservation = [
+                    "安全门禁：禁止执行该变更，因为当前任务尚无已成功且带明确路径的备份证据。",
+                    "请先返回一条创建备份的最小命令；备份必须使用带时间戳且不覆盖历史备份的明确路径，并在输出中打印该路径。",
+                    "备份失败时必须停止，不得继续配置修改、应用部署或数据库变更。"
+                ].joined(separator: "\n")
+                observations.append(guardrailObservation)
+                onUpdate(.init(kind: .thinking, message: guardrailObservation))
+                if rejectedMutationCount >= 2 {
+                    let runResult = result(
+                        goal: goal,
+                        state: .failed,
+                        summary: "备份安全门禁已连续阻止未备份的变更，Stacio 已停止自动执行。",
+                        steps: steps
+                    )
+                    onUpdate(.init(kind: .failed, message: runResult.summary, result: runResult))
+                    return runResult
+                }
+                continue
+            }
+            if Self.isRepeatedWithoutProgress(proposal.command, steps: steps) {
+                let runResult = result(
+                    goal: goal,
+                    state: .failed,
+                    summary: "AI 连续重复同一条命令且没有提出新的验证路径，Stacio 已停止自动执行。请检查现有输出或调整排查方向。",
+                    steps: steps
+                )
+                onUpdate(.init(kind: .failed, message: runResult.summary, result: runResult))
                 return runResult
             }
 
@@ -167,6 +247,19 @@ public final class AgentTaskOrchestrator {
             observations.append(observationBlock(for: step))
             onUpdate(.init(kind: .step, message: stepSummaryText(for: step), step: step))
 
+            if stepState == .failed,
+               AgentVerificationPolicy.isVerificationCommand(step.command),
+               let backup = AgentBackupPolicy.latestVerifiedBackup(in: steps) {
+                let recoveryObservation = [
+                    "变更后验证失败，进入回滚流程。",
+                    "已验证备份位置：\(backup.path)",
+                    "下一步只能提出基于该备份或平台原生 rollback/undo 的最小回滚命令；回滚完成后必须再次运行只读验证。"
+                ].joined(separator: "\n")
+                observations.append(recoveryObservation)
+                onUpdate(.init(kind: .thinking, message: recoveryObservation))
+                continue
+            }
+
             if let stopState = stopState ?? runState(for: stepState) {
                 let runResult = result(goal: goal, state: stopState, summary: summary(for: stopState), steps: steps)
                 onUpdate(.init(kind: updateKind(for: stopState), message: runResult.summary, result: runResult))
@@ -204,15 +297,23 @@ public final class AgentTaskOrchestrator {
     public func makePlan(
         goal: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage] = [],
         attachments: [AIAssistantAttachment] = []
     ) async throws -> AgentTaskPlan {
+        var planningLines = [
+            "先产出一个多步计划，暂时不要执行命令。",
+            "目标：\(goal)",
+            "计划先完成环境与依赖识别和只读基线；若包含配置、部署或数据库变更，步骤顺序必须是：备份 → 变更 → 验证 → 失败回滚。",
+            "每个变更步骤必须对应明确的备份位置、成功判据、验证命令和回滚方法。",
+            "请返回步骤列表、每步意图，以及可选命令。"
+        ]
+        if let guidance = AgentOperationalDomainClassifier.guidance(for: goal) {
+            planningLines.append(guidance)
+        }
         let response = try await ask(
-            question: [
-                "先产出一个多步计划，暂时不要执行命令。",
-                "目标：\(goal)",
-                "请返回步骤列表、每步意图，以及可选命令。"
-            ].joined(separator: "\n"),
+            question: planningLines.joined(separator: "\n"),
             context: context,
+            conversationHistory: conversationHistory,
             attachments: attachments
         )
         let steps = response.commandProposals.map {
@@ -284,12 +385,14 @@ public final class AgentTaskOrchestrator {
     private func ask(
         question: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage],
         attachments: [AIAssistantAttachment]
     ) async throws -> AIAssistantResponse {
         try await withCheckedThrowingContinuation { continuation in
             activeAIRequest = coordinator.askInBackground(
                 question: question,
                 context: context,
+                conversationHistory: conversationHistory,
                 attachments: attachments,
                 progress: { [weak self] message in
                     self?.onUpdate?(.init(kind: .thinking, message: message))
@@ -305,14 +408,31 @@ public final class AgentTaskOrchestrator {
         }
     }
 
+    private static func isRepeatedWithoutProgress(
+        _ command: String,
+        steps: [AgentTaskStepResult]
+    ) -> Bool {
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.isEmpty == false, steps.count >= 2 else { return false }
+        return steps.suffix(2).allSatisfy {
+            $0.command.trimmingCharacters(in: .whitespacesAndNewlines) == normalized
+        }
+    }
+
     private func loopQuestion(goal: String, observations: [String], stepIndex: Int) -> String {
         var lines = [
             "自主执行目标：\(goal)",
             "请根据已有观察决定第 \(stepIndex) 步。",
+            "在任何命令尚未执行或证据尚不充分时，message 只能写“初步判断”和“待验证项”，不得使用“最终结论”“任务完成”等确定性表述；需要只读核验时应说明核验目的。",
             "如果目标已经完成，commands 返回空数组，message 只写给用户的最终答复。",
-            "最终答复必须直接回答原始目标，默认使用 1 至 3 个短句；不要重复命令、执行步骤、完整日志或思考过程，只保留结论和必要的后续建议。",
+            "最终答复必须是排版完整、层次清晰的标准 Markdown 报告，并直接回答原始目标。至少包含结论、关键证据和风险/状态；仅在确有必要时补充后续建议。指标对比、资源状态或多对象结果适合表格时应主动使用 Markdown 表格。不要粘贴完整日志、重复全部执行步骤或暴露内部思考过程。",
+            "如果本次任务执行了配置、部署或数据库变更，最终 Markdown 必须包含“备份与回滚”章节，明确说明已完成备份、备份位置、验证结果和可执行的回滚方法。",
+            "执行任何变更后必须运行针对性的只读验证命令；没有成功验证证据时不得结束任务或宣称完成。",
             "如果还需要行动，只返回下一步最小必要命令。"
         ]
+        if let guidance = AgentOperationalDomainClassifier.guidance(for: goal) {
+            lines.append(guidance)
+        }
         if observations.isEmpty == false {
             lines.append("已执行步骤与观察（敏感信息已由 Stacio redaction 处理）：")
             lines.append(contentsOf: observations)
@@ -321,12 +441,17 @@ public final class AgentTaskOrchestrator {
     }
 
     private func observationBlock(for step: AgentTaskStepResult) -> String {
-        [
+        var lines = [
             "步骤 \(step.requestID)",
             "命令：\(step.command)",
             "状态：\(step.state.rawValue)",
             "观察：\(step.observation)"
-        ].joined(separator: "\n")
+        ]
+        if let backup = AgentBackupPolicy.latestVerifiedBackup(in: [step]) {
+            lines.append("备份位置：\(backup.path)")
+            lines.append("最终报告必须包含“备份与回滚”章节，并基于此路径给出回滚方法。")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func stepPreparationText(for proposal: AgentCommandProposal, stepIndex: Int) -> String {

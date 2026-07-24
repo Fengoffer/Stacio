@@ -65,8 +65,10 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
             return
         }
 
-        let alert = NSAlert(error: error)
+        let alert = NSAlert()
         alert.messageText = L10n.Import.failedTitle
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
         alert.addButton(withTitle: L10n.Common.ok)
         _ = alert.runModal()
     }

@@ -5,6 +5,7 @@ import StacioCoreBindings
 import UniformTypeIdentifiers
 
 public enum SessionImportSourceType: String, Sendable {
+    case bastionHost = "bastion_host"
     case csv
     case legacyINI = "legacy_ini"
     case stacioJSON = "stacio_json"
@@ -68,7 +69,8 @@ public enum AppKitSessionImportSourcePicker {
         .init(type: .finalShell, name: "FinalShell", hint: "conn 目录", symbolName: "folder", iconResourceName: "finalshell.svg"),
         .init(type: .termius, name: "Termius", hint: ".json", symbolName: "cloud", iconResourceName: "termius.svg"),
         .init(type: .electerm, name: "Electerm", hint: ".json", symbolName: "bolt.horizontal", iconResourceName: "electerm.svg"),
-        .init(type: .genericJSON, name: "JSON", hint: ".json", symbolName: "curlybraces", iconResourceName: nil)
+        .init(type: .genericJSON, name: "JSON", hint: ".json", symbolName: "curlybraces", iconResourceName: nil),
+        .init(type: .bastionHost, name: "堡垒机", hint: "厂商导出的连接文件", symbolName: "server.rack", iconResourceName: "bastion-host.png")
     ]
 }
 
@@ -117,6 +119,36 @@ enum SessionImportSourceIconCatalog {
         #else
         return nil
         #endif
+    }
+}
+
+enum SessionImportSourceAvailability {
+    static func configure(
+        _ item: NSMenuItem,
+        for source: SessionImportSourceDescriptor,
+        licenseAccess: any LicenseFeatureAccessProviding = LocalLicenseFeatureAccessProvider()
+    ) {
+        let feature: StacioLicensedFeature = source.type == .bastionHost ? .bastionHost : .sessionBulkIO
+        let isEnabled = licenseAccess.isEnabled(feature)
+        item.isEnabled = isEnabled
+        item.toolTip = isEnabled ? nil : L10n.Import.licenseUnavailableTooltip
+        item.setAccessibilityValue(isEnabled ? nil : L10n.Import.licenseUnavailableTooltip)
+    }
+}
+
+final class SessionImportMenuAvailabilityDelegate: NSObject, NSMenuDelegate {
+    static let shared = SessionImportMenuAvailabilityDelegate()
+
+    func menuWillOpen(_ menu: NSMenu) {
+        for item in menu.items {
+            guard let rawValue = item.representedObject as? String,
+                  let sourceType = SessionImportSourceType(rawValue: rawValue),
+                  let source = AppKitSessionImportSourcePicker.supportedSources.first(where: {
+                      $0.type == sourceType
+                  })
+            else { continue }
+            SessionImportSourceAvailability.configure(item, for: source)
+        }
     }
 }
 
@@ -304,6 +336,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
     private let credentialApplier: ExternalSessionCredentialApplying
     private let secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting
     private let importedPrivateKeyInstaller: SecureSessionTransferPrivateKeyInstalling
+    private let bastionHostAuthorizer: BastionHostFeatureAuthorizing
+    private let licensedFeatureAuthorizer: LicensedFeatureAuthorizing
     private let onImported: () -> Void
 
     public init(
@@ -314,6 +348,10 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         credentialApplier: ExternalSessionCredentialApplying = KeychainExternalSessionCredentialApplier(),
         secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting = AppKitSecureSessionTransferPassphrasePrompter(),
         importedPrivateKeyInstaller: SecureSessionTransferPrivateKeyInstalling = StacioImportedPrivateKeyInstaller(),
+        bastionHostAuthorizer: BastionHostFeatureAuthorizing = LicenseBastionHostFeatureAuthorizer(),
+        licensedFeatureAuthorizer: LicensedFeatureAuthorizing = LicenseFeatureAuthorizer(
+            accessProvider: UnrestrictedLicenseFeatureAccessProvider()
+        ),
         onImported: @escaping () -> Void = {}
     ) {
         self.databasePath = databasePath
@@ -323,6 +361,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         self.credentialApplier = credentialApplier
         self.secureSessionTransferPassphrasePrompter = secureSessionTransferPassphrasePrompter
         self.importedPrivateKeyInstaller = importedPrivateKeyInstaller
+        self.bastionHostAuthorizer = bastionHostAuthorizer
+        self.licensedFeatureAuthorizer = licensedFeatureAuthorizer
         self.onImported = onImported
     }
 
@@ -341,70 +381,74 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         sourceType requestedSourceType: SessionImportSourceType?,
         parentWindow: NSWindow?
     ) throws -> ImportApplyResult? {
-        do {
-            let file: SessionImportFile?
-            if let requestedSourceType {
-                file = try filePicker.pickImportFile(
-                    sourceType: requestedSourceType,
-                    parentWindow: parentWindow
-                )
-            } else {
-                file = try filePicker.pickImportFile(parentWindow: parentWindow)
-            }
-            guard let file,
-                  let preparedImport = try prepareImportFile(file, parentWindow: parentWindow)
-            else {
-                return nil
-            }
-            let importFile = preparedImport.file
-
-            let existingSessionNames = try core
-                .listAllSessionRecords(databasePath: databasePath)
-                .map(\.name)
-            let (sourceType, preview, externalPayload) = try makePreview(
-                for: importFile,
-                existingSessionNames: existingSessionNames
-            )
-            if let secureTransfer = preparedImport.secureTransfer,
-               secureTransferMatchesPreview(secureTransfer, preview: preview) == false {
-                throw SecureSessionTransferError.invalidPayload
-            }
-            guard presenter.confirmImport(
-                preview: preview,
-                sourceName: importFile.sourceName,
-                sourceType: sourceType,
-                parentWindow: parentWindow
-            ) else {
-                return nil
-            }
-            let result = try core.applySessionImport(
-                databasePath: databasePath,
-                sourceType: sourceType,
-                sourceName: importFile.sourceName,
-                preview: preview
-            )
-            if let secureTransfer = preparedImport.secureTransfer,
-               result.importedSessions.isEmpty == false {
-                try applySecureTransfer(
-                    secureTransfer,
-                    to: result.importedSessions
-                )
-            } else if let externalPayload, result.importedSessions.isEmpty == false {
-                try credentialApplier.applyCredentials(
-                    from: externalPayload,
-                    to: result.importedSessions,
-                    databasePath: databasePath
-                )
-            }
-            if result.report.importedCount > 0 {
-                onImported()
-            }
-            presenter.showImportResult(result, parentWindow: parentWindow)
-            return result
-        } catch {
-            presenter.showImportError(error, parentWindow: parentWindow)
-            throw error
+        try licensedFeatureAuthorizer.authorize(.sessionBulkIO)
+        if requestedSourceType == .bastionHost {
+            try bastionHostAuthorizer.authorizeBastionHostAccess()
         }
+        let file: SessionImportFile?
+        if let requestedSourceType {
+            file = try filePicker.pickImportFile(
+                sourceType: requestedSourceType,
+                parentWindow: parentWindow
+            )
+        } else {
+            file = try filePicker.pickImportFile(parentWindow: parentWindow)
+        }
+        guard let file,
+              let preparedImport = try prepareImportFile(file, parentWindow: parentWindow)
+        else {
+            return nil
+        }
+        let importFile = preparedImport.file
+
+        let existingSessionNames = try core
+            .listAllSessionRecords(databasePath: databasePath)
+            .map(\.name)
+        let (sourceType, preview, externalPayload) = try makePreview(
+            for: importFile,
+            existingSessionNames: existingSessionNames
+        )
+        if sourceType != .bastionHost,
+           let externalPayload,
+           BastionHostSessionDetector.containsBastionHostSession(externalPayload) {
+            try bastionHostAuthorizer.authorizeBastionHostAccess()
+        }
+        if let secureTransfer = preparedImport.secureTransfer,
+           secureTransferMatchesPreview(secureTransfer, preview: preview) == false {
+            throw SecureSessionTransferError.invalidPayload
+        }
+        guard presenter.confirmImport(
+            preview: preview,
+            sourceName: importFile.sourceName,
+            sourceType: sourceType,
+            parentWindow: parentWindow
+        ) else {
+            return nil
+        }
+        let result = try core.applySessionImport(
+            databasePath: databasePath,
+            sourceType: sourceType,
+            sourceName: importFile.sourceName,
+            preview: preview
+        )
+        if let secureTransfer = preparedImport.secureTransfer,
+           result.importedSessions.isEmpty == false {
+            try applySecureTransfer(
+                secureTransfer,
+                to: result.importedSessions
+            )
+        } else if let externalPayload, result.importedSessions.isEmpty == false {
+            try credentialApplier.applyCredentials(
+                from: externalPayload,
+                to: result.importedSessions,
+                databasePath: databasePath
+            )
+        }
+        if result.report.importedCount > 0 {
+            onImported()
+        }
+        presenter.showImportResult(result, parentWindow: parentWindow)
+        return result
     }
 
     private func prepareImportFile(
@@ -480,6 +524,13 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         existingSessionNames: [String]
     ) throws -> (SessionImportSourceType, ImportPreview, ExternalSessionImportPayload?) {
         switch file.sourceType {
+        case .bastionHost:
+            let payload = try bastionHostPayload(for: file)
+            return (
+                .bastionHost,
+                externalPreview(payload, existingSessionNames: existingSessionNames),
+                payload
+            )
         case .csv:
             return (
                 .csv,
@@ -589,6 +640,46 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         }
     }
 
+    private func bastionHostPayload(for file: SessionImportFile) throws -> ExternalSessionImportPayload {
+        if let sourceURL = file.sourceURL, sourceURL.hasDirectoryPath {
+            return try ExternalSessionImportParser.parseDirectory(
+                sourceURL,
+                sourceType: .xShell,
+                sourceName: file.sourceName
+            )
+        }
+
+        if let payload = try? BastionHostImportAdapter.parseManifest(file.contents) {
+            return payload
+        }
+
+        let preferredTypes: [SessionImportSourceType]
+        switch file.sourceURL?.pathExtension.lowercased() ?? "" {
+        case "xsh", "xts", "ini", "txt":
+            preferredTypes = [.xShell, .secureCRT]
+        case "xml":
+            preferredTypes = [.secureCRT, .xShell]
+        case "json":
+            preferredTypes = [.windTerm, .electerm, .termius]
+        default:
+            preferredTypes = [.xShell, .secureCRT, .windTerm, .electerm, .termius]
+        }
+        for sourceType in preferredTypes {
+            if let payload = try? ExternalSessionImportParser.parseText(
+                file.contents,
+                sourceType: sourceType,
+                sourceName: file.sourceName
+            ) {
+                return BastionHostImportAdapter.addingDetectedVendorMetadata(
+                    to: payload,
+                    sourceName: file.sourceName,
+                    contents: file.contents
+                )
+            }
+        }
+        throw ExternalSessionImportParserError.invalidFormat
+    }
+
     private func externalPreview(
         _ payload: ExternalSessionImportPayload,
         existingSessionNames: [String]
@@ -603,7 +694,7 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
                 port: session.port,
                 username: session.username,
                 privateKeyPath: session.privateKeyPath,
-                configJson: nil,
+                configJson: session.configJSON,
                 conflict: existing.contains(session.name.lowercased())
             )
         }
@@ -633,7 +724,7 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
             }
         }
         let panel = NSOpenPanel()
-        panel.canChooseDirectories = sourceType == .finalShell || sourceType == .xShell
+        panel.canChooseDirectories = sourceType == .finalShell || sourceType == .xShell || sourceType == .bastionHost
         panel.canChooseFiles = sourceType != .finalShell
         panel.allowsMultipleSelection = false
         panel.message = L10n.Import.chooseFile
@@ -662,6 +753,10 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
     private static func allowedContentTypes(for sourceType: SessionImportSourceType) -> [UTType] {
         let extensions: [String]
         switch sourceType {
+        case .bastionHost:
+            return [UTType.folder] + ["stacio-bastion", "xsh", "xts", "xml", "ini", "txt", "json"].compactMap {
+                UTType(filenameExtension: $0)
+            }
         case .stacioJSON, .genericJSON:
             extensions = ["json", SecureSessionTransfer.fileExtension]
         case .termius, .electerm:

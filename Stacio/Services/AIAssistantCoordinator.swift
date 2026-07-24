@@ -43,6 +43,7 @@ public final class AIAssistantCoordinator {
     public func ask(
         question: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage] = [],
         attachments: [AIAssistantAttachment] = []
     ) throws -> AIAssistantResponse {
         let settings = settingsStore.snapshot()
@@ -50,6 +51,7 @@ public final class AIAssistantCoordinator {
             provider: provider,
             question: question,
             context: context,
+            conversationHistory: conversationHistory,
             attachments: attachments,
             settings: settings,
             requestedSelection: modelSelectionSession.snapshot()
@@ -60,6 +62,7 @@ public final class AIAssistantCoordinator {
     public func askInBackground(
         question: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage] = [],
         attachments: [AIAssistantAttachment] = [],
         progress: @escaping (String) -> Void = { _ in },
         stream: @escaping (String) -> Void = { _ in },
@@ -79,6 +82,7 @@ public final class AIAssistantCoordinator {
             )
             let boundedContext = AITerminalContext(
                 runtimeID: context.runtimeID,
+                historyScopeID: context.historyScopeID,
                 title: context.title,
                 currentDirectory: context.currentDirectory,
                 recentTranscript: recentTranscript
@@ -89,6 +93,13 @@ public final class AIAssistantCoordinator {
             let aiRequest = AIAssistantRequest(
                 question: question,
                 context: boundedContext,
+                conversationHistory: Self.boundedConversationHistory(
+                    conversationHistory,
+                    characterLimit: Self.effectiveContextCharacterLimit(
+                        settings: settings,
+                        requestedSelection: requestedSelection
+                    )
+                ),
                 attachments: attachments
             )
             do {
@@ -129,6 +140,7 @@ public final class AIAssistantCoordinator {
         provider: AIAssistantProviding,
         question: String,
         context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage],
         attachments: [AIAssistantAttachment],
         settings: AppSettings,
         requestedSelection: AIModelSelection?
@@ -140,6 +152,7 @@ public final class AIAssistantCoordinator {
         )
         let boundedContext = AITerminalContext(
             runtimeID: context.runtimeID,
+            historyScopeID: context.historyScopeID,
             title: context.title,
             currentDirectory: context.currentDirectory,
             recentTranscript: recentTranscript
@@ -147,8 +160,37 @@ public final class AIAssistantCoordinator {
         return try provider.respond(to: AIAssistantRequest(
             question: question,
             context: boundedContext,
+            conversationHistory: boundedConversationHistory(
+                conversationHistory,
+                characterLimit: effectiveContextCharacterLimit(
+                    settings: settings,
+                    requestedSelection: requestedSelection
+                )
+            ),
             attachments: attachments
         ))
+    }
+
+    static func boundedConversationHistory(
+        _ history: [AIAssistantConversationMessage],
+        characterLimit: Int
+    ) -> [AIAssistantConversationMessage] {
+        let budget = max(0, min(12_000, characterLimit / 3))
+        guard budget > 0 else { return [] }
+        var selected: [AIAssistantConversationMessage] = []
+        var used = 0
+        for message in history.suffix(20).reversed() {
+            let redacted = AgentProtocolRedaction.redactPreservingLineBreaks(message.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard redacted.isEmpty == false else { continue }
+            let remaining = budget - used
+            guard remaining > 0 else { break }
+            let content = redacted.count <= remaining ? redacted : String(redacted.suffix(remaining))
+            selected.append(AIAssistantConversationMessage(role: message.role, content: content))
+            used += content.count
+            if content.count < redacted.count { break }
+        }
+        return selected.reversed()
     }
 
     static func effectiveRecentTranscript(

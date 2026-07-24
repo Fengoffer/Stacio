@@ -15,7 +15,7 @@ Stacio is a native macOS SSH client and remote operations workbench for managing
 
 ## 快速事实
 
-- **当前稳定版：** Stacio 0.13.5 Stable（构建号 247）
+- **当前稳定版：** Stacio 0.14.0 Stable（构建号 282）
 - **系统要求：** macOS 14 及以上。
 - **安装包：** 下载页分别提供 Apple Silicon 与 Intel Mac 版本，请按设备芯片选择。
 - **首次打开：** 当前安装包尚未经过 Apple 公证。若 macOS 拦截首次启动，请在 Finder 中右键 `Stacio.app`，再选择“打开”。

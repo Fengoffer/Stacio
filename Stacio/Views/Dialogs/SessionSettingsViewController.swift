@@ -457,6 +457,8 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     private let footerSeparator = NSBox()
     private let existingSession: SessionRecord?
     private let existingSerialConfigJSON: String?
+    private let licenseAccess: any LicenseFeatureAccessProviding
+    private var licenseAuthorizationObserver: NSObjectProtocol?
     private weak var testingSaveButton: NSButton?
     private var selectedProtocol: SessionSettingsProtocol = .ssh
     private var initialSerialAdvancedSelection: SerialAdvancedSelection?
@@ -485,10 +487,12 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         selectedFolderID: String?,
         draftFactory: SessionSidebarSessionDraftFactory,
         existingSerialConfigJSON: String? = nil,
-        serialDevicePathProvider: @escaping () -> [String] = SerialConnectionSupport.defaultDevicePaths
+        serialDevicePathProvider: @escaping () -> [String] = SerialConnectionSupport.defaultDevicePaths,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider()
     ) {
         self.existingSession = existingSession
         self.existingSerialConfigJSON = existingSerialConfigJSON
+        self.licenseAccess = licenseAccess
         selectedSessionIconID = SessionIconConfigCodec.iconID(from: existingSerialConfigJSON)
         sshForm = SessionSidebarSessionForm(
             existingSession: existingSession,
@@ -502,11 +506,26 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             selectedProtocol = existingProtocol
         }
         super.init(nibName: nil, bundle: nil)
+        licenseAuthorizationObserver = NotificationCenter.default.addObserver(
+            forName: .stacioLicenseAuthorizationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshProxyJumpModeFields()
+            }
+        }
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         nil
+    }
+
+    deinit {
+        if let licenseAuthorizationObserver {
+            NotificationCenter.default.removeObserver(licenseAuthorizationObserver)
+        }
     }
 
     override func viewDidAppear() {
@@ -1739,15 +1758,30 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     }
 
     private func refreshProxyJumpModeFields() {
+        let licensed = licenseAccess.isEnabled(.proxyJump)
         let mode = proxyJumpModePopup.titleOfSelectedItem
         let usesSavedSession = mode == L10n.SessionSettings.proxyJumpSavedSession
         let usesManual = mode == L10n.SessionSettings.proxyJumpManual
-        proxyJumpSessionIDField.isEnabled = usesSavedSession
-        proxyJumpHostField.isEnabled = usesManual
-        proxyJumpPortField.isEnabled = usesManual
-        proxyJumpUsernameField.isEnabled = usesManual
-        proxyJumpCredentialIDField.isEnabled = usesManual
-        proxyJumpPrivateKeyPathField.isEnabled = usesManual
+        proxyJumpModePopup.isEnabled = licensed
+        proxyJumpSessionIDField.isEnabled = licensed && usesSavedSession
+        proxyJumpHostField.isEnabled = licensed && usesManual
+        proxyJumpPortField.isEnabled = licensed && usesManual
+        proxyJumpUsernameField.isEnabled = licensed && usesManual
+        proxyJumpCredentialIDField.isEnabled = licensed && usesManual
+        proxyJumpPrivateKeyPathField.isEnabled = licensed && usesManual
+        let unavailableTooltip = licensed ? nil : L10n.Import.licenseUnavailableTooltip
+        for control in [
+            proxyJumpModePopup,
+            proxyJumpSessionIDField,
+            proxyJumpHostField,
+            proxyJumpPortField,
+            proxyJumpUsernameField,
+            proxyJumpCredentialIDField,
+            proxyJumpPrivateKeyPathField
+        ] {
+            control.toolTip = unavailableTooltip
+        }
+        proxyJumpHintLabel.toolTip = unavailableTooltip
     }
 
     @objc private func serialProfileChanged(_ sender: NSPopUpButton) {
@@ -2083,6 +2117,10 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         ]
     }
 
+    var isProxyJumpLicensedForTesting: Bool {
+        proxyJumpModePopup.isEnabled
+    }
+
     func setSerialAdvancedValuesForTesting(
         dataBits: String,
         stopBits: String,
@@ -2268,13 +2306,15 @@ final class SessionSettingsWindowController: NSWindowController, NSWindowDelegat
         draftFactory: SessionSidebarSessionDraftFactory,
         errorPresenter: SessionSidebarErrorPresenting,
         existingSerialConfigJSON: String? = nil,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         parentWindowProvider: @escaping () -> NSWindow?
     ) {
         settingsViewController = SessionSettingsViewController(
             existingSession: existingSession,
             selectedFolderID: selectedFolderID,
             draftFactory: draftFactory,
-            existingSerialConfigJSON: existingSerialConfigJSON
+            existingSerialConfigJSON: existingSerialConfigJSON,
+            licenseAccess: licenseAccess
         )
 
         let window = NSWindow(

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import StacioApp
@@ -51,6 +52,50 @@ final class LicenseRevalidationCoordinatorTests: XCTestCase {
             XCTAssertEqual(try store.load()?.status, .invalid)
             XCTAssertEqual(validator.requests.count, 0)
         }
+    }
+
+    func testOfflineAuthorizationRefreshTakesPriorityOverStoredOnlineActivation() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = makeStore()
+        let authorization = OfflineDeviceAuthorization(
+            productID: "stacio",
+            deviceID: "offline-device",
+            username: "Ada",
+            email: "ada@example.com",
+            plan: "professional",
+            entitlements: ["multi_exec"],
+            issuedAt: "2023-11-14T00:00:00.000Z",
+            expiresAt: "2026-11-14T00:00:00.000Z",
+            signatureKeyID: "offline-signing-test",
+            signature: "invalid-for-routing-test"
+        )
+        try store.saveActivationRecord(makeActivation())
+        try store.save(LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let validator = RecordingLicenseOnlineValidator(
+            result: .success(makeTerminalResponse(status: .revoked))
+        )
+        let offlineRefresher = RecordingOfflineLicenseStatusRefresher(
+            result: .failure(URLError(.notConnectedToInternet))
+        )
+        let coordinator = makeCoordinator(
+            store: store,
+            validator: validator,
+            offlineStatusRefresher: offlineRefresher,
+            now: now
+        )
+
+        _ = try await coordinator.revalidateOnLaunch()
+
+        XCTAssertEqual(offlineRefresher.requests, [authorization])
+        XCTAssertEqual(validator.requests.count, 0)
     }
 
     func testRateLimitIsRetriedBeforePersistingRevokedState() async throws {
@@ -129,6 +174,32 @@ final class LicenseRevalidationCoordinatorTests: XCTestCase {
         XCTAssertEqual(try store.load()?.status, .revoked)
     }
 
+    func testRevalidationReadsAndWritesPersistedLicenseOffMainThread() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let backend = ThreadRecordingCoordinatorLicenseKeychainBackend()
+        let store = LicenseKeychainStore(
+            backend: backend,
+            service: "cn.stacio.tests.license.revalidation.threading.\(UUID().uuidString)"
+        )
+        try store.saveActivationRecord(makeActivation())
+        try store.save(makeActiveState(now: now))
+        let coordinator = makeCoordinator(
+            store: store,
+            validator: RecordingLicenseOnlineValidator(
+                result: .success(makeTerminalResponse(status: .revoked))
+            ),
+            now: now
+        )
+        backend.resetThreadRecords()
+
+        _ = try await coordinator.revalidateOnLaunch()
+
+        XCTAssertFalse(backend.readThreads.isEmpty)
+        XCTAssertTrue(backend.readThreads.allSatisfy { $0 == false })
+        XCTAssertFalse(backend.saveThreads.isEmpty)
+        XCTAssertTrue(backend.saveThreads.allSatisfy { $0 == false })
+    }
+
     func testStaleRevalidationResponseDoesNotOverwriteNewerActivationState() async throws {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let store = makeStore()
@@ -168,6 +239,137 @@ final class LicenseRevalidationCoordinatorTests: XCTestCase {
 
     func testTimeoutPreservesSignedStateInsideGraceWindow() async throws {
         try await assertNetworkFailurePreservesGrace(URLError(.timedOut))
+    }
+
+    func testOfflineTerminalStatusErrorsDisableOfflineEntitlements() async throws {
+        let terminalCases: [(OfflineLicenseStatusErrorCode, LicenseStatus)] = [
+            (.licenseRevoked, .revoked),
+            (.licenseExpired, .expired),
+            (.deviceMismatch, .invalid),
+            (.bindingNotFound, .invalid),
+            (.authorizationSignatureInvalid, .invalid)
+        ]
+
+        for (code, expectedStatus) in terminalCases {
+            let now = Date(timeIntervalSince1970: 1_700_000_000)
+            let store = makeStore()
+            let authorization = makeOfflineAuthorization()
+            try store.save(LicenseState(
+                username: authorization.username,
+                email: authorization.email,
+                plan: authorization.plan,
+                permissions: authorization.entitlements,
+                expiresAt: authorization.expirationDate(),
+                status: .offlineActive,
+                offlineDeviceAuthorization: authorization
+            ))
+            let refresher = RecordingOfflineLicenseStatusRefresher(result: .failure(
+                ProductOpsError.backend(
+                    code: code.rawValue,
+                    message: code.rawValue,
+                    requestID: "req-\(code.rawValue)",
+                    statusCode: 409
+                )
+            ))
+            let coordinator = makeCoordinator(
+                store: store,
+                validator: RecordingLicenseOnlineValidator(
+                    result: .success(makeTerminalResponse(status: .revoked))
+                ),
+                offlineStatusRefresher: refresher,
+                now: now
+            )
+
+            let outcome = try await coordinator.revalidateOnLaunch()
+
+            guard case .refreshed(let state) = outcome else {
+                return XCTFail("Expected terminal state for \(code), got \(outcome)")
+            }
+            XCTAssertEqual(state.status, expectedStatus, "Unexpected state for \(code)")
+            XCTAssertTrue(state.permissions.isEmpty, "Entitlements survived \(code)")
+            XCTAssertNil(state.offlineDeviceAuthorization, "Offline authorization survived \(code)")
+            XCTAssertEqual(state.lastAuthorizationSyncErrorCode, code.rawValue)
+            XCTAssertFalse(state.enables(.multiExec, at: now))
+            XCTAssertEqual(try store.load()?.status, expectedStatus)
+        }
+    }
+
+    func testOfflineStatusServerFailurePreservesAuthorizationSnapshot() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = makeStore()
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let authorization = try makeSignedOfflineAuthorization(signingKey: signingKey)
+        let existing = LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        )
+        try store.save(existing)
+        let refresher = RecordingOfflineLicenseStatusRefresher(result: .failure(
+            ProductOpsError.backend(
+                code: "OFFLINE_STATUS_TEMPORARY",
+                message: "服务暂时不可用",
+                requestID: "req-offline-503",
+                statusCode: 503
+            )
+        ))
+        let coordinator = makeCoordinator(
+            store: store,
+            validator: RecordingLicenseOnlineValidator(
+                result: .success(makeTerminalResponse(status: .revoked))
+            ),
+            offlineStatusRefresher: refresher,
+            licenseService: LicenseService(
+                store: store,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: "offline-signing-test",
+                    fingerprintProvider: StacioDeviceFingerprintProvider(
+                        fixedDeviceID: String(repeating: "a", count: 64)
+                    )
+                )
+            ),
+            now: now
+        )
+
+        let outcome = try await coordinator.revalidateOnLaunch()
+
+        guard case .networkUnavailable(let state) = outcome else {
+            return XCTFail("Expected networkUnavailable outcome, got \(outcome)")
+        }
+        XCTAssertEqual(state.status, .offlineActive)
+        XCTAssertEqual(state.permissions, existing.permissions)
+        XCTAssertEqual(state.offlineDeviceAuthorization, authorization)
+        XCTAssertNil(state.lastAuthorizationSyncErrorCode)
+        XCTAssertEqual(try store.load(), existing)
+    }
+
+    func testTerminalOfflineStatusErrorBlocksAutomaticOnlineFallbackUntilReimport() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let store = makeStore()
+        try store.save(makeActiveState(now: now))
+        try store.saveActivationRecord(makeActivation())
+        var state = try XCTUnwrap(store.load())
+        state.status = .invalid
+        state.permissions = []
+        state.lastAuthorizationSyncErrorCode = OfflineLicenseStatusErrorCode.deviceMismatch.rawValue
+        try store.save(state)
+        let validator = RecordingLicenseOnlineValidator(
+            result: .success(makeTerminalResponse(status: .active))
+        )
+        let coordinator = makeCoordinator(store: store, validator: validator, now: now)
+
+        let outcome = try await coordinator.revalidateOnLaunch()
+
+        guard case .refreshed(let refreshed) = outcome else {
+            return XCTFail("Expected persisted terminal state, got \(outcome)")
+        }
+        XCTAssertEqual(refreshed.status, .invalid)
+        XCTAssertEqual(validator.requests.count, 0)
     }
 
     func testOfflineWithoutStoredStateMarksNetworkUnavailable() async throws {
@@ -385,6 +587,24 @@ private final class SequencedLicenseOnlineValidator: LicenseOnlineValidating {
     }
 }
 
+private final class RecordingOfflineLicenseStatusRefresher: OfflineLicenseStatusRefreshing {
+    let result: Result<OfflineDeviceAuthorization, Error>
+    private(set) var requests: [OfflineDeviceAuthorization] = []
+
+    init(result: Result<OfflineDeviceAuthorization, Error>) {
+        self.result = result
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        requests.append(authorization)
+        return try result.get()
+    }
+}
+
 private actor GatedLicenseOnlineValidator: LicenseOnlineValidating {
     private let gate: RevalidationTestGate
     private let response: LicenseValidationResponse
@@ -432,6 +652,8 @@ private func makeStore() -> LicenseKeychainStore {
 private func makeCoordinator(
     store: LicenseKeychainStore,
     validator: LicenseOnlineValidating,
+    offlineStatusRefresher: OfflineLicenseStatusRefreshing? = nil,
+    licenseService: LicenseService? = nil,
     now: Date = Date(timeIntervalSince1970: 1_700_000_000),
     retryPolicy: ProductOpsRetryPolicy = .immediate(maxAttempts: 3),
     sleepForNanoseconds: @escaping (UInt64) async throws -> Void = { _ in }
@@ -450,11 +672,12 @@ private func makeCoordinator(
     )
     return LicenseRevalidationCoordinator(
         store: store,
-        service: LicenseService(
+        service: licenseService ?? LicenseService(
             store: store,
             signedTokenVerifier: CoordinatorSignedTokenVerifier(claims: claims)
         ),
         onlineValidator: validator,
+        offlineStatusRefresher: offlineStatusRefresher,
         contextProvider: {
             LicenseRevalidationContext(
                 appVersion: "0.13.2-Beta",
@@ -482,6 +705,43 @@ private func makeActivation() -> LicenseActivationRecord {
         licenseKey: "STACIO-SECRET-KEY",
         username: "Ada",
         email: "ada@example.com"
+    )
+}
+
+private func makeOfflineAuthorization() -> OfflineDeviceAuthorization {
+    OfflineDeviceAuthorization(
+        productID: "stacio",
+        platform: "macos",
+        deviceID: String(repeating: "a", count: 64),
+        username: "Ada",
+        email: "ada@example.com",
+        plan: "professional",
+        entitlements: ["multi_exec", "ai_agent"],
+        issuedAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2027-01-01T00:00:00.000Z",
+        signatureKeyID: "offline-signing-test",
+        signature: "invalid-for-routing-test"
+    )
+}
+
+private func makeSignedOfflineAuthorization(
+    signingKey: Curve25519.Signing.PrivateKey
+) throws -> OfflineDeviceAuthorization {
+    let unsigned = makeOfflineAuthorization()
+    let signature = try signingKey.signature(for: unsigned.canonicalSignedPayload())
+    return OfflineDeviceAuthorization(
+        productID: unsigned.productID,
+        platform: unsigned.platform,
+        deviceID: unsigned.deviceID,
+        username: unsigned.username,
+        email: unsigned.email,
+        plan: unsigned.plan,
+        entitlements: unsigned.entitlements,
+        issuedAt: unsigned.issuedAt,
+        expiresAt: unsigned.expiresAt,
+        signatureKeyID: unsigned.signatureKeyID,
+        status: unsigned.status,
+        signature: signature.base64EncodedString()
     )
 }
 
@@ -530,5 +790,52 @@ private final class CoordinatorInMemoryLicenseKeychainBackend: LicenseKeychainBa
 
     func delete(service: String, account: String) throws {
         values.removeValue(forKey: account)
+    }
+}
+
+private final class ThreadRecordingCoordinatorLicenseKeychainBackend: LicenseKeychainBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    private var recordedReads: [Bool] = []
+    private var recordedSaves: [Bool] = []
+
+    var readThreads: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedReads
+    }
+
+    var saveThreads: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedSaves
+    }
+
+    func resetThreadRecords() {
+        lock.lock()
+        recordedReads.removeAll()
+        recordedSaves.removeAll()
+        lock.unlock()
+    }
+
+    func save(_ data: Data, service: String, account: String) throws {
+        lock.lock()
+        recordedSaves.append(Thread.isMainThread)
+        values[account] = data
+        lock.unlock()
+    }
+
+    func read(service: String, account: String) throws -> Data? {
+        lock.lock()
+        recordedReads.append(Thread.isMainThread)
+        let value = values[account]
+        lock.unlock()
+        return value
+    }
+
+    func delete(service: String, account: String) throws {
+        lock.lock()
+        values.removeValue(forKey: account)
+        lock.unlock()
     }
 }

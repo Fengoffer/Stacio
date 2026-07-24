@@ -12,6 +12,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let operationsPresenter: SessionSidebarOperationsPresenting
     private let errorPresenter: SessionSidebarErrorPresenting
     private let credentialCleaner: SessionSidebarCredentialCleaning?
+    private let onDeleteSessionHistory: (String) -> Void
     private let remoteEditCacheCleaner: RemoteEditSessionCacheClearing?
     private let hostPinger: SessionSidebarHostPinging
     private let shortcutCreator: SessionSidebarShortcutCreating
@@ -22,6 +23,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
     private let settingsStore: AppSettingsStore
+    private let licenseAccess: any LicenseFeatureAccessProviding
     private var activePingRuns: [String: SessionSidebarPingRunning] = [:]
     private var activePingPresenters: [String: SessionSidebarPingProgressPresenting] = [:]
     private var allNodes: [NSObject] = []
@@ -34,6 +36,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private weak var expandAllButton: NSButton?
     private weak var collapseAllButton: NSButton?
     private weak var clipboardSuggestionBanner: SessionSidebarClipboardSuggestionBannerView?
+    private weak var updateStatusContainer: NSView?
+    private weak var updateStatusLabel: NSTextField?
+    private var updateStatusHeightConstraint: NSLayoutConstraint?
+    private var sessionTreeBottomConstraint: NSLayoutConstraint?
     private var currentClipboardSuggestion: QuickConnectParsedSSHCommand?
     private var clipboardDismissWorkItem: DispatchWorkItem?
     private var appActivationObserver: NSObjectProtocol?
@@ -50,6 +56,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         errorPresenter: SessionSidebarErrorPresenting? = nil,
         credentialCleaner: SessionSidebarCredentialCleaning? = nil,
         remoteEditCacheCleaner: RemoteEditSessionCacheClearing? = RemoteEditCache.defaultCache(),
+        onDeleteSessionHistory: @escaping (String) -> Void = { _ in },
         hostPinger: SessionSidebarHostPinging = SystemSessionSidebarHostPinger(),
         shortcutCreator: SessionSidebarShortcutCreating = WeblocSessionSidebarShortcutCreator(),
         defaultPresetStore: SessionSidebarDefaultPresetStoring = UserDefaultsSessionSidebarDefaultPresetStore(),
@@ -58,7 +65,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting = AppKitSecureSessionTransferPassphrasePrompter(),
         quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore = QuickConnectPromptPrefillStore(),
         clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
-        settingsStore: AppSettingsStore = .shared
+        settingsStore: AppSettingsStore = .shared,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider()
     ) {
         self.sessionStore = sessionStore
         self.onOpenSession = onOpenSession
@@ -67,6 +75,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.operationsPresenter = operationsPresenter ?? AppKitSessionSidebarOperationsPresenter()
         self.errorPresenter = errorPresenter ?? AppKitSessionSidebarErrorPresenter()
         self.credentialCleaner = credentialCleaner
+        self.onDeleteSessionHistory = onDeleteSessionHistory
         self.remoteEditCacheCleaner = remoteEditCacheCleaner
         self.hostPinger = hostPinger
         self.shortcutCreator = shortcutCreator
@@ -77,6 +86,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.quickConnectPromptPrefillStore = quickConnectPromptPrefillStore
         self.clipboardDismissalStore = clipboardDismissalStore
         self.settingsStore = settingsStore
+        self.licenseAccess = licenseAccess
         showsRecentSessions = settingsStore.snapshot().sessionSidebarShowRecentSessions
         super.init(nibName: nil, bundle: nil)
     }
@@ -219,8 +229,37 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         sessionTree.setAccessibilityIdentifier("Stacio.Sidebar.a2SessionTree")
         sessionTree.translatesAutoresizingMaskIntoConstraints = false
 
+        let updateStatus = NSView()
+        updateStatus.translatesAutoresizingMaskIntoConstraints = false
+        updateStatus.wantsLayer = true
+        updateStatus.layer?.cornerRadius = 12
+        updateStatus.layer?.backgroundColor = StacioDesignSystem.theme.warningColor.cgColor
+        updateStatus.isHidden = true
+        updateStatus.setAccessibilityIdentifier("Stacio.Sidebar.updateStatus")
+        let updateLabel = NSTextField(labelWithString: "")
+        updateLabel.translatesAutoresizingMaskIntoConstraints = false
+        updateLabel.alignment = .center
+        updateLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        updateLabel.textColor = .white
+        updateLabel.lineBreakMode = .byTruncatingTail
+        updateLabel.setAccessibilityIdentifier("Stacio.Sidebar.updateStatusLabel")
+        updateStatus.addSubview(updateLabel)
+        let updateStatusHeightConstraint = updateStatus.heightAnchor.constraint(equalToConstant: 0)
+        self.updateStatusHeightConstraint = updateStatusHeightConstraint
+        NSLayoutConstraint.activate([
+            updateLabel.leadingAnchor.constraint(equalTo: updateStatus.leadingAnchor, constant: 10),
+            updateLabel.trailingAnchor.constraint(equalTo: updateStatus.trailingAnchor, constant: -10),
+            updateLabel.centerYAnchor.constraint(equalTo: updateStatus.centerYAnchor),
+            updateStatusHeightConstraint
+        ])
+        updateStatusContainer = updateStatus
+        updateStatusLabel = updateLabel
+
         container.addSubview(header)
         container.addSubview(sessionTree)
+        container.addSubview(updateStatus)
+        let sessionTreeBottomConstraint = sessionTree.bottomAnchor.constraint(equalTo: updateStatus.topAnchor)
+        self.sessionTreeBottomConstraint = sessionTreeBottomConstraint
         NSLayoutConstraint.activate([
             header.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -229,7 +268,11 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             sessionTree.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             sessionTree.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             sessionTree.topAnchor.constraint(equalTo: header.bottomAnchor),
-            sessionTree.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            sessionTreeBottomConstraint,
+
+            updateStatus.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            updateStatus.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            updateStatus.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
 
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
@@ -250,6 +293,26 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     public var outlineRootCount: Int {
         nodes.count
+    }
+
+    public func updateUpdateStatus(_ state: SparkleUpdateButtonState) {
+        let isVisible: Bool
+        switch state {
+        case .downloading, .extracting, .installing, .failed:
+            isVisible = true
+        case .hidden, .available:
+            isVisible = false
+        }
+        updateStatusLabel?.stringValue = state.title
+        updateStatusContainer?.layer?.backgroundColor = {
+            if case .failed = state {
+                return StacioDesignSystem.theme.dangerColor.cgColor
+            }
+            return StacioDesignSystem.theme.warningColor.cgColor
+        }()
+        updateStatusHeightConstraint?.constant = isVisible ? 24 : 0
+        sessionTreeBottomConstraint?.constant = isVisible ? -8 : 0
+        updateStatusContainer?.isHidden = !isVisible
     }
 
     public var sessionOutlineTextSnapshot: String {
@@ -1405,6 +1468,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func exportSessions() {
+        guard licenseAccess.isEnabled(.sessionBulkIO) else { return }
         guard let sessionStore,
               let destinationURL = operationsPresenter.chooseExportDestination(
                 suggestedName: L10n.Sidebar.exportSessionsSuggestedName,
@@ -1492,6 +1556,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func exportFolder(_ folderNode: SessionSidebarFolderNode) {
+        guard licenseAccess.isEnabled(.sessionBulkIO) else { return }
         guard let sessionStore,
               let folder = folderNode.folder,
               let destinationURL = operationsPresenter.chooseFolderExportDestination(
@@ -1531,6 +1596,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         guard let sessionStore else { return }
         for session in sessions {
             try sessionStore.deleteSession(id: session.id)
+            onDeleteSessionHistory(session.id)
             do {
                 try remoteEditCacheCleaner?.clearSession(sessionID: session.id)
             } catch {
@@ -1837,8 +1903,16 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 sessionsByFolderID: sessionsByFolderID,
                 orderByParentID: orderByParentID
             )
-            let virtualNodes = virtualSessionNodes(from: loadedSessions).map { $0 as NSObject }
-            return virtualNodes + loadedNodes
+            let rootSessions = loadedNodes.compactMap { $0 as? SessionSidebarSessionNode }
+            let rootFolders = loadedNodes.filter { $0 is SessionSidebarFolderNode }
+            let virtualNodes = virtualSessionNodes(
+                from: loadedSessions,
+                ungroupedSessions: rootSessions
+            ).map { $0 as NSObject }
+            if showsRecentSessions {
+                return virtualNodes + rootFolders
+            }
+            return virtualNodes + rootSessions.map { $0 as NSObject } + rootFolders
         } catch {
             manualSessionIconIDs = [:]
             return []
@@ -1911,8 +1985,13 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return children
     }
 
-    private func virtualSessionNodes(from sessions: [SessionRecord]) -> [SessionSidebarFolderNode] {
-        let recent = recentSessionNodes(from: sessions)
+    private func virtualSessionNodes(
+        from sessions: [SessionRecord],
+        ungroupedSessions: [SessionSidebarSessionNode]
+    ) -> [SessionSidebarFolderNode] {
+        var recent = recentSessionNodes(from: sessions)
+        let recentIDs = Set(recent.map { $0.session.id })
+        recent.append(contentsOf: ungroupedSessions.filter { !recentIDs.contains($0.session.id) })
         let favorites = sessions.filter { session in
             session.tags.contains { tag in
                 let normalized = tag.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

@@ -22,6 +22,35 @@ final class ProductOpsServicesTests: XCTestCase {
         XCTAssertEqual(configuration.betaAppcastURL?.absoluteString, "https://ops.stacio.cn/updates/stacio/beta/appcast.xml")
     }
 
+    func testConfigurationDefaultsToProductionLicenseTrustAnchors() throws {
+        let defaults = try makeProductOpsDefaults()
+        let configuration = ProductOpsConfigurationStore(
+            defaults: defaults,
+            environment: [:],
+            bundleInfo: [:]
+        ).load()
+
+        XCTAssertEqual(
+            configuration.licensePublicKeyBase64,
+            "vDKaOq0LGT5s3km7DzuPXxjmJPOnGrXbGRBDrlQ/Glg="
+        )
+        XCTAssertEqual(configuration.onlineLicenseSignatureKeyID, "online-license-signing-2026-01")
+        XCTAssertEqual(
+            configuration.offlineLicenseExchangeURL?.absoluteString,
+            "https://ops.stacio.cn/api/v1/public/products/stacio/offline-license/exchange"
+        )
+        XCTAssertEqual(
+            configuration.offlineExchangePublicKeyBase64,
+            "EKuNUsbkqkkRJ3B5Q69RQ2UWdjirgMyMKxfB9KO0fFQ="
+        )
+        XCTAssertEqual(configuration.offlineRequestKeyID, "offline-encryption-2026-01")
+        XCTAssertEqual(configuration.offlineSignatureKeyID, "offline-signing-2026-01")
+        XCTAssertEqual(
+            configuration.offlineAuthorizationPublicKeyBase64,
+            "yGh4lpWhGxrhjFKGBjtNGy1+trm9yOOxwF3+LUmzbWc="
+        )
+    }
+
     func testConfigurationLoadsPackagedInfoPlistValues() throws {
         let defaults = try makeProductOpsDefaults()
         let configuration = ProductOpsConfigurationStore(

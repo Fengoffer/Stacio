@@ -5,8 +5,13 @@ import Sparkle
 protocol WorkbenchWindowShowing: AnyObject {
     func showWindow(_ sender: Any?)
     func openSavedSession(id: String)
+    func openBastionHostConnection(_ request: BastionHostDeepLinkRequest)
     func toggleDeviceDashboardFromMenu(_ sender: Any?)
     func prepareForApplicationTermination() -> Bool
+}
+
+extension WorkbenchWindowShowing {
+    func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {}
 }
 
 extension WorkbenchWindowController: WorkbenchWindowShowing {
@@ -23,9 +28,10 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.13.5"
+    private static let fallbackDisplayVersion = "Stacio-0.14.0"
     public static var displayVersion: String { displayVersion(in: .main) }
     public static let websiteURL = "https://www.stacio.cn/"
+    public static let documentationURL = "https://www.stacio.cn/wiki/"
     public static let repositoryURL = "https://github.com/Fengoffer/Stacio"
     public static let giteeRepositoryURL = "https://gitee.com/fengoffer/Stacio"
     public static let supportedURLSchemes = Set(["stacio", "stacio"])
@@ -487,9 +493,13 @@ public final class AppKitInstalledUpdateReleaseNotesPresenter: InstalledUpdateRe
 
 extension String {
     func stacioPlainReleaseNotesForDisplay() -> String {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.range(of: "<[^>]+>", options: .regularExpression) != nil,
-              let data = trimmed.data(using: .utf8),
+        let decodedLineBreaks = replacingOccurrences(of: "\\r\\n", with: "\n")
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\r", with: "\n")
+        let trimmed = decodedLineBreaks.trimmingCharacters(in: .whitespacesAndNewlines)
+        let plainText: String
+        if trimmed.range(of: "<[^>]+>", options: .regularExpression) != nil,
+           let data = trimmed.data(using: .utf8),
               let attributed = try? NSAttributedString(
                 data: data,
                 options: [
@@ -497,11 +507,25 @@ extension String {
                     .characterEncoding: String.Encoding.utf8.rawValue
                 ],
                 documentAttributes: nil
-              )
-        else {
-            return trimmed
+              ) {
+            plainText = attributed.string
+        } else {
+            plainText = trimmed
         }
-        return attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let items = plainText
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard items.count > 1 else {
+            return items.first ?? ""
+        }
+        return items
+            .map { item in
+                let existingMarkers = ["• ", "- ", "* ", "– ", "— "]
+                return existingMarkers.contains(where: { item.hasPrefix($0) }) ? item : "• \(item)"
+            }
+            .joined(separator: "\n")
     }
 }
 
@@ -1348,7 +1372,7 @@ public struct AppKitRunningTunnelTerminationConfirmation: RunningTunnelTerminati
 }
 
 @MainActor
-public final class AppDelegate: NSObject, NSApplicationDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let workbenchWindowControllerFactory: () -> WorkbenchWindowShowing
     private let feedbackWindowControllerFactory: () -> FeedbackWindowController
     private let runningTunnelTerminationConfirmation: RunningTunnelTerminationConfirming
@@ -1358,22 +1382,37 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let licenseRevalidator: LicenseRevalidating?
     private let licenseNetworkMonitor: LicenseNetworkMonitoring?
     private let appLog: StacioLogWriting?
+    private let licenseAccess: any LicenseFeatureAccessProviding
+    private let licenseStateProvider: () -> LicenseState
+    private let shouldShowFreePlanNotice: Bool
+    private let hasValidLicense: @MainActor () -> Bool
+    private let freePlanNoticeWindowControllerFactory: @MainActor () -> FreePlanNoticeWindowController
+    private let loadPersistedLicenseForFreePlanNotice: Bool
     private var workbenchWindowController: WorkbenchWindowShowing?
     private var settingsWindowController: AppSettingsWindowController?
     private var feedbackWindowController: FeedbackWindowController?
     private var updatePromptWindowController: UpdatePromptWindowController?
     private var licenseWindowController: LicenseWindowController?
+    private var freePlanNoticeWindowController: FreePlanNoticeWindowController?
     private var agentBridgeServer: AgentBridgeServer?
     private var licenseRevalidationTask: Task<Void, Never>?
+    private var licenseRevalidationTimer: Timer?
+    private var licenseNetworkMonitoringStarted = false
+    private var licenseAuthorizationObserver: NSObjectProtocol?
+    private var freePlanNoticeEligibilityTask: Task<Void, Never>?
+    private var didEvaluateFreePlanNotice = false
 
     public override init() {
         let updateController = SparkleUpdateController.shared
-        let licenseConfiguration = ProductOpsConfigurationStore().load()
         let licenseStore = LicenseKeychainStore()
         let licenseService = LicenseService(store: licenseStore)
+        let licenseSnapshot = LicenseAuthorizationSnapshot.shared
+        let featureAccess = LocalLicenseFeatureAccessProvider()
+        let productOpsConfiguration = ProductOpsConfigurationStore().load()
         workbenchWindowControllerFactory = {
             WorkbenchWindowController(
                 workspaceViewController: WorkspaceViewController(),
+                licenseAccess: featureAccess,
                 sparkleUpdateController: updateController
             )
         }
@@ -1381,7 +1420,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             let configuration = ProductOpsConfigurationStore().load()
             return FeedbackWindowController(
                 configuration: configuration,
-                context: FeedbackDiagnosticContext.current(configuration: configuration)
+                context: FeedbackDiagnosticContext.current(
+                    configuration: configuration,
+                    licenseStatusProvider: {
+                        licenseSnapshot.currentState()?.status ?? .inactive
+                    }
+                )
             )
         }
         runningTunnelTerminationConfirmation = AppKitRunningTunnelTerminationConfirmation()
@@ -1391,11 +1435,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         licenseRevalidator = LicenseRevalidationCoordinator(
             store: licenseStore,
             service: licenseService,
-            onlineValidator: LicenseOnlineValidationService(configuration: licenseConfiguration),
+            onlineValidator: LicenseOnlineValidationService(configuration: productOpsConfiguration),
+            offlineStatusRefresher: OfflineLicenseStatusService(configuration: productOpsConfiguration),
             contextProvider: {
                 LicenseRevalidationContext(
-                    appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-                        ?? StacioAppMetadata.displayVersion,
+                    appVersion: StacioAppMetadata.displayVersion,
                     buildNumber: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "dev",
                     anonymousDeviceID: AnonymousDeviceIdentifierStore.shared.deviceID()
                 )
@@ -1403,7 +1447,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         licenseNetworkMonitor = NWPathLicenseNetworkMonitor()
         appLog = StacioLogStore.shared
+        licenseAccess = featureAccess
+        licenseStateProvider = { licenseSnapshot.currentState() ?? LicenseState() }
+        shouldShowFreePlanNotice = true
+        hasValidLicense = { true }
+        freePlanNoticeWindowControllerFactory = { FreePlanNoticeWindowController() }
+        loadPersistedLicenseForFreePlanNotice = true
         super.init()
+        observeLicenseAuthorizationSnapshot()
     }
 
     convenience init(factory: @escaping () -> WorkbenchWindowShowing) {
@@ -1430,15 +1481,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         installedUpdateReleaseNotesPresenter: InstalledUpdateReleaseNotesPresenting? = nil,
         licenseRevalidator: LicenseRevalidating? = nil,
         licenseNetworkMonitor: LicenseNetworkMonitoring? = nil,
+        licenseStateProvider: @escaping () -> LicenseState = { LicenseState() },
         feedbackWindowControllerFactory: (() -> FeedbackWindowController)? = nil,
-        appLog: StacioLogWriting? = nil
+        appLog: StacioLogWriting? = nil,
+        shouldShowFreePlanNotice: Bool = false,
+        hasValidLicense: @escaping @MainActor () -> Bool = { true },
+        freePlanNoticeWindowControllerFactory: @escaping @MainActor () -> FreePlanNoticeWindowController = {
+            FreePlanNoticeWindowController()
+        },
+        loadPersistedLicenseForFreePlanNotice: Bool = false
     ) {
         workbenchWindowControllerFactory = factory
         self.feedbackWindowControllerFactory = feedbackWindowControllerFactory ?? {
             let configuration = ProductOpsConfigurationStore().load()
             return FeedbackWindowController(
                 configuration: configuration,
-                context: FeedbackDiagnosticContext.current(configuration: configuration)
+                context: FeedbackDiagnosticContext.current(
+                    configuration: configuration,
+                    licenseStatusProvider: { licenseStateProvider().status }
+                )
             )
         }
         self.runningTunnelTerminationConfirmation = runningTunnelTerminationConfirmation
@@ -1448,20 +1509,51 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? AppKitInstalledUpdateReleaseNotesPresenter()
         self.licenseRevalidator = licenseRevalidator
         self.licenseNetworkMonitor = licenseNetworkMonitor
+        self.licenseStateProvider = licenseStateProvider
         self.appLog = appLog
+        self.shouldShowFreePlanNotice = shouldShowFreePlanNotice
+        self.hasValidLicense = hasValidLicense
+        self.freePlanNoticeWindowControllerFactory = freePlanNoticeWindowControllerFactory
+        self.loadPersistedLicenseForFreePlanNotice = loadPersistedLicenseForFreePlanNotice
+        licenseAccess = LocalLicenseFeatureAccessProvider(
+            stateProvider: { licenseStateProvider() }
+        )
         super.init()
+    }
+
+    public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let feature: StacioLicensedFeature?
+        switch menuItem.action {
+        case #selector(performMultiExecFromMenu(_:)): feature = .multiExec
+        case #selector(showTunnelsFromMenu(_:)): feature = .sshTunnel
+        case #selector(toggleDeviceDashboardFromMenu(_:)): feature = .advancedMetrics
+        case #selector(showAIAssistantFromMenu(_:)): feature = .aiAgent
+        default: feature = nil
+        }
+        guard let feature else { return true }
+        let enabled = licenseAccess.isEnabled(feature)
+        menuItem.toolTip = enabled ? nil : L10n.Import.licenseUnavailableTooltip
+        return enabled
     }
 
     convenience init(
         factory: @escaping () -> WorkbenchWindowShowing,
         runningTunnelTerminationConfirmation: RunningTunnelTerminationConfirming,
-        appLog: StacioLogWriting? = nil
+        appLog: StacioLogWriting? = nil,
+        shouldShowFreePlanNotice: Bool = false,
+        hasValidLicense: @escaping @MainActor () -> Bool = { true },
+        freePlanNoticeWindowControllerFactory: @escaping @MainActor () -> FreePlanNoticeWindowController = {
+            FreePlanNoticeWindowController()
+        }
     ) {
         self.init(
             factory: factory,
             runningTunnelTerminationConfirmation: runningTunnelTerminationConfirmation,
             sparkleUpdateChecker: SparkleUpdateController(),
-            appLog: appLog
+            appLog: appLog,
+            shouldShowFreePlanNotice: shouldShowFreePlanNotice,
+            hasValidLicense: hasValidLicense,
+            freePlanNoticeWindowControllerFactory: freePlanNoticeWindowControllerFactory
         )
     }
 
@@ -1474,7 +1566,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL)
         )
-        NSApplication.shared.mainMenu = StacioMenuBuilder(target: self).makeMainMenu()
+        NSApplication.shared.mainMenu = StacioMenuBuilder(
+            target: self,
+            licenseAccess: licenseAccess
+        ).makeMainMenu()
         // Stacio has no searchable Help Book. Leaving the system Help menu unset
         // avoids its oversized, non-functional search field while retaining support actions.
         NSApplication.shared.helpMenu = nil
@@ -1483,6 +1578,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         workbenchWindowController = controller
         startAgentBridgeServerIfNeeded()
         NSApplication.shared.activate(ignoringOtherApps: true)
+        showFreePlanNoticeIfNeeded()
         scheduleWorkbenchVisibilityRepair()
         presentInstalledUpdateReleaseNotesIfNeeded()
         startLicenseRevalidation()
@@ -1491,42 +1587,70 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public func applicationWillTerminate(_ notification: Notification) {
         TransferCompletionNotificationPresenter.dismissAllForApplicationTermination()
         licenseNetworkMonitor?.cancel()
+        licenseNetworkMonitoringStarted = false
         licenseRevalidationTask?.cancel()
         licenseRevalidationTask = nil
+        licenseRevalidationTimer?.invalidate()
+        licenseRevalidationTimer = nil
+        freePlanNoticeEligibilityTask?.cancel()
+        freePlanNoticeEligibilityTask = nil
+        if let licenseAuthorizationObserver {
+            NotificationCenter.default.removeObserver(licenseAuthorizationObserver)
+            self.licenseAuthorizationObserver = nil
+        }
+    }
+
+    private func observeLicenseAuthorizationSnapshot() {
+        licenseAuthorizationObserver = NotificationCenter.default.addObserver(
+            forName: .stacioLicenseAuthorizationDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard notification.object is LicenseAuthorizationSnapshot else { return }
+            MainActor.assumeIsolated {
+                self?.startLicenseRevalidation()
+            }
+        }
     }
 
     private func startLicenseRevalidation() {
         guard licenseRevalidator != nil else { return }
+        scheduleLicenseRenewalTimer()
+        guard licenseStateProvider().expiresAt != nil else { return }
+        startLicenseNetworkMonitoringIfNeeded()
+        scheduleLicenseRevalidation(afterNetworkRestore: false)
+    }
+
+    private func startLicenseNetworkMonitoringIfNeeded() {
+        guard licenseNetworkMonitoringStarted == false else { return }
+        licenseNetworkMonitoringStarted = true
         let onNetworkRestored = { [weak self] in
             _ = Task { @MainActor in
                 self?.scheduleLicenseRevalidation(afterNetworkRestore: true)
             }
         }
-        let onNetworkUnavailable = { [weak self] in
-            _ = Task { @MainActor in
-                self?.scheduleLicenseNetworkUnavailable()
-            }
-        }
         if let statusMonitor = licenseNetworkMonitor as? LicenseNetworkStatusMonitoring {
             statusMonitor.start(
                 onNetworkRestored: onNetworkRestored,
-                onNetworkUnavailable: onNetworkUnavailable
+                onNetworkUnavailable: {}
             )
         } else {
             licenseNetworkMonitor?.start(onNetworkRestored: onNetworkRestored)
         }
-        scheduleLicenseRevalidation(afterNetworkRestore: false)
     }
 
     private func scheduleLicenseRevalidation(afterNetworkRestore: Bool) {
+        guard let milestone = pendingLicenseSyncMilestone() else { return }
         licenseRevalidationTask?.cancel()
         licenseRevalidationTask = Task { @MainActor [weak self] in
             guard let self, let licenseRevalidator else { return }
             do {
                 if afterNetworkRestore {
-                    _ = try await licenseRevalidator.revalidateAfterNetworkRestore()
+                    let outcome = try await licenseRevalidator.revalidateAfterNetworkRestore()
+                    self.recordLicenseSyncMilestoneIfRefreshed(milestone, outcome: outcome)
                 } else {
-                    _ = try await licenseRevalidator.revalidateOnLaunch()
+                    let outcome = try await licenseRevalidator.revalidateOnLaunch()
+                    self.recordLicenseSyncMilestoneIfRefreshed(milestone, outcome: outcome)
                 }
             } catch is CancellationError {
                 return
@@ -1534,6 +1658,50 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 // LicenseService preserves the last verified state for explicit offline failures.
             }
         }
+    }
+
+    private func scheduleLicenseRenewalTimer() {
+        guard licenseRevalidationTimer == nil else { return }
+        licenseRevalidationTimer = Timer.scheduledTimer(withTimeInterval: 6 * 60 * 60, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                guard self.licenseStateProvider().expiresAt != nil else { return }
+                self.startLicenseNetworkMonitoringIfNeeded()
+                self.scheduleLicenseRevalidation(afterNetworkRestore: false)
+            }
+        }
+    }
+
+    private func pendingLicenseSyncMilestone(now: Date = Date()) -> String? {
+        let state = licenseStateProvider()
+        guard let expiresAt = state.expiresAt else { return nil }
+        let remainingDays = Int(ceil(expiresAt.timeIntervalSince(now) / 86_400))
+        let threshold: Int
+        if remainingDays <= 0 {
+            threshold = 0
+        } else if remainingDays <= 1 {
+            threshold = 1
+        } else if remainingDays <= 3 {
+            threshold = 3
+        } else if remainingDays <= 15 {
+            threshold = 15
+        } else if remainingDays <= 30 {
+            threshold = 30
+        } else {
+            return nil
+        }
+        let milestone = "\(Int(expiresAt.timeIntervalSince1970)):\(threshold)"
+        let key = "Stacio.License.lastSilentSyncMilestone"
+        return UserDefaults.standard.string(forKey: key) == milestone ? nil : milestone
+    }
+
+    private func recordLicenseSyncMilestoneIfRefreshed(
+        _ milestone: String,
+        outcome: LicenseRevalidationOutcome
+    ) {
+        guard case .refreshed = outcome else { return }
+        UserDefaults.standard.set(milestone, forKey: "Stacio.License.lastSilentSyncMilestone")
     }
 
     private func scheduleLicenseNetworkUnavailable() {
@@ -1604,6 +1772,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc
+    public func openDocumentation(_ sender: Any?) {
+        guard let url = URL(string: StacioAppMetadata.documentationURL) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc
     public func showFeedbackWindow(_ sender: Any?) {
         if feedbackWindowController == nil
             || (feedbackWindowController?.window?.isVisible != true
@@ -1647,10 +1821,67 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         installedUpdateReleaseNotesStore.markPresented()
     }
 
+    func showFreePlanNoticeIfNeededForTesting() {
+        showFreePlanNoticeIfNeeded()
+    }
+
+    private func showFreePlanNoticeIfNeeded() {
+        guard shouldShowFreePlanNotice,
+              didEvaluateFreePlanNotice == false,
+              freePlanNoticeEligibilityTask == nil
+        else {
+            return
+        }
+
+        if loadPersistedLicenseForFreePlanNotice {
+            freePlanNoticeEligibilityTask = Task { [weak self] in
+                let result = await Task.detached(priority: .utility) {
+                    do {
+                        return (state: try LicenseKeychainStore().load(), didLoad: true)
+                    } catch {
+                        return (state: Optional<LicenseState>.none, didLoad: false)
+                    }
+                }.value
+                guard let self, Task.isCancelled == false else { return }
+                freePlanNoticeEligibilityTask = nil
+                didEvaluateFreePlanNotice = true
+                // A transient vault read failure must never be presented as lost authorization.
+                guard result.didLoad,
+                      Self.hasProfessionalAuthorization(result.state) == false
+                else {
+                    return
+                }
+                presentFreePlanNotice()
+            }
+            return
+        }
+
+        didEvaluateFreePlanNotice = true
+        guard hasValidLicense() == false else { return }
+        presentFreePlanNotice()
+    }
+
+    private nonisolated static func hasProfessionalAuthorization(_ state: LicenseState?) -> Bool {
+        guard let state else { return false }
+        return StacioLicensedFeature.allCases.contains { state.enables($0) }
+    }
+
+    private func presentFreePlanNotice() {
+        guard freePlanNoticeWindowController?.window?.isVisible != true else { return }
+        freePlanNoticeWindowController = freePlanNoticeWindowControllerFactory()
+        freePlanNoticeWindowController?.showWindow(self)
+        freePlanNoticeWindowController?.window?.makeKeyAndOrderFront(self)
+    }
+
     @objc
     public func showLicenseWindow(_ sender: Any?) {
         if licenseWindowController?.window?.isVisible != true {
-            licenseWindowController = LicenseWindowController(configuration: ProductOpsConfigurationStore().load())
+            licenseWindowController = LicenseWindowController(
+                configuration: ProductOpsConfigurationStore().load(),
+                persistedStateProvider: {
+                    LicenseAuthorizationSnapshot.shared.currentState() ?? LicenseState()
+                }
+            )
         }
         licenseWindowController?.showWindow(sender)
         licenseWindowController?.window?.makeKeyAndOrderFront(sender)
@@ -1807,16 +2038,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openStacioURL(_ url: URL) {
         guard let scheme = url.scheme?.lowercased(),
               StacioAppMetadata.supportedURLSchemes.contains(scheme),
-              url.host?.lowercased() == "open-session"
+              let route = url.host?.lowercased()
         else {
             return
         }
-        let sessionID = String(url.path.dropFirst()).removingPercentEncoding ?? String(url.path.dropFirst())
-        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+
+        switch route {
+        case "open-session":
+            let sessionID = String(url.path.dropFirst()).removingPercentEncoding ?? String(url.path.dropFirst())
+            guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return
+            }
+            workbenchWindowController?.showWindow(self)
+            workbenchWindowController?.openSavedSession(id: sessionID)
+        case "connect":
+            guard let request = try? BastionHostDeepLinkParser.parse(url) else { return }
+            workbenchWindowController?.showWindow(self)
+            workbenchWindowController?.openBastionHostConnection(request)
+        default:
             return
         }
-        workbenchWindowController?.showWindow(self)
-        workbenchWindowController?.openSavedSession(id: sessionID)
     }
 
     private func startAgentBridgeServerIfNeeded() {

@@ -2089,7 +2089,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertFalse(sidebarItem.isCollapsed)
     }
 
-    func testUpdatePromptToolbarButtonAppearsAfterSidebarAndTracksDownloadProgress() throws {
+    func testUpdateStatusAppearsAtSidebarBottomAndTracksDownloadProgress() throws {
         let updateController = RecordingSparkleUpdateButtonController()
         let controller = WorkbenchWindowController(
             workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
@@ -2100,39 +2100,36 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
         let window = try XCTUnwrap(controller.window)
         let identifiers = window.toolbar?.items.map(\.itemIdentifier.rawValue) ?? []
-        XCTAssertEqual(identifiers.prefix(3), [
+        XCTAssertEqual(identifiers.prefix(2), [
             "Stacio.Toolbar.sidebar",
-            "Stacio.Toolbar.updatePrompt",
             NSToolbarItem.Identifier.flexibleSpace.rawValue
         ])
         XCTAssertEqual(updateController.probeCount, 1)
 
-        let updateButton = try updatePromptToolbarButton(in: controller)
-        XCTAssertTrue(updateButton.isHidden)
-        XCTAssertEqual(updateButton.attributedTitle.string, "")
+        let sidebar = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.first?.viewController as? SessionSidebarViewController)
+        let updateStatus = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatus"))
+        let updateStatusLabel = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatusLabel") as? NSTextField)
+        XCTAssertTrue(updateStatus.isHidden)
 
         updateController.publish(.available(SparkleUpdatePromptInfo(version: "0.14.0", build: "50")))
 
-        XCTAssertFalse(updateButton.isHidden)
-        XCTAssertEqual(updateButton.attributedTitle.string, "更新")
-        XCTAssertEqual(updateButton.action, #selector(WorkbenchWindowController.updatePromptButtonPressed(_:)))
-        XCTAssertEqual(updateButton.accessibilityLabel(), "发现 Stacio 更新 0.14.0 Build 50")
+        XCTAssertTrue(updateStatus.isHidden)
 
-        updateButton.performClick(nil as Any?)
+        updateController.publish(.downloading(progress: 0.12))
 
-        XCTAssertEqual(updateController.installCount, 1)
-
-        updateController.publish(.downloading(progress: 0.42))
-
-        XCTAssertEqual(updateButton.attributedTitle.string, "正在下载 42%")
-        XCTAssertEqual(updateButton.accessibilityLabel(), "正在下载 Stacio 更新 42%")
+        XCTAssertFalse(updateStatus.isHidden)
+        XCTAssertEqual(updateStatusLabel.stringValue, "正在下载 12%")
 
         updateController.publish(.installing)
 
-        XCTAssertEqual(updateButton.attributedTitle.string, "正在安装")
+        XCTAssertEqual(updateStatusLabel.stringValue, "正在安装")
+        XCTAssertFalse(updateStatus.isHidden)
+
+        updateController.publish(.hidden)
+        XCTAssertTrue(updateStatus.isHidden)
     }
 
-    func testUpdatePromptToolbarButtonIsDisabledWhileUpdateIsInProgress() throws {
+    func testSidebarUpdateStatusRemainsVisibleWhileUpdateIsInProgress() throws {
         let updateController = RecordingSparkleUpdateButtonController()
         let controller = WorkbenchWindowController(
             workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
@@ -2141,23 +2138,17 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
         controller.loadWindow()
 
-        let updateButton = try updatePromptToolbarButton(in: controller)
-        updateController.publish(.available(SparkleUpdatePromptInfo(version: "0.14.0", build: "50")))
-        XCTAssertTrue(updateButton.isEnabled)
+        let sidebar = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.first?.viewController as? SessionSidebarViewController)
+        let updateStatus = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatus"))
 
         updateController.publish(.downloading(progress: 0.42))
-        XCTAssertFalse(updateButton.isEnabled)
-        updateButton.performClick(nil as Any?)
+        XCTAssertFalse(updateStatus.isHidden)
 
         updateController.publish(.extracting(progress: 0.7))
-        XCTAssertFalse(updateButton.isEnabled)
-        updateButton.performClick(nil as Any?)
+        XCTAssertFalse(updateStatus.isHidden)
 
         updateController.publish(.installing)
-        XCTAssertFalse(updateButton.isEnabled)
-        updateButton.performClick(nil as Any?)
-
-        XCTAssertEqual(updateController.installCount, 0)
+        XCTAssertFalse(updateStatus.isHidden)
     }
 
     func testShowWindowCreatesProgrammaticMainWindow() {
@@ -2226,8 +2217,10 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
         XCTAssertEqual(importItem.menu.items.map(\.title), [
             "Stacio", "Xshell", "MobaXterm", "WindTerm", "SecureCRT",
-            "FinalShell", "Termius", "Electerm", "JSON"
+            "FinalShell", "Termius", "Electerm", "JSON", "堡垒机"
         ])
+        XCTAssertFalse(importItem.menu.autoenablesItems)
+        XCTAssertTrue(importItem.menu.delegate === SessionImportMenuAvailabilityDelegate.shared)
         XCTAssertEqual(importItem.image?.accessibilityDescription, "导入外部会话")
         XCTAssertFalse(importItem.showsIndicator)
         let panelsItem = try XCTUnwrap(
@@ -2250,6 +2243,77 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.inspector" }?.action,
             #selector(WorkbenchWindowController.toggleInspectorFromToolbar(_:))
         )
+    }
+
+    func testLicensedToolbarAndPanelItemsAreDisabledWithoutEntitlements() throws {
+        let access = MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            licenseAccess: access
+        )
+
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.validateVisibleItems()
+        for identifier in [
+            "Stacio.Toolbar.multiExec",
+            "Stacio.Toolbar.tunnels",
+            "Stacio.Toolbar.deviceDashboard",
+            "Stacio.Toolbar.aiAssistant"
+        ] {
+            let item = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == identifier })
+            XCTAssertFalse(item.isEnabled)
+            XCTAssertEqual(item.toolTip, L10n.Import.licenseUnavailableTooltip)
+        }
+
+        let panels = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem
+        )
+        let menu = try XCTUnwrap(panels.menu)
+        menu.delegate?.menuWillOpen?(menu)
+        for title in [L10n.Workbench.tunnels, L10n.Workbench.deviceDashboard, L10n.AI.title] {
+            let item = try XCTUnwrap(menu.item(withTitle: title))
+            XCTAssertFalse(item.isEnabled)
+            XCTAssertEqual(item.toolTip, L10n.Import.licenseUnavailableTooltip)
+        }
+    }
+
+    func testLicenseChangeImmediatelyEnablesLicensedToolbarItems() throws {
+        let access = MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            licenseAccess: access
+        )
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.validateVisibleItems()
+        let multiExec = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.multiExec" }
+        )
+        XCTAssertFalse(multiExec.isEnabled)
+
+        access.enabledFeatures = Set(StacioLicensedFeature.allCases)
+        NotificationCenter.default.post(name: .stacioLicenseAuthorizationDidChange, object: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertTrue(multiExec.isEnabled)
+        XCTAssertEqual(multiExec.toolTip, L10n.Workbench.multiExecTooltip)
+    }
+
+    func testLicensedActionsCannotBeInvokedWithoutEntitlements() throws {
+        let workspace = WorkspaceViewController()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            licenseAccess: MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        )
+        controller.loadWindow()
+
+        XCTAssertThrowsError(try controller.startMultiExecFromToolbar(nil)) { error in
+            XCTAssertEqual(error as? LicensedFeatureAccessError, .licenseRequired(.multiExec))
+        }
+        controller.showTunnelsFromToolbar(nil)
+        controller.showAIAssistantFromToolbar(nil)
+        controller.toggleDeviceDashboardFromToolbar(nil)
     }
 
     func testToolbarDefaultItemsUseHIGStyleGroupingWithoutOverflowCommands() {
@@ -3764,8 +3828,9 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let starter = RecordingRemoteSessionStarter(
             status: LiveShellStatus(runtimeId: "term_saved", status: "running", diagnostic: "running")
         )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
         let controller = WorkbenchWindowController(
-            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            workspaceViewController: workspace,
             remoteSessionStarter: starter
         )
         let session = SessionRecord(
@@ -3781,6 +3846,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             tags: ["prod"],
             lastOpenedAt: nil
         )
+        controller.loadWindow()
 
         let status = try controller.openSavedSession(session)
 
@@ -3790,6 +3856,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(starter.startedConfigs.map(\.username), ["deploy"])
         XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.agent])
         XCTAssertEqual(starter.startedTitles, ["API Server"])
+        XCTAssertEqual(workspace.aiHistoryScopeIDForTesting(runtimeID: "term_saved"), "session:session_saved")
     }
 
     func testWorkbenchOpenSavedSSHSessionShowsConnectingBannerBeforeBackgroundRuntimeCompletes() throws {
@@ -7251,6 +7318,13 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("sqlite")
         defer { try? FileManager.default.removeItem(at: tempURL) }
+        let settingsSuiteName = "StacioQuickConnectSaveSessionTests-\(UUID().uuidString)"
+        let settingsDefaults = UserDefaults(suiteName: settingsSuiteName)!
+        defer { settingsDefaults.removePersistentDomain(forName: settingsSuiteName) }
+        let settingsStore = AppSettingsStore(defaults: settingsDefaults)
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = false
+        }
         let starter = RecordingRemoteSessionStarter(
             status: LiveShellStatus(runtimeId: "term_quick_saved", status: "running", diagnostic: "running")
         )
@@ -7264,6 +7338,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
                     sessionName: "API 快速连接"
                 )
             ),
+            settingsStore: settingsStore,
             databasePathProvider: { tempURL.path }
         )
         controller.loadWindow()
@@ -8709,6 +8784,18 @@ private func workbenchLiveContext(
         secret: .agent,
         expectedFingerprintSHA256: expectedFingerprintSHA256 ?? "SHA256:\(host)"
     )
+}
+
+private final class MutableWorkbenchLicenseAccessProvider: LicenseFeatureAccessProviding {
+    var enabledFeatures: Set<StacioLicensedFeature>
+
+    init(enabledFeatures: Set<StacioLicensedFeature>) {
+        self.enabledFeatures = enabledFeatures
+    }
+
+    func isEnabled(_ feature: StacioLicensedFeature) -> Bool {
+        enabledFeatures.contains(feature)
+    }
 }
 
 private extension TunnelsViewController {
