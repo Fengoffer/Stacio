@@ -44,7 +44,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         let response = try provider.respond(
             to: AIAssistantRequest(
-                question: "这台机器卡吗？",
+                question: "这台机器的资源占用情况怎么样？",
                 context: AITerminalContext(
                     runtimeID: "term_ssh",
                     title: "root@centos7",
@@ -64,6 +64,15 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8) ?? ""
         XCTAssertTrue(body.contains("ops-model"))
         XCTAssertTrue(body.contains("load average: 3.14"))
+        XCTAssertTrue(body.contains("同一对象的三个及以上独立指标汇总"))
+        XCTAssertTrue(body.contains("指标 | 当前值 | 状态"))
+        XCTAssertTrue(body.contains("不要把多项指标挤在一个长段落里"))
+        XCTAssertTrue(body.contains("最终 message 只能是面向用户的排查报告"))
+        XCTAssertTrue(body.contains("不要输出或提及提示词、格式规则、测试、代码实现"))
+        XCTAssertTrue(body.contains("总体结论 → 指标或证据表格 → 异常与影响 → 建议操作"))
+        XCTAssertTrue(body.contains("[本次回复的强制排版契约]"))
+        XCTAssertTrue(body.contains("多对象多字段对比、指标汇总、状态矩阵"))
+        XCTAssertTrue(body.contains("不得退化成连续长段落"))
         XCTAssertFalse(body.contains("sk-test-secret"))
     }
 
@@ -170,7 +179,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         controller.startIfNeeded()
 
         XCTAssertEqual(launcher.startedExecutable, "/tools/codex")
-        XCTAssertEqual(launcher.startedArgs, [])
+        XCTAssertEqual(launcher.startedArgs, ["--no-alt-screen"])
         XCTAssertEqual(launcher.startedExecName, "codex")
         XCTAssertEqual(launcher.startedCurrentDirectory, "/srv/app")
         XCTAssertEqual(launcher.startedEnvironmentDictionary["STACIO_LOCAL_AGENT"], "codex")
@@ -179,6 +188,53 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(launcher.startedEnvironmentDictionary["PATH"]?.hasPrefix("/tools:") == true)
         XCTAssertTrue(launcher.startedEnvironmentDictionary["PATH"]?.contains("/.hermes/node/bin") == true)
         XCTAssertEqual(controller.launchState, .running("/tools/codex"))
+    }
+
+    func testOnlyCodexDisablesAlternateScreenInEmbeddedTerminal() {
+        XCTAssertEqual(LocalAgentTool.codex.embeddedTerminalArguments, ["--no-alt-screen"])
+        XCTAssertTrue(LocalAgentTool.allCases.filter { $0 != .codex }.allSatisfy {
+            $0.embeddedTerminalArguments.isEmpty
+        })
+    }
+
+    func testLocalAgentTerminalUsesCJKMonospaceFontWithTwoToOneCellWidth() throws {
+        let font = try XCTUnwrap(LocalAgentTerminalFont.font(size: 13))
+        let latinWidth = NSAttributedString(string: "W", attributes: [.font: font]).size().width
+        let chineseWidth = NSAttributedString(string: "中", attributes: [.font: font]).size().width
+        let boxDrawingWidths = ["─", "│", "┌", "┐"].map {
+            NSAttributedString(string: $0, attributes: [.font: font]).size().width
+        }
+
+        XCTAssertEqual(chineseWidth / latinWidth, 2, accuracy: 0.05)
+        XCTAssertTrue(boxDrawingWidths.allSatisfy { abs($0 - latinWidth) < 0.05 })
+    }
+
+    func testLocalAgentSessionObservesEffectiveAppearanceChanges() throws {
+        let controller = LocalAgentSessionViewController(
+            tool: .codex,
+            resolver: StaticLocalAgentToolResolver(paths: [:])
+        )
+
+        controller.loadView()
+
+        let container = try XCTUnwrap(controller.view as? TerminalFocusContainerView)
+        XCTAssertNotNil(container.onEffectiveAppearanceChanged)
+    }
+
+    func testReportFormatContractAlwaysRequiresMarkdownAndDelegatesLayoutChoice() {
+        let contract = OpenAICompatibleAIAssistantProvider.reportFormatContract
+
+        XCTAssertTrue(contract.contains("标准 Markdown"))
+        XCTAssertTrue(contract.contains("由你根据内容选择最合适的结构"))
+        XCTAssertTrue(contract.contains("应使用 Markdown 表格"))
+        XCTAssertTrue(contract.contains("简单回答不滥用标题和表格"))
+        XCTAssertTrue(contract.contains("修改任何配置文件"))
+        XCTAssertTrue(contract.contains("调整应用部署"))
+        XCTAssertTrue(contract.contains("备份与回滚"))
+        XCTAssertTrue(contract.contains("备份位置"))
+        XCTAssertTrue(contract.contains("回滚方法"))
+        XCTAssertTrue(contract.contains("变更后验证"))
+        XCTAssertTrue(contract.contains("健康检查"))
     }
 
     func testLocalAgentSessionCanRestartAfterProcessTerminates() {
@@ -285,8 +341,39 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         )
         XCTAssertTrue(agentInstructions.contains(#"stacio-remote "<command>""#))
         XCTAssertTrue(agentInstructions.contains("/srv/app"))
+        XCTAssertTrue(agentInstructions.contains("production-grade remote operations Agent"))
+        XCTAssertTrue(agentInstructions.contains("do not force every task into a fixed resource-check template"))
+        XCTAssertTrue(agentInstructions.contains("Establish the actual environment before acting"))
+        XCTAssertTrue(agentInstructions.contains("create a new timestamped backup first"))
+        XCTAssertTrue(agentInstructions.contains("A previous backup cannot authorize a later mutation"))
+        XCTAssertTrue(agentInstructions.contains("targeted read-only verification"))
+        XCTAssertTrue(agentInstructions.contains("Verify the rollback result"))
+        XCTAssertTrue(agentInstructions.contains("standard Markdown"))
+        XCTAssertTrue(agentInstructions.contains("Use Markdown tables"))
+        XCTAssertTrue(agentInstructions.contains("备份与回滚"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: "\(workspaceDirectory)/CLAUDE.md"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: "\(workspaceDirectory)/QWEN.md"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: "\(workspaceDirectory)/README.md"))
+        XCTAssertEqual(
+            try String(contentsOfFile: "\(workspaceDirectory)/CLAUDE.md", encoding: .utf8),
+            agentInstructions
+        )
+    }
+
+    func testLocalAgentOperationalContractCoversDiagnosticAssistantSafetyLoop() {
+        let contract = LocalAgentBridgeToolInstaller.operationalContractForTesting
+
+        XCTAssertTrue(contract.contains("host administration"))
+        XCTAssertTrue(contract.contains("application and web services"))
+        XCTAssertTrue(contract.contains("Kubernetes"))
+        XCTAssertTrue(contract.contains("databases"))
+        XCTAssertTrue(contract.contains("explicit user approval"))
+        XCTAssertTrue(contract.contains("new timestamped backup"))
+        XCTAssertTrue(contract.contains("targeted read-only verification"))
+        XCTAssertTrue(contract.contains("platform-native undo/rollback"))
+        XCTAssertTrue(contract.contains("standard Markdown"))
+        XCTAssertTrue(contract.contains("Markdown tables"))
+        XCTAssertTrue(contract.contains("exact backup location"))
     }
 
     func testLocalAgentBridgeTargetFileRefreshesWhenSelectedRuntimeChanges() throws {
@@ -358,6 +445,9 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertFalse(panel.composerHiddenForTesting)
         XCTAssertTrue(panel.localAgentTerminalHostHiddenForTesting)
         XCTAssertFalse(panel.transcriptContentOrderForTesting.contains("localAgent"))
+        XCTAssertFalse(
+            try! XCTUnwrap(panel.view.firstSubview(withIdentifier: "Stacio.AI.conversationControls")).isHidden
+        )
 
         panel.startLocalAgentForTesting(.codex)
 
@@ -366,6 +456,9 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.assistantTranscriptHiddenForTesting)
         XCTAssertTrue(panel.composerHiddenForTesting)
         XCTAssertFalse(panel.localAgentTerminalHostHiddenForTesting)
+        XCTAssertTrue(
+            try! XCTUnwrap(panel.view.firstSubview(withIdentifier: "Stacio.AI.conversationControls")).isHidden
+        )
         XCTAssertEqual(launcher.startedExecutable, "/tools/codex")
         XCTAssertEqual(launcher.startedCurrentDirectory, LocalAgentBridgeToolInstaller.defaultWorkspaceDirectory())
         XCTAssertEqual(launcher.startedEnvironmentDictionary["STACIO_REMOTE_CURRENT_DIRECTORY"], "/srv/app")
@@ -1648,6 +1741,144 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.transcriptTextForTesting.contains("Filesystem 42%"))
         XCTAssertFalse(panel.transcriptTextForTesting.contains("其他会话回复"))
         XCTAssertTrue(historyStore.listedRuntimeIDs.contains("term_1"))
+    }
+
+    func testExpandedProcessGroupRendersMarkdownInsteadOfRawSource() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .step,
+                content: """
+                ### 初步判断
+
+                | 指标 | 状态 |
+                | --- | --- |
+                | CPU | **待验证** |
+                """
+            )
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+
+        panel.loadView()
+        panel.expandAllProcessEntriesForTesting()
+
+        let rendered = try XCTUnwrap(panel.processGroupDetailAttributedStringsForTesting.first)
+        XCTAssertTrue(rendered.string.contains("初步判断"))
+        XCTAssertTrue(rendered.string.contains("CPU"))
+        XCTAssertTrue(rendered.string.contains("待验证"))
+        XCTAssertFalse(rendered.string.contains("###"))
+        XCTAssertFalse(rendered.string.contains("**"))
+        XCTAssertFalse(rendered.string.contains("---"))
+        var tableBlocks = [NSTextTableBlock]()
+        rendered.enumerateAttribute(
+            .paragraphStyle,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            guard let paragraph = value as? NSParagraphStyle else { return }
+            tableBlocks.append(contentsOf: paragraph.textBlocks.compactMap { $0 as? NSTextTableBlock })
+        }
+        XCTAssertEqual(tableBlocks.count, 4)
+    }
+
+    func testAssistantNewConversationStartsIndependentPersistentThread() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(message: "新会话结论", commandProposals: [])
+            ),
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false),
+            conversationHistoryStore: historyStore
+        )
+        panel.loadView()
+
+        XCTAssertEqual(panel.conversationPickerTitlesForTesting, ["新排查会话"])
+        panel.createNewConversationForTesting()
+        panel.setQuestionForTesting("这是新的排查上下文")
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { historyStore.appendedItems.count >= 2 })
+        let storageIDs = Set(historyStore.appendedItems.map(\.runtimeID))
+        XCTAssertEqual(storageIDs.count, 1)
+        let storageID = try XCTUnwrap(storageIDs.first)
+        XCTAssertTrue(storageID.hasPrefix("term_1\u{1F}"))
+        XCTAssertNotEqual(storageID, "term_1")
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("新会话结论"))
+    }
+
+    func testAssistantConversationUsesStableHistoryScopeAcrossRuntimeChanges() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(message: "稳定会话结论", commandProposals: [])
+            ),
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false),
+            conversationHistoryStore: historyStore,
+            contextProvider: { _ in
+                AITerminalContext(
+                    runtimeID: "runtime-reopened",
+                    historyScopeID: "session:saved-1",
+                    title: "Saved Host",
+                    currentDirectory: nil,
+                    recentTranscript: ""
+                )
+            }
+        )
+        panel.loadView()
+        panel.setQuestionForTesting("继续排查")
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { historyStore.appendedItems.count >= 2 })
+        XCTAssertTrue(historyStore.listedRuntimeIDs.contains("session:saved-1"))
+        XCTAssertTrue(historyStore.appendedItems.allSatisfy { $0.runtimeID == "session:saved-1" })
+    }
+
+    func testAssistantConversationContextIsMultiTurnAndIsolatedByNewConversation() throws {
+        let provider = SequencedPanelAIAssistantProvider(responses: [
+            AIAssistantResponse(message: "第一轮结论", commandProposals: []),
+            AIAssistantResponse(message: "第二轮结论", commandProposals: []),
+            AIAssistantResponse(message: "新会话结论", commandProposals: [])
+        ])
+        let panel = makeAssistantPanel(provider: provider)
+        panel.loadView()
+
+        panel.setQuestionForTesting("第一轮问题")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { provider.requests.count == 1 })
+        XCTAssertTrue(provider.requests[0].conversationHistory.isEmpty)
+
+        panel.setQuestionForTesting("第二轮问题")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { provider.requests.count == 2 })
+        XCTAssertEqual(
+            provider.requests[1].conversationHistory,
+            [
+                AIAssistantConversationMessage(role: .user, content: "第一轮问题"),
+                AIAssistantConversationMessage(role: .assistant, content: "第一轮结论")
+            ]
+        )
+
+        panel.createNewConversationForTesting()
+        panel.setQuestionForTesting("新会话问题")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { provider.requests.count == 3 })
+        XCTAssertTrue(provider.requests[2].conversationHistory.isEmpty)
+    }
+
+    func testConversationContextBudgetKeepsRecentMessagesAndRedactsSecrets() {
+        let history = (0..<30).map { index in
+            AIAssistantConversationMessage(
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: index == 29 ? "password=super-secret 最新结论" : "第 \(index) 条历史 " + String(repeating: "x", count: 40)
+            )
+        }
+
+        let bounded = AIAssistantCoordinator.boundedConversationHistory(history, characterLimit: 600)
+
+        XCTAssertLessThanOrEqual(bounded.reduce(0) { $0 + $1.content.count }, 200)
+        XCTAssertTrue(bounded.last?.content.contains("最新结论") == true)
+        XCTAssertFalse(bounded.map(\.content).joined().contains("super-secret"))
+        XCTAssertFalse(bounded.contains { $0.content.contains("第 0 条历史") })
     }
 
     func testAssistantPanelFoldsLegacyPreliminaryAssistantReplyIntoProcessHistory() throws {
@@ -5661,6 +5892,167 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(hasMonospacedCode)
     }
 
+    func testAssistantMarkdownFormattingSurvivesInspectorViewDetachAndReattach() throws {
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(
+                    message: """
+                    ## 排查结论
+                    **重点**：服务正常。
+
+                    ```bash
+                    systemctl status nginx
+                    ```
+                    """,
+                    proposedCommand: nil
+                )
+            ),
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
+        )
+
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 360, height: 480)
+        panel.setQuestionForTesting("检查服务")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains("systemctl status nginx") })
+
+        let before = try XCTUnwrap(panel.assistantAttributedStringsForTesting.first)
+        XCTAssertTrue(hasBoldText(in: before, containing: "重点"))
+        XCTAssertTrue(hasMonospacedText(in: before, containing: "systemctl status nginx"))
+        let inspector = InspectorViewController(
+            transferHistoryStore: NoOpSCPTransferHistoryStore(),
+            aiAssistantViewController: panel
+        )
+        inspector.loadView()
+        inspector.view.frame = NSRect(x: 0, y: 0, width: 520, height: 800)
+        let window = NSWindow(
+            contentRect: inspector.view.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = inspector.view
+        inspector.view.layoutSubtreeIfNeeded()
+        let aiIndex = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.AI.title))
+        inspector.selectSectionForTesting(aiIndex)
+        inspector.view.layoutSubtreeIfNeeded()
+        panel.resetAssistantAttributedStringsForTesting()
+        inspector.selectFilesTabForTesting()
+        inspector.selectSectionForTesting(aiIndex)
+        inspector.view.layoutSubtreeIfNeeded()
+        for width in stride(from: 160, through: 520, by: 20) {
+            inspector.view.frame.size.width = CGFloat(width)
+            inspector.view.layoutSubtreeIfNeeded()
+            panel.view.layoutSubtreeIfNeeded()
+        }
+
+        let after = try XCTUnwrap(panel.assistantAttributedStringsForTesting.first)
+        XCTAssertEqual(after.string, before.string)
+        XCTAssertEqual(after.length, before.length)
+        XCTAssertTrue(after.isEqual(to: before))
+        window.contentView = nil
+    }
+
+    func testAssistantMarkdownFormattingSurvivesConversationHistoryReload() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(
+                    message: "## 排查结论\n**重点**：服务正常。\n\n```bash\nsystemctl status nginx\n```",
+                    proposedCommand: nil
+                )
+            ),
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false),
+            conversationHistoryStore: historyStore,
+            contextProvider: { runtimeID in
+                let resolvedRuntimeID = runtimeID ?? "term_1"
+                return AITerminalContext(
+                    runtimeID: resolvedRuntimeID,
+                    title: "dev@example.com",
+                    currentDirectory: "/srv/app",
+                    recentTranscript: ""
+                )
+            }
+        )
+
+        panel.loadView()
+        panel.setQuestionForTesting("检查服务")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains("systemctl status nginx") })
+        let before = try XCTUnwrap(panel.assistantAttributedStringsForTesting.first)
+        XCTAssertTrue(hasBoldText(in: before, containing: "重点"))
+        XCTAssertTrue(hasMonospacedText(in: before, containing: "systemctl status nginx"))
+
+        panel.selectTargetRuntimeForTesting("term_2")
+        XCTAssertTrue(waitUntil { panel.assistantAttributedStringsForTesting.isEmpty })
+        panel.selectTargetRuntimeForTesting("term_1")
+        XCTAssertTrue(waitUntil { panel.assistantAttributedStringsForTesting.isEmpty == false })
+
+        let after = try XCTUnwrap(panel.assistantAttributedStringsForTesting.first)
+        XCTAssertTrue(hasBoldText(in: after, containing: "重点"))
+        XCTAssertTrue(hasMonospacedText(in: after, containing: "systemctl status nginx"))
+        XCTAssertTrue(after.isEqual(to: before))
+    }
+
+    func testAssistantMarkdownRendererFormatsTablesAndLinks() throws {
+        let rendered = AIAssistantMarkdownRenderer.attributedString(
+            from: """
+            | 主机 | 状态 |
+            | --- | --- |
+            | web-01 | 正常 |
+
+            [打开服务](http://192.168.1.20:8080)
+            """
+        )
+
+        XCTAssertFalse(rendered.string.contains("\t"))
+        XCTAssertTrue(rendered.string.contains("主机\n状态"))
+        XCTAssertTrue(rendered.string.contains("web-01\n正常"))
+        XCTAssertFalse(rendered.string.contains("---"))
+        var tableBlocks = [NSTextTableBlock]()
+        rendered.enumerateAttribute(
+            .paragraphStyle,
+            in: NSRange(location: 0, length: rendered.length)
+        ) { value, _, _ in
+            guard let paragraph = value as? NSParagraphStyle else { return }
+            tableBlocks.append(contentsOf: paragraph.textBlocks.compactMap { $0 as? NSTextTableBlock })
+        }
+        XCTAssertEqual(tableBlocks.count, 4)
+        XCTAssertTrue(tableBlocks.allSatisfy { $0.table.numberOfColumns == 2 })
+        let linkRange = (rendered.string as NSString).range(of: "打开服务")
+        XCTAssertEqual(
+            rendered.attribute(.link, at: linkRange.location, effectiveRange: nil) as? URL,
+            URL(string: "http://192.168.1.20:8080")
+        )
+    }
+
+    func testAssistantLinkRouterUsesStacioForIPAndSystemBrowserForDomains() throws {
+        XCTAssertEqual(
+            AIAssistantLinkRouter.destination(for: try XCTUnwrap(URL(string: "http://192.168.1.20:8080/status"))),
+            .stacioBrowser
+        )
+        XCTAssertEqual(
+            AIAssistantLinkRouter.destination(for: try XCTUnwrap(URL(string: "http://[2001:db8::1]/"))),
+            .stacioBrowser
+        )
+        XCTAssertEqual(
+            AIAssistantLinkRouter.destination(for: try XCTUnwrap(URL(string: "https://status.example.com"))),
+            .systemBrowser
+        )
+    }
+
+    func testAssistantMarkdownRendererAutoLinksBareHTTPAddresses() throws {
+        let rendered = AIAssistantMarkdownRenderer.attributedString(
+            from: "服务地址：http://10.0.0.8:9090/health"
+        )
+        let range = (rendered.string as NSString).range(of: "http://10.0.0.8:9090/health")
+
+        XCTAssertEqual(
+            rendered.attribute(.link, at: range.location, effectiveRange: nil) as? URL,
+            URL(string: "http://10.0.0.8:9090/health")
+        )
+    }
+
     func testAssistantSendButtonBecomesStopDuringStreamingThenReturnsToSend() throws {
         let provider = HangingStreamingAIAssistantProvider()
         let panel = makeAssistantPanel(
@@ -6351,6 +6743,30 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             localAgentToolResolver: localAgentToolResolver,
             localAgentProcessLauncherFactory: localAgentProcessLauncherFactory
         )
+    }
+
+    private func hasBoldText(in attributedString: NSAttributedString, containing text: String) -> Bool {
+        let fullString = attributedString.string as NSString
+        let range = fullString.range(of: text)
+        guard range.location != NSNotFound else { return false }
+        var found = false
+        attributedString.enumerateAttribute(.font, in: range) { value, _, _ in
+            guard let font = value as? NSFont else { return }
+            found = font.fontDescriptor.symbolicTraits.contains(.bold)
+        }
+        return found
+    }
+
+    private func hasMonospacedText(in attributedString: NSAttributedString, containing text: String) -> Bool {
+        let fullString = attributedString.string as NSString
+        let range = fullString.range(of: text)
+        guard range.location != NSNotFound else { return false }
+        var found = false
+        attributedString.enumerateAttribute(.font, in: range) { value, _, _ in
+            guard let font = value as? NSFont else { return }
+            found = font.fontDescriptor.symbolicTraits.contains(.monoSpace)
+        }
+        return found
     }
 
     private func makeModelProvider(

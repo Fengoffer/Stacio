@@ -263,7 +263,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             folders: [],
             sessionsByFolderID: [nil: sessions]
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
 
         controller.loadView()
 
@@ -302,7 +305,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             folders: [folder],
             sessionsByFolderID: [nil: [session]]
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
 
         controller.loadView()
 
@@ -565,7 +571,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         )
         let controller = SessionSidebarViewController(
             sessionStore: store,
-            operationsPresenter: operations
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -609,7 +616,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             folders: [],
             sessionsByFolderID: [nil: [favorite, recent]]
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
 
         controller.loadView()
 
@@ -668,6 +678,81 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         }
 
         XCTAssertEqual(controller.virtualGroupTitlesForTesting, ["最近使用", "收藏"])
+    }
+
+    func testRecentGroupMergesUngroupedSessionsWithoutRepeatingThemAtRoot() {
+        let suiteName = "StacioSidebarMergedRecentSessionsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = true
+        }
+        let folder = SessionFolder(id: "folder_test", parentId: nil, name: "test")
+        let ungrouped = makeSession(id: "ungrouped", protocolName: "ssh", name: "Ungrouped")
+        let grouped = SessionRecord(
+            id: "grouped_recent",
+            folderId: folder.id,
+            name: "Grouped Recent",
+            protocol: "ssh",
+            host: "grouped.example.com",
+            port: 22,
+            username: "ops",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "2026-07-15T12:00:00Z"
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [folder],
+                sessionsByFolderID: [nil: [ungrouped], folder.id: [grouped]]
+            ),
+            settingsStore: settingsStore
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.outlineRootCount, 2)
+        XCTAssertEqual(controller.virtualGroupTitlesForTesting, ["最近使用"])
+        let recentItem = controller.outlineView(controller.outlineView, child: 0, ofItem: nil)
+        XCTAssertEqual(controller.outlineView(controller.outlineView, numberOfChildrenOfItem: recentItem), 2)
+        let ungroupedItem = controller.outlineView(controller.outlineView, child: 1, ofItem: recentItem)
+        XCTAssertEqual(
+            controller.outlineView(controller.outlineView, viewFor: nil, item: ungroupedItem)?.textFieldSnapshot,
+            ["Ungrouped", "ops@ungrouped.example.com:22"]
+        )
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("test\nGrouped Recent"))
+    }
+
+    func testDisablingRecentPlacesAllUngroupedSessionsBeforeFolders() {
+        let suiteName = "StacioSidebarDisabledRecentSessionsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = false
+        }
+        let folder = SessionFolder(id: "folder_test", parentId: nil, name: "test")
+        let ungrouped = makeSession(id: "ungrouped", protocolName: "ssh", name: "Ungrouped")
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [nil: [ungrouped]],
+            sidebarOrderByParentID: [
+                nil: [
+                    (kind: "folder", id: folder.id),
+                    (kind: "session", id: ungrouped.id)
+                ]
+            ]
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: settingsStore
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.sessionOutlineTextSnapshot, "Ungrouped\nops@ungrouped.example.com:22\ntest")
     }
 
     func testSearchFiltersSessionsByNameHostUserAndFolder() throws {
@@ -1300,7 +1385,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         let operations = RecordingSessionSidebarOperationsPresenter(renameValue: "New API")
         let controller = SessionSidebarViewController(
             sessionStore: store,
-            operationsPresenter: operations
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -1513,7 +1599,11 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             createdSession: created
         )
         let editor = RecordingSessionEditor(draft: draft)
-        let controller = SessionSidebarViewController(sessionStore: store, sessionEditor: editor)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionEditor: editor,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
         controller.loadView()
 
         controller.performAddSessionForTesting()
@@ -1601,7 +1691,11 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             updatedSession: updated
         )
         let editor = RecordingSessionEditor(draft: draft)
-        let controller = SessionSidebarViewController(sessionStore: store, sessionEditor: editor)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionEditor: editor,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
         controller.loadView()
 
         controller.performEditSessionForTesting(id: "session_api")
@@ -1695,7 +1789,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         let controller = SessionSidebarViewController(
             sessionStore: store,
             sessionEditor: editor,
-            errorPresenter: errorPresenter
+            errorPresenter: errorPresenter,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -1777,7 +1872,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessionsByFolderID: [nil: [original]],
             duplicatedSession: duplicated
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
         controller.loadView()
 
         controller.performDuplicateSessionForTesting(id: "session_api")
@@ -2018,6 +2116,26 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "")
     }
 
+    func testDeleteSessionClearsAssistantHistoryAfterStoreDeletion() {
+        let session = makeSession(id: "api", protocolName: "ssh", name: "API Server")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]]
+        )
+        var deletedHistorySessionIDs: [String] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionDeleteConfirmer: RecordingSessionDeleteConfirmer(shouldDelete: true),
+            onDeleteSessionHistory: { deletedHistorySessionIDs.append($0) }
+        )
+        controller.loadView()
+
+        controller.performDeleteSessionForTesting(id: "session_api")
+
+        XCTAssertEqual(store.deletedIDs, ["session_api"])
+        XCTAssertEqual(deletedHistorySessionIDs, ["session_api"])
+    }
+
     func testDeleteSessionPresentsStoreDeleteError() {
         let session = SessionRecord(
             id: "session_api",
@@ -2042,7 +2160,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         let controller = SessionSidebarViewController(
             sessionStore: store,
             sessionDeleteConfirmer: confirmer,
-            errorPresenter: errorPresenter
+            errorPresenter: errorPresenter,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -2113,7 +2232,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             folders: [folder],
             sessionsByFolderID: [nil: [root], folder.id: [nested]]
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
         controller.loadView()
 
         XCTAssertTrue(
@@ -2132,7 +2254,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         )
     }
 
-    func testSidebarReordersFoldersAndSessionsInOneSiblingSequence() {
+    func testSidebarReordersRootFoldersAfterUngroupedSessionsWhenRecentIsHidden() {
         let firstFolder = SessionFolder(id: "folder_first", parentId: nil, name: "First Folder")
         let secondFolder = SessionFolder(id: "folder_second", parentId: nil, name: "Second Folder")
         let session = makeSession(id: "root", protocolName: "ssh", name: "Root")
@@ -2140,7 +2262,10 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             folders: [firstFolder, secondFolder],
             sessionsByFolderID: [nil: [session]]
         )
-        let controller = SessionSidebarViewController(sessionStore: store)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
         controller.loadView()
 
         XCTAssertTrue(
@@ -2154,7 +2279,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             controller.sessionOutlineTextSnapshot,
-            "Second Folder\nRoot\nops@root.example.com:22\nFirst Folder"
+            "Root\nops@root.example.com:22\nSecond Folder\nFirst Folder"
         )
     }
 
@@ -2165,7 +2290,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessionStore: RecordingSessionSidebarStore(
                 folders: [],
                 sessionsByFolderID: [nil: [source, target]]
-            )
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -2201,7 +2327,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessionStore: RecordingSessionSidebarStore(
                 folders: [folder],
                 sessionsByFolderID: [nil: [target]]
-            )
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -2241,7 +2368,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessionStore: RecordingSessionSidebarStore(
                 folders: [],
                 sessionsByFolderID: [nil: [favorite]]
-            )
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
         )
         controller.loadView()
 
@@ -2367,6 +2495,19 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: root.id))
         XCTAssertFalse(controller.isFolderExpandedForTesting(folderID: child.id))
     }
+
+    private func makeSettingsStore(showRecentSessions: Bool) -> AppSettingsStore {
+        let suiteName = "StacioSessionSidebarTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let store = AppSettingsStore(defaults: defaults)
+        store.update { settings in
+            settings.sessionSidebarShowRecentSessions = showRecentSessions
+        }
+        return store
+    }
 }
 
 private extension SessionSidebarViewController {
@@ -2441,6 +2582,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         folderExportJSON: String = "{}",
         configJSONByID: [String: String] = [:],
         credentialRecordsByID: [String: CredentialRecord] = [:],
+        sidebarOrderByParentID: Dictionary<String?, [(kind: String, id: String)]> = [:],
         createError: Error? = nil,
         updateError: Error? = nil,
         deleteError: Error? = nil,
@@ -2448,6 +2590,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     ) {
         self.folders = folders
         self.sessionsByFolderID = sessionsByFolderID
+        self.sidebarOrderByParentID = sidebarOrderByParentID
         self.createdSession = createdSession
         self.updatedSession = updatedSession
         self.duplicatedSession = duplicatedSession

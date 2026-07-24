@@ -40,9 +40,11 @@ final class StacioMenuBuilderTests: XCTestCase {
 
         let importSessions = try XCTUnwrap(fileMenu.item(withTitle: "导入会话"))
         let importMenu = try XCTUnwrap(importSessions.submenu)
+        XCTAssertFalse(importMenu.autoenablesItems)
+        XCTAssertTrue(importMenu.delegate === SessionImportMenuAvailabilityDelegate.shared)
         XCTAssertEqual(importMenu.items.map(\.title), [
             "Stacio", "Xshell", "MobaXterm", "WindTerm", "SecureCRT",
-            "FinalShell", "Termius", "Electerm", "JSON"
+            "FinalShell", "Termius", "Electerm", "JSON", "堡垒机"
         ])
         XCTAssertTrue(importMenu.items.allSatisfy {
             $0.action == #selector(AppDelegate.importSessionsFromMenu(_:))
@@ -117,6 +119,11 @@ final class StacioMenuBuilderTests: XCTestCase {
         XCTAssertNil(helpMenu.item(withTitle: "Product Ops 设置"))
         XCTAssertNil(helpMenu.item(withTitle: "Product Ops 设置..."))
         XCTAssertEqual(helpMenu.minimumWidth, 240)
+
+        let documentation = try XCTUnwrap(helpMenu.item(withTitle: "文档"))
+        XCTAssertEqual(documentation.keyEquivalent, "")
+        XCTAssertEqual(documentation.action, #selector(AppDelegate.openDocumentation(_:)))
+        XCTAssertEqual(StacioAppMetadata.documentationURL, "https://www.stacio.cn/wiki/")
 
         let feedback = try XCTUnwrap(helpMenu.item(withTitle: "反馈"))
         XCTAssertEqual(feedback.keyEquivalent, "")

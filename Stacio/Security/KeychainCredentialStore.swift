@@ -91,7 +91,24 @@ public final class KeychainCredentialStore {
     }
 
     public func delete(id: String, account: String) throws {
-        try backend.delete(key: Self.storageKey(for: id, account: account))
+        var firstError: Error?
+        for key in [
+            Self.storageKey(for: id, account: account),
+            Self.legacyStorageKey(for: id, account: account)
+        ] {
+            do {
+                try backend.delete(key: key)
+            } catch KeychainCredentialError.notFound {
+                continue
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+        if let firstError {
+            throw firstError
+        }
     }
 }
 
@@ -176,7 +193,21 @@ public final class StacioFileCredentialBackend: KeychainBackend {
             var vault = try loadVault()
             vault.entries.removeValue(forKey: storageIdentifier(for: key))
             try saveVault(vault)
+            try deleteLegacyFileCredential(key: key)
         }
+    }
+
+    private func deleteLegacyFileCredential(key: StacioCredentialStorageKey) throws {
+        guard let legacyVaultURL,
+              fileManager.fileExists(atPath: legacyVaultURL.path)
+        else {
+            return
+        }
+        var legacyVault = try loadVault(at: legacyVaultURL)
+        guard legacyVault.entries.removeValue(forKey: storageIdentifier(for: key)) != nil else {
+            return
+        }
+        try saveVault(legacyVault, at: legacyVaultURL)
     }
 
     private func readLegacyFileCredential(key: StacioCredentialStorageKey) throws -> Data {
@@ -245,8 +276,12 @@ public final class StacioFileCredentialBackend: KeychainBackend {
     }
 
     private func saveVault(_ vault: CredentialVault) throws {
+        try saveVault(vault, at: vaultURL)
+    }
+
+    private func saveVault(_ vault: CredentialVault, at url: URL) throws {
         do {
-            try writeData(encoder.encode(vault), to: vaultURL)
+            try writeData(encoder.encode(vault), to: url)
         } catch let error as KeychainCredentialError {
             throw error
         } catch {

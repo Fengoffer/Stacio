@@ -28,6 +28,49 @@ public protocol LicenseKeychainBackend: AnyObject {
     func delete(service: String, account: String) throws
 }
 
+public final class EncryptedVaultLicenseBackend: LicenseKeychainBackend {
+    public static let shared = EncryptedVaultLicenseBackend()
+
+    private let backend: KeychainBackend
+
+    public init(backend: KeychainBackend? = nil) {
+        self.backend = backend ?? StacioFileCredentialBackend(
+            directoryURL: Self.defaultDirectoryURL(),
+            legacyDirectoryURL: nil
+        )
+    }
+
+    public func save(_ data: Data, service: String, account: String) throws {
+        try backend.save(key: storageKey(service: service, account: account), secret: data)
+    }
+
+    public func read(service: String, account: String) throws -> Data? {
+        do {
+            return try backend.read(key: storageKey(service: service, account: account))
+        } catch KeychainCredentialError.notFound {
+            return nil
+        }
+    }
+
+    public func delete(service: String, account: String) throws {
+        try backend.delete(key: storageKey(service: service, account: account))
+    }
+
+    private func storageKey(service: String, account: String) -> StacioCredentialStorageKey {
+        StacioCredentialStorageKey(
+            service: service,
+            account: account,
+            id: "stacio.product-ops.license.\(account)"
+        )
+    }
+
+    private static func defaultDirectoryURL() -> URL {
+        StacioFileCredentialBackend.defaultDirectoryURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("LicenseVault", isDirectory: true)
+    }
+}
+
 public final class SystemLicenseKeychainBackend: LicenseKeychainBackend {
     public init() {}
 
@@ -104,7 +147,7 @@ public final class LicenseKeychainStore: LicenseStateStoring, LicenseActivationR
     private let legacyStateStore: LegacyLicenseStateMigrating?
 
     public init(
-        backend: LicenseKeychainBackend = SystemLicenseKeychainBackend(),
+        backend: LicenseKeychainBackend = EncryptedVaultLicenseBackend.shared,
         service: String = LicenseKeychainStore.defaultService,
         legacyStateStore: LegacyLicenseStateMigrating? = nil
     ) {
@@ -112,7 +155,7 @@ public final class LicenseKeychainStore: LicenseStateStoring, LicenseActivationR
         self.service = service
         if let legacyStateStore {
             self.legacyStateStore = legacyStateStore
-        } else if backend is SystemLicenseKeychainBackend,
+        } else if (backend is SystemLicenseKeychainBackend || backend is EncryptedVaultLicenseBackend),
                   service == LicenseKeychainStore.defaultService {
             self.legacyStateStore = KeychainLicenseStateStore()
         } else {
@@ -152,10 +195,16 @@ public final class LicenseKeychainStore: LicenseStateStoring, LicenseActivationR
             service: service,
             account: Self.stateAccount
         )
+        NotificationCenter.default.post(
+            name: .stacioLicenseAuthorizationDidChange,
+            object: self,
+            userInfo: [LicenseAuthorizationNotification.stateUserInfoKey: state]
+        )
     }
 
     public func deleteLicenseState() throws {
         try backend.delete(service: service, account: Self.stateAccount)
+        NotificationCenter.default.post(name: .stacioLicenseAuthorizationDidChange, object: self)
     }
 
     private func migrateLegacyStateIfNeeded() throws -> LicenseState? {

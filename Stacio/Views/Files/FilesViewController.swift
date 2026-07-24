@@ -324,12 +324,17 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var transferStatusRowViews: [FilesTransferStatusRowView] = []
     private var supplementalTransferStatusRowView: FilesTransferStatusRowView?
     private let settingsStore: AppSettingsStore
+    private let licenseAccess: any LicenseFeatureAccessProviding
     private var directoryFollowEnabled = true
     private var showHiddenFilesEnabled = false
     private var isSynchronizingTableSortDescriptors = false
 
-    public init(settingsStore: AppSettingsStore = .shared) {
+    public init(
+        settingsStore: AppSettingsStore = .shared,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider()
+    ) {
         self.settingsStore = settingsStore
+        self.licenseAccess = licenseAccess
         let snapshot = settingsStore.snapshot()
         directoryFollowEnabled = snapshot.filesDirectoryFollowDefault
         selectedSortMode = Self.loadPersistedSortMode()
@@ -2409,6 +2414,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     }
 
     @objc private func syncChangedEditsButtonPressed(_ sender: Any?) {
+        guard licenseAccess.isEnabled(.fileSync) else { return }
         onSyncChangedRemoteEdits?()
     }
 
@@ -2938,7 +2944,11 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         setMoreMenuItemEnabled(hasSelection, title: L10n.Files.deleteRemote)
         setMoreMenuItemEnabled(selectedEntry?.isEditableFile == true, title: L10n.Files.editLocalCopy)
         setMoreMenuItemEnabled(selectedEntry?.isEditableFile == true, title: L10n.Files.saveEditedCopy)
-        setMoreMenuItemEnabled(true, title: L10n.Files.syncChangedEdits)
+        let fileSyncEnabled = licenseAccess.isEnabled(.fileSync)
+        setMoreMenuItemEnabled(fileSyncEnabled, title: L10n.Files.syncChangedEdits)
+        moreMenu.item(withTitle: L10n.Files.syncChangedEdits)?.toolTip = fileSyncEnabled
+            ? nil
+            : L10n.Import.licenseUnavailableTooltip
         setMoreMenuItemEnabled(hasSelection, title: L10n.Files.chmod)
     }
 

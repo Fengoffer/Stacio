@@ -3,6 +3,56 @@ import XCTest
 @testable import StacioApp
 
 final class LicenseKeychainStoreTests: XCTestCase {
+    func testEncryptedVaultBackendSurvivesRecreationWithoutWritingPlaintextLicenseData() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioLicenseVaultTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let activation = LicenseActivationRecord(
+            licenseKey: "STACIO-SECRET-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        let state = LicenseState(
+            username: activation.username,
+            email: activation.email,
+            signedLicenseToken: "v1.signed-payload.signature",
+            plan: "professional",
+            permissions: ["multi_exec"],
+            expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+            status: .active
+        )
+        let makeBackend = {
+            EncryptedVaultLicenseBackend(
+                backend: StacioFileCredentialBackend(
+                    directoryURL: directory,
+                    legacyDirectoryURL: nil
+                )
+            )
+        }
+        var store: LicenseKeychainStore? = LicenseKeychainStore(
+            backend: makeBackend(),
+            service: LicenseKeychainStore.defaultService
+        )
+
+        try store?.saveActivationRecord(activation)
+        try store?.save(state)
+        store = nil
+
+        let restored = LicenseKeychainStore(
+            backend: makeBackend(),
+            service: LicenseKeychainStore.defaultService
+        )
+        XCTAssertEqual(try restored.loadActivationRecord(), activation)
+        XCTAssertEqual(try restored.load(), state)
+
+        let vaultData = try Data(contentsOf: directory.appendingPathComponent("credentials.vault.json"))
+        let vaultText = try XCTUnwrap(String(data: vaultData, encoding: .utf8))
+        XCTAssertFalse(vaultText.contains(activation.licenseKey))
+        XCTAssertFalse(vaultText.contains(activation.username))
+        XCTAssertFalse(vaultText.contains(activation.email))
+        XCTAssertFalse(vaultText.contains(state.signedLicenseToken))
+    }
+
     func testRoundTripsActivationRecordAndLicenseStateThroughSeparateAccounts() throws {
         let backend = InMemoryLicenseKeychainBackend()
         let store = LicenseKeychainStore(

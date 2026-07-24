@@ -5,7 +5,7 @@ SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="${STACIO_PACKAGE_ROOT_OVERRIDE:-$SCRIPT_ROOT_DIR}"
 APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"
-VERSION="${STACIO_VERSION:-0.13.5}"
+VERSION="${STACIO_VERSION:-0.14.0}"
 BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
 SWIFT_BUILD_TRIPLE="${STACIO_SWIFT_BUILD_TRIPLE:-}"
 CARGO_BUILD_TARGET="${STACIO_CARGO_BUILD_TARGET:-}"
@@ -18,8 +18,48 @@ if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
   CODESIGN_APP_ARGS+=(--options runtime --timestamp)
 fi
 SPARKLE_CODESIGN_ARGS=("${CODESIGN_ARGS[@]}" --preserve-metadata=identifier,entitlements,requirements)
-PRODUCT_OPS_PRODUCT_ID="${STACIO_PRODUCT_OPS_PRODUCT_ID:-stacio}"
-PRODUCT_OPS_API_BASE_URL="${STACIO_PRODUCT_OPS_API_BASE_URL:-}"
+LICENSE_TRUST_ANCHORS_PATH="${STACIO_LICENSE_TRUST_ANCHORS_PATH:-$ROOT_DIR/config/license-trust-anchors.json}"
+if [[ "$LICENSE_TRUST_ANCHORS_PATH" != "$ROOT_DIR/config/license-trust-anchors.json" \
+      && "${STACIO_ALLOW_CUSTOM_LICENSE_TRUST_ANCHORS:-0}" != "1" ]]; then
+  echo "Custom License trust-anchor files are disabled for packaging." >&2
+  echo "Use the repository config/license-trust-anchors.json for releases, or set STACIO_ALLOW_CUSTOM_LICENSE_TRUST_ANCHORS=1 only for an explicit test build." >&2
+  exit 1
+fi
+
+read_license_trust_anchor() {
+  local path="$1"
+  shift
+  [[ -f "$path" ]] || return 0
+  python3 - "$path" "$@" <<'PY'
+import json
+import sys
+
+path, *keys = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+for key in keys:
+    value = value[key]
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+TRUST_PRODUCT_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" productID || true)"
+TRUST_API_BASE_URL="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" apiBaseURL || true)"
+TRUST_ONLINE_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" onlineAuthorization publicKeyBase64 || true)"
+TRUST_ONLINE_SIGNATURE_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" onlineAuthorization signatureKeyID || true)"
+TRUST_OFFLINE_EXCHANGE_URL="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense exchangeURL || true)"
+TRUST_OFFLINE_REQUEST_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense request keyID || true)"
+TRUST_OFFLINE_EXCHANGE_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense request publicKeyBase64 || true)"
+TRUST_OFFLINE_SIGNATURE_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense authorization signatureKeyID || true)"
+TRUST_OFFLINE_AUTHORIZATION_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense authorization publicKeyBase64 || true)"
+TRUST_STORAGE_CONTRACT_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" storage contractID || true)"
+TRUST_STORAGE_SCHEMA_VERSION="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" storage schemaVersion || true)"
+
+PRODUCT_OPS_PRODUCT_ID="${STACIO_PRODUCT_OPS_PRODUCT_ID:-${TRUST_PRODUCT_ID:-stacio}}"
+PRODUCT_OPS_API_BASE_URL="${STACIO_PRODUCT_OPS_API_BASE_URL:-${TRUST_API_BASE_URL:-}}"
 PRODUCT_OPS_UPDATE_CHANNEL="${STACIO_PRODUCT_OPS_UPDATE_CHANNEL:-stable}"
 PRODUCT_OPS_BETA_UPDATES_ENABLED="${STACIO_PRODUCT_OPS_BETA_UPDATES_ENABLED:-0}"
 FEEDBACK_PRODUCT_API_KEY="${STACIO_FEEDBACK_PRODUCT_API_KEY:-}"
@@ -27,7 +67,15 @@ SPARKLE_STABLE_APPCAST_URL="${STACIO_SPARKLE_STABLE_APPCAST_URL:-}"
 SPARKLE_BETA_APPCAST_URL="${STACIO_SPARKLE_BETA_APPCAST_URL:-}"
 SPARKLE_UPDATE_ARCHITECTURE="${STACIO_SPARKLE_ARCHITECTURE:-}"
 SPARKLE_PUBLIC_ED_KEY="${STACIO_SPARKLE_PUBLIC_ED_KEY:-}"
-LICENSE_PUBLIC_ED25519_KEY="${STACIO_LICENSE_PUBLIC_ED25519_KEY:-}"
+LICENSE_PUBLIC_ED25519_KEY="${STACIO_LICENSE_PUBLIC_ED25519_KEY:-${TRUST_ONLINE_PUBLIC_KEY:-}}"
+ONLINE_LICENSE_SIGNATURE_KEY_ID="${STACIO_ONLINE_LICENSE_SIGNATURE_KEY_ID:-${TRUST_ONLINE_SIGNATURE_KEY_ID:-}}"
+OFFLINE_LICENSE_EXCHANGE_URL="${STACIO_OFFLINE_LICENSE_EXCHANGE_URL:-${TRUST_OFFLINE_EXCHANGE_URL:-}}"
+OFFLINE_EXCHANGE_PUBLIC_KEY="${STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY:-${TRUST_OFFLINE_EXCHANGE_PUBLIC_KEY:-}}"
+OFFLINE_REQUEST_KEY_ID="${STACIO_OFFLINE_REQUEST_KEY_ID:-${TRUST_OFFLINE_REQUEST_KEY_ID:-}}"
+OFFLINE_LICENSE_SIGNATURE_KEY_ID="${STACIO_OFFLINE_SIGNATURE_KEY_ID:-${TRUST_OFFLINE_SIGNATURE_KEY_ID:-}}"
+OFFLINE_LICENSE_PUBLIC_KEY="${STACIO_OFFLINE_LICENSE_PUBLIC_KEY:-${TRUST_OFFLINE_AUTHORIZATION_PUBLIC_KEY:-}}"
+LICENSE_STORAGE_CONTRACT_ID="${STACIO_LICENSE_STORAGE_CONTRACT_ID:-${TRUST_STORAGE_CONTRACT_ID:-stacio-license-vault-v1}}"
+LICENSE_STORAGE_SCHEMA_VERSION="${STACIO_LICENSE_STORAGE_SCHEMA_VERSION:-${TRUST_STORAGE_SCHEMA_VERSION:-1}}"
 ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG="${STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG:-0}"
 APP_DIR="$OUTPUT_DIR/$APP_NAME.app"
 LOCK_DIR="${STACIO_PACKAGE_LOCK_DIR:-$OUTPUT_DIR/.package-app.lock}"
@@ -54,6 +102,8 @@ SESSION_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/SessionIcons"
 SESSION_ICONS_OUTPUT="$RESOURCES_DIR/SessionIcons"
 IMPORT_SOURCE_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/ImportSourceIcons"
 IMPORT_SOURCE_ICONS_OUTPUT="$RESOURCES_DIR/ImportSourceIcons"
+FONTS_SOURCE="$ROOT_DIR/Stacio/Resources/Fonts"
+FONTS_OUTPUT="$RESOURCES_DIR/Fonts"
 MONACO_VS_SOURCE="${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}"
 MONACO_OUTPUT="$RESOURCES_DIR/MonacoEditor/vs"
 VNC_ADAPTER_PRODUCT="StacioVNCAdapter"
@@ -115,6 +165,7 @@ source_snapshot() {
     "$ROOT_DIR/StacioAgentBridge" \
     "$ROOT_DIR/StacioCLI" \
     "$ROOT_DIR/StacioExecutable" \
+    "$LICENSE_TRUST_ANCHORS_PATH" \
     "$ROOT_DIR/StacioCore/Cargo.toml" \
     "$ROOT_DIR/StacioCore/Cargo.lock" \
     "$ROOT_DIR/StacioCore/migrations" \
@@ -410,12 +461,38 @@ if not valid:
 PY
 }
 
+validate_x25519_public_key() {
+  local name="$1"
+  local configured="$2"
+  python3 - "$name" "$configured" <<'PY'
+import base64
+import binascii
+import sys
+
+name, configured = sys.argv[1:]
+try:
+    key = base64.b64decode("".join(configured.split()), validate=True)
+except (ValueError, binascii.Error):
+    raise SystemExit(f"{name} must contain a base64-encoded raw X25519 public key.")
+if len(key) != 32:
+    raise SystemExit(f"{name} must contain a 32-byte raw X25519 public key.")
+PY
+}
+
 if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
   missing_product_ops_config=()
   [[ -n "${PRODUCT_OPS_API_BASE_URL//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_PRODUCT_OPS_API_BASE_URL")
   [[ -n "${FEEDBACK_PRODUCT_API_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_FEEDBACK_PRODUCT_API_KEY")
   [[ -n "${SPARKLE_PUBLIC_ED_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_SPARKLE_PUBLIC_ED_KEY")
   [[ -n "${LICENSE_PUBLIC_ED25519_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_LICENSE_PUBLIC_ED25519_KEY")
+  [[ -n "${ONLINE_LICENSE_SIGNATURE_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_ONLINE_LICENSE_SIGNATURE_KEY_ID")
+  [[ -n "${OFFLINE_LICENSE_PUBLIC_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_LICENSE_PUBLIC_KEY")
+  [[ -n "${OFFLINE_LICENSE_EXCHANGE_URL//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_LICENSE_EXCHANGE_URL")
+  [[ -n "${OFFLINE_EXCHANGE_PUBLIC_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY")
+  [[ -n "${OFFLINE_REQUEST_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_REQUEST_KEY_ID")
+  [[ -n "${OFFLINE_LICENSE_SIGNATURE_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_SIGNATURE_KEY_ID")
+  [[ -n "${LICENSE_STORAGE_CONTRACT_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_LICENSE_STORAGE_CONTRACT_ID")
+  [[ "$LICENSE_STORAGE_SCHEMA_VERSION" =~ ^[1-9][0-9]*$ ]] || missing_product_ops_config+=("STACIO_LICENSE_STORAGE_SCHEMA_VERSION")
   if (( ${#missing_product_ops_config[@]} > 0 )); then
     echo "Required Product Ops packaging configuration is missing:" >&2
     printf '  %s\n' "${missing_product_ops_config[@]}" >&2
@@ -424,6 +501,8 @@ if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
   fi
   validate_ed25519_public_key "STACIO_SPARKLE_PUBLIC_ED_KEY" "$SPARKLE_PUBLIC_ED_KEY" sparkle
   validate_ed25519_public_key "STACIO_LICENSE_PUBLIC_ED25519_KEY" "$LICENSE_PUBLIC_ED25519_KEY" license
+  validate_ed25519_public_key "STACIO_OFFLINE_LICENSE_PUBLIC_KEY" "$OFFLINE_LICENSE_PUBLIC_KEY" license
+  validate_x25519_public_key "STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY" "$OFFLINE_EXCHANGE_PUBLIC_KEY"
 fi
 
 if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
@@ -594,6 +673,9 @@ cp -R "$SESSION_ICONS_SOURCE/." "$SESSION_ICONS_OUTPUT/"
 mkdir -p "$IMPORT_SOURCE_ICONS_OUTPUT"
 cp -R "$IMPORT_SOURCE_ICONS_SOURCE/." "$IMPORT_SOURCE_ICONS_OUTPUT/"
 /usr/bin/xattr -cr "$IMPORT_SOURCE_ICONS_OUTPUT"
+mkdir -p "$FONTS_OUTPUT"
+cp -R "$FONTS_SOURCE/." "$FONTS_OUTPUT/"
+/usr/bin/xattr -cr "$FONTS_OUTPUT"
 mkdir -p "$(dirname "$MONACO_OUTPUT")"
 cp -R "$MONACO_VS_SOURCE" "$MONACO_OUTPUT"
 chmod 755 "$MACOS_DIR/$APP_NAME" "$HELPERS_DIR/$CLI_HELPER_NAME" "$FRAMEWORKS_DIR/libstacio_core.dylib" "$ADAPTERS_DIR/vnc"
@@ -654,7 +736,7 @@ cat >"$PLIST_PATH" <<PLIST
 </plist>
 PLIST
 
-python3 - "$PLIST_PATH" "$PRODUCT_OPS_PRODUCT_ID" "$PRODUCT_OPS_API_BASE_URL" "$PRODUCT_OPS_UPDATE_CHANNEL" "$PRODUCT_OPS_BETA_UPDATES_ENABLED" "$FEEDBACK_PRODUCT_API_KEY" "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL" "$SPARKLE_PUBLIC_ED_KEY" "$LICENSE_PUBLIC_ED25519_KEY" "$SPARKLE_UPDATE_ARCHITECTURE" <<'PY'
+python3 - "$PLIST_PATH" "$PRODUCT_OPS_PRODUCT_ID" "$PRODUCT_OPS_API_BASE_URL" "$PRODUCT_OPS_UPDATE_CHANNEL" "$PRODUCT_OPS_BETA_UPDATES_ENABLED" "$FEEDBACK_PRODUCT_API_KEY" "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL" "$SPARKLE_PUBLIC_ED_KEY" "$LICENSE_PUBLIC_ED25519_KEY" "$SPARKLE_UPDATE_ARCHITECTURE" "$OFFLINE_LICENSE_EXCHANGE_URL" "$OFFLINE_EXCHANGE_PUBLIC_KEY" "$OFFLINE_LICENSE_PUBLIC_KEY" "$ONLINE_LICENSE_SIGNATURE_KEY_ID" "$OFFLINE_REQUEST_KEY_ID" "$OFFLINE_LICENSE_SIGNATURE_KEY_ID" "$LICENSE_STORAGE_CONTRACT_ID" "$LICENSE_STORAGE_SCHEMA_VERSION" <<'PY'
 import plistlib
 import sys
 from urllib.parse import urlparse
@@ -671,7 +753,15 @@ from urllib.parse import urlparse
     sparkle_public_ed_key,
     license_public_ed25519_key,
     sparkle_architecture,
-) = sys.argv[1:12]
+    offline_license_exchange_url,
+    offline_exchange_public_key,
+    offline_license_public_key,
+    online_license_signature_key_id,
+    offline_request_key_id,
+    offline_license_signature_key_id,
+    license_storage_contract_id,
+    license_storage_schema_version,
+) = sys.argv[1:20]
 product_id = (product_id or "stacio").strip() or "stacio"
 api_base_url = (api_base_url or "").strip()
 update_channel = (update_channel or "stable").strip().lower() or "stable"
@@ -680,6 +770,14 @@ stable_appcast_url = (stable_appcast_url or "").strip()
 beta_appcast_url = (beta_appcast_url or "").strip()
 license_public_ed25519_key = (license_public_ed25519_key or "").strip()
 sparkle_architecture = (sparkle_architecture or "").strip()
+offline_license_exchange_url = (offline_license_exchange_url or "").strip()
+offline_exchange_public_key = (offline_exchange_public_key or "").strip()
+offline_license_public_key = (offline_license_public_key or "").strip()
+online_license_signature_key_id = (online_license_signature_key_id or "").strip()
+offline_request_key_id = (offline_request_key_id or "").strip()
+offline_license_signature_key_id = (offline_license_signature_key_id or "").strip()
+license_storage_contract_id = (license_storage_contract_id or "").strip()
+license_storage_schema_version = (license_storage_schema_version or "").strip()
 if update_channel not in {"stable", "beta"}:
     raise SystemExit(f"Invalid STACIO_PRODUCT_OPS_UPDATE_CHANNEL: {update_channel}")
 
@@ -739,6 +837,50 @@ if license_public_ed25519_key:
 else:
     payload.pop("StacioLicensePublicEd25519Key", None)
 
+if online_license_signature_key_id:
+    payload["StacioOnlineLicenseSignatureKeyID"] = online_license_signature_key_id
+else:
+    payload.pop("StacioOnlineLicenseSignatureKeyID", None)
+
+if offline_license_exchange_url:
+    validate_url("STACIO_OFFLINE_LICENSE_EXCHANGE_URL", offline_license_exchange_url)
+    payload["StacioOfflineLicenseExchangeURL"] = offline_license_exchange_url
+else:
+    payload.pop("StacioOfflineLicenseExchangeURL", None)
+
+if offline_exchange_public_key:
+    payload["StacioOfflineExchangePublicKey"] = offline_exchange_public_key
+else:
+    payload.pop("StacioOfflineExchangePublicKey", None)
+
+if offline_license_public_key:
+    payload["StacioOfflineLicensePublicKey"] = offline_license_public_key
+else:
+    payload.pop("StacioOfflineLicensePublicKey", None)
+
+if offline_request_key_id:
+    payload["StacioOfflineRequestKeyID"] = offline_request_key_id
+else:
+    payload.pop("StacioOfflineRequestKeyID", None)
+
+if offline_license_signature_key_id:
+    payload["StacioOfflineSignatureKeyID"] = offline_license_signature_key_id
+else:
+    payload.pop("StacioOfflineSignatureKeyID", None)
+
+if license_storage_contract_id:
+    payload["StacioLicenseStorageContractID"] = license_storage_contract_id
+else:
+    payload.pop("StacioLicenseStorageContractID", None)
+
+if license_storage_schema_version:
+    try:
+        payload["StacioLicenseStorageSchemaVersion"] = int(license_storage_schema_version)
+    except ValueError:
+        raise SystemExit("STACIO_LICENSE_STORAGE_SCHEMA_VERSION must be an integer")
+else:
+    payload.pop("StacioLicenseStorageSchemaVersion", None)
+
 with open(plist_path, "wb") as handle:
     plistlib.dump(payload, handle, sort_keys=False)
 PY
@@ -775,5 +917,11 @@ codesign "${SPARKLE_CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$FRAMEWORKS_
 codesign "${CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$HELPERS_DIR/$CLI_HELPER_NAME"
 codesign "${CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$ADAPTERS_DIR/vnc"
 codesign "${CODESIGN_APP_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" == "1" ]]; then
+  echo "Skipped License package verification by explicit local-smoke mode."
+else
+  "$ROOT_DIR/scripts/verify-license-package.sh" "$APP_DIR" "$LICENSE_TRUST_ANCHORS_PATH"
+fi
 
 echo "Packaged $APP_DIR"

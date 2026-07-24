@@ -14,6 +14,7 @@ public enum ProductOpsError: LocalizedError, Equatable {
     case timeout
     case client(message: String, requestID: String?)
     case server(message: String, requestID: String?)
+    case backend(code: String, message: String, requestID: String?, statusCode: Int)
     case licenseIdentityMismatch
     case invalidSignedLicenseToken
     case licenseClaimsMismatch
@@ -49,6 +50,10 @@ public enum ProductOpsError: LocalizedError, Equatable {
         case .server(let message, let requestID):
             let suffix = requestID.map { " 请求 ID：\($0)。" } ?? ""
             return message.isEmpty ? "服务暂时不可用。\(suffix)" : "\(message)\(suffix)"
+        case .backend(_, let message, let requestID, let statusCode):
+            let suffix = requestID.map { " 请求 ID：\($0)。" } ?? ""
+            let fallback = (500..<600).contains(statusCode) ? "服务暂时不可用。" : "请求未被服务接受。"
+            return message.isEmpty ? "\(fallback)\(suffix)" : "\(message)\(suffix)"
         case .licenseIdentityMismatch:
             return "授权信息与填写的用户名或邮箱不匹配。"
         case .invalidSignedLicenseToken:
@@ -77,6 +82,16 @@ public enum ProductOpsError: LocalizedError, Equatable {
         return .server(message: error.localizedDescription, requestID: nil)
     }
 
+    public var backendErrorCode: String? {
+        guard case .backend(let code, _, _, _) = self else { return nil }
+        return code
+    }
+
+    public var backendStatusCode: Int? {
+        guard case .backend(_, _, _, let statusCode) = self else { return nil }
+        return statusCode
+    }
+
     public static func responseError(data: Data, response: HTTPURLResponse) -> ProductOpsError {
         let requestID = response.value(forHTTPHeaderField: "X-Request-ID")
             ?? response.value(forHTTPHeaderField: "x-request-id")
@@ -86,10 +101,14 @@ public enum ProductOpsError: LocalizedError, Equatable {
                 requestID: requestID
             )
         }
-        let message = serverMessage(from: data)
+        let details = serverDetails(from: data)
+        let message = details.message
             ?? ((500..<600).contains(response.statusCode)
                 ? "服务暂时不可用。"
                 : "服务返回异常状态：HTTP \(response.statusCode)。")
+        if let code = details.code?.trimmingCharacters(in: .whitespacesAndNewlines), code.isEmpty == false {
+            return .backend(code: code, message: message, requestID: requestID, statusCode: response.statusCode)
+        }
         if (400..<500).contains(response.statusCode) {
             return .client(message: message, requestID: requestID)
         }
@@ -104,14 +123,14 @@ public enum ProductOpsError: LocalizedError, Equatable {
         return nil
     }
 
-    private static func serverMessage(from data: Data) -> String? {
-        guard data.isEmpty == false else { return nil }
+    private static func serverDetails(from data: Data) -> (code: String?, message: String?) {
+        guard data.isEmpty == false else { return (nil, nil) }
         if let envelope = try? JSONDecoder.productOps.decode(ProductOpsServerErrorEnvelope.self, from: data) {
-            return envelope.message ?? envelope.error?.message
+            return (envelope.error?.code, envelope.message ?? envelope.error?.message)
         }
         let plainText = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return plainText.hasPrefix("{") ? nil : (plainText.isEmpty ? nil : plainText)
+        return (nil, plainText.hasPrefix("{") ? nil : (plainText.isEmpty ? nil : plainText))
     }
 }
 
@@ -130,6 +149,15 @@ private enum ProductOpsServerErrorValue: Decodable {
             return value
         case .details(let message, let code):
             return message ?? code
+        }
+    }
+
+    var code: String? {
+        switch self {
+        case .text:
+            return nil
+        case .details(_, let code):
+            return code
         }
     }
 
@@ -173,6 +201,14 @@ public struct ProductOpsConfiguration: Equatable {
     public var betaAppcastURL: URL?
     public var sparklePublicEDKey: String
     public var licensePublicKeyBase64: String
+    public var onlineLicenseSignatureKeyID: String
+    public var offlineLicenseExchangeURL: URL?
+    public var offlineExchangePublicKeyBase64: String
+    public var offlineRequestKeyID: String
+    public var offlineSignatureKeyID: String
+    public var offlineAuthorizationPublicKeyBase64: String
+    public var licenseStorageContractID: String
+    public var licenseStorageSchemaVersion: Int
 
     public init(
         apiBaseURL: URL? = URL(string: "https://ops.stacio.cn"),
@@ -183,7 +219,15 @@ public struct ProductOpsConfiguration: Equatable {
         stableAppcastURL: URL? = URL(string: "https://ops.stacio.cn/updates/stacio/stable/appcast.xml"),
         betaAppcastURL: URL? = URL(string: "https://ops.stacio.cn/updates/stacio/beta/appcast.xml"),
         sparklePublicEDKey: String = "",
-        licensePublicKeyBase64: String = ""
+        licensePublicKeyBase64: String = LicenseTrustAnchors.onlinePublicKeyBase64,
+        onlineLicenseSignatureKeyID: String = LicenseTrustAnchors.onlineSignatureKeyID,
+        offlineLicenseExchangeURL: URL? = URL(string: LicenseTrustAnchors.offlineExchangeURL),
+        offlineExchangePublicKeyBase64: String = LicenseTrustAnchors.offlineExchangePublicKeyBase64,
+        offlineRequestKeyID: String = LicenseTrustAnchors.offlineRequestKeyID,
+        offlineSignatureKeyID: String = LicenseTrustAnchors.offlineSignatureKeyID,
+        offlineAuthorizationPublicKeyBase64: String = LicenseTrustAnchors.offlineAuthorizationPublicKeyBase64,
+        licenseStorageContractID: String = LicenseTrustAnchors.storageContractID,
+        licenseStorageSchemaVersion: Int = LicenseTrustAnchors.storageSchemaVersion
     ) {
         self.apiBaseURL = apiBaseURL
         self.feedbackProductAPIKey = feedbackProductAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -194,6 +238,25 @@ public struct ProductOpsConfiguration: Equatable {
         self.betaAppcastURL = betaAppcastURL
         self.sparklePublicEDKey = sparklePublicEDKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.licensePublicKeyBase64 = licensePublicKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.onlineLicenseSignatureKeyID = onlineLicenseSignatureKeyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.offlineLicenseExchangeURL = offlineLicenseExchangeURL
+        self.offlineExchangePublicKeyBase64 = offlineExchangePublicKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.offlineRequestKeyID = offlineRequestKeyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.offlineSignatureKeyID = offlineSignatureKeyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.offlineAuthorizationPublicKeyBase64 = offlineAuthorizationPublicKeyBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.licenseStorageContractID = licenseStorageContractID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.licenseStorageSchemaVersion = licenseStorageSchemaVersion
+    }
+
+    public var offlineLicenseProtocolConfiguration: OfflineLicenseProtocolConfiguration {
+        OfflineLicenseProtocolConfiguration(
+            requestKeyID: offlineRequestKeyID,
+            requestPublicKeyBase64: offlineExchangePublicKeyBase64,
+            signatureKeyID: offlineSignatureKeyID,
+            authorizationPublicKeyBase64: offlineAuthorizationPublicKeyBase64.isEmpty
+                ? licensePublicKeyBase64 : offlineAuthorizationPublicKeyBase64,
+            exchangeAddress: offlineLicenseExchangeURL
+        )
     }
 
     public var effectiveUpdateChannel: ProductOpsReleaseChannel {
@@ -221,6 +284,8 @@ public final class ProductOpsConfigurationStore {
         public static let betaAppcastURL = "Stacio.ProductOps.betaAppcastURL"
         public static let sparklePublicEDKey = "Stacio.ProductOps.sparklePublicEDKey"
         public static let licensePublicKeyBase64 = "Stacio.ProductOps.licensePublicKeyBase64"
+        public static let offlineLicenseExchangeURL = "Stacio.ProductOps.offlineLicenseExchangeURL"
+        public static let offlineExchangePublicKeyBase64 = "Stacio.ProductOps.offlineExchangePublicKeyBase64"
     }
 
     private enum BundleKey {
@@ -233,6 +298,14 @@ public final class ProductOpsConfigurationStore {
         static let betaAppcastURL = "StacioSparkleBetaAppcastURL"
         static let sparklePublicEDKey = "SUPublicEDKey"
         static let licensePublicKeyBase64 = "StacioLicensePublicEd25519Key"
+        static let onlineLicenseSignatureKeyID = "StacioOnlineLicenseSignatureKeyID"
+        static let offlineLicenseExchangeURL = "StacioOfflineLicenseExchangeURL"
+        static let offlineExchangePublicKeyBase64 = "StacioOfflineExchangePublicKey"
+        static let offlineAuthorizationPublicKeyBase64 = "StacioOfflineLicensePublicKey"
+        static let offlineRequestKeyID = "StacioOfflineRequestKeyID"
+        static let offlineSignatureKeyID = "StacioOfflineSignatureKeyID"
+        static let licenseStorageContractID = "StacioLicenseStorageContractID"
+        static let licenseStorageSchemaVersion = "StacioLicenseStorageSchemaVersion"
     }
 
     private let defaults: UserDefaults
@@ -295,7 +368,26 @@ public final class ProductOpsConfigurationStore {
             licensePublicKeyBase64: developmentOverride("STACIO_LICENSE_PUBLIC_ED25519_KEY")
                 ?? stringValue(for: Key.licensePublicKeyBase64)
                 ?? stringValue(for: BundleKey.licensePublicKeyBase64)
-                ?? ""
+                ?? LicenseTrustAnchors.onlinePublicKeyBase64,
+            onlineLicenseSignatureKeyID: stringValue(for: BundleKey.onlineLicenseSignatureKeyID)
+                ?? LicenseTrustAnchors.onlineSignatureKeyID,
+            offlineLicenseExchangeURL: URL.stacioProductOpsURL(from:
+                developmentOverride("STACIO_OFFLINE_LICENSE_EXCHANGE_URL")
+                    ?? stringValue(for: BundleKey.offlineLicenseExchangeURL)
+                    ?? LicenseTrustAnchors.offlineExchangeURL
+            ),
+            offlineExchangePublicKeyBase64: developmentOverride("STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY")
+                ?? stringValue(for: BundleKey.offlineExchangePublicKeyBase64)
+                ?? LicenseTrustAnchors.offlineExchangePublicKeyBase64,
+            offlineRequestKeyID: stringValue(for: BundleKey.offlineRequestKeyID) ?? LicenseTrustAnchors.offlineRequestKeyID,
+            offlineSignatureKeyID: stringValue(for: BundleKey.offlineSignatureKeyID) ?? LicenseTrustAnchors.offlineSignatureKeyID,
+            offlineAuthorizationPublicKeyBase64: developmentOverride("STACIO_OFFLINE_LICENSE_PUBLIC_KEY")
+                ?? stringValue(for: BundleKey.offlineAuthorizationPublicKeyBase64)
+                ?? LicenseTrustAnchors.offlineAuthorizationPublicKeyBase64,
+            licenseStorageContractID: stringValue(for: BundleKey.licenseStorageContractID)
+                ?? LicenseTrustAnchors.storageContractID,
+            licenseStorageSchemaVersion: intValue(for: BundleKey.licenseStorageSchemaVersion)
+                ?? LicenseTrustAnchors.storageSchemaVersion
         )
     }
 
@@ -309,6 +401,8 @@ public final class ProductOpsConfigurationStore {
         defaults.removeObject(forKey: Key.betaAppcastURL)
         defaults.removeObject(forKey: Key.sparklePublicEDKey)
         defaults.removeObject(forKey: Key.licensePublicKeyBase64)
+        defaults.removeObject(forKey: Key.offlineLicenseExchangeURL)
+        defaults.removeObject(forKey: Key.offlineExchangePublicKeyBase64)
     }
 
     private func developmentOverride(_ key: String) -> String? {
@@ -340,6 +434,19 @@ public final class ProductOpsConfigurationStore {
         default:
             return nil
         }
+    }
+
+    private func intValue(for key: String) -> Int? {
+        if let value = bundleInfo[key] as? Int {
+            return value
+        }
+        if let value = bundleInfo[key] as? NSNumber {
+            return value.intValue
+        }
+        if let value = bundleInfo[key] as? String {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
     }
 }
 
@@ -761,6 +868,7 @@ public struct FeedbackDiagnosticContext: Codable, Equatable {
         configuration: ProductOpsConfiguration,
         deviceIDStore: AnonymousDeviceIdentifierStore = .shared,
         licenseService: LicenseService = LicenseService(),
+        licenseStatusProvider: (() -> LicenseStatus)? = nil,
         bundle: Bundle = .main,
         processInfo: ProcessInfo = .processInfo
     ) -> FeedbackDiagnosticContext {
@@ -773,7 +881,7 @@ public struct FeedbackDiagnosticContext: Codable, Equatable {
             build: build,
             osVersion: processInfo.operatingSystemVersionString,
             deviceID: deviceIDStore.deviceID(),
-            licenseStatus: licenseService.loadState().status,
+            licenseStatus: licenseStatusProvider?() ?? licenseService.loadState().status,
             diagnostics: [
                 "productID": configuration.productID,
                 "configuredUpdateChannel": configuration.effectiveUpdateChannel.rawValue,
@@ -1061,6 +1169,8 @@ private extension ProductOpsError {
     var isRetryable: Bool {
         switch self {
         case .offline, .timeout, .server:
+            return true
+        case .backend(_, _, _, let statusCode) where (500..<600).contains(statusCode):
             return true
         default:
             return false
@@ -1420,7 +1530,9 @@ public struct LicenseState: Codable, Equatable {
     public var graceUntil: Date?
     public var status: LicenseStatus
     public var lastValidatedAt: Date?
+    public var lastAuthorizationSyncErrorCode: String?
     public var offlineToken: OfflineLicenseToken?
+    public var offlineDeviceAuthorization: OfflineDeviceAuthorization?
 
     public init(
         username: String = "",
@@ -1432,7 +1544,9 @@ public struct LicenseState: Codable, Equatable {
         graceUntil: Date? = nil,
         status: LicenseStatus = .inactive,
         lastValidatedAt: Date? = nil,
-        offlineToken: OfflineLicenseToken? = nil
+        lastAuthorizationSyncErrorCode: String? = nil,
+        offlineToken: OfflineLicenseToken? = nil,
+        offlineDeviceAuthorization: OfflineDeviceAuthorization? = nil
     ) {
         self.username = username
         self.email = email
@@ -1443,7 +1557,9 @@ public struct LicenseState: Codable, Equatable {
         self.graceUntil = graceUntil
         self.status = status
         self.lastValidatedAt = lastValidatedAt
+        self.lastAuthorizationSyncErrorCode = lastAuthorizationSyncErrorCode
         self.offlineToken = offlineToken
+        self.offlineDeviceAuthorization = offlineDeviceAuthorization
     }
 }
 
@@ -1685,7 +1801,7 @@ public struct Ed25519SignedLicenseTokenVerifier: SignedLicenseTokenVerifying {
     }
 }
 
-private enum Ed25519PublicKeyMaterial {
+enum Ed25519PublicKeyMaterial {
     private static let subjectPublicKeyInfoPrefix = Data([
         0x30, 0x2A,
         0x30, 0x05,
@@ -1977,6 +2093,7 @@ public final class LicenseService {
     private let store: LicenseStateStoring
     private let verifier: OfflineLicenseTokenVerifying
     private let signedTokenVerifier: SignedLicenseTokenVerifying
+    private let offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier
     private let gracePeriod: TimeInterval
 
     public init(
@@ -1988,11 +2105,17 @@ public final class LicenseService {
             publicKeyBase64: ProductOpsConfigurationStore().load().licensePublicKeyBase64,
             expectedProductID: ProductOpsConfigurationStore().load().productID
         ),
+        offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier = OfflineDeviceAuthorizationVerifier(
+            publicKeyBase64: ProductOpsConfigurationStore().load().offlineLicenseProtocolConfiguration.authorizationPublicKeyBase64,
+            expectedSignatureKeyID: ProductOpsConfigurationStore().load().offlineLicenseProtocolConfiguration.signatureKeyID,
+            expectedProductID: ProductOpsConfigurationStore().load().productID
+        ),
         gracePeriod: TimeInterval = LicenseService.defaultOfflineGracePeriod
     ) {
         self.store = store
         self.verifier = verifier
         self.signedTokenVerifier = signedTokenVerifier
+        self.offlineDeviceAuthorizationVerifier = offlineDeviceAuthorizationVerifier
         self.gracePeriod = gracePeriod
     }
 
@@ -2006,15 +2129,45 @@ public final class LicenseService {
 
     public func loadStateOrThrow(now: Date = Date()) throws -> LicenseState {
         let stored = try store.load() ?? LicenseState()
-        return evaluate(state: stored, now: now)
+        let evaluated = evaluate(state: stored, now: now)
+        if shouldPersistRecoveredState(stored: stored, evaluated: evaluated) {
+            try store.save(evaluated)
+        }
+        return evaluated
     }
 
     public func evaluate(state: LicenseState, now: Date = Date()) -> LicenseState {
         var evaluated = state
         var verifiedClaims: SignedLicenseClaims?
 
-        if [.revoked, .suspended, .invalid, .expired].contains(state.status) {
+        if [.revoked, .suspended, .expired].contains(state.status) {
             return state
+        }
+        if state.lastAuthorizationSyncErrorCode?.isEmpty == false {
+            return state
+        }
+
+        if let authorization = state.offlineDeviceAuthorization {
+            do {
+                try offlineDeviceAuthorizationVerifier.verify(authorization, now: now, allowRevoked: true)
+                evaluated.username = authorization.username
+                evaluated.email = authorization.email
+                evaluated.plan = authorization.plan
+                evaluated.permissions = authorization.entitlements
+                evaluated.expiresAt = authorization.expirationDate()
+                evaluated.graceUntil = nil
+                evaluated.lastAuthorizationSyncErrorCode = nil
+                evaluated.status = authorization.status == .revoked ? .revoked : .offlineActive
+                return evaluated
+            } catch OfflineLicenseFileError.licenseExpired {
+                evaluated.status = .expired
+                evaluated.graceUntil = nil
+                return evaluated
+            } catch {
+                evaluated.status = .invalid
+                evaluated.graceUntil = nil
+                return evaluated
+            }
         }
 
         if let token = state.offlineToken {
@@ -2035,6 +2188,7 @@ public final class LicenseService {
             evaluated.signedLicenseToken = token.signedLicenseToken
             evaluated.expiresAt = token.expiresAt
             evaluated.graceUntil = nil
+            evaluated.lastAuthorizationSyncErrorCode = nil
             evaluated.status = .offlineActive
             return evaluated
         }
@@ -2063,6 +2217,7 @@ public final class LicenseService {
                 return evaluated
             }
             verifiedClaims = claims
+            evaluated.lastAuthorizationSyncErrorCode = nil
             evaluated.graceUntil = min(
                 claims.expiresAt,
                 claims.issuedAt.addingTimeInterval(max(0, claims.offlineGraceSeconds))
@@ -2128,6 +2283,20 @@ public final class LicenseService {
         return evaluated
     }
 
+    private func shouldPersistRecoveredState(
+        stored: LicenseState,
+        evaluated: LicenseState
+    ) -> Bool {
+        guard stored.status == .invalid,
+              stored != evaluated,
+              evaluated.status != .invalid else {
+            return false
+        }
+        return stored.signedLicenseToken.isEmpty == false
+            || stored.offlineToken != nil
+            || stored.offlineDeviceAuthorization != nil
+    }
+
     @discardableResult
     public func state(applyingOfflineToken token: OfflineLicenseToken, now: Date = Date()) throws -> LicenseState {
         let state = try validatedOfflineState(token: token, now: now)
@@ -2149,6 +2318,64 @@ public final class LicenseService {
             expectedEmail: expectedEmail
         )
         let state = try validatedOfflineState(token: token, now: now)
+        try store.save(state)
+        return state
+    }
+
+    @discardableResult
+    public func state(
+        applyingOfflineDeviceAuthorization authorization: OfflineDeviceAuthorization,
+        expectedUsername: String,
+        expectedEmail: String,
+        activationStore: LicenseActivationRecordStoring,
+        now: Date = Date()
+    ) throws -> LicenseState {
+        try validateOfflineIdentity(
+            username: authorization.username,
+            email: authorization.email,
+            expectedUsername: expectedUsername,
+            expectedEmail: expectedEmail
+        )
+        try offlineDeviceAuthorizationVerifier.verify(authorization, now: now, allowRevoked: true)
+        guard let expiresAt = authorization.expirationDate() else {
+            throw OfflineLicenseFileError.fileFormatInvalid
+        }
+        let state = LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: expiresAt,
+            graceUntil: nil,
+            status: authorization.status == .revoked ? .revoked : .offlineActive,
+            lastValidatedAt: nil,
+            offlineToken: nil,
+            offlineDeviceAuthorization: authorization
+        )
+        try persistOfflineState(state, preservingActivationIn: activationStore)
+        return state
+    }
+
+    @discardableResult
+    public func state(
+        applyingOfflineStatusError error: ProductOpsError,
+        now: Date = Date()
+    ) throws -> LicenseState {
+        guard let code = error.offlineLicenseStatusErrorCode else {
+            throw error
+        }
+        var state = try store.load() ?? LicenseState()
+        // A terminal response from the backend is authoritative. Remove every
+        // locally usable credential so the feature gate cannot re-enable the
+        // offline license on the next launch or after a re-evaluation.
+        state.signedLicenseToken = ""
+        state.permissions = []
+        state.graceUntil = nil
+        state.offlineToken = nil
+        state.offlineDeviceAuthorization = nil
+        state.status = code.terminalStatus
+        state.lastValidatedAt = now
+        state.lastAuthorizationSyncErrorCode = code.rawValue
         try store.save(state)
         return state
     }
@@ -2322,20 +2549,29 @@ public final class LicenseService {
             try store.save(unavailable)
             return unavailable
         }
-        if [.revoked, .suspended, .invalid, .expired].contains(stored.status) {
-            return stored
+        // Re-evaluate once before marking the network unavailable. A previous
+        // build may have persisted `invalid` while its trust anchors were
+        // incomplete; a newer build must be able to recover the signed state
+        // without requiring another activation.
+        let recovered = evaluate(state: stored, now: now)
+        if [.revoked, .suspended, .invalid, .expired].contains(recovered.status) {
+            if recovered != stored {
+                try store.save(recovered)
+            }
+            return recovered
         }
-        if stored.signedLicenseToken.isEmpty, stored.offlineToken == nil {
-            var unavailable = stored
+        if recovered.signedLicenseToken.isEmpty, recovered.offlineToken == nil,
+           recovered.offlineDeviceAuthorization == nil {
+            var unavailable = recovered
             unavailable.status = .networkUnavailable
             try store.save(unavailable)
             return unavailable
         }
-        var unavailableCandidate = stored
+        var unavailableCandidate = recovered
         unavailableCandidate.status = .networkUnavailable
-        let evaluated = evaluate(state: unavailableCandidate, now: now)
-        try store.save(evaluated)
-        return evaluated
+        let unavailableState = evaluate(state: unavailableCandidate, now: now)
+        try store.save(unavailableState)
+        return unavailableState
     }
 
     private func validatedOfflineState(token: OfflineLicenseToken, now: Date) throws -> LicenseState {

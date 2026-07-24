@@ -980,6 +980,35 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.hostValueForTesting, "/dev/cu.Custom-Console")
     }
 
+    func testSerialProtocolPrefersNBEETTYDeviceWithoutChangingOtherSerialDevices() throws {
+        let controller = SessionSettingsViewController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            serialDevicePathProvider: {
+                [
+                    "/dev/cu.NBEE_SPP_1103",
+                    "/dev/tty.NBEE_SPP_1103",
+                    "/dev/cu.usbserial-001",
+                    "/dev/tty.usbserial-001",
+                    "/dev/cu.Other-Bluetooth"
+                ]
+            }
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.serial)
+
+        XCTAssertEqual(
+            controller.serialDevicePathChoicesForTesting,
+            [
+                "/dev/cu.usbserial-001",
+                "/dev/tty.NBEE_SPP_1103",
+                "/dev/cu.Other-Bluetooth"
+            ]
+        )
+    }
+
     func testProtocolDraftValuesAreIsolatedWhenSwitchingSessionTypes() throws {
         let controller = SessionSettingsViewController(
             existingSession: nil,

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import XCTest
 @testable import StacioApp
 
@@ -361,7 +362,62 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         XCTAssertEqual(actions.skippedUpdates, [update])
     }
 
-    func testLicenseWindowShowsOfflineGraceStateAndTokenInput() throws {
+    func testReleaseNotesRestoreEscapedLineBreaksAndRenderItemsAsAList() {
+        let releaseNotes = "支持导入会话和分组。\\n新增单个会话加密导出与导入。\\r\\n优化 SSH 启动与凭据重试。"
+
+        XCTAssertEqual(
+            releaseNotes.stacioPlainReleaseNotesForDisplay(),
+            "• 支持导入会话和分组。\n• 新增单个会话加密导出与导入。\n• 优化 SSH 启动与凭据重试。"
+        )
+    }
+
+    func testReleaseNotesKeepExistingListMarkers() {
+        let releaseNotes = "<ul><li>修复终端刷新</li><li>改善工作台稳定性</li></ul>"
+        let rendered = releaseNotes.stacioPlainReleaseNotesForDisplay()
+
+        XCTAssertFalse(rendered.contains("<li>"))
+        XCTAssertTrue(rendered.contains("修复终端刷新"))
+        XCTAssertTrue(rendered.contains("改善工作台稳定性"))
+    }
+
+    func testFreePlanNoticeShowsWebsiteFeatureComparisonAndOpensPricingPage() throws {
+        let opener = StubProductOpsURLOpener()
+        let controller = FreePlanNoticeWindowController(urlOpener: opener)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        XCTAssertEqual(controller.window?.title, "")
+        let title = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.FreePlan.title") as? NSTextField)
+        XCTAssertEqual(title.stringValue, "当前使用的是免费版")
+        let table = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.FreePlan.comparison") as? NSTableView)
+        XCTAssertEqual(table.numberOfRows, 19)
+        XCTAssertEqual(table.tableColumns.map(\.title), ["功能", "免费版", "专业版"])
+        let firstFeatureCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NSTableCellView
+        )
+        XCTAssertEqual(firstFeatureCell.textField?.stringValue, "SSH、Telnet、VNC、FTP、SCP、串口和本地终端")
+        let professionalFeatureCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 8, makeIfNecessary: true) as? NSTableCellView
+        )
+        XCTAssertEqual(professionalFeatureCell.textField?.stringValue, "多终端批量执行与输入广播")
+        table.layoutSubtreeIfNeeded()
+        firstFeatureCell.layoutSubtreeIfNeeded()
+        let firstFeatureLabel = try XCTUnwrap(firstFeatureCell.textField)
+        XCTAssertEqual(firstFeatureLabel.frame.midY, firstFeatureCell.bounds.midY, accuracy: 1.0)
+
+        let getLicenseButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.FreePlan.getLicense") as? NSButton
+        )
+        getLicenseButton.performClick(nil)
+        XCTAssertEqual(
+            opener.openedURLs.map(\.absoluteString),
+            [FreePlanNoticeWindowController.pricingURL.absoluteString]
+        )
+    }
+
+    func testLicenseWindowShowsOnlyAuthorizationInformationAfterActivation() throws {
         let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
         let state = LicenseState(
             username: "Ada",
@@ -400,15 +456,78 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.status") as? NSTextField)
         XCTAssertTrue(status.stringValue.contains("离线宽限期"))
         XCTAssertTrue(status.stringValue.contains("Ada"))
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.offlineToken") as? NSScrollView)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.applyOfflineToken") as? NSButton)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.License.importOfflineLicenseFile") as? NSButton)
+        XCTAssertTrue(try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.activationForm")).isHidden)
+        XCTAssertTrue(try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.actions")).isHidden)
     }
 
-    func testLicenseWindowImportsOfflineLicenseFileDataAndValidatesIdentity() throws {
+    func testLicenseWindowUsesLargeNativeManagementButtonsWithClearActions() throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let state = LicenseState(
+            username: "Ada",
+            email: "ada@example.com",
+            signedLicenseToken: "signed-token",
+            plan: "professional",
+            expiresAt: ISO8601DateFormatter().date(from: "2026-08-01T00:00:00Z"),
+            status: .active,
+            lastValidatedAt: now
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: state),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: SignedLicenseClaims(
+                    licenseID: "license-1",
+                    productID: "stacio",
+                    email: state.email,
+                    username: state.username,
+                    plan: state.plan,
+                    entitlements: state.permissions,
+                    expiresAt: state.expiresAt!,
+                    offlineGraceSeconds: 14 * 24 * 60 * 60,
+                    issuedAt: state.lastValidatedAt!
+                ))
+            ),
+            nowProvider: { now }
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let syncButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let reimportButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.reimport") as? NSButton
+        )
+
+        XCTAssertEqual(syncButton.title, "同步许可")
+        XCTAssertEqual(syncButton.bezelStyle, .rounded)
+        XCTAssertTrue(syncButton.isBordered)
+        XCTAssertFalse(syncButton.wantsLayer)
+        XCTAssertEqual(syncButton.keyEquivalent, "\r")
+        XCTAssertEqual(syncButton.controlSize, .large)
+        XCTAssertNotNil(syncButton.image)
+        XCTAssertEqual(syncButton.imagePosition, .imageLeading)
+
+        XCTAssertEqual(reimportButton.title, "重新导入许可")
+        XCTAssertEqual(reimportButton.bezelStyle, .rounded)
+        XCTAssertTrue(reimportButton.isBordered)
+        XCTAssertFalse(reimportButton.wantsLayer)
+        XCTAssertEqual(reimportButton.controlSize, .large)
+        XCTAssertNotNil(reimportButton.image)
+        XCTAssertEqual(reimportButton.imagePosition, .imageLeading)
+
+        for button in [syncButton, reimportButton] {
+            XCTAssertTrue(button.constraints.contains {
+                $0.firstAttribute == .height && $0.relation == .equal && $0.constant >= 36
+            })
+            XCTAssertTrue(button.constraints.contains {
+                $0.firstAttribute == .width && $0.relation == .greaterThanOrEqual && $0.constant >= 132
+            })
+        }
+    }
+
+    func testLicenseWindowRejectsPlaintextOfflineLicenseData() async throws {
         let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
         let store = InMemoryProductOpsLicenseStateStore()
         let controller = LicenseWindowController(
@@ -427,26 +546,14 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         let email = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField)
         username.stringValue = "Ada"
         email.stringValue = "ada@example.com"
-        let token = OfflineLicenseToken(
-            productID: "stacio",
-            username: "Ada",
-            email: "ada@example.com",
-            plan: "team",
-            issuedAt: now,
-            expiresAt: ISO8601DateFormatter().date(from: "2026-08-10T12:00:00Z")!,
-            signatureKeyID: "primary",
-            signature: "signature"
-        )
+        await controller.importOfflineLicenseFileForTesting(Data("{\"productID\":\"stacio\"}".utf8))
 
-        controller.importOfflineLicenseFileForTesting(try JSONEncoder.productOps.encode(token))
-
-        XCTAssertEqual(store.state?.status, .offlineActive)
-        XCTAssertEqual(store.state?.username, "Ada")
+        XCTAssertNil(store.state)
         let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField)
-        XCTAssertTrue(status.stringValue.contains("离线授权已应用"))
+        XCTAssertTrue(status.stringValue.contains("离线授权文件格式错误"))
     }
 
-    func testLicenseWindowImportsBackendSignedOfflineLicenseFile() throws {
+    func testLicenseWindowRejectsLegacyBackendSignedOfflineLicenseFile() async throws {
         let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
         let claims = SignedLicenseClaims(
             licenseID: "license-1",
@@ -483,17 +590,13 @@ final class ProductOpsWindowControllerTests: XCTestCase {
             "signedLicenseToken": "v1.payload.signature"
         ])
 
-        controller.importOfflineLicenseFileForTesting(fileData)
+        await controller.importOfflineLicenseFileForTesting(fileData)
 
-        XCTAssertEqual(store.state?.status, .offlineActive)
-        XCTAssertEqual(store.state?.signedLicenseToken, "v1.payload.signature")
-        XCTAssertEqual(store.state?.plan, claims.plan)
-        XCTAssertEqual(store.state?.permissions, claims.entitlements)
-        XCTAssertNil(store.state?.offlineToken)
+        XCTAssertNil(store.state)
         let status = try XCTUnwrap(
             content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
         )
-        XCTAssertTrue(status.stringValue.contains("离线授权已应用"), status.stringValue)
+        XCTAssertTrue(status.stringValue.contains("离线授权文件格式错误"), status.stringValue)
     }
 
     func testLicenseWindowShowsRevokedOnlineValidationAsTerminalState() async throws {
@@ -559,7 +662,8 @@ final class ProductOpsWindowControllerTests: XCTestCase {
             offlineGraceSeconds: 7_200,
             issuedAt: now
         )
-        let activationStore = InMemoryProductOpsActivationStore()
+        let activationStore = ThreadRecordingProductOpsActivationStore(record: nil)
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore()
         let validator = StubProductOpsLicenseOnlineValidator(
             response: LicenseValidationResponse(
                 username: claims.username,
@@ -574,7 +678,7 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         )
         let controller = LicenseWindowController(
             service: LicenseService(
-                store: InMemoryProductOpsLicenseStateStore(),
+                store: stateStore,
                 signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
             ),
             onlineValidator: validator,
@@ -607,18 +711,20 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         validate.performClick(nil)
 
         let deadline = Date().addingTimeInterval(1)
-        while activationStore.record == nil, Date() < deadline {
+        while activationStore.currentRecord == nil, Date() < deadline {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
 
         XCTAssertEqual(
-            activationStore.record,
+            activationStore.currentRecord,
             LicenseActivationRecord(
                 licenseKey: "STACIO-SECRET-KEY",
                 username: claims.username,
                 email: claims.email
             )
         )
+        XCTAssertEqual(activationStore.firstSaveWasOnMainThread, false)
+        XCTAssertEqual(stateStore.firstSaveWasOnMainThread, false)
         XCTAssertTrue(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
     }
 
@@ -692,7 +798,7 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         XCTAssertEqual(activationStore.saveAttempts, 1)
     }
 
-    func testLicenseWindowOfflineImportPreservesPreviousOnlineActivationRecordForFutureRevalidation() throws {
+    func testLicenseWindowRejectingPlaintextImportPreservesPreviousOnlineActivationRecord() async throws {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let activationStore = InMemoryProductOpsActivationStore()
         let previous = LicenseActivationRecord(
@@ -721,19 +827,7 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         )
         username.stringValue = "Ada"
         email.stringValue = "ada@example.com"
-        let token = OfflineLicenseToken(
-            productID: "stacio",
-            username: "Ada",
-            email: "ada@example.com",
-            plan: "pro",
-            permissions: ["remote_sessions"],
-            issuedAt: now,
-            expiresAt: now.addingTimeInterval(86_400),
-            signatureKeyID: "primary",
-            signature: "signature"
-        )
-
-        controller.importOfflineLicenseFileForTesting(try JSONEncoder.productOps.encode(token))
+        await controller.importOfflineLicenseFileForTesting(Data("legacy offline token".utf8))
 
         XCTAssertEqual(activationStore.record, previous)
     }
@@ -831,6 +925,384 @@ final class ProductOpsWindowControllerTests: XCTestCase {
             XCTAssertEqual(error as? ProductOpsWindowTestError, .stateWriteFailed)
         }
         XCTAssertEqual(activationStore.record, previous)
+    }
+
+    func testLicenseWindowRefreshPrefersOfflineAuthorizationWhenActivationRecordAlsoExists() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let deviceID = "offline-device"
+        let signatureKeyID = "offline-signing-test"
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: deviceID,
+            signatureKeyID: signatureKeyID
+        )
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-OLD-ONLINE-KEY",
+            username: authorization.username,
+            email: authorization.email
+        )
+        let onlineValidator = StubProductOpsLicenseOnlineValidator(
+            response: LicenseValidationResponse(
+                username: authorization.username,
+                email: authorization.email,
+                plan: "",
+                expiresAt: nil,
+                status: .revoked
+            )
+        )
+        let offlineRefresher = RecordingProductOpsOfflineStatusRefresher(response: authorization)
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: signatureKeyID,
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: deviceID)
+                )
+            ),
+            onlineValidator: onlineValidator,
+            activationStore: activationStore,
+            offlineStatusRefresher: offlineRefresher,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while (offlineRefresher.requests.isEmpty
+            || actionStatus.stringValue.contains("离线授权状态已同步") == false),
+            Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(offlineRefresher.requests, [authorization])
+        XCTAssertTrue(onlineValidator.requests.isEmpty)
+        XCTAssertFalse(actionStatus.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains("离线授权状态已同步"), actionStatus.stringValue)
+        XCTAssertEqual(stateStore.firstSaveWasOnMainThread, false)
+    }
+
+    func testLicenseWindowDisablesOfflineAuthorizationWhenStatusSyncIsTerminal() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: "offline-device",
+            signatureKeyID: "offline-signing-test"
+        )
+        let stateStore = InMemoryProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: "offline-signing-test",
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: "offline-device")
+                )
+            ),
+            offlineStatusRefresher: FailingProductOpsOfflineStatusRefresher(
+                error: ProductOpsError.backend(
+                    code: OfflineLicenseStatusErrorCode.licenseRevoked.rawValue,
+                    message: "License 已撤销",
+                    requestID: "req-terminal",
+                    statusCode: 409
+                )
+            ),
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains("离线授权已停止") == false,
+              Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(stateStore.state?.status, .revoked)
+        XCTAssertTrue(stateStore.state?.permissions.isEmpty == true)
+        XCTAssertNil(stateStore.state?.offlineDeviceAuthorization)
+        XCTAssertTrue(actionStatus.stringValue.contains("请重新导入许可"), actionStatus.stringValue)
+    }
+
+    func testLicenseWindowReimportCancelsPendingOfflineStatusRefresh() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let deviceID = "offline-device"
+        let signatureKeyID = "offline-signing-test"
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: deviceID,
+            signatureKeyID: signatureKeyID
+        )
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let gate = ProductOpsWindowAsyncGate()
+        let offlineRefresher = GatedProductOpsOfflineStatusRefresher(
+            gate: gate,
+            response: authorization
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: signatureKeyID,
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: deviceID)
+                )
+            ),
+            offlineStatusRefresher: offlineRefresher,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let reimport = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.reimport") as? NSButton
+        )
+        let activationForm = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.activationForm")
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+        while await offlineRefresher.requestCount == 0 {
+            await Task.yield()
+        }
+        reimport.performClick(nil)
+        await gate.open()
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertFalse(activationForm.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains("请输入在线 License"))
+        XCTAssertNil(stateStore.firstSaveWasOnMainThread)
+    }
+
+    func testLicenseWindowKeepsManagementActionsForPersistedActivationThatNeedsRefresh() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: LicenseState(
+                    username: "Ada",
+                    email: "ada@example.com",
+                    plan: "professional",
+                    expiresAt: now.addingTimeInterval(86_400),
+                    status: .invalid
+                ))
+            ),
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let activationForm = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.activationForm")
+        )
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+
+        XCTAssertTrue(activationForm.isHidden)
+        XCTAssertFalse(try XCTUnwrap(refresh.superview).isHidden)
+    }
+
+    func testLicenseWindowShowsOnlineSyncResultFromManagementState() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let stateStore = InMemoryProductOpsLicenseStateStore(state: LicenseState(
+            username: claims.username,
+            email: claims.email,
+            plan: claims.plan,
+            expiresAt: claims.expiresAt,
+            status: .invalid
+        ))
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: claims.username,
+            email: claims.email
+        )
+        let onlineValidator = StubProductOpsLicenseOnlineValidator(response: LicenseValidationResponse(
+            username: claims.username,
+            email: claims.email,
+            signedLicenseToken: "v1.payload.signature",
+            plan: claims.plan,
+            permissions: claims.entitlements,
+            expiresAt: claims.expiresAt,
+            offlineGraceSeconds: claims.offlineGraceSeconds,
+            status: .active
+        ))
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: onlineValidator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated) == false,
+              Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(onlineValidator.requests.first?.licenseKey, "STACIO-PERSISTED-KEY")
+        XCTAssertEqual(stateStore.state?.status, .active)
+        XCTAssertFalse(actionStatus.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
+    }
+
+    func testLicenseWindowLoadsPersistedActivationOffMainThreadWhenSyncing() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let activationStore = ThreadRecordingProductOpsActivationStore(record: LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: claims.username,
+            email: claims.email
+        ))
+        let gate = ProductOpsWindowAsyncGate()
+        let validator = GatedProductOpsLicenseOnlineValidator(
+            gate: gate,
+            response: LicenseValidationResponse(
+                username: claims.username,
+                email: claims.email,
+                signedLicenseToken: "v1.payload.signature",
+                plan: claims.plan,
+                permissions: claims.entitlements,
+                expiresAt: claims.expiresAt,
+                offlineGraceSeconds: claims.offlineGraceSeconds,
+                status: .active
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: LicenseState(
+                    username: claims.username,
+                    email: claims.email,
+                    signedLicenseToken: "v1.payload.signature",
+                    plan: claims.plan,
+                    permissions: claims.entitlements,
+                    expiresAt: claims.expiresAt,
+                    status: .active,
+                    lastValidatedAt: now
+                )),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: validator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while activationStore.firstLoadWasOnMainThread == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(activationStore.firstLoadWasOnMainThread, false)
+        controller.close()
+        await gate.open()
     }
 
     func testLicenseWindowCancelsPendingOnlineValidationWhenClosed() async throws {
@@ -1043,13 +1515,70 @@ private struct StubProductOpsSignedLicenseTokenVerifier: SignedLicenseTokenVerif
 
 private final class StubProductOpsLicenseOnlineValidator: LicenseOnlineValidating {
     let response: LicenseValidationResponse
+    private(set) var requests: [LicenseValidationRequest] = []
 
     init(response: LicenseValidationResponse) {
         self.response = response
     }
 
     func validate(_ requestBody: LicenseValidationRequest) async throws -> LicenseValidationResponse {
-        response
+        requests.append(requestBody)
+        return response
+    }
+}
+
+private final class RecordingProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    let response: OfflineDeviceAuthorization
+    private(set) var requests: [OfflineDeviceAuthorization] = []
+
+    init(response: OfflineDeviceAuthorization) {
+        self.response = response
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        requests.append(authorization)
+        return response
+    }
+}
+
+private final class FailingProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        throw error
+    }
+}
+
+private actor GatedProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    private let gate: ProductOpsWindowAsyncGate
+    private let response: OfflineDeviceAuthorization
+    private(set) var requestCount = 0
+
+    init(gate: ProductOpsWindowAsyncGate, response: OfflineDeviceAuthorization) {
+        self.gate = gate
+        self.response = response
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        requestCount += 1
+        await gate.wait()
+        return response
     }
 }
 
@@ -1105,6 +1634,84 @@ private final class InMemoryProductOpsActivationStore: LicenseActivationRecordSt
     }
 }
 
+private final class ThreadRecordingProductOpsActivationStore: LicenseActivationRecordStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var record: LicenseActivationRecord?
+    private var loadThreads: [Bool] = []
+    private var saveThreads: [Bool] = []
+
+    init(record: LicenseActivationRecord?) {
+        self.record = record
+    }
+
+    var firstLoadWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadThreads.first
+    }
+
+    var firstSaveWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return saveThreads.first
+    }
+
+    var currentRecord: LicenseActivationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return record
+    }
+
+    func loadActivationRecord() throws -> LicenseActivationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        loadThreads.append(Thread.isMainThread)
+        return record
+    }
+
+    func saveActivationRecord(_ record: LicenseActivationRecord) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        saveThreads.append(Thread.isMainThread)
+        self.record = record
+    }
+
+    func deleteActivationRecord() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        record = nil
+    }
+}
+
+private final class ThreadRecordingProductOpsLicenseStateStore: LicenseStateStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: LicenseState?
+    private var saveThreads: [Bool] = []
+
+    init(state: LicenseState? = nil) {
+        self.state = state
+    }
+
+    var firstSaveWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return saveThreads.first
+    }
+
+    func load() throws -> LicenseState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+
+    func save(_ state: LicenseState) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        saveThreads.append(Thread.isMainThread)
+        self.state = state
+    }
+}
+
 private enum ProductOpsWindowTestError: Error {
     case activationWriteFailed
     case stateWriteFailed
@@ -1149,6 +1756,39 @@ private final class InMemoryProductOpsLicenseStateStore: LicenseStateStoring {
     func save(_ state: LicenseState) throws {
         self.state = state
     }
+}
+
+private func makeSignedProductOpsOfflineAuthorization(
+    signingKey: Curve25519.Signing.PrivateKey,
+    deviceID: String,
+    signatureKeyID: String
+) throws -> OfflineDeviceAuthorization {
+    let unsigned = OfflineDeviceAuthorization(
+        productID: "stacio",
+        deviceID: deviceID,
+        username: "Ada",
+        email: "ada@example.com",
+        plan: "professional",
+        entitlements: ["multi_exec", "ssh_tunnel"],
+        issuedAt: "2026-07-01T00:00:00.000Z",
+        expiresAt: "2026-08-01T00:00:00.000Z",
+        signatureKeyID: signatureKeyID,
+        signature: ""
+    )
+    let signature = try signingKey.signature(for: unsigned.canonicalSignedPayload())
+    return OfflineDeviceAuthorization(
+        productID: unsigned.productID,
+        platform: unsigned.platform,
+        deviceID: unsigned.deviceID,
+        username: unsigned.username,
+        email: unsigned.email,
+        plan: unsigned.plan,
+        entitlements: unsigned.entitlements,
+        issuedAt: unsigned.issuedAt,
+        expiresAt: unsigned.expiresAt,
+        signatureKeyID: unsigned.signatureKeyID,
+        signature: signature.base64EncodedString()
+    )
 }
 
 private extension NSView {

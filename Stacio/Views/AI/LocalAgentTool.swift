@@ -45,6 +45,15 @@ public enum LocalAgentTool: String, CaseIterable, Hashable {
         }
     }
 
+    public var embeddedTerminalArguments: [String] {
+        switch self {
+        case .codex:
+            return ["--no-alt-screen"]
+        case .claude, .opencode, .mimoCode, .zcode, .qwenCode:
+            return []
+        }
+    }
+
     public func commonExecutablePaths(homeDirectory: String) -> [String] {
         let home = homeDirectory.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let rootedHome = home.isEmpty ? homeDirectory : "/\(home)"

@@ -253,6 +253,7 @@ public final class WorkspaceViewController: NSViewController {
     private var multiExecSession: MultiExecInteractiveSession?
     private var terminalSelectionNotificationGeneration: UInt64 = 0
     private var runtimeIDReattachments: [String: String] = [:]
+    private var aiHistoryScopeIDs: [String: String] = [:]
     private var settingsObserver: NSObjectProtocol?
     private weak var lastCommandTerminalPane: NSViewController?
     private lazy var commandCompletionNotificationCoordinator = TerminalCommandCompletionNotificationCoordinator(
@@ -877,6 +878,7 @@ public final class WorkspaceViewController: NSViewController {
         if let remoteTerminal = terminalPane as? RemoteTerminalPaneViewController {
             return AITerminalContext(
                 runtimeID: remoteTerminal.runtimeID,
+                historyScopeID: aiHistoryScopeIDs[remoteTerminal.runtimeID],
                 title: remoteTerminal.terminalTitle,
                 currentDirectory: remoteTerminal.currentRemoteDirectory,
                 recentTranscript: remoteTerminal.terminalOutputTranscript
@@ -885,12 +887,22 @@ public final class WorkspaceViewController: NSViewController {
         if let localTerminal = terminalPane as? TerminalPaneViewController {
             return AITerminalContext(
                 runtimeID: localTerminal.runtimeID,
+                historyScopeID: aiHistoryScopeIDs[localTerminal.runtimeID],
                 title: title(for: localTerminal),
                 currentDirectory: localTerminal.currentLocalDirectory,
                 recentTranscript: localTerminal.terminalOutputTranscript
             )
         }
         return nil
+    }
+
+    public func setAIHistoryScopeID(_ historyScopeID: String, runtimeID: String) {
+        guard historyScopeID.isEmpty == false, runtimeID.isEmpty == false else { return }
+        aiHistoryScopeIDs[runtimeID] = historyScopeID
+    }
+
+    func aiHistoryScopeIDForTesting(runtimeID: String) -> String? {
+        aiHistoryScopeIDs[runtimeID]
     }
 
     public func currentAITerminalContext() -> AITerminalContext? {
@@ -1986,6 +1998,9 @@ public final class WorkspaceViewController: NSViewController {
 
     private func recordRuntimeReattachment(oldRuntimeID: String, newRuntimeID: String) {
         guard oldRuntimeID != newRuntimeID else { return }
+        if let historyScopeID = aiHistoryScopeIDs.removeValue(forKey: oldRuntimeID) {
+            aiHistoryScopeIDs[newRuntimeID] = historyScopeID
+        }
         let aliases = runtimeIDReattachments.compactMap { alias, targetRuntimeID in
             targetRuntimeID == oldRuntimeID ? alias : nil
         }
@@ -2179,6 +2194,7 @@ public final class WorkspaceViewController: NSViewController {
         for alias in runtimeAliasesToRemove {
             runtimeIDReattachments[alias] = nil
         }
+        aiHistoryScopeIDs[paneRuntimeID] = nil
         return true
     }
 

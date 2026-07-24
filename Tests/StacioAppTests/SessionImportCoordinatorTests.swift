@@ -14,7 +14,8 @@ final class SessionImportCoordinatorTests: XCTestCase {
             .finalShell,
             .termius,
             .electerm,
-            .genericJSON
+            .genericJSON,
+            .bastionHost
         ])
         XCTAssertFalse(AppKitSessionImportSourcePicker.supportedSources.map(\.name).contains("NyaTerm"))
         XCTAssertEqual(
@@ -26,7 +27,8 @@ final class SessionImportCoordinatorTests: XCTestCase {
                 "securecrt.svg",
                 "finalshell.svg",
                 "termius.svg",
-                "electerm.svg"
+                "electerm.svg",
+                "bastion-host.png"
             ]
         )
     }
@@ -41,6 +43,69 @@ final class SessionImportCoordinatorTests: XCTestCase {
         }
     }
 
+    func testBastionImportMenuItemIsDisabledWithUpgradeTooltipWithoutLicense() throws {
+        let source = try XCTUnwrap(
+            AppKitSessionImportSourcePicker.supportedSources.first { $0.type == .bastionHost }
+        )
+        let item = NSMenuItem(title: source.name, action: nil, keyEquivalent: "")
+        SessionImportSourceAvailability.configure(
+            item,
+            for: source,
+            licenseAccess: RecordingLicenseFeatureAccessProvider(enabled: false)
+        )
+
+        XCTAssertFalse(item.isEnabled)
+        XCTAssertEqual(item.toolTip, "该功能模块无有效授权，请升级授权。")
+    }
+
+    func testBastionImportMenuItemIsEnabledWithValidLicense() throws {
+        let source = try XCTUnwrap(
+            AppKitSessionImportSourcePicker.supportedSources.first { $0.type == .bastionHost }
+        )
+        let item = NSMenuItem(title: source.name, action: nil, keyEquivalent: "")
+        SessionImportSourceAvailability.configure(
+            item,
+            for: source,
+            licenseAccess: RecordingLicenseFeatureAccessProvider(enabled: true)
+        )
+
+        XCTAssertTrue(item.isEnabled)
+        XCTAssertNil(item.toolTip)
+    }
+
+    func testOrdinaryBulkImportMenuItemRequiresSessionBulkIOLicense() throws {
+        let source = try XCTUnwrap(
+            AppKitSessionImportSourcePicker.supportedSources.first { $0.type == .windTerm }
+        )
+        let item = NSMenuItem(title: source.name, action: nil, keyEquivalent: "")
+        SessionImportSourceAvailability.configure(
+            item,
+            for: source,
+            licenseAccess: RecordingLicenseFeatureAccessProvider(enabled: false)
+        )
+
+        XCTAssertFalse(item.isEnabled)
+        XCTAssertEqual(item.toolTip, L10n.Import.licenseUnavailableTooltip)
+    }
+
+    func testBulkImportRequiresLicenseBeforeOpeningFilePicker() throws {
+        let picker = RecordingSourceAwareSessionImportFilePicker(file: nil)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: picker,
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore(),
+            licensedFeatureAuthorizer: LicenseFeatureAuthorizer(
+                accessProvider: RecordingLicenseFeatureAccessProvider(enabled: false)
+            )
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(sourceType: .windTerm, parentWindow: nil)) { error in
+            XCTAssertEqual(error as? LicensedFeatureAccessError, .licenseRequired(.sessionBulkIO))
+        }
+        XCTAssertTrue(picker.requestedSourceTypes.isEmpty)
+    }
+
     func testCoordinatorRequestsFileForSelectedImportSourceWithoutSourcePicker() throws {
         let picker = RecordingSourceAwareSessionImportFilePicker(file: nil)
         let coordinator = SessionImportCoordinator(
@@ -53,6 +118,133 @@ final class SessionImportCoordinatorTests: XCTestCase {
         _ = try coordinator.runImport(sourceType: .windTerm, parentWindow: nil)
 
         XCTAssertEqual(picker.requestedSourceTypes, [.windTerm])
+    }
+
+    func testBastionImportRequiresLicenseBeforeOpeningFilePicker() {
+        let picker = RecordingSourceAwareSessionImportFilePicker(file: nil)
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: picker,
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(error: .licenseRequired)
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)) { error in
+            XCTAssertEqual(error as? BastionHostFeatureAccessError, .licenseRequired)
+        }
+        XCTAssertTrue(picker.requestedSourceTypes.isEmpty)
+        XCTAssertTrue(presenter.shownErrors.isEmpty)
+    }
+
+    func testBastionImportAutomaticallyParsesXshellFileBehindDedicatedSource() throws {
+        let contents = """
+        [CONNECTION]
+        Host=bastion.example.com
+        Port=60022
+        UserName=SSH@ops@10.0.0.8
+        """
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let authorizer = RecordingBastionHostFeatureAuthorizer()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "asset.xsh",
+                    sourceType: .bastionHost,
+                    contents: contents,
+                    sourceURL: URL(fileURLWithPath: "/tmp/asset.xsh")
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertEqual(authorizer.authorizationCount, 1)
+        XCTAssertEqual(presenter.previewedSessionNames, ["asset"])
+    }
+
+    func testBastionManifestConfigIsForwardedIntoImportPreview() throws {
+        let contents = """
+        {"format":"stacio.bastion.v1","vendor":"安恒","sessions":[{
+          "name":"DB","protocol":"ssh","gatewayHost":"bastion.example.com",
+          "gatewayPort":22,"gatewayUsername":"dba@asset@gateway","assetId":"asset-db"
+        }]}
+        """
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let core = RecordingSessionImportCore()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "db.stacio-bastion",
+                    sourceType: .bastionHost,
+                    contents: contents,
+                    sourceURL: URL(fileURLWithPath: "/tmp/db.stacio-bastion")
+                )
+            ),
+            presenter: presenter,
+            core: core,
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer()
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertEqual(presenter.previewedSessionNames, ["DB"])
+        XCTAssertTrue(try XCTUnwrap(presenter.previewedConfigJSON.first).contains("dbappsecurity"))
+    }
+
+    func testCoordinatorRequiresBastionLicenseBeforeConfirmingDetectedXshellSession() {
+        let contents = """
+        [CONNECTION]
+        Host=bastion.example.com
+        Port=60022
+        UserName=SSH@ops@10.0.0.8
+        """
+        let presenter = RecordingSessionImportPresenter(confirmImport: true)
+        let authorizer = RecordingBastionHostFeatureAuthorizer(error: .licenseRequired)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(sourceName: "asset.xsh", sourceType: .xShell, contents: contents)
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(parentWindow: nil)) { error in
+            XCTAssertEqual(error as? BastionHostFeatureAccessError, .licenseRequired)
+        }
+        XCTAssertEqual(authorizer.authorizationCount, 1)
+        XCTAssertTrue(presenter.previewedSessionNames.isEmpty)
+    }
+
+    func testCoordinatorDoesNotRequireBastionLicenseForOrdinaryXshellSession() throws {
+        let contents = """
+        [CONNECTION]
+        Host=server.example.com
+        Port=22
+        UserName=root
+        """
+        let authorizer = RecordingBastionHostFeatureAuthorizer(error: .licenseRequired)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(sourceName: "server.xsh", sourceType: .xShell, contents: contents)
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        _ = try coordinator.runImport(parentWindow: nil)
+
+        XCTAssertEqual(authorizer.authorizationCount, 0)
     }
 
     func testCoordinatorAppliesExternalCredentialsAfterSessionImport() throws {
@@ -615,7 +807,9 @@ private final class RecordingSourceAwareSessionImportFilePicker: SessionImportFi
 private final class RecordingSessionImportPresenter: SessionImportPreviewPresenting {
     private let confirmImport: Bool
     private(set) var previewedSessionNames: [String] = []
+    private(set) var previewedConfigJSON: [String] = []
     private(set) var shownResults: [ImportApplyResult] = []
+    private(set) var shownErrors: [Error] = []
 
     init(confirmImport: Bool) {
         self.confirmImport = confirmImport
@@ -628,6 +822,7 @@ private final class RecordingSessionImportPresenter: SessionImportPreviewPresent
         parentWindow: NSWindow?
     ) -> Bool {
         previewedSessionNames = preview.sessions.map(\.name)
+        previewedConfigJSON = preview.sessions.compactMap(\.configJson)
         return confirmImport
     }
 
@@ -635,7 +830,17 @@ private final class RecordingSessionImportPresenter: SessionImportPreviewPresent
         shownResults.append(result)
     }
 
-    func showImportError(_ error: Error, parentWindow: NSWindow?) {}
+    func showImportError(_ error: Error, parentWindow: NSWindow?) {
+        shownErrors.append(error)
+    }
+}
+
+private struct RecordingLicenseFeatureAccessProvider: LicenseFeatureAccessProviding {
+    let enabled: Bool
+
+    func isEnabled(_ feature: StacioLicensedFeature) -> Bool {
+        enabled
+    }
 }
 
 private final class RecordingSessionImportCore: SessionImportCoreBridging {
@@ -716,6 +921,20 @@ private final class RecordingExternalSessionCredentialApplier: ExternalSessionCr
     ) throws {
         appliedPayload = payload
         appliedSessions = importedSessions
+    }
+}
+
+private final class RecordingBastionHostFeatureAuthorizer: BastionHostFeatureAuthorizing {
+    private let error: BastionHostFeatureAccessError?
+    private(set) var authorizationCount = 0
+
+    init(error: BastionHostFeatureAccessError? = nil) {
+        self.error = error
+    }
+
+    func authorizeBastionHostAccess() throws {
+        authorizationCount += 1
+        if let error { throw error }
     }
 }
 

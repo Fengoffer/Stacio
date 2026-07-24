@@ -37,6 +37,20 @@ public protocol AIAssistantConversationHistoryClearing {
     func clearConversationHistory() throws
 }
 
+public struct AIAssistantConversationThreadSummary: Equatable {
+    public let id: String
+    public let title: String
+    public let latestMessageAt: String
+}
+
+public protocol AIAssistantConversationThreadListing {
+    func listConversationThreads(runtimeID: String) throws -> [AIAssistantConversationThreadSummary]
+}
+
+public extension AIAssistantConversationThreadListing {
+    func listConversationThreads(runtimeID: String) throws -> [AIAssistantConversationThreadSummary] { [] }
+}
+
 public struct AIConversationHistoryConversationSummary: Equatable {
     public let runtimeID: String
     public let firstUserMessagePreview: String
@@ -80,9 +94,10 @@ public typealias AIAssistantConversationHistoryStoring =
     AIAssistantConversationHistoryRecording
     & AIAssistantConversationHistoryListing
     & AIAssistantConversationHistoryClearing
+    & AIAssistantConversationThreadListing
 
 public struct CoreBridgeAIAssistantConversationHistoryStore: AIAssistantConversationHistoryRecording,
-    AIAssistantConversationHistoryBrowsing {
+    AIAssistantConversationHistoryBrowsing, AIAssistantConversationThreadListing {
     private let databasePath: String
 
     public init(databasePath: String) {
@@ -116,6 +131,50 @@ public struct CoreBridgeAIAssistantConversationHistoryStore: AIAssistantConversa
 
     public func listConversationHistory(runtimeID: String) throws -> [AIConversationHistoryItemRecord] {
         try CoreBridge.listAIConversationHistory(databasePath: databasePath, runtimeID: runtimeID)
+    }
+
+    public func listConversationThreads(runtimeID: String) throws -> [AIAssistantConversationThreadSummary] {
+        let connection = try AIConversationHistorySQLiteConnection(path: databasePath)
+        guard try connection.tableExists("ai_conversation_history") else { return [] }
+        let prefix = Self.threadStorageID(runtimeID: runtimeID, threadID: "")
+        let statement = try connection.prepare(
+            """
+            SELECT runtime_id,
+                   COALESCE((SELECT content FROM ai_conversation_history first
+                             WHERE first.runtime_id = history.runtime_id AND first.role = 'user'
+                             ORDER BY first.rowid ASC LIMIT 1), ''),
+                   MAX(created_at)
+            FROM ai_conversation_history history
+            WHERE runtime_id = ? OR runtime_id LIKE ? ESCAPE '\\'
+            GROUP BY runtime_id
+            ORDER BY MAX(rowid) DESC
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try connection.bind(runtimeID, to: 1, in: statement)
+        try connection.bind(Self.prefixLikePattern(for: prefix), to: 2, in: statement)
+        var threads: [AIAssistantConversationThreadSummary] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let storageID = connection.columnString(statement, index: 0)
+            let threadID = Self.threadID(from: storageID, runtimeID: runtimeID) ?? "legacy"
+            let firstMessage = connection.columnString(statement, index: 1)
+            threads.append(.init(
+                id: threadID,
+                title: firstMessage.isEmpty ? "排查会话" : Self.previewText(firstMessage),
+                latestMessageAt: connection.columnString(statement, index: 2)
+            ))
+        }
+        return threads
+    }
+
+    public static func threadStorageID(runtimeID: String, threadID: String) -> String {
+        threadID == "legacy" ? runtimeID : runtimeID + "\u{1F}" + threadID
+    }
+
+    private static func threadID(from storageID: String, runtimeID: String) -> String? {
+        let prefix = runtimeID + "\u{1F}"
+        guard storageID.hasPrefix(prefix) else { return storageID == runtimeID ? "legacy" : nil }
+        return String(storageID.dropFirst(prefix.count))
     }
 
     public func clearConversationHistory() throws {
@@ -217,10 +276,11 @@ public struct CoreBridgeAIAssistantConversationHistoryStore: AIAssistantConversa
             return
         }
         let statement = try connection.prepare(
-            "DELETE FROM ai_conversation_history WHERE runtime_id = ?"
+            "DELETE FROM ai_conversation_history WHERE runtime_id = ? OR runtime_id LIKE ? ESCAPE '\\'"
         )
         defer { sqlite3_finalize(statement) }
         try connection.bind(runtimeID, to: 1, in: statement)
+        try connection.bind(Self.prefixLikePattern(for: Self.threadStorageID(runtimeID: runtimeID, threadID: "")), to: 2, in: statement)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw connection.error("delete conversation history")
         }
@@ -240,6 +300,18 @@ public struct CoreBridgeAIAssistantConversationHistoryStore: AIAssistantConversa
     private static func likePattern(for query: String) -> String {
         var pattern = "%"
         for character in query {
+            if character == "\\" || character == "%" || character == "_" {
+                pattern.append("\\")
+            }
+            pattern.append(character)
+        }
+        pattern.append("%")
+        return pattern
+    }
+
+    private static func prefixLikePattern(for prefix: String) -> String {
+        var pattern = ""
+        for character in prefix {
             if character == "\\" || character == "%" || character == "_" {
                 pattern.append("\\")
             }

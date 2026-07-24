@@ -37,6 +37,48 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertNotNil(weakController)
     }
 
+    func testApplicationShowsFreePlanNoticeOnLaunchWhenNoLicenseIsActive() {
+        var noticeController: FreePlanNoticeWindowController?
+        let delegate = AppDelegate(
+            factory: { FakeWorkbenchWindowController() },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            shouldShowFreePlanNotice: true,
+            hasValidLicense: { false },
+            freePlanNoticeWindowControllerFactory: {
+                let controller = FreePlanNoticeWindowController()
+                noticeController = controller
+                return controller
+            }
+        )
+        defer { noticeController?.close() }
+
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+
+        XCTAssertTrue(noticeController?.window?.isVisible == true)
+    }
+
+    func testApplicationDoesNotShowFreePlanNoticeWhenLicenseIsActive() {
+        var noticeFactoryCallCount = 0
+        let delegate = AppDelegate(
+            factory: { FakeWorkbenchWindowController() },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            shouldShowFreePlanNotice: true,
+            hasValidLicense: { true },
+            freePlanNoticeWindowControllerFactory: {
+                noticeFactoryCallCount += 1
+                return FreePlanNoticeWindowController()
+            }
+        )
+
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+
+        XCTAssertEqual(noticeFactoryCallCount, 0)
+    }
+
     func testApplicationReopensWorkbenchWhenStateRestorationLeavesNoVisibleWindows() {
         let workbench = FakeWorkbenchWindowController()
         let delegate = AppDelegate(factory: { workbench })
@@ -70,10 +112,10 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.13.5"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.0"))
     }
 
-    func testApplicationLaunchRevalidatesLicenseAndStartsNetworkMonitoring() async {
+    func testApplicationLaunchDoesNotRevalidatePersistedLicenseOrStartNetworkMonitoring() async {
         let revalidator = RecordingLicenseRevalidator()
         let networkMonitor = RecordingLicenseNetworkMonitor()
         let delegate = AppDelegate(
@@ -87,16 +129,53 @@ final class StacioApplicationTests: XCTestCase {
         )
 
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
-        for _ in 0..<100 where revalidator.launchCount == 0 {
-            await Task.yield()
-        }
+        await Task.yield()
 
-        XCTAssertEqual(revalidator.launchCount, 1)
+        XCTAssertEqual(revalidator.launchCount, 0)
         XCTAssertEqual(revalidator.networkRestoreCount, 0)
-        XCTAssertEqual(networkMonitor.startCount, 1)
+        XCTAssertEqual(networkMonitor.startCount, 0)
     }
 
-    func testApplicationRevalidatesLicenseAfterNetworkRestoreAndStopsMonitorOnTermination() async {
+    func testApplicationSilentlyRevalidatesLicenseInsideRenewalMilestone() async {
+        let markerKey = "Stacio.License.lastSilentSyncMilestone"
+        let previousMarker = UserDefaults.standard.object(forKey: markerKey)
+        UserDefaults.standard.removeObject(forKey: markerKey)
+        defer {
+            if let previousMarker {
+                UserDefaults.standard.set(previousMarker, forKey: markerKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: markerKey)
+            }
+        }
+        let revalidator = RecordingLicenseRevalidator(outcome: .refreshed(LicenseState(status: .active)))
+        let networkMonitor = RecordingLicenseNetworkMonitor()
+        let delegate = AppDelegate(
+            factory: { FakeWorkbenchWindowController() },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            sparkleUpdateChecker: RecordingSparkleUpdateChecker(),
+            licenseRevalidator: revalidator,
+            licenseNetworkMonitor: networkMonitor,
+            licenseStateProvider: {
+                LicenseState(
+                    expiresAt: Date().addingTimeInterval(3 * 86_400),
+                    status: .active
+                )
+            }
+        )
+
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        for _ in 0..<10 where revalidator.launchCount == 0 {
+            await Task.yield()
+        }
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+
+        XCTAssertEqual(networkMonitor.startCount, 1)
+        XCTAssertEqual(revalidator.launchCount, 1)
+    }
+
+    func testApplicationIgnoresNetworkRestoreForPersistedLicense() async {
         let revalidator = RecordingLicenseRevalidator()
         let networkMonitor = RecordingLicenseNetworkMonitor()
         let delegate = AppDelegate(
@@ -111,16 +190,14 @@ final class StacioApplicationTests: XCTestCase {
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
 
         networkMonitor.simulateNetworkRestore()
-        for _ in 0..<100 where revalidator.networkRestoreCount == 0 {
-            await Task.yield()
-        }
+        await Task.yield()
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
 
-        XCTAssertEqual(revalidator.networkRestoreCount, 1)
+        XCTAssertEqual(revalidator.networkRestoreCount, 0)
         XCTAssertEqual(networkMonitor.cancelCount, 1)
     }
 
-    func testApplicationMarksLicenseNetworkUnavailableDuringRuntimeDisconnect() async {
+    func testApplicationIgnoresRuntimeNetworkDisconnectForPersistedLicense() async {
         let revalidator = RecordingLicenseRevalidator()
         let networkMonitor = RecordingLicenseNetworkMonitor()
         let delegate = AppDelegate(
@@ -135,11 +212,9 @@ final class StacioApplicationTests: XCTestCase {
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
 
         networkMonitor.simulateNetworkUnavailable()
-        for _ in 0..<100 where revalidator.networkUnavailableCount == 0 {
-            await Task.yield()
-        }
+        await Task.yield()
 
-        XCTAssertEqual(revalidator.networkUnavailableCount, 1)
+        XCTAssertEqual(revalidator.networkUnavailableCount, 0)
         XCTAssertEqual(revalidator.networkRestoreCount, 0)
     }
 
@@ -268,6 +343,47 @@ final class StacioApplicationTests: XCTestCase {
         delegate.openStacioURLForTesting(URL(string: "stacio://unknown/session_api")!)
 
         XCTAssertEqual(workbench.openSavedSessionIDs, [])
+    }
+
+    func testStacioConnectURLForwardsValidatedBastionRequestToWorkbench() throws {
+        let workbench = FakeWorkbenchWindowController()
+        let delegate = AppDelegate(factory: { workbench })
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        let request = BastionHostDeepLinkRequest(
+            version: 1,
+            vendor: "example",
+            protocolName: "ssh",
+            gatewayHost: "bastion.example.com",
+            gatewayPort: 60022,
+            gatewayUsername: "SSH@ops@10.0.0.8",
+            targetHost: "10.0.0.8",
+            targetPort: 22,
+            targetUsername: "ops",
+            assetID: "asset-1",
+            accountID: "account-1",
+            requestID: "req-1",
+            nonce: "nonce-1",
+            expiresAt: Date().addingTimeInterval(60)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let payload = try encoder.encode(request).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        var components = URLComponents(string: "stacio://connect")!
+        components.queryItems = [URLQueryItem(name: "payload", value: payload)]
+
+        delegate.openStacioURLForTesting(try XCTUnwrap(components.url))
+
+        let forwarded = try XCTUnwrap(workbench.openBastionHostRequests.first)
+        XCTAssertEqual(forwarded.vendor, request.vendor)
+        XCTAssertEqual(forwarded.gatewayHost, request.gatewayHost)
+        XCTAssertEqual(forwarded.gatewayPort, request.gatewayPort)
+        XCTAssertEqual(forwarded.gatewayUsername, request.gatewayUsername)
+        XCTAssertEqual(forwarded.targetHost, request.targetHost)
+        XCTAssertEqual(forwarded.requestID, request.requestID)
+        XCTAssertEqual(forwarded.expiresAt.timeIntervalSince1970, request.expiresAt.timeIntervalSince1970, accuracy: 1)
     }
 
     func testDeviceDashboardMenuActionForwardsToWorkbench() {
@@ -428,6 +544,39 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertEqual(presenter.presentedVersions, ["0.14.0"])
     }
 
+    func testInstalledUpdateReleaseNotesCapsLongContentInScrollableViewport() throws {
+        let releaseNotes = """
+        <!-- sparkle-sign-warning:
+        IMPORTANT: This file was signed by Sparkle.
+        -->
+        """ + (1...80)
+            .map { "## 更新内容 \($0)\n- 这是一条需要在固定正文区域内滚动查看的较长更新说明。" }
+            .joined(separator: "\n")
+        let presenter = AppKitInstalledUpdateReleaseNotesPresenter()
+
+        let alert = presenter.makeAlert(version: "0.14.0", releaseNotes: releaseNotes)
+        alert.layout()
+
+        XCTAssertEqual(alert.messageText, "Stacio 已更新到 0.14.0")
+        XCTAssertEqual(alert.informativeText, "")
+        XCTAssertLessThanOrEqual(alert.window.frame.height, 560)
+        let scrollView = try XCTUnwrap(alert.accessoryView as? NSScrollView)
+        XCTAssertTrue(scrollView.hasVerticalScroller)
+        XCTAssertFalse(scrollView.hasHorizontalScroller)
+        XCTAssertEqual(
+            scrollView.frame.height,
+            AppKitInstalledUpdateReleaseNotesPresenter.releaseNotesViewportMaximumHeight
+        )
+        let textView = try XCTUnwrap(scrollView.documentView as? NSTextView)
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertTrue(textView.string.hasPrefix("更新内容 1\n- 这是一条"))
+        XCTAssertFalse(textView.string.contains("sparkle-sign-warning"))
+        XCTAssertFalse(textView.string.contains("## 更新内容"))
+        XCTAssertTrue(textView.string.contains("更新内容 80"))
+        XCTAssertGreaterThan(textView.frame.height, scrollView.contentSize.height)
+    }
+
     func testSparkleUpdatePromptOnlyTreatsBackendNewerVersionOrBuildAsAvailable() {
         XCTAssertTrue(
             SparkleUpdatePromptInfo(version: "0.14.0", build: "1")
@@ -455,7 +604,7 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.13.5")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.0")
         XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
         XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")
@@ -493,7 +642,7 @@ final class StacioApplicationTests: XCTestCase {
         let image = NSImage(size: NSSize(width: 32, height: 32))
         let content = StacioAboutContent(
             applicationName: "Stacio",
-            displayVersion: "Stacio-0.13.5",
+            displayVersion: "Stacio-0.14.0",
             websiteURL: URL(string: "https://www.stacio.cn/")!,
             repositoryURL: URL(string: "https://github.com/Fengoffer/Stacio")!,
             giteeRepositoryURL: URL(string: "https://gitee.com/fengoffer/Stacio")!,
@@ -539,6 +688,7 @@ final class StacioApplicationTests: XCTestCase {
 private final class FakeWorkbenchWindowController: WorkbenchWindowShowing {
     var hasRunningTunnels: Bool
     var openSavedSessionIDs: [String] = []
+    var openBastionHostRequests: [BastionHostDeepLinkRequest] = []
     var deviceDashboardMenuToggleCount = 0
     var shouldPrepareForTermination = true
     private(set) var showWindowCount = 0
@@ -554,6 +704,10 @@ private final class FakeWorkbenchWindowController: WorkbenchWindowShowing {
 
     func openSavedSession(id: String) {
         openSavedSessionIDs.append(id)
+    }
+
+    func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {
+        openBastionHostRequests.append(request)
     }
 
     func toggleDeviceDashboardFromMenu(_ sender: Any?) {
@@ -668,18 +822,23 @@ private final class RecordingApplicationLogStore: StacioLogWriting {
 
 @MainActor
 private final class RecordingLicenseRevalidator: LicenseRevalidating, LicenseNetworkUnavailableHandling {
+    private let outcome: LicenseRevalidationOutcome
     private(set) var launchCount = 0
     private(set) var networkRestoreCount = 0
     private(set) var networkUnavailableCount = 0
 
+    init(outcome: LicenseRevalidationOutcome = .noActivation) {
+        self.outcome = outcome
+    }
+
     func revalidateOnLaunch() async throws -> LicenseRevalidationOutcome {
         launchCount += 1
-        return .noActivation
+        return outcome
     }
 
     func revalidateAfterNetworkRestore() async throws -> LicenseRevalidationOutcome {
         networkRestoreCount += 1
-        return .noActivation
+        return outcome
     }
 
     func markNetworkUnavailable() async throws -> LicenseRevalidationOutcome {

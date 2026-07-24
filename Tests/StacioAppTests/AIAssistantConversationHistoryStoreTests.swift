@@ -3,7 +3,7 @@ import XCTest
 @testable import StacioApp
 
 final class AIAssistantConversationHistoryStoreTests: XCTestCase {
-    func testCoreBridgeConversationHistoryStorePersistsTrimsAndClearsLocalHistory() throws {
+    func testCoreBridgeConversationHistoryStorePersistsAllAndClearsLocalHistory() throws {
         let databaseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("StacioAIConversationHistoryStoreTests-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: databaseURL) }
@@ -41,8 +41,8 @@ final class AIAssistantConversationHistoryStoreTests: XCTestCase {
             )
         }
         let trimmed = try store.listConversationHistory(runtimeID: "runtime-trim")
-        XCTAssertEqual(trimmed.count, 30)
-        XCTAssertEqual(trimmed.first?.content, "message-5")
+        XCTAssertEqual(trimmed.count, 35)
+        XCTAssertEqual(trimmed.first?.content, "message-0")
         XCTAssertEqual(trimmed.last?.requestId, "req-34")
         XCTAssertLessThan(trimmed.last?.content.count ?? 0, oversized.count)
 
@@ -101,5 +101,30 @@ final class AIAssistantConversationHistoryStoreTests: XCTestCase {
 
         XCTAssertTrue(try store.listConversationHistory(runtimeID: "runtime-new").isEmpty)
         XCTAssertEqual(try store.listConversationSummaries(searchQuery: nil).map(\.runtimeID), ["runtime-old"])
+    }
+
+    func testConversationThreadsPersistIndependentlyAndDeleteWithRuntime() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioAIConversationThreads-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let store = CoreBridgeAIAssistantConversationHistoryStore(databasePath: databaseURL.path)
+        let first = CoreBridgeAIAssistantConversationHistoryStore.threadStorageID(
+            runtimeID: "runtime-a",
+            threadID: "thread-1"
+        )
+        let second = CoreBridgeAIAssistantConversationHistoryStore.threadStorageID(
+            runtimeID: "runtime-a",
+            threadID: "thread-2"
+        )
+        _ = try store.appendConversationHistoryItem(runtimeID: first, role: .user, content: "检查 CPU", requestID: nil)
+        _ = try store.appendConversationHistoryItem(runtimeID: second, role: .user, content: "检查磁盘", requestID: nil)
+
+        let threads = try store.listConversationThreads(runtimeID: "runtime-a")
+        XCTAssertEqual(Set(threads.map(\.id)), ["thread-1", "thread-2"])
+        XCTAssertEqual(try store.listConversationHistory(runtimeID: first).map(\.content), ["检查 CPU"])
+        XCTAssertEqual(try store.listConversationHistory(runtimeID: second).map(\.content), ["检查磁盘"])
+
+        try store.deleteConversationHistory(runtimeID: "runtime-a")
+        XCTAssertTrue(try store.listConversationThreads(runtimeID: "runtime-a").isEmpty)
     }
 }

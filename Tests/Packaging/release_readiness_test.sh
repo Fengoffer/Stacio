@@ -36,7 +36,13 @@ printf 'source\n' >"$SOURCE_ROOT/App.swift"
 touch -t 202001010000 "$SOURCE_ROOT/App.swift"
 export STACIO_RELEASE_SOURCE_ROOT="$SOURCE_ROOT"
 
-touch "$APP_DIR/Contents/MacOS/Stacio"
+printf '%s\n' \
+  'cn.stacio.product-ops.license' \
+  'stacio.product-ops.license.' \
+  'credentials.vault.json' \
+  'credentials.vault.key' \
+  'stacio-license-vault-v1' \
+  >"$APP_DIR/Contents/MacOS/Stacio"
 chmod +x "$APP_DIR/Contents/MacOS/Stacio"
 printf 'fake dylib\n' >"$APP_DIR/Contents/Frameworks/libstacio_core.dylib"
 printf 'fake sparkle framework\n' >"$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
@@ -93,6 +99,36 @@ cat >"$APP_DIR/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+python3 - "$APP_DIR/Contents/Info.plist" "$ROOT_DIR/config/license-trust-anchors.json" <<'PY'
+import json
+import plistlib
+import sys
+
+plist_path, trust_path = sys.argv[1:]
+with open(plist_path, "rb") as stream:
+    plist = plistlib.load(stream)
+with open(trust_path, "r", encoding="utf-8") as stream:
+    trust = json.load(stream)
+
+online = trust["onlineAuthorization"]
+offline = trust["offlineLicense"]
+request = offline["request"]
+authorization = offline["authorization"]
+storage = trust["storage"]
+plist.update({
+    "StacioLicensePublicEd25519Key": online["publicKeyBase64"],
+    "StacioOnlineLicenseSignatureKeyID": online["signatureKeyID"],
+    "StacioOfflineLicenseExchangeURL": offline["exchangeURL"],
+    "StacioOfflineExchangePublicKey": request["publicKeyBase64"],
+    "StacioOfflineRequestKeyID": request["keyID"],
+    "StacioOfflineSignatureKeyID": authorization["signatureKeyID"],
+    "StacioOfflineLicensePublicKey": authorization["publicKeyBase64"],
+    "StacioLicenseStorageContractID": storage["contractID"],
+    "StacioLicenseStorageSchemaVersion": int(storage["schemaVersion"]),
+})
+with open(plist_path, "wb") as stream:
+    plistlib.dump(plist, stream, fmt=plistlib.FMT_XML, sort_keys=False)
+PY
 printf '\x72' >"$DMG_PATH"
 
 write_stable_appcast() {
@@ -504,6 +540,14 @@ expect_missing_product_ops_field_failure "SUFeedURL"
 expect_missing_product_ops_field_failure "StacioSparkleBetaAppcastURL"
 expect_missing_product_ops_field_failure "SUPublicEDKey"
 expect_missing_product_ops_field_failure "StacioLicensePublicEd25519Key"
+expect_missing_product_ops_field_failure "StacioOnlineLicenseSignatureKeyID"
+expect_missing_product_ops_field_failure "StacioOfflineLicenseExchangeURL"
+expect_missing_product_ops_field_failure "StacioOfflineExchangePublicKey"
+expect_missing_product_ops_field_failure "StacioOfflineRequestKeyID"
+expect_missing_product_ops_field_failure "StacioOfflineSignatureKeyID"
+expect_missing_product_ops_field_failure "StacioOfflineLicensePublicKey"
+expect_missing_product_ops_field_failure "StacioLicenseStorageContractID"
+expect_missing_product_ops_field_failure "StacioLicenseStorageSchemaVersion"
 expect_missing_product_ops_field_failure "SUEnableAutomaticChecks"
 expect_missing_product_ops_field_failure "SUAutomaticallyUpdate"
 expect_missing_product_ops_field_failure "SUAllowsAutomaticUpdates"
@@ -539,6 +583,8 @@ expect_product_ops_value_failure "SUScheduledCheckInterval" "3600" "SUScheduledC
 expect_product_ops_value_failure "StacioSparkleArchitecture" "unsupported" "StacioSparkleArchitecture must be arm64 or x86_64"
 expect_product_ops_value_failure "SUPublicEDKey" "not-base64" "SUPublicEDKey must contain a valid Ed25519 public key"
 expect_product_ops_value_failure "StacioLicensePublicEd25519Key" "not-base64" "StacioLicensePublicEd25519Key must contain a valid Ed25519 public key"
+expect_product_ops_value_failure "StacioOfflineLicensePublicKey" "not-base64" "StacioOfflineLicensePublicKey must contain a valid Ed25519 public key"
+expect_product_ops_value_failure "StacioOfflineExchangePublicKey" "not-base64" "StacioOfflineExchangePublicKey must contain a valid X25519 public key"
 
 INCOMPLETE_APP_DIR="$TMP_DIR/incomplete-local-smoke.app"
 cp -R "$APP_DIR" "$INCOMPLETE_APP_DIR"

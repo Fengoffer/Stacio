@@ -1044,6 +1044,19 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertEqual(chmodSelections, [RemoteFileSelection(path: "/srv/app/run.sh", size: 128)])
     }
 
+    func testFileSyncActionIsDisabledAndCannotExecuteWithoutLicense() throws {
+        let controller = FilesViewController(
+            licenseAccess: RecordingFilesLicenseAccessProvider(enabledFeatures: [])
+        )
+        var syncCount = 0
+        controller.onSyncChangedRemoteEdits = { syncCount += 1 }
+        controller.loadView()
+
+        controller.performSyncChangedRemoteEditsForTesting()
+
+        XCTAssertEqual(syncCount, 0)
+    }
+
     func testFolderContextMenuExposesRequestedActions() {
         let controller = FilesViewController()
         controller.loadView()
@@ -2738,6 +2751,14 @@ private final class FilesViewControllerRecordingRemoteTextEditorCloseConfirmer: 
     func confirmClose(fileName: String, parentWindow: NSWindow?) -> RemoteTextEditorCloseDecision {
         promptedFileNames.append(fileName)
         return decision
+    }
+}
+
+private struct RecordingFilesLicenseAccessProvider: LicenseFeatureAccessProviding {
+    let enabledFeatures: Set<StacioLicensedFeature>
+
+    func isEnabled(_ feature: StacioLicensedFeature) -> Bool {
+        enabledFeatures.contains(feature)
     }
 }
 

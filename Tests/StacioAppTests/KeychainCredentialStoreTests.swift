@@ -66,7 +66,7 @@ final class KeychainCredentialStoreTests: XCTestCase {
         XCTAssertEqual(try store.readSecret(id: "credential-two", account: "deploy@example.com"), "second-secret")
     }
 
-    func testDeleteRemovesCredentialItem() throws {
+    func testDeleteRemovesCurrentAndLegacyCredentialItems() throws {
         let backend = RecordingDeleteKeychainBackend()
         let store = KeychainCredentialStore(backend: backend)
 
@@ -74,8 +74,31 @@ final class KeychainCredentialStoreTests: XCTestCase {
 
         XCTAssertEqual(
             backend.deletedKeys,
-            [KeychainCredentialStore.storageKey(for: "credential-one", account: "deploy@example.com")]
+            [
+                KeychainCredentialStore.storageKey(for: "credential-one", account: "deploy@example.com"),
+                KeychainCredentialStore.legacyStorageKey(for: "credential-one", account: "deploy@example.com")
+            ]
         )
+    }
+
+    func testDeletePreventsLegacyServiceCredentialFromBeingRestored() throws {
+        let backend = InMemoryKeychainBackend()
+        let store = KeychainCredentialStore(backend: backend)
+        let legacyKey = KeychainCredentialStore.legacyStorageKey(
+            for: "credential-one",
+            account: "deploy@example.com"
+        )
+        try backend.save(key: legacyKey, secret: Data("legacy-secret".utf8))
+        XCTAssertEqual(
+            try store.readSecret(id: "credential-one", account: "deploy@example.com"),
+            "legacy-secret"
+        )
+
+        try store.delete(id: "credential-one", account: "deploy@example.com")
+
+        XCTAssertThrowsError(try store.readSecret(id: "credential-one", account: "deploy@example.com")) { error in
+            XCTAssertEqual(error as? KeychainCredentialError, .notFound)
+        }
     }
 
     func testCredentialDebugDescriptionRedactsSecret() throws {
@@ -191,6 +214,49 @@ final class KeychainCredentialStoreTests: XCTestCase {
             try stacioStore.readSecret(id: "session-1-password", account: "deploy@example.com"),
             "legacy-file-secret"
         )
+    }
+
+    func testFileBackendDeleteRemovesCurrentAndLegacyDirectoryCredentials() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioCredentialVault-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stacioDirectory = root.appendingPathComponent("Stacio/CredentialVault", isDirectory: true)
+        let legacyDirectory = root
+            .appendingPathComponent(["Port", "Desk"].joined(), isDirectory: true)
+            .appendingPathComponent("CredentialVault", isDirectory: true)
+        let legacyStore = KeychainCredentialStore(
+            backend: StacioFileCredentialBackend(directoryURL: legacyDirectory, legacyDirectoryURL: nil)
+        )
+        try legacyStore.save(
+            KeychainCredential(
+                id: "session-1-password",
+                account: "deploy@example.com",
+                secret: "legacy-file-secret"
+            )
+        )
+        let stacioStore = KeychainCredentialStore(
+            backend: StacioFileCredentialBackend(
+                directoryURL: stacioDirectory,
+                legacyDirectoryURL: legacyDirectory
+            )
+        )
+        XCTAssertEqual(
+            try stacioStore.readSecret(id: "session-1-password", account: "deploy@example.com"),
+            "legacy-file-secret"
+        )
+
+        try stacioStore.delete(id: "session-1-password", account: "deploy@example.com")
+
+        XCTAssertThrowsError(
+            try stacioStore.readSecret(id: "session-1-password", account: "deploy@example.com")
+        ) { error in
+            XCTAssertEqual(error as? KeychainCredentialError, .notFound)
+        }
+        XCTAssertThrowsError(
+            try legacyStore.readSecret(id: "session-1-password", account: "deploy@example.com")
+        ) { error in
+            XCTAssertEqual(error as? KeychainCredentialError, .notFound)
+        }
     }
 }
 

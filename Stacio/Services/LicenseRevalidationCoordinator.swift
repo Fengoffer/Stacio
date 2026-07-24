@@ -98,6 +98,7 @@ public final class LicenseRevalidationCoordinator {
     private let store: LicenseKeychainStore
     private let service: LicenseService
     private let onlineValidator: LicenseOnlineValidating
+    private let offlineStatusRefresher: OfflineLicenseStatusRefreshing?
     private let contextProvider: () -> LicenseRevalidationContext
     private let retryPolicy: ProductOpsRetryPolicy
     private let nowProvider: () -> Date
@@ -108,6 +109,7 @@ public final class LicenseRevalidationCoordinator {
         store: LicenseKeychainStore,
         service: LicenseService,
         onlineValidator: LicenseOnlineValidating,
+        offlineStatusRefresher: OfflineLicenseStatusRefreshing? = nil,
         contextProvider: @escaping () -> LicenseRevalidationContext,
         retryPolicy: ProductOpsRetryPolicy = ProductOpsRetryPolicy(maxAttempts: 3),
         nowProvider: @escaping () -> Date = Date.init,
@@ -118,6 +120,7 @@ public final class LicenseRevalidationCoordinator {
         self.store = store
         self.service = service
         self.onlineValidator = onlineValidator
+        self.offlineStatusRefresher = offlineStatusRefresher
         self.contextProvider = contextProvider
         self.retryPolicy = retryPolicy
         self.nowProvider = nowProvider
@@ -135,7 +138,12 @@ public final class LicenseRevalidationCoordinator {
     public func markNetworkUnavailable() async throws -> LicenseRevalidationOutcome {
         inFlightTask?.cancel()
         inFlightTask = nil
-        return .networkUnavailable(try service.stateForNetworkUnavailable(now: nowProvider()))
+        let service = self.service
+        let now = nowProvider()
+        let state = try await performPersistence {
+            try service.stateForNetworkUnavailable(now: now)
+        }
+        return .networkUnavailable(state)
     }
 
     private func revalidate() async throws -> LicenseRevalidationOutcome {
@@ -165,12 +173,65 @@ public final class LicenseRevalidationCoordinator {
 
     private func performRevalidation() async throws -> LicenseRevalidationOutcome {
         let now = nowProvider()
-        guard let activation = try store.loadActivationRecord() else {
-            if var state = try store.load(),
+        let store = self.store
+        let service = self.service
+        let stored = try await performPersistence { try store.load() }
+        if let stored,
+           let authorization = stored.offlineDeviceAuthorization {
+            guard let offlineStatusRefresher else {
+                return .refreshed(service.evaluate(state: stored, now: now))
+            }
+            let context = contextProvider()
+            do {
+                let refreshed = try await offlineStatusRefresher.refresh(
+                    authorization: authorization,
+                    appVersion: context.appVersion,
+                    buildNumber: context.buildNumber
+                )
+                let state = try await performPersistence {
+                    try service.state(
+                        applyingOfflineDeviceAuthorization: refreshed,
+                        expectedUsername: authorization.username,
+                        expectedEmail: authorization.email,
+                        activationStore: store,
+                        now: now
+                    )
+                }
+                return .refreshed(state)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let classified = ProductOpsError.classify(error)
+                if classified.offlineLicenseStatusErrorCode != nil {
+                    let state = try await performPersistence {
+                        try service.state(applyingOfflineStatusError: classified, now: now)
+                    }
+                    return .refreshed(state)
+                }
+                switch classified {
+                case .offline, .timeout, .rateLimited, .server:
+                    return .networkUnavailable(service.evaluate(state: stored, now: now))
+                case .backend(_, _, _, let statusCode) where (500..<600).contains(statusCode):
+                    return .networkUnavailable(service.evaluate(state: stored, now: now))
+                default:
+                    throw classified
+                }
+            }
+        }
+        if let stored,
+           stored.lastAuthorizationSyncErrorCode?.isEmpty == false {
+            // A terminal offline-status response requires an explicit
+            // re-import before another automatic online activation is tried.
+            return .refreshed(service.evaluate(state: stored, now: now))
+        }
+        guard let activation = try await performPersistence({
+            try store.loadActivationRecord()
+        }) else {
+            if var state = stored,
                state.status == .active || state.status == .trial {
                 state.status = .invalid
                 state.graceUntil = nil
-                try store.save(state)
+                try await performPersistence { try store.save(state) }
                 return .refreshed(state)
             }
             return .noActivation
@@ -193,22 +254,34 @@ public final class LicenseRevalidationCoordinator {
             let classified = ProductOpsError.classify(error)
             switch classified {
             case .offline, .timeout, .rateLimited, .server:
-                return .networkUnavailable(try service.stateForNetworkUnavailable(now: now))
+                let service = self.service
+                let state = try await performPersistence {
+                    try service.stateForNetworkUnavailable(now: now)
+                }
+                return .networkUnavailable(state)
+            case .backend(_, _, _, let statusCode) where (500..<600).contains(statusCode):
+                let service = self.service
+                let state = try await performPersistence {
+                    try service.stateForNetworkUnavailable(now: now)
+                }
+                return .networkUnavailable(state)
             default:
                 throw classified
             }
         }
-        guard try currentActivationMatches(request) else {
-            if let currentState = try store.load() {
+        guard try await currentActivationMatches(request) else {
+            if let currentState = try await performPersistence({ try store.load() }) {
                 return .refreshed(service.evaluate(state: currentState, now: now))
             }
             return .noActivation
         }
-        let state = try service.state(
-            applyingRevalidation: response,
-            expected: request,
-            now: now
-        )
+        let state = try await performPersistence {
+            try service.state(
+                applyingRevalidation: response,
+                expected: request,
+                now: now
+            )
+        }
         return .refreshed(state)
     }
 
@@ -242,6 +315,8 @@ public final class LicenseRevalidationCoordinator {
         switch error {
         case .rateLimited, .server:
             return true
+        case .backend(_, _, _, let statusCode) where (500..<600).contains(statusCode):
+            return true
         default:
             return false
         }
@@ -255,14 +330,33 @@ public final class LicenseRevalidationCoordinator {
         return min(Self.maximumRetryDelay, retryPolicy.delay)
     }
 
-    private func currentActivationMatches(_ request: LicenseValidationRequest) throws -> Bool {
-        guard let activation = try store.loadActivationRecord() else {
+    private func currentActivationMatches(_ request: LicenseValidationRequest) async throws -> Bool {
+        let store = self.store
+        guard let activation = try await performPersistence({
+            try store.loadActivationRecord()
+        }) else {
             return false
         }
         return activation.licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
             == request.licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
             && activation.username.caseInsensitiveCompare(request.username) == .orderedSame
             && activation.email.caseInsensitiveCompare(request.email) == .orderedSame
+    }
+
+    private func performPersistence<T>(
+        _ operation: @escaping () throws -> T
+    ) async throws -> T {
+        let task = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            let value = try operation()
+            try Task.checkCancellation()
+            return value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 }
 
