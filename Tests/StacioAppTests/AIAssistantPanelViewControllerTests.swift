@@ -221,6 +221,36 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertNotNil(container.onEffectiveAppearanceChanged)
     }
 
+    func testAssistantHeaderAndComposerRefreshSemanticColorsAcrossAppearances() throws {
+        let panel = makeAssistantPanel()
+
+        panel.loadView()
+
+        let themedViews = try [
+            "Stacio.AI.header",
+            "Stacio.AI.targetPicker",
+            "Stacio.AI.collapse",
+            "Stacio.AI.composer",
+            "Stacio.AI.composer.add",
+            "Stacio.AI.composer.permission",
+            "Stacio.AI.composer.model"
+        ].map { identifier in
+            try XCTUnwrap(panel.view.firstSubview(withIdentifier: identifier))
+        }
+
+        panel.view.appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        panel.view.viewDidChangeEffectiveAppearance()
+        let lightColors = try themedViews.map { try XCTUnwrap($0.layer?.backgroundColor) }
+
+        panel.view.appearance = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        panel.view.viewDidChangeEffectiveAppearance()
+        let darkColors = try themedViews.map { try XCTUnwrap($0.layer?.backgroundColor) }
+
+        for (lightColor, darkColor) in zip(lightColors, darkColors) {
+            XCTAssertNotEqual(lightColor, darkColor)
+        }
+    }
+
     func testReportFormatContractAlwaysRequiresMarkdownAndDelegatesLayoutChoice() {
         let contract = OpenAICompatibleAIAssistantProvider.reportFormatContract
 
@@ -1779,6 +1809,52 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             tableBlocks.append(contentsOf: paragraph.textBlocks.compactMap { $0 as? NSTextTableBlock })
         }
         XCTAssertEqual(tableBlocks.count, 4)
+    }
+
+    func testExpandedProcessMarkdownFormattingSurvivesTextSelection() throws {
+        let historyStore = RecordingAIConversationHistoryStore()
+        historyStore.listedItems = [
+            makeHistoryRecord(
+                runtimeID: "term_1",
+                role: .step,
+                content: """
+                ### 初步判断
+
+                | 指标 | 状态 |
+                | --- | --- |
+                | CPU | **待验证** |
+                """
+            )
+        ]
+        let panel = makeAssistantPanel(conversationHistoryStore: historyStore)
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 520, height: 800)
+        let window = NSWindow(
+            contentRect: panel.view.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = panel.view
+        defer { window.contentView = nil }
+
+        panel.expandAllProcessEntriesForTesting()
+        panel.view.layoutSubtreeIfNeeded()
+        let processGroup = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.processGroup")
+        )
+        let detailLabel = try XCTUnwrap(processGroup.subviews.compactMap { $0 as? NSTextField }.first)
+        XCTAssertTrue(hasTableTextBlocks(in: detailLabel.attributedStringValue))
+
+        detailLabel.selectText(nil)
+
+        let fieldEditor = try XCTUnwrap(detailLabel.currentEditor() as? NSTextView)
+        let selectedPresentation = try XCTUnwrap(fieldEditor.textStorage)
+        XCTAssertTrue(hasBoldText(in: selectedPresentation, containing: "待验证"))
+        XCTAssertTrue(
+            hasTableTextBlocks(in: selectedPresentation),
+            "Selecting expanded process output must not flatten its Markdown table."
+        )
     }
 
     func testAssistantNewConversationStartsIndependentPersistentThread() throws {
@@ -5994,6 +6070,58 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(after.isEqual(to: before))
     }
 
+    func testAssistantMarkdownFormattingSurvivesTextSelection() throws {
+        let panel = makeAssistantPanel(
+            provider: RecordingAIAssistantProvider(
+                response: AIAssistantResponse(
+                    message: """
+                    ## 关键证据
+                    **推荐测试**
+
+                    | 服务地址 | 监听进程 | 状态 |
+                    | --- | --- | --- |
+                    | 154.37.212.69:8000 | node | 200 OK |
+                    """,
+                    proposedCommand: nil
+                )
+            ),
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
+        )
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 520, height: 800)
+        let window = NSWindow(
+            contentRect: panel.view.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = panel.view
+        defer { window.contentView = nil }
+
+        panel.setQuestionForTesting("检查 Web 服务")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains("154.37.212.69:8000") })
+        panel.view.layoutSubtreeIfNeeded()
+
+        let label = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.transcript.assistantText") as? NSTextField
+        )
+        let rendered = label.attributedStringValue
+        XCTAssertTrue(hasBoldText(in: rendered, containing: "推荐测试"))
+        XCTAssertTrue(hasTableTextBlocks(in: rendered))
+
+        label.selectText(nil)
+
+        let fieldEditor = try XCTUnwrap(label.currentEditor() as? NSTextView)
+        let selectedPresentation = try XCTUnwrap(fieldEditor.textStorage)
+        XCTAssertEqual(selectedPresentation.string, rendered.string)
+        XCTAssertTrue(hasBoldText(in: selectedPresentation, containing: "推荐测试"))
+        XCTAssertTrue(
+            hasTableTextBlocks(in: selectedPresentation),
+            "Clicking or selecting an assistant response must not flatten Markdown tables."
+        )
+    }
+
     func testAssistantMarkdownRendererFormatsTablesAndLinks() throws {
         let rendered = AIAssistantMarkdownRenderer.attributedString(
             from: """
@@ -6765,6 +6893,23 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         attributedString.enumerateAttribute(.font, in: range) { value, _, _ in
             guard let font = value as? NSFont else { return }
             found = font.fontDescriptor.symbolicTraits.contains(.monoSpace)
+        }
+        return found
+    }
+
+    private func hasTableTextBlocks(in attributedString: NSAttributedString) -> Bool {
+        var found = false
+        attributedString.enumerateAttribute(
+            .paragraphStyle,
+            in: NSRange(location: 0, length: attributedString.length)
+        ) { value, _, stop in
+            guard let paragraph = value as? NSParagraphStyle,
+                  paragraph.textBlocks.contains(where: { $0 is NSTextTableBlock })
+            else {
+                return
+            }
+            found = true
+            stop.pointee = true
         }
         return found
     }

@@ -29,13 +29,16 @@ public struct GraphicsSessionDiagnostic: Equatable {
 }
 
 public final class GraphicsSessionPaneViewController: NSViewController {
-    public let runtimeID: String
-    public let diagnostic: GraphicsSessionDiagnostic
-    private let onClose: ((String) -> Void)?
-    private let attachment: GraphicsRuntimeAttachment?
+    public private(set) var runtimeID: String
+    public private(set) var diagnostic: GraphicsSessionDiagnostic
+    private var onClose: ((String) -> Void)?
+    private var attachment: GraphicsRuntimeAttachment?
+    private var isConnecting = false
+    private var connectionFailureMessage: String?
     private var didCloseRuntime = false
     private var copiedDiagnosticSummary = ""
     private var renderSurfaceView: GraphicsRenderSurfaceView?
+    private let connectionStateView: SessionConnectionStateView
 
     private let titleLabel = NSTextField(labelWithString: L10n.Graphics.title)
     private let engineLabel: NSTextField
@@ -49,6 +52,9 @@ public final class GraphicsSessionPaneViewController: NSViewController {
 
     public var visibleTextSnapshotForTesting: String {
         _ = view
+        if connectionStateView.isHidden == false, presentsConnectionState {
+            return connectionStateView.visibleTextForTesting
+        }
         return [
             visibleText(titleLabel),
             visibleText(engineLabel),
@@ -67,6 +73,11 @@ public final class GraphicsSessionPaneViewController: NSViewController {
     public var hasEmbeddedRenderSurfaceForTesting: Bool {
         _ = view
         return renderSurfaceView != nil
+    }
+
+    public var isConnectionStateVisibleForTesting: Bool {
+        _ = view
+        return presentsConnectionState && connectionStateView.isHidden == false
     }
 
     public var hasExternalClientPresentationForTesting: Bool {
@@ -137,6 +148,10 @@ public final class GraphicsSessionPaneViewController: NSViewController {
         self.diagnostic = diagnostic
         self.attachment = attachment
         self.onClose = onClose
+        self.connectionStateView = SessionConnectionStateView(
+            protocolName: diagnostic.protocolName,
+            endpoint: "\(diagnostic.host):\(diagnostic.port)"
+        )
         self.engineLabel = NSTextField(labelWithString: Self.engineText(for: diagnostic))
         self.summaryLabel = NSTextField(labelWithString: Self.summaryText(for: diagnostic))
         self.endpointValue = NSTextField(labelWithString: "\(diagnostic.host):\(diagnostic.port)")
@@ -149,10 +164,89 @@ public final class GraphicsSessionPaneViewController: NSViewController {
         self.title = title
     }
 
+    public init(
+        connectingRuntimeID runtimeID: String,
+        title: String,
+        protocolName: String,
+        host: String,
+        port: UInt16
+    ) {
+        let diagnostic = GraphicsSessionDiagnostic(
+            protocolName: protocolName,
+            host: host,
+            port: port,
+            adapterPath: nil,
+            launchArguments: [],
+            status: L10n.TerminalLifecycle.connecting
+        )
+        self.runtimeID = runtimeID
+        self.diagnostic = diagnostic
+        self.attachment = nil
+        self.onClose = nil
+        self.isConnecting = true
+        self.connectionStateView = SessionConnectionStateView(
+            protocolName: protocolName,
+            endpoint: "\(host):\(port)"
+        )
+        self.engineLabel = NSTextField(labelWithString: Self.engineText(for: diagnostic))
+        self.summaryLabel = NSTextField(labelWithString: Self.summaryText(for: diagnostic))
+        self.endpointValue = NSTextField(labelWithString: "\(host):\(port)")
+        self.adapterValue = NSTextField(labelWithString: L10n.Graphics.missingAdapter)
+        self.statusValue = NSTextField(labelWithString: L10n.TerminalLifecycle.connecting)
+        self.argumentsValue = NSTextField(labelWithString: "-")
+        super.init(nibName: nil, bundle: nil)
+        self.title = title
+    }
+
     public func closeGraphicsRuntime() {
         guard !didCloseRuntime else { return }
         didCloseRuntime = true
         onClose?(runtimeID)
+    }
+
+    @discardableResult
+    public func attachRuntime(
+        runtimeID: String,
+        diagnostic: GraphicsSessionDiagnostic,
+        attachment: GraphicsRuntimeAttachment?,
+        onClose: ((String) -> Void)?
+    ) -> Bool {
+        guard didCloseRuntime == false else {
+            onClose?(runtimeID)
+            return false
+        }
+        self.runtimeID = runtimeID
+        self.diagnostic = diagnostic
+        self.attachment = attachment
+        self.onClose = onClose
+        isConnecting = false
+        connectionFailureMessage = nil
+        refreshDiagnosticLabels()
+        if isViewLoaded {
+            rebuildPresentation(animated: view.window != nil)
+        }
+        return true
+    }
+
+    public func displayConnectionFailure(_ diagnostic: GraphicsSessionDiagnostic) {
+        guard didCloseRuntime == false else { return }
+        self.diagnostic = diagnostic
+        attachment = nil
+        onClose = nil
+        isConnecting = false
+        let message = RuntimeDiagnosticFormatter.userMessage(diagnostic.status)
+        connectionFailureMessage = message.hasPrefix(L10n.TerminalLifecycle.connectionFailed)
+            ? message
+            : L10n.TerminalLifecycle.connectionFailedMessage(message)
+        connectionStateView.update(
+            phase: .failed(message: connectionFailureMessage ?? L10n.TerminalLifecycle.connectionFailed),
+            protocolName: diagnostic.protocolName,
+            endpoint: "\(diagnostic.host):\(diagnostic.port)"
+        )
+        refreshDiagnosticLabels()
+        if isViewLoaded {
+            rebuildPresentation(animated: view.window != nil)
+        }
     }
 
     public func copyDiagnosticSummary() {
@@ -181,6 +275,28 @@ public final class GraphicsSessionPaneViewController: NSViewController {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.applyWorkspaceSurface(container)
+        view = container
+        installCurrentPresentation(in: container)
+    }
+
+    private func installCurrentPresentation(in container: NSView) {
+        renderSurfaceView = nil
+        if presentsConnectionState {
+            if let connectionFailureMessage {
+                connectionStateView.update(phase: .failed(message: connectionFailureMessage))
+            } else {
+                connectionStateView.update(phase: .connecting)
+            }
+            container.addSubview(connectionStateView)
+            NSLayoutConstraint.activate([
+                connectionStateView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                connectionStateView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                connectionStateView.topAnchor.constraint(equalTo: container.topAnchor),
+                connectionStateView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ])
+            connectionStateView.setPresented(true, animated: false)
+            return
+        }
 
         if let attachment {
             let surface = makeRenderSurface(for: attachment)
@@ -192,13 +308,11 @@ public final class GraphicsSessionPaneViewController: NSViewController {
                 surface.topAnchor.constraint(equalTo: container.topAnchor),
                 surface.bottomAnchor.constraint(equalTo: container.bottomAnchor)
             ])
-            view = container
             return
         }
 
         if case .externalClient = diagnostic.presentation {
             configureExternalClientLayout(in: container)
-            view = container
             return
         }
 
@@ -283,7 +397,35 @@ public final class GraphicsSessionPaneViewController: NSViewController {
 
         NSLayoutConstraint.activate(constraints)
 
-        view = container
+    }
+
+    private func rebuildPresentation(animated: Bool) {
+        let container = view
+        connectionStateView.setPresented(false, animated: false)
+        container.subviews.forEach { $0.removeFromSuperview() }
+        installCurrentPresentation(in: container)
+        guard animated,
+              NSWorkspace.shared.accessibilityDisplayShouldReduceMotion == false
+        else {
+            container.alphaValue = 1
+            return
+        }
+        StacioDesignSystem.fadeIn(container)
+    }
+
+    private func refreshDiagnosticLabels() {
+        engineLabel.stringValue = Self.engineText(for: diagnostic)
+        summaryLabel.stringValue = Self.summaryText(for: diagnostic)
+        endpointValue.stringValue = "\(diagnostic.host):\(diagnostic.port)"
+        adapterValue.stringValue = diagnostic.adapterPath ?? L10n.Graphics.missingAdapter
+        statusValue.stringValue = diagnostic.status
+        argumentsValue.stringValue = diagnostic.launchArguments.isEmpty
+            ? "-"
+            : diagnostic.launchArguments.joined(separator: " ")
+    }
+
+    private var presentsConnectionState: Bool {
+        isConnecting || connectionFailureMessage != nil
     }
 
     private func configureExternalClientLayout(in container: NSView) {

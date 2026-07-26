@@ -45,9 +45,28 @@ pub fn parse_ftp_list_listing(
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            !trimmed.is_empty() && trimmed != "." && trimmed != ".."
+            !trimmed.is_empty()
+                && trimmed != "."
+                && trimmed != ".."
+                && !trimmed.to_ascii_lowercase().starts_with("total ")
         })
         .map(|line| parse_ftp_list_line(base_path, line))
+        .collect()
+}
+
+pub fn parse_ftp_mlsd_listing(
+    base_path: &str,
+    input: &str,
+) -> Result<Vec<RemoteFileEntry>, FilesError> {
+    validate_remote_path(base_path)?;
+    input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match parse_ftp_mlsd_line(base_path, line) {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect()
 }
 
@@ -129,6 +148,9 @@ fn validate_remote_path(path: &str) -> Result<(), FilesError> {
 }
 
 fn parse_ftp_list_line(base_path: &str, line: &str) -> Result<RemoteFileEntry, FilesError> {
+    if let Ok(entry) = parse_ftp_dos_list_line(base_path, line) {
+        return Ok(entry);
+    }
     let parts = line.split_whitespace().collect::<Vec<_>>();
     if parts.len() < 9 {
         return Err(FilesError::InvalidListingRow);
@@ -170,6 +192,126 @@ fn parse_ftp_list_line(base_path: &str, line: &str) -> Result<RemoteFileEntry, F
     })
 }
 
+fn parse_ftp_dos_list_line(base_path: &str, line: &str) -> Result<RemoteFileEntry, FilesError> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 4 || !looks_like_dos_ftp_date(parts[0]) || !looks_like_dos_ftp_time(parts[1]) {
+        return Err(FilesError::InvalidListingRow);
+    }
+    let (kind, size) = if parts[2].eq_ignore_ascii_case("<DIR>") {
+        (RemoteFileKind::Directory, 0)
+    } else {
+        (
+            RemoteFileKind::File,
+            parts[2]
+                .replace(',', "")
+                .parse::<u64>()
+                .map_err(|_| FilesError::InvalidFileSize)?,
+        )
+    };
+    let name = parts[3..].join(" ");
+    validate_ftp_child_name(&name)?;
+    Ok(RemoteFileEntry {
+        kind,
+        path: join_remote_path(base_path, &name),
+        size,
+        modified_time: Some(format!("{} {}", parts[0], parts[1])),
+        link_target: None,
+        owner: None,
+        permissions: None,
+    })
+}
+
+fn parse_ftp_mlsd_line(base_path: &str, line: &str) -> Result<Option<RemoteFileEntry>, FilesError> {
+    let trimmed = line.trim();
+    let separator = trimmed
+        .find(char::is_whitespace)
+        .ok_or(FilesError::InvalidListingRow)?;
+    let facts_text = &trimmed[..separator];
+    let name = trimmed[separator..].trim();
+
+    let mut kind = None;
+    let mut size = 0_u64;
+    let mut modified_time = None;
+    let mut owner = None;
+    let mut permissions = None;
+    for fact in facts_text.split(';').filter(|fact| !fact.is_empty()) {
+        let Some((key, value)) = fact.split_once('=') else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "type" => {
+                let normalized = value.to_ascii_lowercase();
+                if normalized == "cdir" || normalized == "pdir" {
+                    return Ok(None);
+                }
+                kind = Some(if normalized == "dir" {
+                    RemoteFileKind::Directory
+                } else if normalized.contains("slink") {
+                    RemoteFileKind::Symlink
+                } else {
+                    RemoteFileKind::File
+                });
+            }
+            "size" => {
+                size = value
+                    .parse::<u64>()
+                    .map_err(|_| FilesError::InvalidFileSize)?;
+            }
+            "modify" => modified_time = optional_listing_value(value),
+            "unix.owner" | "unix.ownername" => owner = optional_listing_value(value),
+            "unix.mode" => permissions = optional_listing_value(value),
+            _ => {}
+        }
+    }
+    let kind = kind.ok_or(FilesError::InvalidFileKind)?;
+    validate_ftp_child_name(name)?;
+    let path = join_remote_path(base_path, name);
+    validate_remote_path(&path)?;
+    Ok(Some(RemoteFileEntry {
+        kind,
+        path,
+        size,
+        modified_time,
+        link_target: None,
+        owner,
+        permissions,
+    }))
+}
+
+fn validate_ftp_child_name(name: &str) -> Result<(), FilesError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains("../")
+        || name.chars().any(char::is_control)
+    {
+        return Err(FilesError::UnsafePath);
+    }
+    Ok(())
+}
+
+fn looks_like_dos_ftp_date(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn looks_like_dos_ftp_time(value: &str) -> bool {
+    let uppercased = value.to_ascii_uppercase();
+    let clock = uppercased
+        .strip_suffix("AM")
+        .or_else(|| uppercased.strip_suffix("PM"))
+        .unwrap_or(&uppercased);
+    let parts = clock.split(':').collect::<Vec<_>>();
+    parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 fn join_remote_path(base_path: &str, name: &str) -> String {
     let base = base_path.trim();
     if base == "/" {
@@ -183,7 +325,10 @@ fn join_remote_path(base_path: &str, name: &str) -> String {
 
 #[cfg(test)]
 mod remote_file_tests {
-    use super::{parse_ftp_list_listing, parse_remote_listing, FilesError, RemoteFileKind};
+    use super::{
+        parse_ftp_list_listing, parse_ftp_mlsd_listing, parse_remote_listing, FilesError,
+        RemoteFileKind,
+    };
 
     #[test]
     fn parses_exec_listing_rows() {
@@ -274,6 +419,43 @@ lrwxrwxrwx  1 deploy staff       8 Jan 01 12:00 current -> releases
         assert_eq!(entries[2].kind, RemoteFileKind::Symlink);
         assert_eq!(entries[2].modified_time.as_deref(), Some("Jan 01 12:00"));
         assert_eq!(entries[2].link_target, Some("releases".to_string()));
+    }
+
+    #[test]
+    fn ignores_unix_total_header_in_ftp_list_output() {
+        let listing = "total 8\ndrwxr-xr-x 2 deploy staff 4096 Jul 24 16:17 releases\n";
+
+        let entries = parse_ftp_list_listing("/", listing).expect("parse ftp list with total");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/releases");
+        assert_eq!(entries[0].kind, RemoteFileKind::Directory);
+    }
+
+    #[test]
+    fn parses_dos_ftp_list_rows() {
+        let listing = "07-24-26  04:17PM       <DIR>          releases\n07-24-26  04:18PM                1,024 app.log\n";
+
+        let entries = parse_ftp_list_listing("/pub", listing).expect("parse dos ftp list");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/pub/releases");
+        assert_eq!(entries[0].kind, RemoteFileKind::Directory);
+        assert_eq!(entries[1].path, "/pub/app.log");
+        assert_eq!(entries[1].size, 1024);
+    }
+
+    #[test]
+    fn parses_standard_mlsd_rows_and_skips_directory_markers() {
+        let listing = "type=cdir;modify=20260724161701; .\ntype=dir;modify=20260724161701;unix.owner=deploy;unix.mode=0755; releases\ntype=file;size=128;modify=20260724161802;unix.owner=deploy;unix.mode=0644; app.log\n";
+
+        let entries = parse_ftp_mlsd_listing("/pub", listing).expect("parse mlsd");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "/pub/releases");
+        assert_eq!(entries[0].owner.as_deref(), Some("deploy"));
+        assert_eq!(entries[1].path, "/pub/app.log");
+        assert_eq!(entries[1].size, 128);
     }
 
     #[test]

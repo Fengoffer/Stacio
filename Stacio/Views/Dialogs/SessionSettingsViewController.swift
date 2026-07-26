@@ -7,7 +7,7 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
     case rsh
     case xdmcp
     case vnc
-    case ftp
+    case sftp
     case scp
     case serial
     case file
@@ -29,8 +29,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "XDMCP（图形登录）"
         case .vnc:
             return "VNC（远程控制）"
-        case .ftp:
-            return "FTP（文件传输）"
+        case .sftp:
+            return "SFTP（安全文件传输）"
         case .scp:
             return "SCP（安全复制）"
         case .serial:
@@ -62,8 +62,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "XDMCP"
         case .vnc:
             return "VNC"
-        case .ftp:
-            return "FTP"
+        case .sftp:
+            return "SFTP"
         case .scp:
             return "SCP"
         case .serial:
@@ -95,8 +95,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "xdmcp"
         case .vnc:
             return "vnc"
-        case .ftp:
-            return "ftp"
+        case .sftp:
+            return "sftp"
         case .scp:
             return "scp"
         case .serial:
@@ -118,7 +118,7 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
 
     var defaultPort: UInt16 {
         switch self {
-        case .ssh, .scp:
+        case .ssh, .sftp, .scp:
             return 22
         case .telnet:
             return 23
@@ -128,8 +128,6 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return 177
         case .vnc:
             return 5900
-        case .ftp:
-            return 21
         case .serial:
             return 9600
         case .file, .shell, .wsl:
@@ -153,8 +151,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             self = .xdmcp
         case "vnc":
             self = .vnc
-        case "ftp":
-            self = .ftp
+        case "sftp":
+            self = .sftp
         case "scp":
             self = .scp
         case "serial":
@@ -188,10 +186,10 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "display"
         case .vnc:
             return "rectangle.connected.to.line.below"
-        case .ftp:
-            return "globe"
+        case .sftp:
+            return "externaldrive.connected.to.line.below"
         case .scp:
-            return "arrow.left.arrow.right"
+            return "arrow.up.arrow.down.square.fill"
         case .serial:
             return "cable.connector"
         case .file:
@@ -211,7 +209,7 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
 
     var isAvailableForSaving: Bool {
         switch self {
-        case .ssh, .telnet, .vnc, .ftp, .scp, .serial, .file, .shell, .browser:
+        case .ssh, .telnet, .vnc, .sftp, .scp, .serial, .file, .shell, .browser:
             return true
         case .rsh, .xdmcp, .mosh, .awsS3, .wsl:
             return false
@@ -1287,8 +1285,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         switch sessionProtocol {
         case .serial:
             return .serial
-        case .ftp:
-            return .ftp
         case .browser:
             return .browser
         case .file:
@@ -1405,7 +1401,9 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             ? ""
             : L10n.SessionSettings.unsupportedProtocol(selectedProtocol.label)
         automationView.isHidden = !selectedProtocol.isAvailableForSaving
-        proxyJumpView.isHidden = selectedProtocol != .ssh && selectedProtocol != .scp
+        proxyJumpView.isHidden = selectedProtocol != .ssh
+            && selectedProtocol != .sftp
+            && selectedProtocol != .scp
         let showsSessionIcon = selectedProtocol == .ssh
         sessionIconView.isHidden = !showsSessionIcon
         sessionIconHeightConstraint?.constant = showsSessionIcon ? 36 : 0
@@ -2078,6 +2076,26 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
 
     var nameValueForTesting: String {
         sshForm.nameValueForTesting
+    }
+
+    var activeHostControlForTesting: NSTextField {
+        sshForm.activeHostControlForTesting
+    }
+
+    var namePlaceholderForTesting: String {
+        sshForm.namePlaceholderForTesting
+    }
+
+    var hostPlaceholderForTesting: String {
+        sshForm.hostPlaceholderForTesting
+    }
+
+    var namePlaceholderCandidatesForTesting: [String] {
+        sshForm.namePlaceholderCandidatesForTesting
+    }
+
+    var networkHostPlaceholderCandidatesForTesting: [String] {
+        sshForm.networkHostPlaceholderCandidatesForTesting
     }
 
     func selectBaudRateForTesting(_ title: String) {

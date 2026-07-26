@@ -247,7 +247,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     public override func loadView() {
-        let container = NSView()
+        let container = StacioAppearanceRefreshView()
         container.wantsLayer = true
         container.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         container.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -356,11 +356,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         headerContainer.layer?.cornerCurve = .continuous
         StacioDesignSystem.setLayerBackgroundColor(
             headerContainer,
-            color: StacioDesignSystem.theme.elevatedPanelColor.withAlphaComponent(0.76)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.elevatedPanelColor,
+                alpha: 0.76
+            )
         )
         StacioDesignSystem.setLayerBorderColor(
             headerContainer,
-            color: StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.32)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.separatorColor,
+                alpha: 0.32
+            )
         )
         headerContainer.layer?.borderWidth = 1
         headerIconView.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: L10n.AI.assistant)
@@ -581,12 +587,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composer.layer?.cornerCurve = .continuous
         StacioDesignSystem.setLayerBackgroundColor(
             composer,
-            color: NSColor.textBackgroundColor.withAlphaComponent(0.95)
+            color: StacioDesignSystem.dynamicColor(.textBackgroundColor, alpha: 0.95)
         )
         composer.layer?.borderWidth = 1
         StacioDesignSystem.setLayerBorderColor(
             composer,
-            color: NSColor.separatorColor.withAlphaComponent(0.35)
+            color: StacioDesignSystem.dynamicColor(.separatorColor, alpha: 0.35)
         )
 
         conversationContainer.addSubview(headerContainer)
@@ -4403,7 +4409,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         button.layer?.cornerCurve = .continuous
         let background = emphasized
             ? NSColor.controlAccentColor
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.86)
+            : StacioDesignSystem.dynamicColor(.controlBackgroundColor, alpha: 0.86)
         StacioDesignSystem.setLayerBackgroundColor(button, color: background)
         button.contentTintColor = emphasized ? .white : .labelColor
     }
@@ -4424,7 +4430,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         button.layer?.cornerCurve = .continuous
         StacioDesignSystem.setLayerBackgroundColor(
             button,
-            color: NSColor.controlBackgroundColor.withAlphaComponent(0.76)
+            color: StacioDesignSystem.dynamicColor(.controlBackgroundColor, alpha: 0.76)
         )
         button.contentTintColor = .secondaryLabelColor
         button.setContentHuggingPriority(.required, for: .horizontal)
@@ -4451,7 +4457,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         button.layer?.cornerCurve = .continuous
         StacioDesignSystem.setLayerBackgroundColor(
             button,
-            color: NSColor.controlBackgroundColor.withAlphaComponent(0.58)
+            color: StacioDesignSystem.dynamicColor(.controlBackgroundColor, alpha: 0.58)
         )
         button.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -5201,6 +5207,7 @@ private final class AITranscriptProcessGroupView: NSView {
         detailLabel.cell?.wraps = true
         detailLabel.cell?.usesSingleLineMode = false
         detailLabel.isSelectable = true
+        detailLabel.allowsEditingTextAttributes = true
         detailLabel.isHidden = isCollapsed
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -5399,7 +5406,7 @@ private final class AITranscriptBubbleView: NSView {
 
         label.stringValue = entry.displayText
         label.isSelectable = true
-        label.allowsEditingTextAttributes = false
+        label.allowsEditingTextAttributes = true
         label.setAccessibilityIdentifier(entry.textAccessibilityIdentifier)
         label.maximumNumberOfLines = 0
         label.lineBreakMode = .byCharWrapping

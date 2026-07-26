@@ -64,6 +64,7 @@ use infrastructure::{
     files::{
         ftp_control::FtpControlClient,
         libssh2_exec_listing::{Libssh2ExecListing, RemoteFileOperation},
+        libssh2_sftp::Libssh2SftpEngine,
     },
     import_repository::ImportReportRepository,
     known_host_repository::KnownHostRepository,
@@ -71,7 +72,8 @@ use infrastructure::{
     serial::SerialShellChannel,
     session_repository::SessionRepository,
     ssh::libssh2_transport::{
-        Libssh2ShellChannel, Libssh2ShellRequest, Libssh2Transport, SshSecret,
+        Libssh2ConnectedSession, Libssh2ShellChannel, Libssh2ShellRequest, Libssh2Transport,
+        SshSecret,
     },
     telnet::TelnetShellChannel,
     terminal_macro_repository::{
@@ -173,6 +175,18 @@ fn terminal_registry() -> &'static Mutex<TerminalRuntimeRegistry> {
 fn live_ssh_session_infos() -> &'static Mutex<HashMap<String, LiveSshSessionInfo>> {
     static INFOS: OnceLock<Mutex<HashMap<String, LiveSshSessionInfo>>> = OnceLock::new();
     INFOS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+enum LiveRemoteReadSession {
+    Scp(Libssh2ConnectedSession),
+    Sftp(Libssh2ConnectedSession),
+}
+
+fn live_remote_read_sessions() -> &'static Mutex<HashMap<String, Arc<Mutex<LiveRemoteReadSession>>>>
+{
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<LiveRemoteReadSession>>>>> =
+        OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn recover_global_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -846,7 +860,7 @@ pub fn delete_session_record(database_path: String, id: String) -> Result<(), Se
     if let Some(session) = session {
         if matches!(
             session.protocol.trim().to_ascii_lowercase().as_str(),
-            "ssh" | "scp"
+            "ssh" | "sftp" | "scp"
         ) {
             clear_known_host_record(database_path, session.host, session.port as u16)?;
         }
@@ -1365,6 +1379,53 @@ pub fn run_live_scp_transfer_with_resume(
 }
 
 #[uniffi::export]
+pub fn run_live_sftp_transfer(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    job: ScpTransferJob,
+) -> Result<Vec<ScpTransferProgress>, SshRuntimeError> {
+    with_live_scp_transfer_cancellation_scope(&job.id.clone(), || {
+        let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+        let bytes_done = Libssh2SftpEngine::new()
+            .transfer(&session, &job)
+            .map_err(files_error_to_ssh_runtime)?;
+        let bytes_total = if job.bytes_total == 0 {
+            bytes_done
+        } else {
+            job.bytes_total
+        };
+        Ok(vec![
+            ScpTransferProgress {
+                job_id: job.id.clone(),
+                bytes_done: 0,
+                bytes_total,
+                status: "running".to_string(),
+            },
+            ScpTransferProgress {
+                job_id: job.id,
+                bytes_done,
+                bytes_total,
+                status: "completed".to_string(),
+            },
+        ])
+    })
+}
+
+fn connect_live_sftp_session(
+    config: &SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+) -> Result<Libssh2ConnectedSession, SshRuntimeError> {
+    validate_ssh_config_target(config.clone())?;
+    Libssh2Transport::new().connect_with_secret_and_expected_transfer_session(
+        config,
+        auth_secret_to_libssh2(secret),
+        expected_fingerprint_sha256,
+    )
+}
+
+#[uniffi::export]
 pub fn run_live_ftp_transfer(
     config: FtpConnectionConfig,
     secret: FtpAuthSecret,
@@ -1416,12 +1477,66 @@ fn run_ftp_download(
     client: &mut FtpControlClient,
     job: &ScpTransferJob,
 ) -> Result<(u64, u64), SshRuntimeError> {
-    let destination_path = Path::new(&job.destination_path);
+    // Directory selections carry a zero estimated size. Ask SIZE first so
+    // ordinary files (including zero-byte files and resumed downloads) keep
+    // the existing FTP command order. Only a failed SIZE probe falls back to
+    // a directory listing.
+    if job.bytes_total == 0 {
+        if let Ok(remote_size) = client.file_size(&job.source_path) {
+            return download_ftp_file(
+                client,
+                job,
+                &job.source_path,
+                Path::new(&job.destination_path),
+                remote_size,
+                Some(remote_size),
+            );
+        }
+        if let Ok(entries) = client.list_directory(&job.source_path) {
+            let source_path = job.source_path.trim_end_matches('/');
+            let looks_like_single_file = entries.len() == 1
+                && entries[0].kind != domain::files::RemoteFileKind::Directory
+                && entries[0].path.trim_end_matches('/') == source_path;
+            if !looks_like_single_file {
+                let destination_path = Path::new(&job.destination_path);
+                let mut bytes_done = 0_u64;
+                download_ftp_directory_children(
+                    client,
+                    job,
+                    &job.source_path,
+                    destination_path,
+                    &mut bytes_done,
+                )?;
+                return Ok((bytes_done, bytes_done));
+            }
+        }
+    }
+    download_ftp_file(
+        client,
+        job,
+        &job.source_path,
+        Path::new(&job.destination_path),
+        job.bytes_total,
+        None,
+    )
+}
+
+fn download_ftp_file(
+    client: &mut FtpControlClient,
+    job: &ScpTransferJob,
+    source_path: &str,
+    destination_path: &Path,
+    estimated_total: u64,
+    known_remote_size: Option<u64>,
+) -> Result<(u64, u64), SshRuntimeError> {
     let partial_path = ftp_partial_download_path(destination_path);
     let partial_bytes = local_file_size_if_regular(&partial_path)?;
 
     if partial_bytes > 0 {
-        let remote_size = client.file_size(&job.source_path)?;
+        let remote_size = match known_remote_size {
+            Some(size) => size,
+            None => client.file_size(source_path)?,
+        };
         if partial_bytes > remote_size {
             return Err(files_error_to_ssh_runtime(
                 "FILES_SIZE_MISMATCH".to_string(),
@@ -1433,7 +1548,7 @@ fn run_ftp_download(
                 .open(&partial_path)
                 .map_err(|_| files_error_to_ssh_runtime("FILES_LOCAL_WRITE_FAILED".to_string()))?;
             let copied = client.retrieve_file_to_writer_with_job(
-                &job.source_path,
+                source_path,
                 partial_bytes,
                 &mut partial_file,
                 &job.id,
@@ -1456,15 +1571,53 @@ fn run_ftp_download(
         .open(&partial_path)
         .map_err(|_| files_error_to_ssh_runtime("FILES_LOCAL_WRITE_FAILED".to_string()))?;
     let bytes_done =
-        client.retrieve_file_to_writer_with_job(&job.source_path, 0, &mut partial_file, &job.id)?;
+        client.retrieve_file_to_writer_with_job(source_path, 0, &mut partial_file, &job.id)?;
     drop(partial_file);
     promote_ftp_partial_download(&partial_path, destination_path)?;
-    let bytes_total = if job.bytes_total == 0 {
+    let bytes_total = if estimated_total == 0 {
         bytes_done
     } else {
-        job.bytes_total
+        estimated_total
     };
     Ok((bytes_done, bytes_total))
+}
+
+fn download_ftp_directory_children(
+    client: &mut FtpControlClient,
+    job: &ScpTransferJob,
+    remote_directory: &str,
+    local_directory: &Path,
+    bytes_done: &mut u64,
+) -> Result<(), SshRuntimeError> {
+    if is_live_scp_transfer_cancelled(&job.id) {
+        return Err(SshRuntimeError::Transport {
+            message: "FTP_TRANSFER_CANCELLED".to_string(),
+        });
+    }
+    std::fs::create_dir_all(local_directory)
+        .map_err(|_| files_error_to_ssh_runtime("FILES_LOCAL_WRITE_FAILED".to_string()))?;
+    let entries = client.list_directory(remote_directory)?;
+    for entry in entries {
+        if is_live_scp_transfer_cancelled(&job.id) {
+            return Err(SshRuntimeError::Transport {
+                message: "FTP_TRANSFER_CANCELLED".to_string(),
+            });
+        }
+        let name = Path::new(&entry.path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+            .ok_or_else(|| files_error_to_ssh_runtime("FILES_UNSAFE_PATH".to_string()))?;
+        let local_path = local_directory.join(name);
+        if entry.kind == domain::files::RemoteFileKind::Directory {
+            download_ftp_directory_children(client, job, &entry.path, &local_path, bytes_done)?;
+        } else {
+            let (copied, _) =
+                download_ftp_file(client, job, &entry.path, &local_path, entry.size, None)?;
+            *bytes_done = bytes_done.saturating_add(copied);
+        }
+    }
+    Ok(())
 }
 
 fn run_ftp_upload(
@@ -1831,6 +1984,88 @@ pub fn read_live_remote_file(
         .map_err(files_error_to_ssh_runtime)
 }
 
+/// Opens an authenticated SCP/libssh2 session for repeated remote reads.
+///
+/// The returned opaque id is intentionally independent from a terminal runtime
+/// id. File previews can outlive a terminal tab briefly, and closing the read
+/// handle therefore owns the connection lifetime explicitly.
+#[uniffi::export]
+pub fn open_live_remote_file_read_session(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+) -> Result<String, SshRuntimeError> {
+    validate_ssh_config_target(config.clone())?;
+    let session = Libssh2Transport::new().connect_with_secret_and_expected_transfer_session(
+        &config,
+        auth_secret_to_libssh2(secret),
+        expected_fingerprint_sha256,
+    )?;
+    let session_id = format!("remote-read-{}", uuid::Uuid::new_v4());
+    recover_global_lock(live_remote_read_sessions()).insert(
+        session_id.clone(),
+        Arc::new(Mutex::new(LiveRemoteReadSession::Scp(session))),
+    );
+    Ok(session_id)
+}
+
+/// Opens an authenticated SFTP/libssh2 session for repeated remote reads.
+#[uniffi::export]
+pub fn open_live_sftp_file_read_session(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+) -> Result<String, SshRuntimeError> {
+    validate_ssh_config_target(config.clone())?;
+    let session = Libssh2Transport::new().connect_with_secret_and_expected_transfer_session(
+        &config,
+        auth_secret_to_libssh2(secret),
+        expected_fingerprint_sha256,
+    )?;
+    let session_id = format!("sftp-read-{}", uuid::Uuid::new_v4());
+    recover_global_lock(live_remote_read_sessions()).insert(
+        session_id.clone(),
+        Arc::new(Mutex::new(LiveRemoteReadSession::Sftp(session))),
+    );
+    Ok(session_id)
+}
+
+/// Reads a byte range through an already-authenticated SCP/SFTP session.
+#[uniffi::export]
+pub fn read_live_remote_file_session(
+    session_id: String,
+    remote_path: String,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Vec<u8>, SshRuntimeError> {
+    let session = recover_global_lock(live_remote_read_sessions())
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| SshRuntimeError::Transport {
+            message: "FILES_READ_SESSION_NOT_FOUND".to_string(),
+        })?;
+    let session = recover_global_lock(session.as_ref());
+    match &*session {
+        LiveRemoteReadSession::Scp(session) => Libssh2ScpEngine::new()
+            .read_file_bytes(session, &remote_path, offset, length)
+            .map_err(files_error_to_ssh_runtime),
+        LiveRemoteReadSession::Sftp(session) => Libssh2SftpEngine::new()
+            .read_file(session, &remote_path, offset, length)
+            .map_err(files_error_to_ssh_runtime),
+    }
+}
+
+/// Closes an SCP/SFTP read session. Closing an unknown id is intentionally
+/// idempotent so media/editor teardown can race safely with navigation.
+#[uniffi::export]
+pub fn close_live_remote_file_read_session(session_id: String) -> Result<(), SshRuntimeError> {
+    if session_id.trim().is_empty() {
+        return Ok(());
+    }
+    recover_global_lock(live_remote_read_sessions()).remove(&session_id);
+    Ok(())
+}
+
 #[uniffi::export]
 pub fn write_live_remote_file(
     config: SshConnectionConfig,
@@ -1869,6 +2104,132 @@ fn apply_live_remote_file_operation(
     )?;
     Libssh2ExecListing::new()
         .apply_operation(&session, &operation)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn list_live_sftp_directory(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+) -> Result<Vec<RemoteFileEntry>, SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .list_directory(&session, &remote_path)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn search_live_sftp_files(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+    keyword: String,
+    depth: u32,
+) -> Result<Vec<RemoteFileEntry>, SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .search(&session, &remote_path, &keyword, depth)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn create_live_sftp_directory(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+) -> Result<(), SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .create_directory(&session, &remote_path)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn rename_live_sftp_path(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    from_path: String,
+    to_path: String,
+) -> Result<(), SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .rename(&session, &from_path, &to_path)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn delete_live_sftp_path(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+    recursive: bool,
+) -> Result<(), SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .delete(&session, &remote_path, recursive)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn chmod_live_sftp_path(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+    mode: String,
+) -> Result<(), SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .chmod(&session, &remote_path, &mode)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn copy_live_sftp_path(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    from_path: String,
+    to_path: String,
+) -> Result<(), SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .copy(&session, &from_path, &to_path)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn read_live_sftp_file(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<Vec<u8>, SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .read_file(&session, &remote_path, offset, length)
+        .map_err(files_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn write_live_sftp_file(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    remote_path: String,
+    contents: Vec<u8>,
+) -> Result<u64, SshRuntimeError> {
+    let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
+    Libssh2SftpEngine::new()
+        .write_file(&session, &remote_path, &contents)
         .map_err(files_error_to_ssh_runtime)
 }
 
@@ -1990,7 +2351,7 @@ fn import_preview_session(
 }
 
 fn is_supported_import_protocol(protocol: &str) -> bool {
-    matches!(protocol, "ssh" | "ftp" | "telnet" | "vnc")
+    matches!(protocol, "ssh" | "sftp" | "scp" | "ftp" | "telnet" | "vnc")
 }
 
 fn normalize_import_source_type(source_type: &str) -> Result<String, SessionError> {
@@ -1999,7 +2360,7 @@ fn normalize_import_source_type(source_type: &str) -> Result<String, SessionErro
         "legacy_ini" => Ok("legacy_ini".to_string()),
         "json" | "stacio_json" => Ok("stacio_json".to_string()),
         "xshell" | "mobaxterm" | "windterm" | "securecrt" | "finalshell" | "termius"
-        | "electerm" => Ok(source_type.trim().to_ascii_lowercase()),
+        | "electerm" | "bastion_host" => Ok(source_type.trim().to_ascii_lowercase()),
         _ => Err(SessionError::InvalidQuickConnect),
     }
 }
@@ -2334,46 +2695,77 @@ pub fn start_live_local_tunnel_runtime(
                 expected_fingerprint_sha256,
             )
             .map_err(ssh_runtime_error_to_tunnel_error)?;
-        match profile.kind {
-            TunnelKind::Local => {
-                session.session().set_blocking(false);
-                let acceptor =
-                    TcpTunnelClientAcceptor::bind(&profile.local_host, profile.local_port)
-                        .map_err(|_| TunnelError::LocalPortInUse)?;
-                let opener = Libssh2DirectTcpIpOpener::new(session);
-                Ok(LiveTunnelWorker::Local(LocalTunnelWorker::new(
-                    profile.clone(),
-                    acceptor,
-                    opener,
-                )))
-            }
-            TunnelKind::Dynamic => {
-                session.session().set_blocking(false);
-                let acceptor =
-                    TcpTunnelClientAcceptor::bind(&profile.local_host, profile.local_port)
-                        .map_err(|_| TunnelError::LocalPortInUse)?;
-                let opener = Libssh2DirectTcpIpOpener::new(session);
-                Ok(LiveTunnelWorker::Dynamic(DynamicSocksTunnelWorker::new(
-                    profile.clone(),
-                    acceptor,
-                    opener,
-                )))
-            }
-            TunnelKind::Remote => {
-                let acceptor = Libssh2RemoteForwardListener::listen(session, profile)
-                    .map_err(|_| TunnelError::SshFailed)?;
-                let connector = TcpTunnelTargetConnector::new();
-                Ok(LiveTunnelWorker::Remote(RemoteTunnelWorker::new(
-                    profile.clone(),
-                    acceptor,
-                    connector,
-                )))
-            }
-        }
+        live_tunnel_worker_for_connected_session(profile, session)
     })
     .map_err(tunnel_error_to_ssh_runtime)?;
     notify_live_tunnel_pump();
     Ok(status)
+}
+
+#[uniffi::export]
+pub fn start_live_local_tunnel_runtime_with_proxy_jump(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    proxy_jump: SshProxyJumpRuntimeConfig,
+    profile: TunnelProfile,
+) -> Result<TunnelRuntimeStatus, SshRuntimeError> {
+    validate_proxy_jump_runtime_config_target(config.clone(), proxy_jump.clone())?;
+
+    start_live_tunnel_pump_if_needed();
+    let mut manager = recover_global_lock(live_tunnel_manager());
+    let status = start_managed_tunnel_worker(&mut manager, profile, |profile| {
+        let session = Libssh2Transport::new()
+            .connect_with_proxy_jump_and_expected_session(
+                &config,
+                auth_secret_to_libssh2(secret),
+                proxy_jump,
+            )
+            .map_err(ssh_runtime_error_to_tunnel_error)?;
+        live_tunnel_worker_for_connected_session(profile, session)
+    })
+    .map_err(tunnel_error_to_ssh_runtime)?;
+    notify_live_tunnel_pump();
+    Ok(status)
+}
+
+fn live_tunnel_worker_for_connected_session(
+    profile: &TunnelProfile,
+    session: Libssh2ConnectedSession,
+) -> Result<LiveTunnelWorker, TunnelError> {
+    match profile.kind {
+        TunnelKind::Local => {
+            session.session().set_blocking(false);
+            let acceptor = TcpTunnelClientAcceptor::bind(&profile.local_host, profile.local_port)
+                .map_err(|_| TunnelError::LocalPortInUse)?;
+            let opener = Libssh2DirectTcpIpOpener::new(session);
+            Ok(LiveTunnelWorker::Local(LocalTunnelWorker::new(
+                profile.clone(),
+                acceptor,
+                opener,
+            )))
+        }
+        TunnelKind::Dynamic => {
+            session.session().set_blocking(false);
+            let acceptor = TcpTunnelClientAcceptor::bind(&profile.local_host, profile.local_port)
+                .map_err(|_| TunnelError::LocalPortInUse)?;
+            let opener = Libssh2DirectTcpIpOpener::new(session);
+            Ok(LiveTunnelWorker::Dynamic(DynamicSocksTunnelWorker::new(
+                profile.clone(),
+                acceptor,
+                opener,
+            )))
+        }
+        TunnelKind::Remote => {
+            let acceptor = Libssh2RemoteForwardListener::listen(session, profile)
+                .map_err(|_| TunnelError::SshFailed)?;
+            let connector = TcpTunnelTargetConnector::new();
+            Ok(LiveTunnelWorker::Remote(RemoteTunnelWorker::new(
+                profile.clone(),
+                acceptor,
+                connector,
+            )))
+        }
+    }
 }
 
 #[uniffi::export]
@@ -3415,6 +3807,60 @@ mod live_shell_api_tests {
 }
 
 #[cfg(test)]
+mod remote_read_session_api_tests {
+    use super::{
+        close_live_remote_file_read_session, open_live_remote_file_read_session,
+        open_live_sftp_file_read_session, read_live_remote_file_session,
+    };
+    use crate::domain::ssh::{SshAuthMethod, SshAuthSecret, SshConnectionConfig, SshRuntimeError};
+
+    fn invalid_config() -> SshConnectionConfig {
+        SshConnectionConfig {
+            host: String::new(),
+            port: 22,
+            username: "deploy".to_string(),
+            auth_method: SshAuthMethod::Agent,
+            connect_timeout_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn open_read_sessions_validate_config_before_network() {
+        let config = invalid_config();
+        assert_eq!(
+            open_live_remote_file_read_session(config.clone(), SshAuthSecret::Agent, "fp".into())
+                .expect_err("invalid SCP read session config"),
+            SshRuntimeError::InvalidConfig
+        );
+        assert_eq!(
+            open_live_sftp_file_read_session(config, SshAuthSecret::Agent, "fp".into())
+                .expect_err("invalid SFTP read session config"),
+            SshRuntimeError::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn missing_read_session_is_reported_and_close_is_idempotent() {
+        let error = read_live_remote_file_session(
+            "missing-read-session".to_string(),
+            "/tmp/file".to_string(),
+            0,
+            Some(16),
+        )
+        .expect_err("missing read session");
+        assert_eq!(
+            error,
+            SshRuntimeError::Transport {
+                message: "FILES_READ_SESSION_NOT_FOUND".to_string()
+            }
+        );
+        close_live_remote_file_read_session("missing-read-session".to_string())
+            .expect("closing an unknown read session is idempotent");
+        close_live_remote_file_read_session(String::new()).expect("empty close is idempotent");
+    }
+}
+
+#[cfg(test)]
 mod session_api_tests {
     use crate::domain::agent::{
         AgentActionAuditEvent, AgentTaskProposalDraft, AgentTaskSessionDraft,
@@ -3422,7 +3868,9 @@ mod session_api_tests {
     use crate::domain::credential::CredentialDraft;
     use crate::domain::multiexec::MultiExecTarget;
     use crate::domain::session::{SessionDraft, SessionUpdate};
-    use crate::services::import_service::preview_stacio_json_import;
+    use crate::services::import_service::{
+        preview_stacio_json_import, ImportPreview, ImportSessionPreview,
+    };
 
     #[test]
     fn session_bridge_persists_folders_and_sessions() {
@@ -3757,6 +4205,57 @@ mod session_api_tests {
     }
 
     #[test]
+    fn session_bridge_round_trips_sftp_protocol_and_auth_config() {
+        let temp = tempfile::NamedTempFile::new().expect("temp database");
+        let database_path = temp.path().to_string_lossy().to_string();
+
+        let credential = super::save_credential_record(
+            database_path.clone(),
+            CredentialDraft {
+                kind: "password".to_string(),
+                label: "SFTP credential".to_string(),
+                keychain_service: "Stacio".to_string(),
+                keychain_account: "deploy@files.example.com".to_string(),
+            },
+        )
+        .expect("create credential metadata");
+
+        let credential_id = credential.id.clone();
+
+        let session = super::create_session_record(
+            database_path.clone(),
+            SessionDraft {
+                folder_id: None,
+                name: "SFTP Server".to_string(),
+                protocol: "sftp".to_string(),
+                host: "files.example.com".to_string(),
+                port: 22,
+                username: Some("deploy".to_string()),
+                private_key_path: Some("~/.ssh/deploy".to_string()),
+                credential_id: Some(credential_id.clone()),
+                tags: vec![],
+                config_json: None,
+            },
+        )
+        .expect("create sftp session");
+
+        let listed = super::list_all_session_records(database_path.clone()).expect("list sessions");
+        let config_json = super::get_session_config_json(database_path, session.id)
+            .expect("get sftp config")
+            .expect("sftp config json");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].protocol, "sftp");
+        let config: serde_json::Value = serde_json::from_str(&config_json).expect("config json");
+        assert_eq!(config["kind"], "sftp");
+        assert_eq!(config["host"], "files.example.com");
+        assert_eq!(config["port"], 22);
+        assert_eq!(config["username"], "deploy");
+        assert_eq!(config["privateKeyPath"], "~/.ssh/deploy");
+        assert_eq!(config["credentialId"], credential_id);
+    }
+
+    #[test]
     fn session_bridge_persists_credential_reference_without_secret_values() {
         let temp = tempfile::NamedTempFile::new().expect("temp database");
         let database_path = temp.path().to_string_lossy().to_string();
@@ -3949,6 +4448,64 @@ mod session_api_tests {
         assert!(all_sessions.contains(&existing));
         assert!(!serialized.contains("do-not-import"));
         assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn session_import_bridge_accepts_bastion_host_source_and_composite_username() {
+        let temp = tempfile::NamedTempFile::new().expect("temp database");
+        let database_path = temp.path().to_string_lossy().to_string();
+        let preview = ImportPreview {
+            sessions: vec![ImportSessionPreview {
+                name: "Topsec asset".to_string(),
+                folder: None,
+                protocol: "ssh".to_string(),
+                host: "bastion.example.com".to_string(),
+                port: 2222,
+                username: Some("opaque-account@default@SSH@ops@10.0.0.8@22".to_string()),
+                private_key_path: None,
+                config_json: Some(
+                    r#"{"bastionVendor":"topsec","bastionFormat":"topsec_xshell_zip","bastionTargetHost":"10.0.0.8","bastionTargetPort":22,"bastionTargetUsername":"ops","bastionAssetId":"asset-8","bastionAccountId":"account-8","password":"must-not-persist"}"#.to_string(),
+                ),
+                conflict: false,
+            }],
+            warnings: vec![],
+            conflict_count: 0,
+            ignored_secret_field_count: 0,
+        };
+
+        let result = super::apply_session_import(
+            database_path.clone(),
+            "bastion_host".to_string(),
+            "sessions.zip".to_string(),
+            preview,
+        )
+        .expect("apply bastion host import");
+        let sessions =
+            super::list_all_session_records(database_path.clone()).expect("list sessions");
+
+        assert_eq!(result.report.source_type, "bastion_host");
+        assert_eq!(result.report.imported_count, 1);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].host, "bastion.example.com");
+        assert_eq!(sessions[0].port, 2222);
+        assert_eq!(
+            sessions[0].username.as_deref(),
+            Some("opaque-account@default@SSH@ops@10.0.0.8@22")
+        );
+        let config_json = super::get_session_config_json(database_path, sessions[0].id.clone())
+            .expect("read imported config")
+            .expect("imported config json");
+        let config: serde_json::Value =
+            serde_json::from_str(&config_json).expect("parse imported config json");
+        assert_eq!(config["bastionVendor"], "topsec");
+        assert_eq!(config["bastionFormat"], "topsec_xshell_zip");
+        assert_eq!(config["bastionTargetHost"], "10.0.0.8");
+        assert_eq!(config["bastionTargetPort"], 22);
+        assert_eq!(config["bastionTargetUsername"], "ops");
+        assert_eq!(config["bastionAssetId"], "asset-8");
+        assert_eq!(config["bastionAccountId"], "account-8");
+        assert!(config.get("password").is_none());
+        assert!(!config_json.contains("must-not-persist"));
     }
 
     #[test]
@@ -4247,9 +4804,13 @@ mod session_api_tests {
 mod tunnel_api_tests {
     use super::{
         check_tunnel_local_port_available, close_live_tunnel_runtime, poll_live_tunnel_runtime,
-        start_live_local_tunnel_runtime, start_mock_tunnel, stop_tunnel_runtime,
+        start_live_local_tunnel_runtime, start_live_local_tunnel_runtime_with_proxy_jump,
+        start_mock_tunnel, stop_tunnel_runtime,
     };
-    use crate::domain::ssh::{SshAuthMethod, SshAuthSecret, SshConnectionConfig, SshRuntimeError};
+    use crate::domain::ssh::{
+        SshAuthMethod, SshAuthSecret, SshConnectionConfig, SshProxyJumpRuntimeConfig,
+        SshRuntimeError,
+    };
     use crate::domain::tunnel::{TunnelError, TunnelKind, TunnelProfile, TunnelState};
     use crate::services::tunnel_service::MockTunnelOutcome;
     use std::net::TcpListener;
@@ -4332,6 +4893,36 @@ mod tunnel_api_tests {
             remote_profile,
         )
         .expect_err("invalid ssh config");
+
+        assert_eq!(error, SshRuntimeError::InvalidConfig);
+    }
+
+    #[test]
+    fn exported_proxy_jump_tunnel_rejects_invalid_jump_config_before_binding_port() {
+        let error = start_live_local_tunnel_runtime_with_proxy_jump(
+            SshConnectionConfig {
+                host: "app.internal".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth_method: SshAuthMethod::Agent,
+                connect_timeout_ms: 10_000,
+            },
+            SshAuthSecret::Agent,
+            SshProxyJumpRuntimeConfig {
+                jump_config: SshConnectionConfig {
+                    host: "".to_string(),
+                    port: 22,
+                    username: "ops".to_string(),
+                    auth_method: SshAuthMethod::Agent,
+                    connect_timeout_ms: 10_000,
+                },
+                jump_secret: SshAuthSecret::Agent,
+                jump_expected_fingerprint_sha256: "SHA256:jump".to_string(),
+                target_expected_fingerprint_sha256: "SHA256:target".to_string(),
+            },
+            profile(),
+        )
+        .expect_err("invalid proxy jump config");
 
         assert_eq!(error, SshRuntimeError::InvalidConfig);
     }

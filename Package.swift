@@ -18,7 +18,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle.git", .upToNextMajor(from: "2.7.0")),
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", .upToNextMajor(from: "1.13.0"))
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", .upToNextMajor(from: "1.13.0")),
+        .package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.19")
     ],
     targets: [
         .target(
@@ -48,7 +49,8 @@ let package = Package(
                 "StacioAgentBridge",
                 "StacioCoreBindings",
                 .product(name: "Sparkle", package: "Sparkle"),
-                .product(name: "SwiftTerm", package: "SwiftTerm")
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+                .product(name: "ZIPFoundation", package: "ZIPFoundation")
             ],
             path: "Stacio",
             exclude: [
@@ -83,7 +85,8 @@ let package = Package(
                 "StacioApp",
                 "StacioCoreBindings",
                 .product(name: "Sparkle", package: "Sparkle"),
-                .product(name: "SwiftTerm", package: "SwiftTerm")
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+                .product(name: "ZIPFoundation", package: "ZIPFoundation")
             ],
             path: "Tests/StacioAppTests"
         ),

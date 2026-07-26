@@ -1,6 +1,10 @@
 import AppKit
 import StacioCoreBindings
 
+private struct WorkbenchUncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 public final class SidebarToggleTitlebarButton: NSButton {
     public var onPointerEntered: (() -> Void)?
     public var onPointerExited: (() -> Void)?
@@ -187,6 +191,7 @@ public struct AppKitPlaintextProtocolSessionConfirmation: PlaintextProtocolSessi
 
 public enum WorkbenchSessionOpenError: Error, Equatable, LocalizedError {
     case protocolRuntimeUnavailable(String)
+    case protocolRemoved(String, replacement: String)
     case invalidSavedSessionPort(String, UInt32)
     case savedSessionNotFound(String)
 
@@ -194,6 +199,8 @@ public enum WorkbenchSessionOpenError: Error, Equatable, LocalizedError {
         switch self {
         case .protocolRuntimeUnavailable(let sessionProtocol):
             return "当前 Stacio 尚未接入 \(sessionProtocol) 会话运行时。"
+        case let .protocolRemoved(sessionProtocol, replacement):
+            return "\(sessionProtocol) 会话已从 Stacio 移除，请改用 \(replacement) 新建安全文件传输会话。"
         case .invalidSavedSessionPort(let sessionProtocol, let port):
             return "\(sessionProtocol) 会话端口无效：\(port)。"
         case .savedSessionNotFound:
@@ -218,7 +225,7 @@ private final class WorkbenchLicensedFeatureMenuDelegate: NSObject, NSMenuDelega
     weak var controller: WorkbenchWindowController?
 
     func menuWillOpen(_ menu: NSMenu) {
-        controller?.refreshLicensedFeatureMenu(menu)
+        controller?.refreshPanelMenuAvailability(menu)
     }
 }
 
@@ -252,7 +259,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let licensedFeatureMenuDelegate = WorkbenchLicensedFeatureMenuDelegate()
     private var serialSessionStarter: SerialSessionStarting?
     private var savedSessionContextBuilder: TunnelLiveSessionContextBuilding?
-    private var ftpCredentialResolver: FTPCredentialResolving?
     private let quickConnectPromptPresenter: QuickConnectPromptPresenting
     private let quickConnectErrorPresenter: QuickConnectErrorPresenting
     private let multiExecPromptPresenter: MultiExecPromptPresenting
@@ -306,6 +312,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var pendingInspectorWidth: CGFloat?
     private var preservedInspectorWidthDuringSidebarMove: CGFloat?
     private var isPendingInspectorWidthRepairScheduled = false
+    private var interactiveSplitResizeWorkItem: DispatchWorkItem?
+    private var splitWidthPersistenceWorkItem: DispatchWorkItem?
+    private var isInteractiveSplitResizeActive = false
     private var allowsUserSplitWidthPersistence = false
     private var isSidebarTemporarilyExpanded = false
     private var pendingProgrammaticWindowFrameRestore: NSRect?
@@ -316,6 +325,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let minimumInspectorWidthBeforeDeferredUncollapse: CGFloat = 420
     private let preferredFilesCapabilityInspectorWidth: CGFloat = 960
     private let unrestrictedInspectorPanelWidth: CGFloat = 100_000
+    private let splitResizeSettleInterval: TimeInterval = 0.08
 
     private enum ToolbarItem {
         static let sidebar = NSToolbarItem.Identifier("Stacio.Toolbar.sidebar")
@@ -363,7 +373,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         telnetSessionStarter: TelnetSessionStarting? = nil,
         serialSessionStarter: SerialSessionStarting? = nil,
         savedSessionContextBuilder: TunnelLiveSessionContextBuilding? = nil,
-        ftpCredentialResolver: FTPCredentialResolving? = nil,
         quickConnectPromptPresenter: QuickConnectPromptPresenting = AppKitQuickConnectPromptPresenter(),
         quickConnectErrorPresenter: QuickConnectErrorPresenting? = nil,
         multiExecPromptPresenter: MultiExecPromptPresenting = AppKitMultiExecPromptPresenter(),
@@ -421,7 +430,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         self.telnetSessionStarter = telnetSessionStarter
         self.serialSessionStarter = serialSessionStarter
         self.savedSessionContextBuilder = savedSessionContextBuilder
-        self.ftpCredentialResolver = ftpCredentialResolver
         self.quickConnectPromptPresenter = quickConnectPromptPresenter
         self.quickConnectErrorPresenter = quickConnectErrorPresenter ?? AppKitQuickConnectErrorPresenter()
         self.multiExecPromptPresenter = multiExecPromptPresenter
@@ -459,10 +467,19 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.refreshLicensedToolbarItems()
+                self?.refreshToolbarItemAvailability()
             }
         }
         workspaceViewController.onRequestNewSession = { [weak self] in
+            self?.performNewSessionFromToolbar(nil)
+        }
+        workspaceViewController.fileTransferRemoteDeviceOptionsProvider = { [weak self] in
+            self?.fileTransferRemoteDeviceOptions() ?? []
+        }
+        workspaceViewController.onRequestConnectFileTransferRemoteDevice = { [weak self] filesPane, sessionID in
+            self?.connectFileTransferRemoteDevice(sessionID: sessionID, to: filesPane)
+        }
+        workspaceViewController.onRequestCreateFileTransferRemoteDevice = { [weak self] in
             self?.performNewSessionFromToolbar(nil)
         }
     }
@@ -473,6 +490,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     deinit {
+        interactiveSplitResizeWorkItem?.cancel()
+        splitWidthPersistenceWorkItem?.cancel()
         if let splitResizeObserver {
             NotificationCenter.default.removeObserver(splitResizeObserver)
         }
@@ -552,7 +571,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         bindUpdatePromptControllerIfNeeded()
         sparkleUpdateController?.probeForAvailableUpdate()
         refreshWorkbenchAppearance()
-        refreshLicensedToolbarItems()
+        refreshToolbarItemAvailability()
         updateInspectorToolbarTopInset(in: window)
     }
 
@@ -796,6 +815,51 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
     }
 
+    private func isInteractiveSplitPositionChange(in splitView: NSSplitView? = nil) -> Bool {
+        if let pinnedSplitView = splitView as? StacioPinnedSplitView,
+           pinnedSplitView.isTrackingUserDividerDrag
+        {
+            return true
+        }
+        guard let event = NSApp.currentEvent else {
+            return false
+        }
+        switch event.type {
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp:
+            return (NSEvent.pressedMouseButtons & 1) != 0 || event.type == .leftMouseUp
+        default:
+            return false
+        }
+    }
+
+    private func scheduleInteractiveSplitResizeRepair() {
+        isInteractiveSplitResizeActive = true
+        interactiveSplitResizeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.interactiveSplitResizeWorkItem = nil
+            self.isInteractiveSplitResizeActive = false
+            self.applyPendingInspectorWidthIfNeeded()
+            self.synchronizeInspectorContentFrameAfterSplitLayout()
+            self.preservedInspectorWidthDuringSidebarMove = nil
+            self.saveSplitColumnWidthsIfNeeded()
+        }
+        interactiveSplitResizeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + splitResizeSettleInterval, execute: workItem)
+    }
+
+    private func scheduleSplitWidthPersistence() {
+        guard allowsUserSplitWidthPersistence else { return }
+        splitWidthPersistenceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.splitWidthPersistenceWorkItem = nil
+            self.saveSplitColumnWidthsIfNeeded()
+        }
+        splitWidthPersistenceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + splitResizeSettleInterval, execute: workItem)
+    }
+
     private func restoreStoredSidebarWidthIfNeeded(in splitView: NSSplitView) {
         guard let storedSidebarWidth = storedSplitWidth(column: "sidebar"),
               splitView.arrangedSubviews.count >= 3
@@ -860,13 +924,21 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let constrainedPosition = min(max(proposedPosition, lowerBound), upperBound)
         if splitPositionOverrideDepth == 0 {
             pendingInspectorWidth = max(0, splitView.bounds.width - constrainedPosition - dividerThickness)
-            updatePreferredInspectorFraction(pendingInspectorWidth ?? 0, splitWidth: splitView.bounds.width)
-            applyWorkbenchSplitFrames(
-                forDividerOnePosition: constrainedPosition,
-                in: splitView,
-                pinsInspectorWidthDuringLayout: true
-            )
-            saveSplitColumnWidthsIfNeeded()
+            if isInteractiveSplitPositionChange(in: splitView) {
+                // During a mouse drag AppKit already moves the divider and
+                // lays out the columns. Defer the Inspector-wide repair until
+                // the pointer settles so the drag stays on the live layout
+                // path instead of recursively forcing Auto Layout each tick.
+                scheduleInteractiveSplitResizeRepair()
+            } else {
+                updatePreferredInspectorFraction(pendingInspectorWidth ?? 0, splitWidth: splitView.bounds.width)
+                applyWorkbenchSplitFrames(
+                    forDividerOnePosition: constrainedPosition,
+                    in: splitView,
+                    pinsInspectorWidthDuringLayout: true
+                )
+                saveSplitColumnWidthsIfNeeded()
+            }
         }
         return constrainedPosition
     }
@@ -944,13 +1016,44 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             if let preservedInspectorWidthDuringSidebarMove {
                 pendingInspectorWidth = preservedInspectorWidthDuringSidebarMove
             }
-            applyPendingInspectorWidthIfNeeded()
+            if isInteractiveSplitResizeActive || isInteractiveSplitPositionChange(in: splitView) {
+                scheduleInteractiveSplitResizeRepair()
+                return
+            }
+            let targetSidebarWidth = clampedSidebarWidth(
+                position,
+                availableWidth: splitView.bounds.width
+            )
+            sidebarSplitViewItem?.holdingPriority = .defaultHigh
+            if let pendingInspectorWidth, pendingInspectorWidth > 0 {
+                let inspectorDividerPosition = splitView.bounds.width
+                    - pendingInspectorWidth
+                    - splitView.dividerThickness
+                applyWorkbenchSplitFrames(
+                    forDividerOnePosition: inspectorDividerPosition,
+                    in: splitView,
+                    preservingWindowFrame: window?.frame,
+                    pinsInspectorWidthDuringLayout: true,
+                    pinnedSidebarWidth: targetSidebarWidth
+                )
+            } else {
+                performProgrammaticSplitLayout {
+                    splitView.setPosition(targetSidebarWidth, ofDividerAt: 0)
+                    splitView.layoutSubtreeIfNeeded()
+                }
+            }
             preservedInspectorWidthDuringSidebarMove = nil
             saveSplitColumnWidthsIfNeeded()
             return
         }
 
         guard dividerIndex == 1 else { return }
+
+        if isInteractiveSplitResizeActive || isInteractiveSplitPositionChange(in: splitView) {
+            pendingInspectorWidth = max(0, splitView.bounds.width - position - splitView.dividerThickness)
+            scheduleInteractiveSplitResizeRepair()
+            return
+        }
 
         let constrainedPosition = constrainWorkbenchSplitPosition(
             splitView,
@@ -1328,6 +1431,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func schedulePendingInspectorWidthRepair() {
+        if isInteractiveSplitResizeActive {
+            scheduleInteractiveSplitResizeRepair()
+            return
+        }
         guard isPendingInspectorWidthRepairScheduled == false else { return }
 
         isPendingInspectorWidthRepairScheduled = true
@@ -1687,11 +1794,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         ) { [weak self] _ in
             if Thread.isMainThread {
                 MainActor.assumeIsolated {
-                    self?.saveSplitColumnWidthsIfNeeded()
+                    self?.scheduleSplitWidthPersistence()
                 }
             } else {
                 Task { @MainActor [weak self] in
-                    self?.saveSplitColumnWidthsIfNeeded()
+                    self?.scheduleSplitWidthPersistence()
                 }
             }
         }
@@ -1781,6 +1888,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let inspectorController = InspectorViewController(
             transferHistoryStore: transferHistoryStore,
             aiAssistantViewController: makeAIAssistantPanelViewController(),
+            workspaceSessionProtocolProvider: { [weak workspaceViewController] in
+                workspaceViewController?.currentSessionProtocol ?? .noSession
+            },
             tunnelLiveSessionContextProvider: tunnelLiveSessionContextProvider,
             remoteFilePathTerminalSender: { [weak workspaceViewController] path in
                 _ = workspaceViewController?.sendTextToCurrentTerminal(path)
@@ -1916,8 +2026,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 ) == true
             )
         }
-        workspaceViewController.onCurrentTerminalChanged = { [weak inspectorController] in
+        workspaceViewController.onCurrentTerminalChanged = { [weak self, weak inspectorController] in
+            inspectorController?.refreshWorkspaceCapabilities()
             inspectorController?.refreshCurrentTerminalContextPanels()
+            self?.refreshToolbarItemAvailability()
         }
         workspaceViewController.onCommandHistoryChanged = { [weak inspectorController] in
             inspectorController?.reloadCommandHistory()
@@ -2083,6 +2195,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func showAIAssistantInspector(prefilling text: String? = nil) {
+        guard allowsWorkspaceCapability(.ai) else { return }
         guard let inspectorSplitViewItem,
               let inspectorViewController
         else {
@@ -2419,9 +2532,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         item.target = self
         item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
             ?? fallbackSymbolName.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: title) }
-        if let feature = licensedFeature(for: action) {
-            configureLicenseAvailability(item, feature: feature)
-        }
+        configurePanelMenuAvailability(item)
         return item
     }
 
@@ -2435,15 +2546,45 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
     }
 
-    private func configureLicenseAvailability(_ item: NSMenuItem, feature: StacioLicensedFeature) {
-        item.isEnabled = licenseAccess.isEnabled(feature)
-        item.toolTip = item.isEnabled ? nil : L10n.Import.licenseUnavailableTooltip
+    private func workspaceCapability(for action: Selector?) -> WorkspaceCapability? {
+        switch action {
+        case #selector(showFilesFromToolbar(_:)): .files
+        case #selector(showBrowserFromToolbar(_:)): .browser
+        case #selector(showTunnelsFromToolbar(_:)): .tunnels
+        case #selector(toggleDeviceDashboardFromToolbar(_:)): .deviceDashboard
+        case #selector(showDiagnosticsFromToolbar(_:)): .diagnostics
+        case #selector(showAIAssistantFromToolbar(_:)): .ai
+        default: nil
+        }
     }
 
-    fileprivate func refreshLicensedFeatureMenu(_ menu: NSMenu) {
+    public func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool {
+        WorkspaceCapabilityPolicy.allows(
+            capability,
+            for: workspaceViewController.currentSessionProtocol
+        )
+    }
+
+    private func configurePanelMenuAvailability(_ item: NSMenuItem) {
+        if let capability = workspaceCapability(for: item.action),
+           allowsWorkspaceCapability(capability) == false
+        {
+            item.isEnabled = false
+            item.toolTip = L10n.Workbench.sshSessionRequiredTooltip
+            return
+        }
+        if let feature = licensedFeature(for: item.action), isLicensed(feature) == false {
+            item.isEnabled = false
+            item.toolTip = L10n.Import.licenseUnavailableTooltip
+            return
+        }
+        item.isEnabled = true
+        item.toolTip = nil
+    }
+
+    fileprivate func refreshPanelMenuAvailability(_ menu: NSMenu) {
         for item in menu.items {
-            guard let feature = licensedFeature(for: item.action) else { continue }
-            configureLicenseAvailability(item, feature: feature)
+            configurePanelMenuAvailability(item)
         }
     }
 
@@ -2628,6 +2769,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        if let capability = workspaceCapability(for: item.action),
+           allowsWorkspaceCapability(capability) == false
+        {
+            item.toolTip = L10n.Workbench.sshSessionRequiredTooltip
+            return false
+        }
         let feature: StacioLicensedFeature?
         switch item.itemIdentifier {
         case ToolbarItem.multiExec: feature = .multiExec
@@ -2636,24 +2783,29 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         case ToolbarItem.aiAssistant: feature = .aiAgent
         default: feature = nil
         }
-        guard let feature else { return true }
+        guard let feature else {
+            item.toolTip = toolbarDefaultToolTip(for: item.itemIdentifier)
+            return true
+        }
         let enabled = isLicensed(feature)
-        item.toolTip = enabled ? licensedToolbarDefaultToolTip(for: item.itemIdentifier) : L10n.Import.licenseUnavailableTooltip
+        item.toolTip = enabled ? toolbarDefaultToolTip(for: item.itemIdentifier) : L10n.Import.licenseUnavailableTooltip
         return enabled
     }
 
-    private func refreshLicensedToolbarItems() {
+    private func refreshToolbarItemAvailability() {
         guard let toolbar = window?.toolbar else { return }
         for item in toolbar.items {
-            guard licensedToolbarDefaultToolTip(for: item.itemIdentifier) != nil else { continue }
+            guard toolbarDefaultToolTip(for: item.itemIdentifier) != nil else { continue }
             item.isEnabled = validateToolbarItem(item)
         }
         toolbar.validateVisibleItems()
     }
 
-    private func licensedToolbarDefaultToolTip(for identifier: NSToolbarItem.Identifier) -> String? {
+    private func toolbarDefaultToolTip(for identifier: NSToolbarItem.Identifier) -> String? {
         switch identifier {
         case ToolbarItem.multiExec: L10n.Workbench.multiExecTooltip
+        case ToolbarItem.files: L10n.Inspector.files
+        case ToolbarItem.browser: L10n.Inspector.browser
         case ToolbarItem.tunnels: L10n.Workbench.tunnels
         case ToolbarItem.deviceDashboard: L10n.Workbench.toggleDeviceDashboard
         case ToolbarItem.aiAssistant: L10n.AI.assistant
@@ -2739,6 +2891,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showFilesFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.files) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
         defer {
@@ -2792,6 +2945,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showTunnelsFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.tunnels) else { return }
         guard isLicensed(.sshTunnel) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
@@ -2815,6 +2969,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showBrowserFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.browser) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
         defer {
@@ -2837,6 +2992,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showDiagnosticsFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.diagnostics) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
         defer {
@@ -2904,6 +3060,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func toggleDeviceDashboardFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.deviceDashboard) else { return }
         guard isLicensed(.advancedMetrics) else { return }
         preserveProgrammaticWindowFrame(window?.frame)
         workspaceViewController.toggleDeviceMetricsDashboardVisibility()
@@ -2916,6 +3073,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @objc
     public func showAIAssistantFromToolbar(_ sender: Any?) {
+        guard allowsWorkspaceCapability(.ai) else { return }
         guard isLicensed(.aiAgent) else { return }
         let windowFrame = window?.frame
         preserveProgrammaticWindowFrame(windowFrame)
@@ -3290,6 +3448,95 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return alert.runModal() == .alertFirstButtonReturn
     }
 
+    private func fileTransferRemoteDeviceOptions() -> [FileTransferRemoteDeviceOption] {
+        do {
+            let databasePath = try databasePathProvider()
+            return try CoreBridge.listAllSessionRecords(databasePath: databasePath)
+                .compactMap { session -> FileTransferRemoteDeviceOption? in
+                    let normalizedProtocol = session.protocol
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                    guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
+                        return nil
+                    }
+                    let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let host = session.host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let username = session.username?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let hostAndPort = "\(host):\(session.port)"
+                    let endpoint = username.isEmpty ? hostAndPort : "\(username)@\(hostAndPort)"
+                    return FileTransferRemoteDeviceOption(
+                        sessionID: session.id,
+                        title: title.isEmpty ? host : title,
+                        protocolName: normalizedProtocol.uppercased(),
+                        endpoint: endpoint
+                    )
+                }
+                .sorted {
+                    $0.menuTitle.localizedCaseInsensitiveCompare($1.menuTitle) == .orderedAscending
+                }
+        } catch {
+            return []
+        }
+    }
+
+    private func connectFileTransferRemoteDevice(
+        sessionID: String,
+        to filesPane: RemoteFilesPaneViewController
+    ) {
+        do {
+            let databasePath = try databasePathProvider()
+            guard let session = try CoreBridge.listAllSessionRecords(databasePath: databasePath)
+                .first(where: { $0.id == sessionID })
+            else {
+                throw WorkbenchSessionOpenError.savedSessionNotFound(sessionID)
+            }
+            let normalizedProtocol = session.protocol
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol)
+            }
+
+            let config = try savedSessionSSHConfig(for: session)
+            let context = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
+                config: config,
+                databasePath: databasePath
+            )
+            let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "\(config.username)@\(config.host)"
+                : session.name
+            let paneBridge: RemoteFilesBridging
+            let paneScheduler: SCPTransferScheduling?
+            if normalizedProtocol == "sftp" {
+                paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
+                paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
+            } else {
+                paneBridge = remoteFilesBridge
+                paneScheduler = currentTransferScheduler()
+            }
+
+            let configuration = FileTransferRemotePaneConfiguration(
+                sourceRuntimeID: "saved:\(session.id)",
+                context: context,
+                title: title,
+                bridge: paneBridge,
+                transferScheduler: paneScheduler,
+                remoteProtocolName: normalizedProtocol.uppercased(),
+                initialRemotePath: "~",
+                remoteFilePathTerminalSender: { [weak workspace = workspaceViewController] path in
+                    _ = workspace?.sendTextToCurrentTerminal(path)
+                }
+            )
+            guard filesPane.attachFileTransferRemoteDevice(configuration) != nil else {
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(normalizedProtocol.uppercased())
+            }
+            markSavedSessionOpened(session)
+        } catch {
+            quickConnectErrorPresenter.presentQuickConnectError(error, parentWindow: window)
+        }
+    }
+
     @discardableResult
     public func openSavedSession(_ session: SessionRecord) throws -> LiveShellStatus {
         let status = try openSavedSession(session, allowMissingCredentialRepair: true)
@@ -3352,21 +3599,32 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 bridge: remoteFilesBridge,
                 transferScheduler: currentTransferScheduler()
             )
+            (workspaceViewController.currentTerminalPane as? RemoteFilesPaneViewController)?
+                .markPrimaryFileTransferRemoteDevice(sessionID: session.id)
             markSavedSessionOpened(session)
             return LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: L10n.Workbench.scpFilePaneOpened)
         }
-        if normalizedProtocol == "ftp" {
-            try confirmPlaintextProtocolSession(protocolName: "FTP")
-            let context = try resolvedFTPCredentialResolver().resolve(session: session)
-            let title = savedSessionTitle(for: session, username: context.config.username)
-            let runtimeID = try workspaceViewController.openFTPFilesSession(
+        if normalizedProtocol == "sftp" {
+            let config = try savedSessionSSHConfig(for: session)
+            let context = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
+                config: config,
+                databasePath: databasePathProvider()
+            )
+            tunnelLiveSessionStore.replace(with: context)
+            let title = session.name.isEmpty ? "\(config.username)@\(config.host)" : session.name
+            let runtimeID = try workspaceViewController.openSFTPFilesSession(
                 context: context,
                 title: title,
                 bridge: remoteFilesBridge,
-                ftpTransferScheduler: currentFTPTransferScheduler()
+                sftpTransferScheduler: currentSFTPTransferScheduler()
             )
+            (workspaceViewController.currentTerminalPane as? RemoteFilesPaneViewController)?
+                .markPrimaryFileTransferRemoteDevice(sessionID: session.id)
             markSavedSessionOpened(session)
-            return LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: L10n.Workbench.ftpFilePaneOpened)
+            return LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: L10n.Workbench.sftpFilePaneOpened)
+        }
+        if normalizedProtocol == "ftp" {
+            throw WorkbenchSessionOpenError.protocolRemoved("FTP", replacement: "SFTP")
         }
         if normalizedProtocol == "telnet" {
             try confirmPlaintextProtocolSession(protocolName: "Telnet")
@@ -3377,7 +3635,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 connectTimeoutMs: 10_000
             )
             let title = savedSessionTitle(for: session, username: session.username)
-            let status = try resolvedTelnetSessionStarter().start(config: config, title: title)
+            let status = try resolvedTelnetSessionStarter().openSessionTab(config: config, title: title)
             markSavedSessionOpened(session)
             return status
         }
@@ -3408,43 +3666,80 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             }
             let title = session.name.isEmpty ? session.host : session.name
             if let launchConfig {
+                let port = try networkPort(for: session)
                 let runtimeArguments = try graphicsRuntimeArguments(
                     for: normalizedProtocol,
                     session: session,
                     launchArguments: launchConfig.arguments
                 )
-                let runtimeStatus = try graphicsRuntimeManager.start(
-                    request: GraphicsRuntimeStartRequest(
-                        protocolName: protocolName,
-                        adapterPath: launchConfig.adapterPath,
-                        arguments: runtimeArguments,
-                        host: session.host,
-                        port: try networkPort(for: session)
-                    )
+                let request = GraphicsRuntimeStartRequest(
+                    protocolName: protocolName,
+                    adapterPath: launchConfig.adapterPath,
+                    arguments: runtimeArguments,
+                    host: session.host,
+                    port: port
                 )
-                let diagnostic = GraphicsSessionDiagnostic(
+                let redactedArguments = redactedGraphicsLaunchArguments(runtimeArguments)
+                let pane = workspaceViewController.openConnectingGraphicsSession(
+                    title: title,
                     protocolName: protocolName,
                     host: session.host,
-                    port: try networkPort(for: session),
-                    adapterPath: launchConfig.adapterPath,
-                    launchArguments: redactedGraphicsLaunchArguments(runtimeArguments),
-                    status: runtimeStatus.diagnostic,
-                    presentation: runtimeStatus.presentation
+                    port: port
                 )
-                let runtimeID = workspaceViewController.openGraphicsSession(
-                    title: title,
-                    diagnostic: diagnostic,
-                    runtimeID: runtimeStatus.runtimeID,
-                    attachment: runtimeStatus.attachment,
-                    onClose: { [graphicsRuntimeManager] runtimeID in
-                        _ = graphicsRuntimeManager.stop(runtimeID: runtimeID)
+                let managerBox = WorkbenchUncheckedSendable(value: graphicsRuntimeManager)
+                let requestBox = WorkbenchUncheckedSendable(value: request)
+                DispatchQueue.global(qos: .userInitiated).async { [weak pane] in
+                    let result = Result {
+                        try managerBox.value.start(request: requestBox.value)
                     }
-                )
+                    DispatchQueue.main.async {
+                        guard let pane else {
+                            if case let .success(runtimeStatus) = result {
+                                _ = managerBox.value.stop(runtimeID: runtimeStatus.runtimeID)
+                            }
+                            return
+                        }
+                        switch result {
+                        case let .success(runtimeStatus):
+                            let diagnostic = GraphicsSessionDiagnostic(
+                                protocolName: protocolName,
+                                host: session.host,
+                                port: port,
+                                adapterPath: launchConfig.adapterPath,
+                                launchArguments: redactedArguments,
+                                status: runtimeStatus.diagnostic,
+                                presentation: runtimeStatus.presentation
+                            )
+                            if runtimeStatus.status == "running" {
+                                pane.attachRuntime(
+                                    runtimeID: runtimeStatus.runtimeID,
+                                    diagnostic: diagnostic,
+                                    attachment: runtimeStatus.attachment,
+                                    onClose: { runtimeID in
+                                        _ = managerBox.value.stop(runtimeID: runtimeID)
+                                    }
+                                )
+                            } else {
+                                pane.displayConnectionFailure(diagnostic)
+                            }
+                        case let .failure(error):
+                            let diagnostic = GraphicsSessionDiagnostic(
+                                protocolName: protocolName,
+                                host: session.host,
+                                port: port,
+                                adapterPath: launchConfig.adapterPath,
+                                launchArguments: redactedArguments,
+                                status: RuntimeDiagnosticFormatter.userMessage(for: error)
+                            )
+                            pane.displayConnectionFailure(diagnostic)
+                        }
+                    }
+                }
                 markSavedSessionOpened(session)
                 return LiveShellStatus(
-                    runtimeId: runtimeID,
-                    status: runtimeStatus.status,
-                    diagnostic: runtimeStatus.diagnostic
+                    runtimeId: pane.runtimeID,
+                    status: "connecting",
+                    diagnostic: L10n.TerminalLifecycle.connecting
                 )
             }
             let diagnostic = GraphicsSessionDiagnostic(
@@ -3565,7 +3860,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         for session: SessionRecord
     ) -> SshConnectionConfig? {
         let normalizedProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalizedProtocol == "ssh" || normalizedProtocol == "scp" else {
+        guard normalizedProtocol == "ssh" || normalizedProtocol == "sftp" || normalizedProtocol == "scp" else {
             return nil
         }
 
@@ -3627,7 +3922,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let normalizedProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let displayName = optionalTrimmed(session.name) ?? session.host
         switch normalizedProtocol {
-        case "ssh", "scp":
+        case "ssh", "sftp", "scp":
             guard optionalTrimmed(session.credentialId) != nil else {
                 return nil
             }
@@ -3644,20 +3939,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 account: account,
                 kind: kind,
                 label: savedSessionCredentialLabel(displayName: displayName, kind: kind)
-            )
-        case "ftp":
-            let username = optionalTrimmed(session.username) ?? "anonymous"
-            guard username != "anonymous" else {
-                return nil
-            }
-            return SavedSessionCredentialPromptRequest(
-                sessionID: session.id,
-                sessionName: displayName,
-                protocolName: "FTP",
-                host: session.host,
-                account: "\(username)@\(session.host)",
-                kind: .password,
-                label: savedSessionCredentialLabel(displayName: displayName, kind: .password)
             )
         case "vnc":
             let username = graphicsUsername(for: session)
@@ -3791,15 +4072,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let starter = SerialSessionCoordinator(workspace: workspaceViewController)
         serialSessionStarter = starter
         return starter
-    }
-
-    private func resolvedFTPCredentialResolver() -> FTPCredentialResolving {
-        if let ftpCredentialResolver {
-            return ftpCredentialResolver
-        }
-        let resolver = FTPCredentialResolver(store: KeychainCredentialStore())
-        ftpCredentialResolver = resolver
-        return resolver
     }
 
     private func resolvedQuickConnectCoordinator() throws -> QuickConnectCoordinator {
@@ -4092,7 +4364,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return inspectorViewController.transferQueueCoordinator
     }
 
-    private func currentFTPTransferScheduler() -> FTPTransferScheduling? {
+    private func currentSFTPTransferScheduler() -> SFTPTransferScheduling? {
         guard let inspectorViewController else {
             return nil
         }

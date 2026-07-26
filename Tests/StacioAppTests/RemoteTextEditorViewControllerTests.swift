@@ -5,6 +5,47 @@ import XCTest
 
 @MainActor
 final class RemoteTextEditorViewControllerTests: XCTestCase {
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        return condition()
+    }
+
+    private func waitForLocalDocumentLoads(
+        _ controller: RemoteTextEditorViewController,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            waitUntil { controller.hasPendingLocalDocumentLoadsForTesting == false },
+            "Timed out waiting for local editor document loading",
+            file: file,
+            line: line
+        )
+    }
+
+    private func waitForSaveState(
+        _ expectedState: RemoteTextEditorSaveState,
+        in controller: RemoteTextEditorViewController,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            waitUntil { controller.activeSaveStateForTesting == expectedState },
+            "Timed out waiting for save state \(expectedState)",
+            file: file,
+            line: line
+        )
+    }
+
     func testEditorLoadsMonacoWorkspaceWithLanguageTabsAndStatusMetadata() throws {
         let suiteName = "StacioEditorThemeTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -23,6 +64,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         )
 
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         let webView = try XCTUnwrap(
             controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
@@ -243,10 +285,11 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
     func testEditorRejectsNonUTF8ContentInsteadOfTreatingExtensionAsDecider() throws {
         let directory = try makeTemporaryEditorDirectory()
         let fileURL = directory.appendingPathComponent("unknown.bin")
-        try Data([0xff, 0xfe, 0x00]).write(to: fileURL)
+        try Data([0xDE, 0xAD, 0xBE, 0xEF]).write(to: fileURL)
 
         let controller = RemoteTextEditorViewController(localURL: fileURL)
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         XCTAssertFalse(controller.canEditTextForTesting)
         XCTAssertTrue(controller.editorErrorTextForTesting?.contains("UTF-8") ?? false)
@@ -259,8 +302,10 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         let secondURL = try makeTemporaryEditorFile(name: "second.yaml", contents: "enabled: true\n")
         let controller = RemoteTextEditorViewController(localURL: firstURL)
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         controller.openDocumentForTesting(localURL: secondURL)
+        waitForLocalDocumentLoads(controller)
         controller.replaceTextForTesting("enabled: false\n")
 
         XCTAssertEqual(controller.tabTitlesForTesting, ["first.conf", "second.yaml"])
@@ -285,6 +330,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         let videoURL = try makeTemporaryEditorFile(name: "demo.mp4", data: Data([0x00, 0x00, 0x00, 0x18]))
         let controller = RemoteTextEditorViewController(localURL: textURL)
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         controller.openDocumentForTesting(localURL: imageURL)
         controller.openDocumentForTesting(localURL: audioURL)
@@ -309,6 +355,36 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.activeDocumentDisplayModeForTesting, "text")
         XCTAssertEqual(controller.currentTextForTesting, "enabled=true\n")
+    }
+
+    func testClosingRemoteMediaTabUnregistersReadSource() throws {
+        let invalidation = EditorMediaInvalidationCounter()
+        let sourceURL = RemoteFileOnlineMediaRegistry.shared.register(
+            fileName: "clip.mp4",
+            mimeType: "video/mp4",
+            byteCount: 4,
+            onInvalidate: { invalidation.increment() },
+            reader: { _, _ in Data([0, 0, 0, 4]) }
+        )
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.openDocument(RemoteTextEditorDocumentDescriptor(
+            remotePath: "/srv/clip.mp4",
+            fileName: "clip.mp4",
+            content: "",
+            contentKind: .video,
+            previewSource: sourceURL.absoluteString,
+            byteCount: 4
+        ))
+
+        XCTAssertNotNil(RemoteFileOnlineMediaRegistry.shared.source(for: sourceURL))
+        editor.closeDocumentForTesting(fileName: "clip.mp4")
+
+        XCTAssertNil(RemoteFileOnlineMediaRegistry.shared.source(for: sourceURL))
+        XCTAssertEqual(invalidation.value, 1)
     }
 
     func testEditorTabsExposeOverflowArrowControls() throws {
@@ -348,11 +424,13 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             onSave: { url in savedURLs.append(url) }
         )
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         controller.replaceTextForTesting("PermitRootLogin prohibit-password\n")
         XCTAssertTrue(controller.hasUnsavedChangesForTesting)
 
         try controller.performSaveForTesting()
+        waitForSaveState(.saved, in: controller)
 
         XCTAssertEqual(try String(contentsOf: fileURL), "PermitRootLogin prohibit-password\n")
         XCTAssertEqual(savedURLs, [fileURL])
@@ -466,6 +544,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         )
 
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         XCTAssertEqual(controller.activeSaveStateForTesting, .saved)
         XCTAssertEqual(controller.activeSaveStateTextForTesting, "已保存")
@@ -476,7 +555,8 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.activeSaveStateTextForTesting, "未保存改动")
 
         shouldFail = true
-        XCTAssertThrowsError(try controller.performSaveForTesting())
+        try controller.performSaveForTesting()
+        waitForSaveState(.failed, in: controller)
 
         XCTAssertEqual(controller.activeSaveStateForTesting, .failed)
         XCTAssertEqual(controller.activeSaveStateTextForTesting, "保存失败：无法打开“app.conf”：upload failed")
@@ -484,12 +564,16 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
 
         shouldFail = false
         try controller.performSaveForTesting()
+        waitForSaveState(.saved, in: controller)
 
         XCTAssertEqual(controller.activeSaveStateForTesting, .saved)
         XCTAssertEqual(controller.activeSaveStateTextForTesting, "已保存")
         XCTAssertTrue(observedSavingState)
         XCTAssertTrue(controller.editorHTMLForTesting.contains("saveStateText"))
         XCTAssertTrue(controller.editorHTMLForTesting.contains("window.setTimeout(() => {"))
+        XCTAssertTrue(controller.editorHTMLForTesting.contains(
+            "updateStatus();\n    }\n\n    function renderTabState"
+        ))
     }
 
     func testWindowTitleUsesEditedDotAndClearsAfterSave() throws {
@@ -498,6 +582,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         let windowController = RemoteTextEditorWindowController(editorViewController: controller)
         defer { windowController.close() }
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
 
         XCTAssertEqual(windowController.window?.title, "app.toml")
         XCTAssertEqual(windowController.window?.isDocumentEdited, false)
@@ -508,9 +593,26 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(windowController.window?.isDocumentEdited, true)
 
         try controller.performSaveForTesting()
+        waitForSaveState(.saved, in: controller)
 
         XCTAssertEqual(windowController.window?.title, "app.toml")
         XCTAssertEqual(windowController.window?.isDocumentEdited, false)
+    }
+
+    func testEditorWindowOpensWithUsableDocumentWorkspaceSize() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "large-editor.conf", contents: "enabled=true\n")
+        let editor = RemoteTextEditorViewController(localURL: fileURL)
+        let windowController = RemoteTextEditorWindowController(editorViewController: editor)
+        defer { windowController.close() }
+
+        windowController.showWindow(nil)
+        let window = try XCTUnwrap(windowController.window)
+        window.layoutIfNeeded()
+
+        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.width, 900)
+        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.height, 620)
+        XCTAssertGreaterThanOrEqual(window.contentMinSize.width, 720)
+        XCTAssertGreaterThanOrEqual(window.contentMinSize.height, 480)
     }
 
     func testEditorBuildsAIQuestionForActiveRemoteTextDocument() throws {
@@ -595,6 +697,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         controller.loadView()
         controller.markEditorReadyForTesting()
         controller.openDocumentForTesting(localURL: secondURL)
+        waitForLocalDocumentLoads(controller)
         controller.resetEditorFunctionCallsForTesting()
 
         controller.receiveSwitchTabMessageForTesting(
@@ -665,14 +768,257 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         )
         defer { windowController.close() }
         controller.loadView()
+        waitForLocalDocumentLoads(controller)
         controller.replaceTextForTesting("debug = true\n")
 
-        XCTAssertTrue(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
+        XCTAssertFalse(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
+        waitForSaveState(.saved, in: controller)
 
         XCTAssertEqual(confirmer.promptedFileNames, ["app.toml"])
         XCTAssertEqual(savedURLs, [fileURL])
         XCTAssertEqual(try String(contentsOf: fileURL), "debug = true\n")
         XCTAssertFalse(controller.hasUnsavedChangesForTesting)
+    }
+
+    func testWindowCloseWaitsForAsyncSaveSuccessBeforeClosing() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.toml",
+            fileName: "app.toml",
+            content: "debug = false\n"
+        )
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: descriptor,
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        let windowController = RemoteTextEditorWindowController(
+            editorViewController: editor,
+            closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+        )
+        var closeCount = 0
+        windowController.onClose = { _ in closeCount += 1 }
+        windowController.showWindow(nil)
+        defer { windowController.close() }
+        editor.replaceTextForTesting("debug = true\n")
+
+        XCTAssertFalse(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
+        XCTAssertEqual(closeCount, 0)
+        XCTAssertEqual(editor.activeSaveStateForTesting, .saving)
+
+        saveCompletion?(.success(()))
+
+        XCTAssertEqual(closeCount, 1)
+        XCTAssertFalse(editor.hasUnsavedChangesForTesting)
+    }
+
+    func testWindowCloseRechecksMonacoRevisionBeforeDelayedChangedMessageArrives() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.toml",
+            fileName: "app.toml",
+            content: "debug = false\n"
+        )
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: descriptor,
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        let windowController = RemoteTextEditorWindowController(
+            editorViewController: editor,
+            closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+        )
+        var closeCount = 0
+        windowController.onClose = { _ in closeCount += 1 }
+        windowController.showWindow(nil)
+        defer { windowController.close() }
+        editor.replaceTextForTesting("debug = true\n")
+
+        let webView = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        let documentIDJSON = try XCTUnwrap(
+            String(data: JSONEncoder().encode(editor.documentIDsForTesting[0]), encoding: .utf8)
+        )
+        let pageLoaded = expectation(description: "handshake test page loaded")
+        webView.loadHTMLString(
+            """
+            <script>
+              window.monacoContent = 'debug = newest\\n';
+              window.monacoRevision = 2;
+              window.StacioEditor = {
+                confirmSavedContentBeforeClose(payload) {
+                  window.webkit.messageHandlers.stacioEditor.postMessage({
+                    name: 'closeHandshake',
+                    payload: {
+                      id: payload.documentID,
+                      requestID: payload.requestID,
+                      content: window.monacoContent,
+                      revision: window.monacoRevision
+                    }
+                  });
+                }
+              };
+            </script>
+            """,
+            baseURL: nil
+        )
+        func waitForPage() {
+            webView.evaluateJavaScript("document.readyState") { value, _ in
+                if value as? String == "complete" {
+                    pageLoaded.fulfill()
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: waitForPage)
+                }
+            }
+        }
+        waitForPage()
+        wait(for: [pageLoaded], timeout: 2)
+        editor.markEditorReadyForTesting()
+
+        XCTAssertFalse(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
+        XCTAssertEqual(editor.activeSaveStateForTesting, .saving)
+
+        let delayedChangedScheduled = expectation(description: "delayed changed message scheduled")
+        webView.evaluateJavaScript(
+            """
+            window.setTimeout(() => {
+              window.webkit.messageHandlers.stacioEditor.postMessage({
+                name: 'changed',
+                payload: {
+                  id: \(documentIDJSON),
+                  content: window.monacoContent,
+                  revision: window.monacoRevision
+                }
+              });
+            }, 100);
+            """
+        ) { _, error in
+            XCTAssertNil(error)
+            saveCompletion?(.success(()))
+            delayedChangedScheduled.fulfill()
+        }
+        wait(for: [delayedChangedScheduled], timeout: 2)
+        XCTAssertTrue(
+            waitUntil {
+                closeCount != 0
+                    || (editor.currentTextForTesting == "debug = newest\n"
+                        && editor.hasUnsavedChangesForTesting)
+            },
+            "Timed out waiting for Monaco's close handshake or delayed change message"
+        )
+
+        XCTAssertEqual(closeCount, 0)
+        XCTAssertEqual(editor.currentTextForTesting, "debug = newest\n")
+        XCTAssertTrue(editor.hasUnsavedChangesForTesting)
+    }
+
+    func testWindowCloseKeepsDirtyEditorOpenWhenAsyncSaveFails() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.toml",
+            fileName: "app.toml",
+            content: "debug = false\n"
+        )
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: descriptor,
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        let windowController = RemoteTextEditorWindowController(
+            editorViewController: editor,
+            closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+        )
+        var closeCount = 0
+        windowController.onClose = { _ in closeCount += 1 }
+        windowController.showWindow(nil)
+        defer { windowController.close() }
+        editor.replaceTextForTesting("debug = true\n")
+
+        XCTAssertFalse(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
+        saveCompletion?(.failure(CocoaError(.fileWriteUnknown)))
+
+        XCTAssertEqual(closeCount, 0)
+        XCTAssertEqual(editor.activeSaveStateForTesting, .failed)
+        XCTAssertTrue(editor.hasUnsavedChangesForTesting)
+    }
+
+    func testTabCloseWaitsForAsyncSaveSuccessBeforeRemovingDocument() {
+        let first = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/first.conf",
+            fileName: "first.conf",
+            content: "enabled=false\n"
+        )
+        let second = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/second.conf",
+            fileName: "second.conf",
+            content: "port=22\n"
+        )
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: first,
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        editor.openDocument(second)
+        editor.switchToDocumentForTesting(fileName: "first.conf")
+        editor.replaceTextForTesting("enabled=true\n")
+
+        editor.closeDocumentForTesting(
+            fileName: "first.conf",
+            closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+        )
+
+        XCTAssertEqual(editor.tabTitlesForTesting, ["first.conf", "second.conf"])
+        XCTAssertEqual(editor.activeSaveStateForTesting, .saving)
+
+        saveCompletion?(.success(()))
+
+        XCTAssertEqual(editor.tabTitlesForTesting, ["second.conf"])
+    }
+
+    func testTabCloseKeepsDirtyDocumentWhenAsyncSaveFails() {
+        let first = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/first.conf",
+            fileName: "first.conf",
+            content: "enabled=false\n"
+        )
+        let second = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/second.conf",
+            fileName: "second.conf",
+            content: "port=22\n"
+        )
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: first,
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        editor.openDocument(second)
+        editor.switchToDocumentForTesting(fileName: "first.conf")
+        editor.replaceTextForTesting("enabled=true\n")
+
+        editor.closeDocumentForTesting(
+            fileName: "first.conf",
+            closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+        )
+        saveCompletion?(.failure(CocoaError(.fileWriteUnknown)))
+
+        XCTAssertEqual(editor.tabTitlesForTesting, ["first.conf", "second.conf"])
+        XCTAssertEqual(editor.activeSaveStateForTesting, .failed)
+        XCTAssertTrue(editor.hasUnsavedChangesForTesting)
+    }
+}
+
+private final class EditorMediaInvalidationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
     }
 }
 

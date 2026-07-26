@@ -249,9 +249,14 @@ public final class WorkspaceViewController: NSViewController {
     private var tabMetadata: [NSTabViewItem: WorkspaceTabMetadata] = [:]
     private var tabDuplicateHandlers: [NSTabViewItem: (String) throws -> Void] = [:]
     private var paneTabRestorations: [ObjectIdentifier: WorkspacePaneTabRestoration] = [:]
+    private var explicitSessionProtocols: [ObjectIdentifier: WorkspaceSessionProtocol] = [:]
     private var detachedTabWindows: [NSWindowController] = []
     private var multiExecSession: MultiExecInteractiveSession?
     private var terminalSelectionNotificationGeneration: UInt64 = 0
+    private weak var pendingTerminalSelectionPane: NSViewController?
+    private weak var lastDeliveredTerminalSelectionPane: NSViewController?
+    private var terminalSelectionNotificationWorkItem: DispatchWorkItem?
+    private let terminalSelectionContextDebounceInterval: TimeInterval = 0.08
     private var runtimeIDReattachments: [String: String] = [:]
     private var aiHistoryScopeIDs: [String: String] = [:]
     private var settingsObserver: NSObjectProtocol?
@@ -275,6 +280,9 @@ public final class WorkspaceViewController: NSViewController {
     }
     public private(set) var currentTerminalPane: NSViewController?
     public var onRequestNewSession: (() -> Void)?
+    var fileTransferRemoteDeviceOptionsProvider: (() -> [FileTransferRemoteDeviceOption])?
+    var onRequestConnectFileTransferRemoteDevice: ((RemoteFilesPaneViewController, String) -> Void)?
+    var onRequestCreateFileTransferRemoteDevice: (() -> Void)?
     public var onRemoteTerminalDirectoryChanged: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onRemoteTerminalRuntimeReattached: ((RemoteTerminalPaneViewController, String, LiveShellStatus, TunnelLiveSessionContext?) -> Void)?
     public var onRemoteTerminalClosed: ((RemoteTerminalPaneViewController) -> Bool)?
@@ -342,6 +350,7 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     deinit {
+        terminalSelectionNotificationWorkItem?.cancel()
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }
@@ -369,7 +378,7 @@ public final class WorkspaceViewController: NSViewController {
 
         addChild(tabViewController)
         tabViewController.didSelectItem = { [weak self] in
-            self?.syncCurrentTerminalPaneWithSelectedTab()
+            self?.syncCurrentTerminalPaneWithSelectedTab(deferContextRefresh: true)
         }
         tabViewController.addLocalTerminalHandler = { [weak self] in
             self?.openLocalShellFromTabStrip()
@@ -725,14 +734,19 @@ public final class WorkspaceViewController: NSViewController {
             bridge: bridge,
             transferScheduler: transferScheduler,
             initialRemotePath: initialRemotePath,
+            initialLoadPresentation: .connectionState,
+            presentationMode: .transferBrowser,
             remoteFilePathTerminalSender: { [weak self] path in
                 _ = self?.sendTextToCurrentTerminal(path)
             }
         )
+        explicitSessionProtocols[ObjectIdentifier(filesPane)] = .scp
         _ = filesPane.view
+        configureFileTransferRemoteDeviceActions(for: filesPane)
 
         let item = makeTerminalTab(label: title, firstPane: filesPane)
         item.label = title
+        configureFileTransferTabIcon(for: item, protocolName: "SCP")
         tabDuplicateHandlers[item] = { [weak self, context, bridge, weak transferScheduler] duplicateTitle in
             _ = try self?.openRemoteFilesSession(
                 context: context,
@@ -747,37 +761,85 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     @discardableResult
-    public func openFTPFilesSession(
-        context: FTPLiveSessionContext,
+    public func openSFTPFilesSession(
+        context: TunnelLiveSessionContext,
         title: String,
         bridge: RemoteFilesBridging,
-        ftpTransferScheduler: FTPTransferScheduling? = nil
+        sftpTransferScheduler: SFTPTransferScheduling? = nil,
+        initialRemotePath: String = "~"
     ) throws -> String {
-        let runtimeID = "ftp_\(UUID().uuidString.lowercased())"
+        let runtimeID = "sftp_\(UUID().uuidString.lowercased())"
+        let sftpBridge = SFTPRemoteFilesBridgeAdapter(base: bridge)
+        let sftpScheduler = sftpTransferScheduler.map(SFTPTransferSchedulerAdapter.init)
         let filesPane = RemoteFilesPaneViewController(
             runtimeID: runtimeID,
-            ftpContext: context,
+            context: context,
             title: title,
-            bridge: bridge,
-            ftpTransferScheduler: ftpTransferScheduler,
+            bridge: sftpBridge,
+            transferScheduler: sftpScheduler,
+            remoteProtocolName: "SFTP",
+            initialRemotePath: initialRemotePath,
+            initialLoadPresentation: .connectionState,
+            presentationMode: .transferBrowser,
             remoteFilePathTerminalSender: { [weak self] path in
                 _ = self?.sendTextToCurrentTerminal(path)
             }
         )
+        explicitSessionProtocols[ObjectIdentifier(filesPane)] = .sftp
         _ = filesPane.view
+        configureFileTransferRemoteDeviceActions(for: filesPane)
 
         let item = makeTerminalTab(label: title, firstPane: filesPane)
         item.label = title
-        tabDuplicateHandlers[item] = { [weak self, context, bridge, weak ftpTransferScheduler] duplicateTitle in
-            _ = try self?.openFTPFilesSession(
+        configureFileTransferTabIcon(for: item, protocolName: "SFTP")
+        tabDuplicateHandlers[item] = { [weak self, context, bridge, weak sftpTransferScheduler] duplicateTitle in
+            _ = try self?.openSFTPFilesSession(
                 context: context,
                 title: duplicateTitle,
                 bridge: bridge,
-                ftpTransferScheduler: ftpTransferScheduler
+                sftpTransferScheduler: sftpTransferScheduler,
+                initialRemotePath: initialRemotePath
             )
         }
         select(item, currentPane: filesPane)
         return runtimeID
+    }
+
+    private func configureFileTransferRemoteDeviceActions(for filesPane: RemoteFilesPaneViewController) {
+        filesPane.setFileTransferRemoteDeviceActions(
+            optionsProvider: { [weak self] in
+                self?.fileTransferRemoteDeviceOptionsProvider?() ?? []
+            },
+            connectHandler: { [weak self, weak filesPane] sessionID in
+                guard let self, let filesPane else { return }
+                self.onRequestConnectFileTransferRemoteDevice?(filesPane, sessionID)
+            },
+            createHandler: { [weak self] in
+                self?.onRequestCreateFileTransferRemoteDevice?()
+            }
+        )
+    }
+
+    @discardableResult
+    public func openConnectingGraphicsSession(
+        title: String,
+        protocolName: String,
+        host: String,
+        port: UInt16
+    ) -> GraphicsSessionPaneViewController {
+        let graphicsPane = GraphicsSessionPaneViewController(
+            connectingRuntimeID: "pending_graphics_\(UUID().uuidString.lowercased())",
+            title: title,
+            protocolName: protocolName,
+            host: host,
+            port: port
+        )
+
+        let item = makeTerminalTab(label: title, firstPane: graphicsPane)
+        item.label = title
+        configureGraphicsTabIcon(for: item, protocolName: protocolName)
+        select(item, currentPane: graphicsPane)
+        return graphicsPane
     }
 
     @discardableResult
@@ -825,6 +887,49 @@ public final class WorkspaceViewController: NSViewController {
             return remoteFiles.context
         }
         return nil
+    }
+
+    public var currentSessionProtocol: WorkspaceSessionProtocol {
+        syncCurrentTerminalPaneWithFirstResponder()
+        return sessionProtocol(for: currentTerminalPane)
+    }
+
+    private func sessionProtocol(for pane: NSViewController?) -> WorkspaceSessionProtocol {
+        guard let pane else { return .noSession }
+        if let remote = pane as? RemoteTerminalPaneViewController {
+            switch remote.connectionKind {
+            case .ssh: return .ssh
+            case .serial: return .serial
+            case .telnet: return .telnet
+            }
+        }
+        if let sessionProtocol = explicitSessionProtocols[ObjectIdentifier(pane)] {
+            return sessionProtocol
+        }
+        if let graphics = pane as? GraphicsSessionPaneViewController {
+            return WorkspaceSessionProtocol(remoteProtocolName: graphics.diagnostic.protocolName)
+        }
+        if pane is TerminalPaneViewController || pane is LocalFilePaneViewController {
+            return .local
+        }
+        if pane is BrowserPaneViewController {
+            return .browser
+        }
+        if pane is RemoteFilesPaneViewController {
+            return .unsupportedRemote("remote-files")
+        }
+        return .unmanaged
+    }
+
+    public func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool {
+        WorkspaceCapabilityPolicy.allows(capability, for: currentSessionProtocol)
+    }
+
+    private func allowsWorkspaceCapability(
+        _ capability: WorkspaceCapability,
+        for pane: NSViewController
+    ) -> Bool {
+        WorkspaceCapabilityPolicy.allows(capability, for: sessionProtocol(for: pane))
     }
 
     public var currentPaneOwnsRemoteSessionContext: Bool {
@@ -910,6 +1015,7 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     public func requestAIForCurrentTerminalForTesting(selectedText: String?) {
+        guard allowsWorkspaceCapability(.ai) else { return }
         guard let target = currentTerminalPaneForAgent() else {
             return
         }
@@ -1145,6 +1251,7 @@ public final class WorkspaceViewController: NSViewController {
         tabMetadata.removeAll()
         tabDuplicateHandlers.removeAll()
         paneTabRestorations.removeAll()
+        explicitSessionProtocols.removeAll()
         lastCommandTerminalPane = nil
         for item in tabViewController.tabViewItems {
             tabViewController.removeTabViewItem(item)
@@ -1320,6 +1427,7 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     public func toggleDeviceMetricsDashboardVisibility() {
+        guard allowsWorkspaceCapability(.deviceDashboard) else { return }
         isDeviceMetricsDashboardEnabled.toggle()
         updateDeviceMetricsDashboardVisibilityForAllWorkspaces()
     }
@@ -1957,10 +2065,13 @@ public final class WorkspaceViewController: NSViewController {
         focusCurrentTerminalPane()
     }
 
-    private func syncCurrentTerminalPaneWithSelectedTab() {
+    private func syncCurrentTerminalPaneWithSelectedTab(deferContextRefresh: Bool = false) {
         currentTerminalPane = currentSelectedWorkspace?.selectedPane
         rememberCommandTerminalPane(currentTerminalPane)
-        notifyCurrentRemoteTerminalChangedIfNeeded(currentTerminalPane)
+        notifyCurrentRemoteTerminalChangedIfNeeded(
+            currentTerminalPane,
+            deferContextRefresh: deferContextRefresh
+        )
         DispatchQueue.main.async { [weak self] in
             self?.focusCurrentTerminalPaneOnce()
         }
@@ -2034,23 +2145,58 @@ public final class WorkspaceViewController: NSViewController {
         return self.runtimeID(for: currentTerminalPane) == runtimeID
     }
 
-    private func notifyCurrentRemoteTerminalChangedIfNeeded(_ pane: NSViewController?) {
-        onCurrentTerminalChanged?()
+    private func notifyCurrentRemoteTerminalChangedIfNeeded(
+        _ pane: NSViewController?,
+        deferContextRefresh: Bool = false
+    ) {
         terminalSelectionNotificationGeneration &+= 1
         let generation = terminalSelectionNotificationGeneration
-        let remoteChanged = onCurrentRemoteTerminalChanged
-        if pane is RemoteFilesPaneViewController {
+        if deferContextRefresh,
+           let lastDeliveredTerminalSelectionPane,
+           lastDeliveredTerminalSelectionPane === pane
+        {
             return
         }
-        DispatchQueue.main.async { [weak self] in
+        pendingTerminalSelectionPane = pane
+        terminalSelectionNotificationWorkItem?.cancel()
+        guard deferContextRefresh else {
+            terminalSelectionNotificationWorkItem = nil
+            pendingTerminalSelectionPane = nil
+            deliverCurrentTerminalSelectionNotification(pane)
+            tabViewController.markCurrentSelectionDelivered()
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
             guard let self,
                   self.terminalSelectionNotificationGeneration == generation
             else { return }
-            let selectedRemote = (pane as? RemoteTerminalPaneViewController).flatMap { remote in
-                remote.lifecycleState == .running ? remote : nil
-            }
-            remoteChanged?(selectedRemote)
+
+            self.terminalSelectionNotificationWorkItem = nil
+            let selectedPane = self.pendingTerminalSelectionPane
+            self.pendingTerminalSelectionPane = nil
+            self.deliverCurrentTerminalSelectionNotification(selectedPane)
         }
+        terminalSelectionNotificationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + terminalSelectionContextDebounceInterval,
+            execute: workItem
+        )
+    }
+
+    private func deliverCurrentTerminalSelectionNotification(_ pane: NSViewController?) {
+        lastDeliveredTerminalSelectionPane = pane
+        onCurrentTerminalChanged?()
+
+        // SCP/FTP/SFTP file panes own their own remote context. Do not
+        // rebind the Inspector's live SSH context while selecting one.
+        guard !(pane is RemoteFilesPaneViewController) else {
+            return
+        }
+        let selectedRemote = (pane as? RemoteTerminalPaneViewController).flatMap { remote in
+            remote.lifecycleState == .running ? remote : nil
+        }
+        onCurrentRemoteTerminalChanged?(selectedRemote)
     }
 
     private func syncCurrentTerminalPaneWithFirstResponder() {
@@ -2061,9 +2207,25 @@ public final class WorkspaceViewController: NSViewController {
             return
         }
 
+        selectPaneFromUserFocus(pane, in: workspace)
+    }
+
+    private func terminalPaneDidBecomeFirstResponder(_ pane: NSViewController) {
+        guard let workspace = currentSelectedWorkspace,
+              workspace.containsPane(pane)
+        else { return }
+        selectPaneFromUserFocus(pane, in: workspace)
+    }
+
+    private func selectPaneFromUserFocus(
+        _ pane: NSViewController,
+        in workspace: TerminalSplitWorkspace
+    ) {
+        guard currentTerminalPane !== pane else { return }
         workspace.selectPane(pane)
         currentTerminalPane = pane
         rememberCommandTerminalPane(pane)
+        notifyCurrentRemoteTerminalChangedIfNeeded(pane)
     }
 
     private func rememberCommandTerminalPane(_ pane: NSViewController?) {
@@ -2188,6 +2350,7 @@ public final class WorkspaceViewController: NSViewController {
         (pane as? RemoteFilesPaneViewController)?.closeRemoteFilesRuntime()
         (pane as? BrowserPaneViewController)?.closeBrowserPane()
         paneTabRestorations.removeValue(forKey: ObjectIdentifier(pane))
+        explicitSessionProtocols.removeValue(forKey: ObjectIdentifier(pane))
         let runtimeAliasesToRemove = runtimeIDReattachments.compactMap { alias, targetRuntimeID in
             alias == paneRuntimeID || targetRuntimeID == paneRuntimeID ? alias : nil
         }
@@ -2411,14 +2574,28 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     private func configureAIContextMenu(for pane: TerminalPaneViewController) {
-        pane.onAIContextRequest = { [weak self] request in
-            self?.onAIContextRequest?(request)
+        pane.onKeyboardFocusRequested = { [weak self, weak pane] in
+            guard let pane else { return }
+            self?.terminalPaneDidBecomeFirstResponder(pane)
+        }
+        pane.onAIContextRequest = { [weak self, weak pane] request in
+            guard let self, let pane,
+                  self.allowsWorkspaceCapability(.ai, for: pane)
+            else { return }
+            self.onAIContextRequest?(request)
         }
     }
 
     private func configureAIContextMenu(for pane: RemoteTerminalPaneViewController) {
-        pane.onAIContextRequest = { [weak self] request in
-            self?.onAIContextRequest?(request)
+        pane.onKeyboardFocusRequested = { [weak self, weak pane] in
+            guard let pane else { return }
+            self?.terminalPaneDidBecomeFirstResponder(pane)
+        }
+        pane.onAIContextRequest = { [weak self, weak pane] request in
+            guard let self, let pane,
+                  self.allowsWorkspaceCapability(.ai, for: pane)
+            else { return }
+            self.onAIContextRequest?(request)
         }
     }
 
@@ -2580,6 +2757,13 @@ public final class WorkspaceViewController: NSViewController {
     private func configureGraphicsTabIcon(for item: NSTabViewItem, protocolName: String) {
         var metadata = tabMetadata[item] ?? WorkspaceTabMetadata()
         metadata.defaultIcon = .graphicsProtocol(protocolName)
+        tabMetadata[item] = metadata
+        applyTabIcon(for: item)
+    }
+
+    private func configureFileTransferTabIcon(for item: NSTabViewItem, protocolName: String) {
+        var metadata = tabMetadata[item] ?? WorkspaceTabMetadata()
+        metadata.defaultIcon = .transferProtocol(protocolName)
         tabMetadata[item] = metadata
         applyTabIcon(for: item)
     }
@@ -3326,8 +3510,7 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
     private static let addButtonFallbackHeight: CGFloat = 24
     private static let closeButtonSize: CGFloat = 16
     private static let closeButtonLeadingInset: CGFloat = 5
-    private static let minimumTabSegmentWidth: CGFloat = 76
-    private static let tabTitleCloseProtectionWidth: CGFloat = 54
+    private static let fixedTabSegmentWidth: CGFloat = 176
 
     var didSelectItem: (() -> Void)?
     var addLocalTerminalHandler: (() -> Void)?
@@ -3386,6 +3569,8 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
     private var rightClickedTabIndex: Int?
     private var hoveredTabIndex: Int?
     private weak var constrainedTabControl: NSSegmentedControl?
+    private var didSelectItemCallbackScheduled = false
+    private weak var lastDeliveredSelectedItem: NSTabViewItem?
     private var tabHoverTrackingArea: NSTrackingArea?
     private var tabControlLeadingConstraint: NSLayoutConstraint?
     private var addButtonConstraints: [NSLayoutConstraint] = []
@@ -3394,7 +3579,7 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
     override func viewDidLoad() {
         super.viewDidLoad()
         tabStyle = .segmentedControlOnTop
-        tabView.menu = contextMenu
+        tabView.menu = nil
         StacioDesignSystem.setLayerBackgroundColor(view, color: .windowBackgroundColor)
         view.addSubview(addLocalTerminalButton)
         view.addSubview(closeHoveredTabButton)
@@ -3431,13 +3616,40 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
     override var selectedTabViewItemIndex: Int {
         didSet {
             guard oldValue != selectedTabViewItemIndex else { return }
-            didSelectItem?()
+            scheduleDidSelectItemCallback()
         }
     }
 
     override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         super.tabView(tabView, didSelect: tabViewItem)
-        didSelectItem?()
+        scheduleDidSelectItemCallback()
+    }
+
+    private func scheduleDidSelectItemCallback() {
+        guard didSelectItemCallbackScheduled == false else { return }
+        didSelectItemCallbackScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.didSelectItemCallbackScheduled = false
+            let selectedItem = self.currentSelectedItem
+            guard selectedItem !== self.lastDeliveredSelectedItem else {
+                return
+            }
+            self.lastDeliveredSelectedItem = selectedItem
+            self.didSelectItem?()
+        }
+    }
+
+    func markCurrentSelectionDelivered() {
+        lastDeliveredSelectedItem = currentSelectedItem
+    }
+
+    private var currentSelectedItem: NSTabViewItem? {
+        let index = selectedTabViewItemIndex
+        guard index >= 0, index < tabViewItems.count else {
+            return nil
+        }
+        return tabViewItems[index]
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -3516,17 +3728,17 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
         if let tabControl = tabSegmentedControl {
             let point = tabControl.convert(windowPoint, from: nil)
             guard tabControl.bounds.contains(point) else {
-                return selectedTabViewItemIndex
+                return -1
             }
             return segmentIndex(atX: point.x, in: tabControl, itemCount: items.count)
         }
         guard let tabBarView = tabView.superview else {
-            return selectedTabViewItemIndex
+            return -1
         }
         let point = tabBarView.convert(windowPoint, from: nil)
         let tabAreaHeight: CGFloat = 32
         guard point.y >= tabBarView.bounds.height - tabAreaHeight else {
-            return selectedTabViewItemIndex
+            return -1
         }
         let itemWidth = max(1, tabBarView.bounds.width / CGFloat(items.count))
         let rawIndex = Int(point.x / itemWidth)
@@ -3566,6 +3778,8 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
               constrainedTabControl !== tabControl
         else { return }
 
+        tabControl.menu = contextMenu
+        tabControl.setAccessibilityIdentifier("Stacio.Workspace.tabs.control")
         tabControlLeadingConstraint?.isActive = false
         removeSystemHorizontalPositioningConstraints(for: tabControl)
         tabControl.translatesAutoresizingMaskIntoConstraints = false
@@ -3584,15 +3798,8 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
     private func updateTabSegmentWidthsIfNeeded() {
         guard let tabControl = tabSegmentedControl else { return }
 
-        let font = tabControl.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
         for index in 0..<min(tabViewItems.count, tabControl.segmentCount) {
-            let title = tabViewItems[index].label
-            let titleWidth = title.size(withAttributes: [.font: font]).width
-            let imageWidth: CGFloat = tabViewItems[index].image == nil ? 0 : 24
-            let width = max(
-                Self.minimumTabSegmentWidth,
-                ceil(titleWidth + Self.tabTitleCloseProtectionWidth + imageWidth)
-            )
+            let width = Self.fixedTabSegmentWidth
             if abs(tabControl.width(forSegment: index) - width) > 0.5 {
                 tabControl.setWidth(width, forSegment: index)
             }
@@ -3773,6 +3980,7 @@ private final class WorkspaceTabViewController: NSTabViewController, NSMenuDeleg
         firstSubview(of: NSSegmentedControl.self, in: view) { [weak self] control in
             guard let self else { return true }
             return control !== self.addLocalTerminalButton
+                && control.isDescendant(of: self.tabView) == false
         }
     }
 

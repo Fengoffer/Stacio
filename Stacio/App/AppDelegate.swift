@@ -7,11 +7,13 @@ protocol WorkbenchWindowShowing: AnyObject {
     func openSavedSession(id: String)
     func openBastionHostConnection(_ request: BastionHostDeepLinkRequest)
     func toggleDeviceDashboardFromMenu(_ sender: Any?)
+    func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool
     func prepareForApplicationTermination() -> Bool
 }
 
 extension WorkbenchWindowShowing {
     func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {}
+    func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool { true }
 }
 
 extension WorkbenchWindowController: WorkbenchWindowShowing {
@@ -28,7 +30,7 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.14.0"
+    private static let fallbackDisplayVersion = "Stacio-0.14.1"
     public static var displayVersion: String { displayVersion(in: .main) }
     public static let websiteURL = "https://www.stacio.cn/"
     public static let documentationURL = "https://www.stacio.cn/wiki/"
@@ -1612,6 +1614,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let capability: WorkspaceCapability?
+        switch menuItem.action {
+        case #selector(showFilesFromMenu(_:)): capability = .files
+        case #selector(showBrowserFromMenu(_:)): capability = .browser
+        case #selector(showTunnelsFromMenu(_:)): capability = .tunnels
+        case #selector(toggleDeviceDashboardFromMenu(_:)): capability = .deviceDashboard
+        case #selector(showDiagnosticsFromMenu(_:)): capability = .diagnostics
+        case #selector(showAIAssistantFromMenu(_:)): capability = .ai
+        default: capability = nil
+        }
+        if let capability,
+           workbenchWindowController?.allowsWorkspaceCapability(capability) == false
+        {
+            menuItem.toolTip = L10n.Workbench.sshSessionRequiredTooltip
+            return false
+        }
+        if capability != nil {
+            menuItem.toolTip = nil
+        }
+
         let feature: StacioLicensedFeature?
         switch menuItem.action {
         case #selector(performMultiExecFromMenu(_:)): feature = .multiExec

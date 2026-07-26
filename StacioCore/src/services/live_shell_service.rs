@@ -679,7 +679,9 @@ impl<C: ShellChannel> LiveShellManager<C> {
     }
 
     pub fn has_pending_input(&self) -> bool {
-        self.workers.values().any(LiveShellWorker::has_pending_input)
+        self.workers
+            .values()
+            .any(LiveShellWorker::has_pending_input)
     }
 
     pub fn wait_interests(&self) -> Vec<ShellWaitInterest> {
@@ -1110,7 +1112,9 @@ mod live_shell_tests {
         worker.poll(&mut registry).expect("first poll");
         assert_eq!(worker.channel().written_bytes(), b"\n".to_vec());
 
-        worker.poll(&mut registry).expect("second poll after prompt output");
+        worker
+            .poll(&mut registry)
+            .expect("second poll after prompt output");
         assert_eq!(worker.channel().written_bytes(), b"\n\n".to_vec());
     }
 
@@ -2096,12 +2100,16 @@ mod live_shell_tests {
         worker.set_keepalive_interval_seconds(5);
         worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(6));
 
-        worker.poll(&mut registry).expect("poll after configured interval");
+        worker
+            .poll(&mut registry)
+            .expect("poll after configured interval");
         assert_eq!(worker.channel().keepalive_count, 1);
 
         worker.set_keepalive_interval_seconds(0);
         worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(60));
-        worker.poll(&mut registry).expect("poll with disabled keepalive");
+        worker
+            .poll(&mut registry)
+            .expect("poll with disabled keepalive");
         assert_eq!(worker.channel().keepalive_count, 1);
     }
 

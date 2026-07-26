@@ -80,7 +80,7 @@ public struct TunnelEndpointSession: Equatable {
 
     public init?(session: SessionRecord) {
         let normalizedProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalizedProtocol == "ssh" || normalizedProtocol == "scp",
+        guard normalizedProtocol == "ssh" || normalizedProtocol == "sftp" || normalizedProtocol == "scp",
               session.port > 0,
               session.port <= UInt32(UInt16.max)
         else {

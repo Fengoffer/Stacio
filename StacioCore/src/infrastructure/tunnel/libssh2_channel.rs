@@ -1,5 +1,7 @@
 use crate::domain::tunnel::{TunnelError, TunnelKind, TunnelProfile};
-use crate::infrastructure::ssh::libssh2_transport::Libssh2ConnectedSession;
+use crate::infrastructure::ssh::libssh2_transport::{
+    with_temporary_blocking, Libssh2ConnectedSession,
+};
 use crate::infrastructure::tunnel::socks5::{
     parse_socks5_client_hello, parse_socks5_connect_request, socks5_failure_response,
     SOCKS5_CONNECT_SUCCESS_RESPONSE, SOCKS5_GENERAL_FAILURE_RESPONSE,
@@ -12,7 +14,8 @@ use crate::services::tunnel_service::{
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Libssh2TunnelOpenRequest {
@@ -95,6 +98,8 @@ pub struct TunnelCopyPump<C, R> {
     remote: R,
     client_closed: bool,
     remote_closed: bool,
+    client_to_remote_pending: Vec<u8>,
+    remote_to_client_pending: Vec<u8>,
 }
 
 impl<C, R> TunnelCopyPump<C, R>
@@ -108,19 +113,51 @@ where
             remote,
             client_closed: false,
             remote_closed: false,
+            client_to_remote_pending: Vec::new(),
+            remote_to_client_pending: Vec::new(),
         }
+    }
+
+    fn enqueue_client_to_remote(&mut self, bytes: &[u8]) {
+        self.client_to_remote_pending.extend_from_slice(bytes);
+    }
+
+    fn flush_client_to_remote(&mut self) -> io::Result<u64> {
+        flush_pending(&mut self.remote, &mut self.client_to_remote_pending)
+    }
+
+    fn enqueue_remote_to_client(&mut self, bytes: &[u8]) {
+        self.remote_to_client_pending.extend_from_slice(bytes);
+    }
+
+    fn flush_remote_to_client(&mut self) -> io::Result<u64> {
+        flush_pending(&mut self.client, &mut self.remote_to_client_pending)
     }
 
     pub fn poll_once(&mut self) -> io::Result<TunnelCopyStats> {
         let (client_to_remote_bytes, client_closed) = if self.client_closed {
-            (0, true)
+            (
+                flush_pending(&mut self.remote, &mut self.client_to_remote_pending)?,
+                self.client_to_remote_pending.is_empty(),
+            )
         } else {
-            pump_direction(&mut self.client, &mut self.remote)?
+            pump_direction(
+                &mut self.client,
+                &mut self.remote,
+                &mut self.client_to_remote_pending,
+            )?
         };
         let (remote_to_client_bytes, remote_closed) = if self.remote_closed {
-            (0, true)
+            (
+                flush_pending(&mut self.client, &mut self.remote_to_client_pending)?,
+                self.remote_to_client_pending.is_empty(),
+            )
         } else {
-            pump_direction(&mut self.remote, &mut self.client)?
+            pump_direction(
+                &mut self.remote,
+                &mut self.client,
+                &mut self.remote_to_client_pending,
+            )?
         };
         self.client_closed = client_closed;
         self.remote_closed = remote_closed;
@@ -151,21 +188,50 @@ where
     }
 }
 
-fn pump_direction<R, W>(reader: &mut R, writer: &mut W) -> io::Result<(u64, bool)>
+fn pump_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    pending: &mut Vec<u8>,
+) -> io::Result<(u64, bool)>
 where
     R: Read,
     W: Write,
 {
+    let written = flush_pending(writer, pending)?;
+    if !pending.is_empty() {
+        return Ok((written, false));
+    }
+
     let mut buffer = [0_u8; 16 * 1024];
     match reader.read(&mut buffer) {
-        Ok(0) => Ok((0, true)),
+        Ok(0) => Ok((written, true)),
         Ok(bytes_read) => {
-            writer.write_all(&buffer[..bytes_read])?;
-            Ok((bytes_read as u64, false))
+            pending.extend_from_slice(&buffer[..bytes_read]);
+            let flushed = flush_pending(writer, pending)?;
+            Ok((written + flushed, false))
         }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok((0, false)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok((written, false)),
         Err(error) => Err(error),
     }
+}
+
+fn flush_pending<W>(writer: &mut W, pending: &mut Vec<u8>) -> io::Result<u64>
+where
+    W: Write,
+{
+    let mut written = 0_u64;
+    while !pending.is_empty() {
+        match writer.write(pending) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(bytes_written) => {
+                pending.drain(..bytes_written);
+                written += bytes_written as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(written)
 }
 
 pub struct AcceptedTunnelClient<C> {
@@ -275,17 +341,54 @@ impl TunnelRemoteChannelOpener for Libssh2DirectTcpIpOpener {
         let Some(session) = self.session.as_ref() else {
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         };
-        let channel = session
-            .session()
-            .channel_direct_tcpip(
-                &request.remote_host,
-                request.remote_port,
-                Some((&request.origin_host, request.origin_port)),
-            )
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-        self.opened_count += 1;
-        Ok(channel)
+
+        // A direct-tcpip request is a small SSH handshake of its own. Keep the
+        // tunnel session non-blocking while it completes so one unreachable
+        // browser target cannot hold the whole SOCKS worker for the session's
+        // 60-second libssh2 timeout. The pending SOCKS client is dropped (and
+        // receives a failure response) when this bounded window expires.
+        const DIRECT_TCPIP_TIMEOUT: Duration = Duration::from_secs(8);
+        const DIRECT_TCPIP_RETRY_DELAY: Duration = Duration::from_millis(10);
+        let deadline = Instant::now() + DIRECT_TCPIP_TIMEOUT;
+        loop {
+            let result = with_temporary_blocking(session.session(), false, || {
+                session.session().channel_direct_tcpip(
+                    &request.remote_host,
+                    request.remote_port,
+                    Some((&request.origin_host, request.origin_port)),
+                )
+            });
+            match result {
+                Ok(channel) => {
+                    self.opened_count += 1;
+                    return Ok(channel);
+                }
+                Err(error) => {
+                    let io_error: io::Error = error.into();
+                    if !is_would_block_io_error(&io_error) {
+                        return Err(io_error);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "direct-tcpip channel open timed out",
+                        ));
+                    }
+                    thread::sleep(DIRECT_TCPIP_RETRY_DELAY);
+                }
+            }
+        }
     }
+}
+
+fn is_would_block_io_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    let lowered = error.to_string().to_ascii_lowercase();
+    lowered.contains("would block")
+        || lowered.contains("operation would block")
+        || lowered.contains("session(-37)")
 }
 
 pub struct Libssh2RemoteForwardListener {
@@ -539,33 +642,44 @@ where
                 .push(DynamicSocksPendingClient::new(accepted));
         }
 
-        let mut client_to_remote_bytes = self.poll_pending_clients()?;
+        let mut client_to_remote_bytes = self.poll_pending_clients();
         let mut remote_to_client_bytes = 0;
-        for connection in &mut self.connections {
-            let stats = connection.poll_once()?;
-            client_to_remote_bytes += stats.client_to_remote_bytes;
-            remote_to_client_bytes += stats.remote_to_client_bytes;
-        }
 
-        #[cfg(test)]
-        {
-            let mut index = 0;
-            while index < self.connections.len() {
-                if self.connections[index].is_closed() {
+        // Browser engines open and close many short-lived connections while a
+        // page is loading. A reset on one connection is expected and must not
+        // tear down the listener or every other in-flight request.
+        let mut index = 0;
+        while index < self.connections.len() {
+            match self.connections[index].poll_once() {
+                Ok(stats) => {
+                    client_to_remote_bytes += stats.client_to_remote_bytes;
+                    remote_to_client_bytes += stats.remote_to_client_bytes;
+                    if self.connections[index].is_closed() {
+                        let connection = self.connections.remove(index);
+                        #[cfg(test)]
+                        {
+                            let (client, remote) = connection.into_parts();
+                            self.completed_clients.push(client);
+                            self.completed_remotes.push(remote);
+                        }
+                        #[cfg(not(test))]
+                        drop(connection);
+                    } else {
+                        index += 1;
+                    }
+                }
+                Err(_) => {
                     let connection = self.connections.remove(index);
-                    let (client, remote) = connection.into_parts();
-                    self.completed_clients.push(client);
-                    self.completed_remotes.push(remote);
-                } else {
-                    index += 1;
+                    #[cfg(test)]
+                    {
+                        let (client, remote) = connection.into_parts();
+                        self.completed_clients.push(client);
+                        self.completed_remotes.push(remote);
+                    }
+                    #[cfg(not(test))]
+                    drop(connection);
                 }
             }
-        }
-
-        #[cfg(not(test))]
-        {
-            self.connections
-                .retain(|connection| !connection.is_closed());
         }
 
         Ok(LocalTunnelWorkerStats {
@@ -598,32 +712,37 @@ where
         }
     }
 
-    fn poll_pending_clients(&mut self) -> io::Result<u64> {
+    fn poll_pending_clients(&mut self) -> u64 {
         let mut index = 0;
         let mut buffered_client_to_remote_bytes = 0;
         while index < self.pending_clients.len() {
             let pending = self.pending_clients.remove(index);
-            match pending.poll(&mut self.opener)? {
-                DynamicSocksPendingResult::Pending(pending) => {
+            match pending.poll(&mut self.opener) {
+                Ok(DynamicSocksPendingResult::Pending(pending)) => {
                     self.pending_clients.insert(index, pending);
                     index += 1;
                 }
-                DynamicSocksPendingResult::Connected {
+                Ok(DynamicSocksPendingResult::Connected {
                     pump,
                     client_to_remote_bytes,
-                } => {
+                }) => {
                     buffered_client_to_remote_bytes += client_to_remote_bytes;
                     self.connections.push(pump);
                 }
-                DynamicSocksPendingResult::Completed(_client) => {
+                Ok(DynamicSocksPendingResult::Completed(_client)) => {
                     #[cfg(test)]
                     {
                         self.completed_clients.push(_client);
                     }
                 }
+                Err(_) => {
+                    // The browser may close a SOCKS connection while its
+                    // request is being negotiated. Treat that as a
+                    // connection-scoped failure and keep accepting new ones.
+                }
             }
         }
-        Ok(buffered_client_to_remote_bytes)
+        buffered_client_to_remote_bytes
     }
 }
 
@@ -696,8 +815,8 @@ where
         let buffered_payload = self.buffer[payload_start..].to_vec();
         self.buffer.clear();
 
-        let mut remote = match opener.open_channel(Libssh2TunnelOpenRequest {
-            remote_host: connect.target_host(),
+        let remote = match opener.open_channel(Libssh2TunnelOpenRequest {
+            remote_host: normalized_socks_target_host(connect.target_host()),
             remote_port: connect.target_port,
             origin_host: self.origin_host,
             origin_port: self.origin_port,
@@ -708,14 +827,70 @@ where
                 return Ok(DynamicSocksPendingResult::Completed(self.stream));
             }
         };
-        if !buffered_payload.is_empty() {
-            remote.write_all(&buffered_payload)?;
-        }
-        self.stream.write_all(&SOCKS5_CONNECT_SUCCESS_RESPONSE)?;
+        let mut pump = TunnelCopyPump::new(self.stream, remote);
+        pump.enqueue_remote_to_client(&SOCKS5_CONNECT_SUCCESS_RESPONSE);
+        pump.enqueue_client_to_remote(&buffered_payload);
+        pump.flush_remote_to_client()?;
+        let client_to_remote_bytes = pump.flush_client_to_remote()?;
         Ok(DynamicSocksPendingResult::Connected {
-            pump: TunnelCopyPump::new(self.stream, remote),
-            client_to_remote_bytes: buffered_payload.len() as u64,
+            pump,
+            client_to_remote_bytes,
         })
+    }
+}
+
+fn normalized_socks_target_host(host: String) -> String {
+    const IPV4_TRANSPORT_PREFIX: &str = "stacio-ipv4-";
+    const LOCALHOST_TRANSPORT_HOST: &str = "stacio-host-localhost-x.invalid";
+    const IPV6_TRANSPORT_PREFIX: &str = "stacio-ipv6-";
+    const IPV6_TRANSPORT_SUFFIX: &str = "-x.invalid";
+    const TRANSPORT_HOST_SUFFIX: &str = "-x.invalid";
+    let normalized_host = host.to_ascii_lowercase();
+
+    if let Some(encoded) = normalized_host
+        .strip_prefix(IPV4_TRANSPORT_PREFIX)
+        .and_then(|value| value.strip_suffix(TRANSPORT_HOST_SUFFIX))
+    {
+        let octets = encoded
+            .split('-')
+            .map(|octet| octet.parse::<u8>().ok())
+            .collect::<Option<Vec<_>>>();
+        if let Some(octets) = octets.filter(|octets| octets.len() == 4) {
+            return octets
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+        }
+    }
+
+    if normalized_host == LOCALHOST_TRANSPORT_HOST {
+        return "localhost".to_string();
+    }
+
+    if let Some(encoded) = normalized_host
+        .strip_prefix(IPV6_TRANSPORT_PREFIX)
+        .and_then(|value| value.strip_suffix(IPV6_TRANSPORT_SUFFIX))
+    {
+        if !encoded.is_empty()
+            && encoded.chars().all(|character| {
+                character.is_ascii_hexdigit() || character == '-' || character == '.'
+            })
+        {
+            let decoded = encoded.replace('-', ":");
+            if decoded.contains(':') {
+                return decoded;
+            }
+        }
+    }
+
+    let Some(without_root_label) = normalized_host.strip_suffix('.') else {
+        return normalized_host;
+    };
+    if without_root_label.is_empty() {
+        normalized_host
+    } else {
+        without_root_label.to_string()
     }
 }
 
@@ -922,7 +1097,54 @@ impl Write for MemoryTunnelStream {
 #[cfg(test)]
 mod tunnel_copy_pump_tests {
     use crate::infrastructure::tunnel::libssh2_channel::{MemoryTunnelStream, TunnelCopyPump};
-    use std::io;
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
+
+    struct PartialWriteStream {
+        read_chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+        max_write: usize,
+        block_next_write: bool,
+    }
+
+    impl PartialWriteStream {
+        fn block_after_partial_write(max_write: usize) -> Self {
+            Self {
+                read_chunks: VecDeque::new(),
+                written: Vec::new(),
+                max_write,
+                block_next_write: false,
+            }
+        }
+    }
+
+    impl Read for PartialWriteStream {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            match self.read_chunks.pop_front() {
+                Some(_) => Ok(0),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl Write for PartialWriteStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.block_next_write {
+                self.block_next_write = false;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let bytes = buffer.len().min(self.max_write);
+            self.written.extend_from_slice(&buffer[..bytes]);
+            if bytes < buffer.len() {
+                self.block_next_write = true;
+            }
+            Ok(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn pumps_client_bytes_to_ssh_channel_and_remote_bytes_back() {
@@ -950,6 +1172,24 @@ mod tunnel_copy_pump_tests {
         assert_eq!(stats.remote_to_client_bytes, 0);
         assert!(!stats.client_closed);
         assert!(!stats.remote_closed);
+    }
+
+    #[test]
+    fn keeps_unwritten_bytes_for_the_next_nonblocking_poll() {
+        let client = MemoryTunnelStream::with_read_chunks(vec![b"client-query".to_vec()]);
+        let channel = PartialWriteStream::block_after_partial_write(4);
+        let mut pump = TunnelCopyPump::new(client, channel);
+
+        let first = pump.poll_once().expect("first partial poll");
+        assert_eq!(first.client_to_remote_bytes, 4);
+        assert_eq!(pump.remote.written, b"clie");
+
+        let second = pump.poll_once().expect("second partial poll");
+        assert_eq!(second.client_to_remote_bytes, 4);
+
+        let third = pump.poll_once().expect("third partial poll");
+        assert_eq!(third.client_to_remote_bytes, 4);
+        assert_eq!(pump.remote.written, b"client-query");
     }
 
     #[test]
@@ -981,9 +1221,10 @@ mod tunnel_copy_pump_tests {
 mod local_tunnel_worker_tests {
     use crate::domain::tunnel::{TunnelKind, TunnelProfile};
     use crate::infrastructure::tunnel::libssh2_channel::{
-        AcceptedTunnelClient, DynamicSocksTunnelWorker, Libssh2TunnelOpenRequest,
-        LocalTunnelWorker, MemoryTunnelStream, RemoteForwardChannelAcceptor, RemoteTunnelWorker,
-        TunnelClientAcceptor, TunnelRemoteChannelOpener, TunnelTargetConnector,
+        normalized_socks_target_host, AcceptedTunnelClient, DynamicSocksTunnelWorker,
+        Libssh2TunnelOpenRequest, LocalTunnelWorker, MemoryTunnelStream,
+        RemoteForwardChannelAcceptor, RemoteTunnelWorker, TunnelClientAcceptor,
+        TunnelRemoteChannelOpener, TunnelTargetConnector,
     };
     use std::{collections::VecDeque, io};
 
@@ -1073,6 +1314,30 @@ mod local_tunnel_worker_tests {
         assert_eq!(
             worker.completed_client(0).written_bytes(),
             &[0x05, 0x00, 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn dynamic_socks_target_restores_hosts_encoded_to_force_proxy_use() {
+        assert_eq!(
+            normalized_socks_target_host("127.0.0.1.".to_string()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            normalized_socks_target_host("stacio-ipv4-192-168-1-20-x.invalid".to_string()),
+            "192.168.1.20"
+        );
+        assert_eq!(
+            normalized_socks_target_host("stacio-ipv6---1-x.invalid".to_string()),
+            "::1"
+        );
+        assert_eq!(
+            normalized_socks_target_host("stacio-host-localhost-x.invalid".to_string()),
+            "localhost"
+        );
+        assert_eq!(
+            normalized_socks_target_host("db.internal".to_string()),
+            "db.internal"
         );
     }
 
@@ -1268,6 +1533,48 @@ mod local_tunnel_worker_tests {
             worker.completed_client(0).written_bytes(),
             &[0x05, 0x00, 0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn dynamic_socks_worker_keeps_listener_running_when_client_pump_fails() {
+        let mut first_request = vec![
+            0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x0b, b'd', b'b', b'.', b'i', b'n', b't',
+            b'e', b'r', b'n', b'a', b'l', 0x15, 0x38,
+        ];
+        first_request.extend_from_slice(b"GET / HTTP/1.1\r\n");
+        let second_request = vec![
+            0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x0b, b'd', b'b', b'.', b'i', b'n', b't',
+            b'e', b'r', b'n', b'a', b'l', 0x15, 0x39,
+        ];
+        let acceptor = FakeTunnelAcceptor::with_clients(vec![
+            AcceptedTunnelClient::new(
+                MemoryTunnelStream::with_read_chunks(vec![first_request]),
+                "127.0.0.1".to_string(),
+                51011,
+            ),
+            AcceptedTunnelClient::new(
+                MemoryTunnelStream::with_read_chunks(vec![second_request]),
+                "127.0.0.1".to_string(),
+                51012,
+            ),
+        ]);
+        let opener = RecordingRemoteOpener::with_channels(vec![
+            MemoryTunnelStream::write_failing(),
+            MemoryTunnelStream::new(),
+        ]);
+        let mut worker = DynamicSocksTunnelWorker::new(dynamic_profile(), acceptor, opener);
+
+        let first_tick = worker
+            .poll_once()
+            .expect("a failed client pump must not kill the SOCKS worker");
+        let second_tick = worker
+            .poll_once()
+            .expect("the listener must accept a later client");
+
+        assert_eq!(first_tick.accepted_connections, 1);
+        assert_eq!(first_tick.active_connections, 0);
+        assert_eq!(second_tick.accepted_connections, 1);
+        assert_eq!(worker.opener().opened_requests.len(), 2);
     }
 
     #[test]

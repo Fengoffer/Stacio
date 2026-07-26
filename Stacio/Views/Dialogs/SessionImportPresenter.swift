@@ -1,6 +1,54 @@
 import AppKit
 import StacioCoreBindings
 
+public struct AppKitBastionHostVendorSelector: BastionHostVendorSelecting {
+    static let selectableVendors: [BastionHostVendor] = [.topsec]
+        + BastionHostVendor.allCases.filter { $0 != .topsec }
+
+    public init() {}
+
+    public func selectVendor(sourceName: String, parentWindow: NSWindow?) -> BastionHostVendor? {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync {
+                selectVendor(sourceName: sourceName, parentWindow: parentWindow)
+            }
+        }
+
+        let alert = NSAlert()
+        alert.messageText = L10n.Import.bastionVendorSelectionTitle
+        alert.informativeText = L10n.Import.bastionVendorSelectionMessage(sourceName: sourceName)
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: L10n.Import.bastionVendorRetryAction)
+        alert.addButton(withTitle: L10n.Common.cancel)
+
+        let popup = Self.makeVendorPopup()
+        popup.frame = NSRect(x: 0, y: 0, width: 320, height: 26)
+        alert.accessoryView = popup
+
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let rawValue = popup.selectedItem?.representedObject as? String
+        else {
+            return nil
+        }
+        return BastionHostVendor(rawValue: rawValue)
+    }
+
+    static func vendorPopupForTesting() -> NSPopUpButton {
+        makeVendorPopup()
+    }
+
+    private static func makeVendorPopup() -> NSPopUpButton {
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.identifier = NSUserInterfaceItemIdentifier("Stacio.Import.bastionVendor")
+        for vendor in selectableVendors {
+            popup.addItem(withTitle: vendor.displayName)
+            popup.lastItem?.representedObject = vendor.rawValue
+        }
+        popup.selectItem(at: 0)
+        return popup
+    }
+}
+
 public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresenting {
     public init() {}
 
@@ -67,7 +115,7 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
 
         let alert = NSAlert()
         alert.messageText = L10n.Import.failedTitle
-        alert.informativeText = error.localizedDescription
+        alert.informativeText = Self.userFacingErrorDescription(error)
         alert.alertStyle = .warning
         alert.addButton(withTitle: L10n.Common.ok)
         _ = alert.runModal()
@@ -128,6 +176,47 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
         previewText(preview)
     }
 
+    static func errorMessageForTesting(_ error: Error) -> String {
+        userFacingErrorDescription(error)
+    }
+
+    private static func userFacingErrorDescription(_ error: Error) -> String {
+        if let sessionError = error as? SessionError {
+            switch sessionError {
+            case .InvalidQuickConnect:
+                return L10n.Import.invalidSessionData
+            case .InvalidPort:
+                return L10n.Import.invalidPort
+            case .Database:
+                return L10n.Import.databaseFailure
+            case .NotFound:
+                return L10n.Import.referencedItemMissing
+            }
+        }
+        if let parserError = error as? ExternalSessionImportParserError {
+            return parserError.localizedDescription
+        }
+        if let fallbackError = error as? BastionHostVendorFallbackError {
+            return fallbackError.localizedDescription
+        }
+        if let removedProtocolError = error as? SessionImportRemovedProtocolError {
+            return removedProtocolError.localizedDescription
+        }
+        if let secureTransferError = error as? SecureSessionTransferError {
+            return secureTransferError.localizedDescription
+        }
+        if let licenseError = error as? LicensedFeatureAccessError {
+            return licenseError.localizedDescription
+        }
+        if let bastionLicenseError = error as? BastionHostFeatureAccessError {
+            return bastionLicenseError.localizedDescription
+        }
+        if error is KeychainCredentialError {
+            return L10n.Import.credentialStorageFailure
+        }
+        return L10n.Import.genericFailure
+    }
+
     private static func previewText(_ preview: ImportPreview) -> String {
         var lines = [L10n.Import.header]
         lines.append(contentsOf: preview.sessions.map { session in
@@ -150,8 +239,10 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
         switch protocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "ssh":
             return "SSH"
-        case "ftp":
-            return "FTP"
+        case "sftp":
+            return "SFTP"
+        case "scp":
+            return "SCP"
         case "telnet":
             return "Telnet"
         case "vnc":

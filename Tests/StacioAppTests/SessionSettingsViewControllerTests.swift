@@ -9,6 +9,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         let controller = makeController()
 
         controller.loadView()
+        controller.selectProtocolForTesting(.ssh)
 
         XCTAssertFalse(controller.sessionIconRowIsHiddenForTesting)
         XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.SessionSettings.sessionIcon"))
@@ -43,7 +44,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.sessionIconRowIsHiddenForTesting)
     }
 
-    func testProtocolSelectorOnlyShowsSaveableProtocolsAndUsesSCPInsteadOfSFTP() {
+    func testProtocolSelectorDefaultsNewSessionsToSSH() {
         let controller = makeController()
 
         controller.loadView()
@@ -54,13 +55,13 @@ final class SessionSettingsViewControllerTests: XCTestCase {
                 "SSH（安全 Shell）",
                 "Telnet（远程登录）",
                 "VNC（远程控制）",
-                "FTP（文件传输）",
+                "SFTP（安全文件传输）",
                 "SCP（安全复制）",
                 "串口",
                 "本地终端"
             ]
         )
-        XCTAssertFalse(controller.protocolLabelsForTesting.contains("SFTP"))
+        XCTAssertTrue(controller.protocolLabelsForTesting.contains("SFTP（安全文件传输）"))
         XCTAssertFalse(controller.protocolLabelsForTesting.contains("RSH（远程 Shell）"))
         XCTAssertFalse(controller.protocolLabelsForTesting.contains("XDMCP（图形登录）"))
         XCTAssertFalse(controller.protocolLabelsForTesting.contains("Mosh（移动 Shell）"))
@@ -76,9 +77,104 @@ final class SessionSettingsViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             controller.protocolSourceListLabelsForTesting,
-            ["SSH", "Telnet", "VNC", "FTP", "SCP", "串口", "本地终端"]
+            ["SSH", "Telnet", "VNC", "SFTP", "SCP", "串口", "本地终端"]
         )
         XCTAssertFalse(controller.protocolSourceListLabelsForTesting.contains { $0.contains("（") })
+    }
+
+    func testSFTPAndSCPSessionTypesUseDistinctAvailableSymbols() {
+        XCTAssertEqual(
+            SessionSettingsProtocol.scp.systemSymbolName,
+            "arrow.up.arrow.down.square.fill"
+        )
+        XCTAssertNotEqual(
+            SessionSettingsProtocol.sftp.systemSymbolName,
+            SessionSettingsProtocol.scp.systemSymbolName
+        )
+        XCTAssertNotNil(NSImage(systemSymbolName: SessionSettingsProtocol.sftp.systemSymbolName, accessibilityDescription: nil))
+        XCTAssertNotNil(NSImage(systemSymbolName: SessionSettingsProtocol.scp.systemSymbolName, accessibilityDescription: nil))
+    }
+
+    func testNetworkProtocolsUsePlainHostTextFieldWithoutDropdown() {
+        let controller = makeController()
+        controller.loadView()
+
+        for sessionProtocol in [
+            SessionSettingsProtocol.ssh,
+            .telnet,
+            .vnc,
+            .sftp,
+            .scp
+        ] {
+            controller.selectProtocolForTesting(sessionProtocol)
+
+            XCTAssertFalse(
+                controller.activeHostControlForTesting is NSComboBox,
+                "\(sessionProtocol.label) 的主机输入框不应显示下拉箭头。"
+            )
+            XCTAssertEqual(
+                controller.activeHostControlForTesting.accessibilityIdentifier(),
+                "Stacio.SessionEditor.host"
+            )
+        }
+
+        controller.selectProtocolForTesting(.serial)
+
+        XCTAssertTrue(controller.activeHostControlForTesting is NSComboBox)
+        XCTAssertEqual(
+            controller.activeHostControlForTesting.accessibilityIdentifier(),
+            "Stacio.SessionEditor.serialDevicePath"
+        )
+    }
+
+    func testSessionNameAndNetworkHostUseStableRandomizedPlaceholders() {
+        let controller = makeController()
+        controller.loadView()
+
+        let expectedHostExamples = [
+            "192.168.1.10",
+            "172.16.10.100",
+            "10.10.100.53"
+        ]
+        let expectedNameExamples = [
+            "应用服务器",
+            "数据库服务器",
+            "测试服务器",
+            "开发服务器",
+            "Web 虚拟机"
+        ]
+        let initialHostPlaceholder = controller.hostPlaceholderForTesting
+        let initialNamePlaceholder = controller.namePlaceholderForTesting
+
+        XCTAssertTrue(
+            expectedHostExamples.allSatisfy(controller.networkHostPlaceholderCandidatesForTesting.contains)
+        )
+        XCTAssertGreaterThan(controller.networkHostPlaceholderCandidatesForTesting.count, expectedHostExamples.count)
+        XCTAssertTrue(
+            expectedNameExamples.allSatisfy(controller.namePlaceholderCandidatesForTesting.contains)
+        )
+        XCTAssertGreaterThan(controller.namePlaceholderCandidatesForTesting.count, expectedNameExamples.count)
+        XCTAssertTrue(controller.networkHostPlaceholderCandidatesForTesting.contains(initialHostPlaceholder))
+        XCTAssertTrue(controller.namePlaceholderCandidatesForTesting.contains(initialNamePlaceholder))
+        XCTAssertNotEqual(initialHostPlaceholder, "api.example.com")
+        XCTAssertNotEqual(initialHostPlaceholder, "例如：server.example.com")
+        XCTAssertNotEqual(initialNamePlaceholder, "生产 API")
+
+        for sessionProtocol in [
+            SessionSettingsProtocol.telnet,
+            .vnc,
+            .sftp,
+            .scp,
+            .ssh
+        ] {
+            controller.selectProtocolForTesting(sessionProtocol)
+            XCTAssertEqual(controller.hostPlaceholderForTesting, initialHostPlaceholder)
+            XCTAssertEqual(controller.namePlaceholderForTesting, initialNamePlaceholder)
+        }
+
+        XCTAssertEqual(controller.hostValueForTesting, "")
+        XCTAssertEqual(controller.nameValueForTesting, "")
+        XCTAssertFalse(controller.saveButtonIsEnabledForTesting)
     }
 
     func testNewSessionProtocolListDoesNotOfferLocalFileOrBrowser() {
@@ -90,7 +186,8 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertFalse(controller.protocolSourceListLabelsForTesting.contains("浏览器"))
         XCTAssertFalse(controller.protocolSourceListLabelsForTesting.contains("RDP"))
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("VNC"))
-        XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("FTP"))
+        XCTAssertFalse(controller.protocolSourceListLabelsForTesting.contains("FTP"))
+        XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("SFTP"))
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("SCP"))
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("串口"))
     }
@@ -1209,51 +1306,9 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(config["baudRate"] as? Int, 57_600)
     }
 
-    func testFTPProtocolUsesNetworkFormAndKeepsPasswordCredentialReference() throws {
-        let credentialSaver = RecordingSessionSettingsCredentialSaver(
-            savedCredentialID: "cred_ftp_password"
-        )
-        let controller = SessionSettingsViewController(
-            existingSession: nil,
-            selectedFolderID: nil,
-            draftFactory: SessionSidebarSessionDraftFactory(
-                credentialSaver: credentialSaver,
-                defaultUsername: { "local" }
-            )
-        )
-        let saveButton = NSButton(title: "保存", target: nil, action: nil)
-
-        controller.loadView()
-        controller.bindSaveButtonForTesting(saveButton)
-        controller.selectProtocolForTesting(.ftp)
-        controller.setSSHValuesForTesting(
-            SessionSidebarSessionFormValues(
-                name: "FTP 仓库",
-                host: "ftp.example.com",
-                port: controller.portValueForTesting,
-                username: "deploy",
-                authMode: .password,
-                privateKeyPath: "",
-                credentialSecret: "ftp-secret",
-                tags: "files"
-            )
-        )
-
-        let draft = try XCTUnwrap(controller.draft())
-
-        XCTAssertEqual(controller.hostLabelForTesting, "主机")
-        XCTAssertEqual(controller.portLabelForTesting, "端口")
-        XCTAssertFalse(controller.userRowIsHiddenForTesting)
-        XCTAssertTrue(controller.authRowIsHiddenForTesting)
-        XCTAssertTrue(saveButton.isEnabled)
-        XCTAssertEqual(draft.protocol, "ftp")
-        XCTAssertEqual(draft.host, "ftp.example.com")
-        XCTAssertEqual(draft.port, 21)
-        XCTAssertEqual(draft.username, "deploy")
-        XCTAssertEqual(draft.credentialId, "cred_ftp_password")
-        XCTAssertNil(draft.privateKeyPath)
-        XCTAssertEqual(credentialSaver.savedSecrets, ["ftp-secret"])
-        XCTAssertFalse(String(describing: draft).contains("ftp-secret"))
+    func testFTPStorageKeyCannotCreateOrRestoreASettingsProtocol() {
+        XCTAssertNil(SessionSettingsProtocol(storageKey: "ftp"))
+        XCTAssertFalse(SessionSettingsProtocol.allCases.map(\.storageKey).contains("ftp"))
     }
 
     func testBrowserProtocolUsesURLFieldAndBuildsSecretFreeDraft() throws {
@@ -1368,18 +1423,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
 
     func testAvailableProtocolsCanBuildSessionDrafts() throws {
         for sessionProtocol in SessionSettingsProtocol.allCases where sessionProtocol.isAvailableForSaving {
-            let controller = sessionProtocol == .ftp
-                ? SessionSettingsViewController(
-                    existingSession: nil,
-                    selectedFolderID: nil,
-                    draftFactory: SessionSidebarSessionDraftFactory(
-                        credentialSaver: RecordingSessionSettingsCredentialSaver(
-                            savedCredentialID: "cred_\(sessionProtocol.storageKey)"
-                        ),
-                        defaultUsername: { "local" }
-                    )
-                )
-                : makeController()
+            let controller = makeController()
             controller.loadView()
             controller.selectProtocolForTesting(sessionProtocol)
             controller.setSSHValuesForTesting(
@@ -1388,9 +1432,9 @@ final class SessionSettingsViewControllerTests: XCTestCase {
                     host: "target.example.com",
                     port: controller.portValueForTesting,
                     username: "user",
-                    authMode: sessionProtocol == .ftp ? .password : .agent,
+                    authMode: .agent,
                     privateKeyPath: "",
-                    credentialSecret: sessionProtocol == .ftp ? "ftp-secret" : "",
+                    credentialSecret: "",
                     tags: ""
                 )
             )
@@ -1440,6 +1484,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         let saveButton = NSButton(title: "保存", target: nil, action: nil)
 
         controller.loadView()
+        controller.selectProtocolForTesting(.ssh)
         controller.bindSaveButtonForTesting(saveButton)
         controller.setSSHValuesForTesting(
             SessionSidebarSessionFormValues(

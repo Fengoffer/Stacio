@@ -263,6 +263,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public var onRuntimeReattached: ((RemoteTerminalPaneViewController, String, LiveShellStatus, TunnelLiveSessionContext?) -> Void)?
     public var onRemoteDirectoryChanged: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
+    public var onKeyboardFocusRequested: (() -> Void)?
     public var onMultiExecPresentationChanged: ((RemoteTerminalPaneViewController) -> Void)?
     public var onCommandSubmitted: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onCommandFinished: ((RemoteTerminalPaneViewController) -> Void)?
@@ -271,6 +272,13 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public var onUploadDroppedFiles: ((String, [String]) -> Void)?
     public var canAcceptDroppedLocalFiles: Bool {
         connectionKind == .ssh && liveSessionContext != nil
+    }
+    private var workspaceSessionProtocol: WorkspaceSessionProtocol {
+        switch connectionKind {
+        case .ssh: .ssh
+        case .serial: .serial
+        case .telnet: .telnet
+        }
     }
 
     private let bridge: RemoteTerminalBridging
@@ -328,7 +336,12 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         },
         askAI: { [weak self] request in
             self?.onAIContextRequest?(request)
-        }
+        },
+        canAskAI: { [weak self] in
+            guard let self else { return false }
+            return WorkspaceCapabilityPolicy.allows(.ai, for: self.workspaceSessionProtocol)
+        },
+        disabledAIActionToolTip: L10n.Workbench.sshSessionRequiredTooltip
     )
     private var outputPollTimer: Timer?
     private var immediateOutputDrainScheduled = false
@@ -359,6 +372,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private var remotePromptOutputBuffer = ""
     private var previousRemoteDirectory: String?
     private var remoteDirectoryStack: [String] = []
+    private let connectionStateView: SessionConnectionStateView
     private let lifecycleBar = NSStackView()
     private let lifecycleLabel = NSTextField(labelWithString: "")
     private let reconnectButton = NSButton(
@@ -396,7 +410,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         linkOpener: TerminalLinkOpening? = nil,
         startsPollingAutomatically: Bool = true,
         silentInputEchoTimeout: TimeInterval = 5.0,
-        pathCompletionProvider: TerminalPathCompletionProviding? = nil
+        pathCompletionProvider: TerminalPathCompletionProviding? = nil,
+        connectionEndpoint: String? = nil
     ) {
         self.runtimeID = runtimeID
         self.terminalTitle = title
@@ -415,6 +430,10 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         self.silentInputEchoTimeout = max(silentInputEchoTimeout, 0)
         self.terminalView = StacioRemoteTerminalView(frame: .zero)
         self.hasEstablishedRuntime = runtimeID.hasPrefix("pending_") == false
+        self.connectionStateView = SessionConnectionStateView(
+            protocolName: Self.connectionProtocolName(for: connectionKind),
+            endpoint: connectionEndpoint ?? title
+        )
         super.init(nibName: nil, bundle: nil)
         self.title = title
     }
@@ -426,6 +445,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public override func loadView() {
         let container = TerminalFocusContainerView()
+        container.onTerminalFocusRequested = { [weak self] in
+            self?.onKeyboardFocusRequested?()
+        }
         container.onEffectiveAppearanceChanged = { [weak self] in
             self?.terminalEffectiveAppearanceDidChange()
         }
@@ -481,6 +503,13 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         container.addSubview(commandHintOverlay)
         container.addSubview(agentTraceOverlay)
         terminalSearchController.install(in: container, overlaying: terminalView)
+        container.addSubview(connectionStateView)
+        connectionStateView.setRetryAction(
+            title: L10n.TerminalLifecycle.reconnect,
+            action: reconnecter == nil ? nil : { [weak self] in
+                self?.retryFromConnectionState()
+            }
+        )
         let terminalBottomToContainer = terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         let terminalBottomToCommandHint = terminalView.bottomAnchor.constraint(
             equalTo: commandHintOverlay.topAnchor,
@@ -554,12 +583,17 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             agentTraceLeading,
             agentTraceOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
             agentTraceTop,
-            agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
+            agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            connectionStateView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            connectionStateView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            connectionStateView.topAnchor.constraint(equalTo: container.topAnchor),
+            connectionStateView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         applyTerminalRuntimeSettings(settingsStore.snapshot())
 
         view = container
         displayStartupBannerIfNeeded()
+        applyLifecyclePresentation()
     }
 
     public override func viewDidLayout() {
@@ -1082,6 +1116,13 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         setLifecycle(.connecting, message: L10n.TerminalLifecycle.connecting)
     }
 
+    public func setConnectionEndpoint(_ endpoint: String) {
+        connectionStateView.update(
+            phase: lifecycleState == .reconnecting ? .reconnecting : .connecting,
+            endpoint: endpoint
+        )
+    }
+
     public func displayConnectionFailure(_ diagnostic: String) {
         guard didClose == false,
               lifecycleState != .closed
@@ -1381,6 +1422,18 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         lifecycleBar.isHidden == false
     }
 
+    public var isConnectionStateVisibleForTesting: Bool {
+        connectionStateView.isHidden == false
+    }
+
+    public var connectionStateVisibleTextForTesting: String {
+        connectionStateView.visibleTextForTesting
+    }
+
+    public var isTerminalContentHiddenForTesting: Bool {
+        terminalView.isHidden
+    }
+
     public var didDisplayStartupBannerForTesting: Bool {
         didDisplayStartupBanner
     }
@@ -1527,6 +1580,10 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public var lineInfoGutterPreferredWidthForTesting: CGFloat {
         lineInfoGutter.preferredWidthForTesting
+    }
+
+    public var lineInfoGutterLayoutWidthForTesting: CGFloat {
+        lineInfoGutterWidthConstraint?.constant ?? 0
     }
 
     public var lineInfoGutterUsesTerminalSurfaceStyleForTesting: Bool {
@@ -2241,12 +2298,33 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func applyLifecyclePresentation() {
-        lifecycleBar.isHidden = lifecycleState == .running
-        reconnectButton.isHidden = lifecycleState == .closed
-            || lifecycleState == .running
-            || lifecycleState == .connecting
-            || reconnecter == nil
-        reconnectButton.isEnabled = lifecycleState == .disconnected
+        let showsConnectionState = lifecycleState == .connecting
+            || lifecycleState == .reconnecting
+            || lifecycleState == .disconnected
+        let phase: SessionConnectionPhase
+        switch lifecycleState {
+        case .connecting:
+            phase = .connecting
+        case .reconnecting:
+            phase = .reconnecting
+        case .disconnected:
+            phase = .failed(message: lifecycleLabel.stringValue)
+        case .running, .closed:
+            phase = .connecting
+        }
+        connectionStateView.update(phase: phase)
+        connectionStateView.setPresented(
+            showsConnectionState,
+            animated: isViewLoaded && view.window != nil
+        )
+        terminalView.isHidden = showsConnectionState
+        // Connection feedback now remains on the full-surface state view through failure.
+        lifecycleBar.isHidden = true
+        reconnectButton.isHidden = true
+        reconnectButton.isEnabled = false
+        if isViewLoaded, terminalView.superview === view {
+            applyTerminalRuntimeSettings(settingsStore.snapshot())
+        }
     }
 
     private func refreshTerminalAppearanceAfterEffectiveAppearanceChange() {
@@ -2305,14 +2383,18 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private func applyTerminalRuntimeSettings(_ settings: AppSettings) {
         lineInfoGutter.apply(settings: settings, terminalView: terminalView)
         let rows = terminalView.terminal.getDims().rows
-        lineInfoGutterWidthConstraint?.constant = TerminalLineInfoGutterView.preferredWidth(for: settings, rows: rows)
+        let showsLineInfoGutter = shouldShowLineInfoGutter(for: settings)
+        lineInfoGutter.isHidden = showsLineInfoGutter == false
+        lineInfoGutterWidthConstraint?.constant = showsLineInfoGutter
+            ? TerminalLineInfoGutterView.preferredWidth(for: settings, rows: rows)
+            : 0
         terminalLeadingToContainerConstraint?.isActive = false
         terminalLeadingToLineInfoConstraint?.isActive = false
         terminalTopToContainerConstraint?.isActive = false
         terminalTopWithPaddingConstraint?.isActive = false
         terminalTrailingToContainerConstraint?.isActive = false
         terminalTrailingWithPaddingConstraint?.isActive = false
-        if settings.terminalLineNumbersEnabled || settings.terminalTimestampsEnabled {
+        if showsLineInfoGutter {
             terminalLeadingToLineInfoConstraint?.isActive = true
         } else {
             terminalLeadingToContainerConstraint?.isActive = true
@@ -2330,7 +2412,28 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         lineInfoGutter.refresh(from: terminalView, date: date)
         let settings = settingsStore.snapshot()
         let rows = terminalView.terminal.getDims().rows
-        lineInfoGutterWidthConstraint?.constant = TerminalLineInfoGutterView.preferredWidth(for: settings, rows: rows)
+        let showsLineInfoGutter = shouldShowLineInfoGutter(for: settings)
+        lineInfoGutter.isHidden = showsLineInfoGutter == false
+        lineInfoGutterWidthConstraint?.constant = showsLineInfoGutter
+            ? TerminalLineInfoGutterView.preferredWidth(for: settings, rows: rows)
+            : 0
+    }
+
+    private func shouldShowLineInfoGutter(for settings: AppSettings) -> Bool {
+        hasEstablishedRuntime
+            && lifecycleState == .running
+            && (settings.terminalLineNumbersEnabled || settings.terminalTimestampsEnabled)
+    }
+
+    private static func connectionProtocolName(for kind: RemoteTerminalConnectionKind) -> String {
+        switch kind {
+        case .ssh:
+            return "SSH"
+        case .serial:
+            return "Serial"
+        case .telnet:
+            return "Telnet"
+        }
     }
 
     private func recordSubmittedCommands(_ bytes: [UInt8]) {
@@ -2499,6 +2602,11 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     @objc
     private func reconnectButtonPressed() {
+        _ = try? reconnectTerminal()
+    }
+
+    private func retryFromConnectionState() {
+        guard lifecycleState == .disconnected else { return }
         _ = try? reconnectTerminal()
     }
 }

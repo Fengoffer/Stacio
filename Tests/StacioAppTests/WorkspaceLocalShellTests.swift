@@ -52,6 +52,34 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual((workspace.currentTerminalPane as? TerminalPaneViewController)?.runtimeID, firstRuntimeID)
     }
 
+    func testRapidTabSelectionDeliversOnlyTheFinalTerminalContext() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+
+        workspace.loadView()
+        _ = try workspace.openLocalShell()
+        let finalRuntimeID = try workspace.openLocalShell()
+        _ = try workspace.openLocalShell()
+        workspace.view.layoutSubtreeIfNeeded()
+
+        var terminalContextChangeCount = 0
+        workspace.onCurrentTerminalChanged = {
+            terminalContextChangeCount += 1
+        }
+
+        let tabController = try XCTUnwrap(workspace.workspaceTabControllerForTesting)
+        for index in [0, 2, 1] {
+            tabController.tabView.selectTabViewItem(at: index)
+        }
+
+        XCTAssertTrue(waitUntil { terminalContextChangeCount == 1 })
+        XCTAssertEqual(terminalContextChangeCount, 1)
+        XCTAssertEqual((workspace.currentTerminalPane as? TerminalPaneViewController)?.runtimeID, finalRuntimeID)
+    }
+
     func testActivateTerminalResolvesPreReconnectRuntimeIDToCurrentPane() throws {
         let reconnecter = RecordingWorkspaceRemoteTerminalReconnecter(
             status: LiveShellStatus(runtimeId: "term_after_reconnect", status: "running", diagnostic: "running")
@@ -213,6 +241,84 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertLessThan(terminalFrame.maxY, workspace.view.bounds.maxY - 20)
         XCTAssertEqual(terminalFrame.minX, workspace.view.bounds.minX, accuracy: 1)
         XCTAssertEqual(terminalFrame.width, workspace.view.bounds.width, accuracy: 1)
+    }
+
+    func testFileTransferLayoutControlDoesNotInheritSessionTabContextMenu() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [])
+        workspace.loadView()
+
+        _ = try workspace.openRemoteFilesSession(
+            context: liveContext(host: "files.example.com"),
+            title: "SCP 文件",
+            bridge: bridge,
+            transferScheduler: nil
+        )
+        workspace.view.layoutSubtreeIfNeeded()
+
+        let tabController = try XCTUnwrap(workspace.workspaceTabControllerForTesting)
+        let sessionTabControl = try XCTUnwrap(
+            tabController.view.firstSubview(withIdentifier: "Stacio.Workspace.tabs.control") as? NSSegmentedControl
+        )
+        let layoutControl = try XCTUnwrap(
+            tabController.view.firstSubview(withIdentifier: "Stacio.FileTransferBrowser.layoutControl") as? NSSegmentedControl
+        )
+
+        XCTAssertNil(tabController.tabView.menu)
+        XCTAssertNotNil(sessionTabControl.menu)
+        XCTAssertNil(layoutControl.menu)
+        XCTAssertFalse(sessionTabControl.isDescendant(of: tabController.tabView))
+        XCTAssertTrue(layoutControl.isDescendant(of: tabController.tabView))
+    }
+
+    func testFileTransferTabsUseProtocolSpecificTransferIcons() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [])
+        workspace.loadView()
+
+        _ = try workspace.openRemoteFilesSession(
+            context: liveContext(host: "scp.example.com"),
+            title: "SCP 文件",
+            bridge: bridge,
+            transferScheduler: nil
+        )
+        _ = try workspace.openSFTPFilesSession(
+            context: liveContext(host: "sftp.example.com"),
+            title: "SFTP 文件",
+            bridge: bridge
+        )
+
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "scp-transfer")
+        XCTAssertEqual(workspace.tabImageAccessibilityDescriptionForTesting(index: 0), "SCP 文件传输")
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 1), "sftp-transfer")
+        XCTAssertEqual(workspace.tabImageAccessibilityDescriptionForTesting(index: 1), "SFTP 文件传输")
+    }
+
+    func testWorkspaceTabSegmentsUseOneFixedWidthForDifferentTitles() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        try workspace.openLocalShell()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "fixed_width_short", status: "running", diagnostic: "running"),
+            title: "短标签",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "fixed_width_long", status: "running", diagnostic: "running"),
+            title: "deploy@172.16.10.250",
+            connectionKind: .ssh
+        )
+        workspace.view.layoutSubtreeIfNeeded()
+
+        let widths = (0..<3).compactMap { workspace.tabSegmentWidthForTesting(index: $0) }
+        XCTAssertEqual(widths.count, 3)
+        XCTAssertTrue(widths.allSatisfy { abs($0 - widths[0]) < 0.5 })
+        XCTAssertEqual(widths[0], 176, accuracy: 0.5)
     }
 
     func testTabStripPlusButtonAlwaysFollowsTabsAndOpensLocalShell() throws {
@@ -1054,7 +1160,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         let pane = try XCTUnwrap(workspace.currentTerminalPane as? BrowserPaneViewController)
         XCTAssertEqual(pane.currentURLStringForTesting, "https://example.com/docs")
         XCTAssertEqual(pane.addressFieldValueForTesting, "https://example.com/docs")
-        XCTAssertEqual(pane.statusTextForTesting, "准备载入：https://example.com/docs")
+        XCTAssertEqual(pane.statusTextForTesting, "正在载入：https://example.com/docs")
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("failed"))
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("error"))
 
@@ -1186,10 +1292,12 @@ final class WorkspaceLocalShellTests: XCTestCase {
 
         let pane = try XCTUnwrap(workspace.currentTerminalPane as? LocalFilePaneViewController)
         pane.loadView()
+        let expectedStatus = "本地路径不存在：\(missingPath)"
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == expectedStatus })
 
         XCTAssertTrue(runtimeID.hasPrefix("file_"))
         XCTAssertEqual(pane.currentPathForTesting, missingPath)
-        XCTAssertEqual(pane.statusTextForTesting, "本地路径不存在：\(missingPath)")
+        XCTAssertEqual(pane.statusTextForTesting, expectedStatus)
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("invalid"))
     }
 
@@ -1203,8 +1311,10 @@ final class WorkspaceLocalShellTests: XCTestCase {
         )
 
         pane.loadView()
+        let expectedStatus = "本地路径不存在：\(missingURL.path)"
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == expectedStatus })
 
-        XCTAssertEqual(pane.statusTextForTesting, "本地路径不存在：\(missingURL.path)")
+        XCTAssertEqual(pane.statusTextForTesting, expectedStatus)
         XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("本地路径不存在"))
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("permission denied"))
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("no such file"))
@@ -1218,6 +1328,196 @@ final class WorkspaceLocalShellTests: XCTestCase {
 
         XCTAssertEqual(pane.fileActionsForTesting, ["refresh", "reveal", "open"])
         XCTAssertEqual(pane.currentPathForTesting, missingURL.path)
+    }
+
+    func testLocalFilePaneRoutesRevealAndOpenActionsToWorkspaceHandlers() throws {
+        let directoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("stacio-workspace-actions-\(UUID().uuidString)", isDirectory: true)
+        var revealedURL: URL?
+        var openedURL: URL?
+        let pane = LocalFilePaneViewController(
+            runtimeID: "file_workspace_actions",
+            directoryURL: directoryURL,
+            title: "本地文件",
+            workspaceActions: LocalFileWorkspaceActions(
+                reveal: { revealedURL = $0 },
+                open: { openedURL = $0 }
+            )
+        )
+
+        pane.loadView()
+        pane.revealCurrentPath()
+        pane.openCurrentPath()
+
+        XCTAssertEqual(revealedURL, directoryURL)
+        XCTAssertEqual(openedURL, directoryURL)
+        XCTAssertEqual(pane.fileActionsForTesting, ["reveal", "open"])
+    }
+
+    func testLocalFilePaneUsesEditableAddressBarAndSelectionGatedUpload() throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("stacio-local-upload-\(UUID().uuidString)", isDirectory: true)
+        let childDirectory = tempRoot.appendingPathComponent("incoming", isDirectory: true)
+        try FileManager.default.createDirectory(at: childDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let fileURL = childDirectory.appendingPathComponent("release.txt")
+        let folderURL = childDirectory.appendingPathComponent("assets", isDirectory: true)
+        try Data("release".utf8).write(to: fileURL)
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+
+        var uploadedPaths: [String] = []
+        let pane = LocalFilePaneViewController(
+            runtimeID: "file_upload_selection",
+            directoryURL: tempRoot,
+            title: "本地文件"
+        )
+        pane.onUploadLocalPaths = { uploadedPaths = $0 }
+        pane.loadView()
+        XCTAssertTrue(waitUntil {
+            pane.statusTextForTesting == "当前路径：\(tempRoot.path)"
+        })
+
+        XCTAssertTrue(pane.localPathFieldIsEditableForTesting)
+        XCTAssertEqual(pane.localPathTextForTesting, tempRoot.path)
+        XCTAssertFalse(pane.uploadButtonIsHiddenForTesting)
+        XCTAssertFalse(pane.uploadButtonIsEnabledForTesting)
+
+        pane.submitLocalPathForTesting(childDirectory.path)
+        XCTAssertTrue(waitUntil {
+            pane.statusTextForTesting == "当前路径：\(childDirectory.standardizedFileURL.path)"
+                && pane.tableView.numberOfRows == 2
+        })
+
+        XCTAssertEqual(pane.currentPathForTesting, childDirectory.standardizedFileURL.path)
+        XCTAssertEqual(pane.localPathTextForTesting, childDirectory.standardizedFileURL.path)
+        XCTAssertFalse(pane.uploadButtonIsEnabledForTesting)
+
+        pane.selectLocalItemsForTesting(named: ["assets", "release.txt"])
+
+        XCTAssertTrue(pane.uploadButtonIsEnabledForTesting)
+        pane.performSelectedUploadForTesting()
+        XCTAssertEqual(
+            Set(uploadedPaths.map { URL(fileURLWithPath: $0).lastPathComponent }),
+            Set(["assets", "release.txt"])
+        )
+        XCTAssertTrue(uploadedPaths.allSatisfy(FileManager.default.fileExists(atPath:)))
+
+        pane.selectLocalItemsForTesting(named: [])
+        XCTAssertFalse(pane.uploadButtonIsEnabledForTesting)
+    }
+
+    func testLocalFilePaneDirectoryMenuProvidesFinderLocationsAndRecentPathNavigation() throws {
+        let suiteName = "StacioLocalDirectoryHistoryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let historyStore = UserDefaultsLocalDirectoryHistoryStore(
+            defaults: defaults,
+            key: "recent-directories"
+        )
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("stacio-directory-menu-\(UUID().uuidString)", isDirectory: true)
+        let childDirectory = tempRoot.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: childDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let pane = LocalFilePaneViewController(
+            runtimeID: "file_directory_menu",
+            directoryURL: tempRoot,
+            title: "本地文件",
+            directoryHistoryStore: historyStore
+        )
+
+        pane.loadView()
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == "当前路径：\(tempRoot.path)" })
+
+        XCTAssertTrue(pane.localDirectoryMenuButtonIsVisibleForTesting)
+        XCTAssertEqual(
+            pane.localDirectoryMenuTitlesForTesting,
+            ["最近使用", "共享", "桌面", "文稿", "下载", "图片", "音乐", "影片"]
+        )
+
+        pane.navigate(to: childDirectory)
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == "当前路径：\(childDirectory.path)" })
+        XCTAssertEqual(pane.recentLocalDirectoryPathsForTesting.first, childDirectory.path)
+        XCTAssertTrue(pane.recentLocalDirectoryPathsForTesting.contains(tempRoot.path))
+
+        XCTAssertTrue(pane.performLocalDirectoryMenuSelectionForTesting(path: tempRoot.path))
+        XCTAssertTrue(waitUntil { pane.currentPathForTesting == tempRoot.path })
+        XCTAssertEqual(pane.localPathTextForTesting, tempRoot.path)
+    }
+
+    func testLocalFilePaneFailedDirectoryMenuNavigationKeepsCurrentPathAndRows() throws {
+        let suiteName = "StacioLocalDirectoryFailureTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let historyStore = UserDefaultsLocalDirectoryHistoryStore(
+            defaults: defaults,
+            key: "recent-directories"
+        )
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-directory-failure-\(UUID().uuidString)", isDirectory: true)
+        let blockedDirectory = tempRoot.appendingPathComponent("blocked", isDirectory: true)
+        let visibleFile = tempRoot.appendingPathComponent("app.conf")
+        try FileManager.default.createDirectory(at: blockedDirectory, withIntermediateDirectories: true)
+        try Data("ready".utf8).write(to: visibleFile)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        historyStore.recordDirectoryURL(blockedDirectory)
+        let pane = LocalFilePaneViewController(
+            runtimeID: "file_directory_failure",
+            directoryURL: tempRoot,
+            title: "本地文件",
+            directoryContentsProvider: { directory in
+                if directory.standardizedFileURL == blockedDirectory.standardizedFileURL {
+                    throw LocalFilePaneError.invalidPath(directory.path)
+                }
+                return try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil
+                )
+            },
+            directoryHistoryStore: historyStore
+        )
+
+        pane.loadView()
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == "当前路径：\(tempRoot.path)" })
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("app.conf"))
+
+        XCTAssertTrue(pane.performLocalDirectoryMenuSelectionForTesting(path: blockedDirectory.path))
+        XCTAssertTrue(waitUntil {
+            pane.statusTextForTesting == "无法读取本地路径：\(blockedDirectory.path)"
+        })
+        XCTAssertEqual(pane.currentPathForTesting, tempRoot.path)
+        XCTAssertEqual(pane.localPathTextForTesting, tempRoot.path)
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("app.conf"))
+    }
+
+    func testRemoteFileDragPayloadRoundTripsMultipleSelectionsWithoutModifiedTime() throws {
+        let selections = [
+            RemoteFileSelection(
+                path: "/srv/app/logs",
+                size: 0,
+                kind: .directory,
+                modifiedTime: nil
+            ),
+            RemoteFileSelection(
+                path: "/srv/app/config.json",
+                size: 42,
+                kind: .file,
+                modifiedTime: "07-25 12:00"
+            )
+        ]
+        let pasteboard = NSPasteboard(name: .init("StacioRemoteFileDrag-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects(
+            selections.map {
+                RemoteFileDragPayload.pasteboardItem(
+                    for: $0,
+                    sourceRuntimeID: "sftp_drag_source"
+                )
+            }
+        ))
+
+        XCTAssertEqual(RemoteFileDragPayload.selections(from: pasteboard), selections)
+        XCTAssertEqual(RemoteFileDragPayload.sourceRuntimeID(from: pasteboard), "sftp_drag_source")
     }
 
     func testLocalFilePaneShowsChineseErrorForUnreadablePath() throws {
@@ -1237,8 +1537,10 @@ final class WorkspaceLocalShellTests: XCTestCase {
         )
 
         pane.loadView()
+        let expectedStatus = "没有权限读取本地路径：\(tempRoot.path)"
+        XCTAssertTrue(waitUntil { pane.statusTextForTesting == expectedStatus })
 
-        XCTAssertEqual(pane.statusTextForTesting, "没有权限读取本地路径：\(tempRoot.path)")
+        XCTAssertEqual(pane.statusTextForTesting, expectedStatus)
         XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("没有权限读取本地路径"))
         XCTAssertFalse(pane.statusTextForTesting.localizedCaseInsensitiveContains("permission denied"))
     }
@@ -1262,6 +1564,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
         )
 
         pane.loadView()
+        XCTAssertTrue(waitUntil { pane.tableView.numberOfRows == 4 })
 
         XCTAssertEqual(pane.tableView.tableColumns.map(\.title), ["名称", "大小", "时间"])
         XCTAssertGreaterThanOrEqual(pane.tableView.rowHeight, 34)
@@ -1308,7 +1611,12 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual(workspace.openTerminalPaneCount, 1)
         XCTAssertEqual(workspace.currentTerminalPane?.title, "文件服务器")
         XCTAssertEqual(workspace.tabLabelsForTesting, ["文件服务器"])
-        XCTAssertEqual(bridge.liveHosts, ["files.example.com"])
+        XCTAssertTrue(pane.isInitialConnectionStateVisibleForTesting)
+        XCTAssertTrue(pane.isFilesWorkspaceHiddenForTesting)
+        XCTAssertTrue(waitUntil {
+            bridge.liveHosts == ["files.example.com"]
+                && pane.visibleTextSnapshotForTesting.contains("app.log")
+        })
         XCTAssertEqual(pane.visibleTextSnapshotForTesting, "文件\n/home/deploy\napp.log\n0.06 KB\n—\n—\n-")
     }
 
@@ -1337,75 +1645,6 @@ final class WorkspaceLocalShellTests: XCTestCase {
             bridge: bridge,
             transferScheduler: scheduler
         )
-        workspace.closeCurrentTerminal()
-
-        XCTAssertEqual(scheduler.disconnectedRuntimeIDs, [runtimeID])
-        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
-    }
-
-    func testOpenFTPFilesSessionAddsFTPFilesPaneAndUsesFTPEngineLabel() throws {
-        let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [
-            RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
-        ])
-        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let context = FTPLiveSessionContext(
-            config: FtpConnectionConfig(
-                host: "ftp.example.com",
-                port: 21,
-                username: "deploy",
-                connectTimeoutMs: 10_000
-            ),
-            secret: .password(value: "ftp-password")
-        )
-
-        workspace.loadView()
-        let runtimeID = try workspace.openFTPFilesSession(
-            context: context,
-            title: "FTP 文件",
-            bridge: bridge
-        )
-
-        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
-        XCTAssertTrue(runtimeID.hasPrefix("ftp_"))
-        XCTAssertEqual(pane.runtimeID, runtimeID)
-        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
-        XCTAssertEqual(workspace.currentTerminalPane?.title, "FTP 文件")
-        XCTAssertEqual(workspace.tabLabelsForTesting, ["FTP 文件"])
-        XCTAssertEqual(bridge.ftpHosts, ["ftp.example.com"])
-        XCTAssertEqual(pane.visibleTextSnapshotForTesting, "文件\n内置 FTP\n/pub\nreadme.txt\n0.06 KB\n—\n—\n-")
-        XCTAssertFalse(pane.visibleTextSnapshotForTesting.localizedCaseInsensitiveContains("SFTP"))
-    }
-
-    func testClosingFTPFilesSessionDisconnectsRuntimeScopedTransfers() throws {
-        let localFile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("stacio-ftp-close-\(UUID().uuidString).txt")
-        try Data("upload".utf8).write(to: localFile)
-        defer { try? FileManager.default.removeItem(at: localFile) }
-        let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [
-            RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
-        ])
-        let scheduler = RecordingWorkspaceFTPTransferScheduler()
-        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let context = FTPLiveSessionContext(
-            config: FtpConnectionConfig(
-                host: "ftp.example.com",
-                port: 21,
-                username: "deploy",
-                connectTimeoutMs: 10_000
-            ),
-            secret: .password(value: "ftp-password")
-        )
-
-        workspace.loadView()
-        let runtimeID = try workspace.openFTPFilesSession(
-            context: context,
-            title: "FTP 文件",
-            bridge: bridge,
-            ftpTransferScheduler: scheduler
-        )
-        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
-        pane.filesViewControllerForTesting.performDropLocalFilesForTesting([localFile.path])
-        XCTAssertEqual(scheduler.scheduledRuntimeIDs, [runtimeID])
         workspace.closeCurrentTerminal()
 
         XCTAssertEqual(scheduler.disconnectedRuntimeIDs, [runtimeID])
@@ -2495,6 +2734,91 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual(serialTitle.stringValue, "串口控制台")
         XCTAssertGreaterThan(sshPauseFrame.minX, sshTitleFrame.maxX)
         XCTAssertGreaterThan(serialPauseFrame.minX, serialTitleFrame.maxX)
+    }
+
+    func testRestrictedSourcePaneAIRequestCannotBorrowCurrentSSHPaneCapability() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ai_ssh", status: "running", diagnostic: "running"),
+            title: "生产 SSH",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ai_serial", status: "running", diagnostic: "running"),
+            title: "串口控制台",
+            connectionKind: .serial
+        )
+        try workspace.startMultiExecSession(targetIDs: ["term_ai_ssh", "term_ai_serial"])
+        let serialPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_ai_serial"))
+        XCTAssertTrue(workspace.activateTerminal(runtimeID: "term_ai_ssh", bringAppToFront: false))
+        var requests: [TerminalAIContextRequest] = []
+        workspace.onAIContextRequest = { requests.append($0) }
+
+        serialPane.onAIContextRequest?(
+            TerminalAIContextRequest(runtimeID: serialPane.runtimeID, selectedText: "blocked")
+        )
+
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testMixedProtocolFirstResponderChangesNotifyCapabilitiesOncePerPane() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkspaceRemoteTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkspaceRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let window = NSWindow(contentViewController: workspace)
+        defer { window.close() }
+        window.setContentSize(NSSize(width: 960, height: 640))
+        window.makeKeyAndOrderFront(nil)
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_ssh", status: "running", diagnostic: "running"),
+            title: "生产 SSH",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_serial", status: "running", diagnostic: "running"),
+            title: "串口控制台",
+            connectionKind: .serial
+        )
+        try workspace.startMultiExecSession(targetIDs: ["term_focus_ssh", "term_focus_serial"])
+        let sshPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_ssh"))
+        let serialPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_serial"))
+        window.contentView?.layoutSubtreeIfNeeded()
+        func focus(_ pane: RemoteTerminalPaneViewController) throws {
+            let container = try XCTUnwrap(pane.view as? TerminalFocusContainerView)
+            container.layoutSubtreeIfNeeded()
+            let point = pane.terminalView.convert(NSPoint(x: 1, y: 1), to: container)
+            XCTAssertNotNil(container.hitTest(point))
+            XCTAssertIdentical(window.firstResponder, pane.terminalView)
+        }
+        try focus(sshPane)
+        _ = workspace.currentSessionProtocol
+
+        var changeCount = 0
+        workspace.onCurrentTerminalChanged = { changeCount += 1 }
+
+        try focus(serialPane)
+        XCTAssertIdentical(workspace.currentTerminalPane, serialPane)
+        XCTAssertEqual(workspace.currentSessionProtocol, .serial)
+        XCTAssertEqual(changeCount, 1)
+
+        try focus(serialPane)
+        _ = workspace.currentSessionProtocol
+        _ = workspace.currentSessionProtocol
+        XCTAssertEqual(changeCount, 1)
+
+        try focus(sshPane)
+        XCTAssertIdentical(workspace.currentTerminalPane, sshPane)
+        XCTAssertEqual(workspace.currentSessionProtocol, .ssh)
+        XCTAssertEqual(changeCount, 2)
     }
 
     func testStartingMultiExecSessionDefaultsFourTargetsToTwoByTwoGrid() throws {
@@ -3777,35 +4101,6 @@ private final class RecordingWorkspaceSCPTransferScheduler: SCPTransferSchedulin
         config: SshConnectionConfig,
         secret: SshAuthSecret,
         expectedFingerprintSHA256: String,
-        job: ScpTransferJob,
-        completion: ((ScpTransferProgress) -> Void)?
-    ) {}
-
-    func disconnectTransfers(runtimeID: String) -> [String] {
-        disconnectedRuntimeIDs.append(runtimeID)
-        return []
-    }
-
-    func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
-}
-
-private final class RecordingWorkspaceFTPTransferScheduler: FTPTransferScheduling {
-    private(set) var disconnectedRuntimeIDs: [String] = []
-    private(set) var scheduledRuntimeIDs: [String] = []
-
-    func scheduleLiveFTPTransfer(
-        runtimeID: String,
-        config: FtpConnectionConfig,
-        secret: FtpAuthSecret,
-        job: ScpTransferJob,
-        completion: ((ScpTransferProgress) -> Void)?
-    ) {
-        scheduledRuntimeIDs.append(runtimeID)
-    }
-
-    func scheduleLiveFTPTransfer(
-        config: FtpConnectionConfig,
-        secret: FtpAuthSecret,
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)?
     ) {}

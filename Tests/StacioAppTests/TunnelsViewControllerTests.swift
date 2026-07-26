@@ -1122,6 +1122,48 @@ final class TunnelsViewControllerTests: XCTestCase {
         XCTAssertEqual(liveBridge.startedProfiles.map(\.kind), [.dynamic])
     }
 
+    func testCoreTunnelBridgeStartsDynamicSocksRuntimeThroughCurrentProxyJumpRoute() throws {
+        let liveBridge = RecordingLiveTunnelCoreBridge()
+        let proxyJump = SshProxyJumpRuntimeConfig(
+            jumpConfig: SshConnectionConfig(
+                host: "bastion.example.com",
+                port: 22,
+                username: "jump-user",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            jumpSecret: .agent,
+            jumpExpectedFingerprintSha256: "SHA256:jump",
+            targetExpectedFingerprintSha256: "SHA256:target"
+        )
+        let context = TunnelLiveSessionContext(
+            config: sshConfig(),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:target",
+            proxyJump: proxyJump
+        )
+        let bridge = CoreBridgeTunnelRuntimeBridge(
+            liveSessionContextProvider: { context },
+            liveBridge: liveBridge
+        )
+        let profile = TunnelProfile(
+            id: "tun_dynamic_proxy_jump",
+            kind: .dynamic,
+            localHost: "127.0.0.1",
+            localPort: 1081,
+            remoteHost: "socks",
+            remotePort: 1081
+        )
+
+        let status = try bridge.start(profile: profile)
+
+        XCTAssertEqual(status.state, .running)
+        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), ["tun_dynamic_proxy_jump"])
+        XCTAssertEqual(liveBridge.startedProxyJumps.map(\.jumpConfig.host), ["bastion.example.com"])
+        XCTAssertEqual(liveBridge.startedConfigs.map(\.host), [sshConfig().host])
+        XCTAssertEqual(liveBridge.expectedFingerprints, [])
+    }
+
     func testCoreTunnelBridgeStartsRemoteForwardRuntimeWithLiveSessionContext() throws {
         let liveBridge = RecordingLiveTunnelCoreBridge()
         let context = TunnelLiveSessionContext(
@@ -1156,7 +1198,8 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
@@ -1166,11 +1209,18 @@ final class TunnelsViewControllerTests: XCTestCase {
         XCTAssertEqual(bridge.startedProfiles.map(\.localPort), [18080])
         XCTAssertEqual(bridge.startedProfiles.map(\.remoteHost), ["socks"])
         XCTAssertEqual(controller.browserPaneViewControllerForTesting?.proxyConfigurationCountForTesting, 1)
+        XCTAssertEqual(controller.browserPaneViewControllerForTesting?.proxyMatchDomainsForTesting, ["."])
+        XCTAssertEqual(controller.browserPaneViewControllerForTesting?.proxyAllowsFailoverForTesting, false)
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("127.0.0.1:18080"))
     }
 
-    func testRemoteNetworkBrowserStopsDynamicTunnelOnCleanup() throws {
-        let bridge = RecordingTunnelRuntimeBridge()
+    func testRemoteNetworkBrowserShowsConnectionStateWhileAsyncProxyStarts() throws {
+        let context = TunnelLiveSessionContext(
+            config: sshConfig(),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let bridge = BlockingStartTunnelRuntimeBridge(liveSessionContext: context)
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
@@ -1178,10 +1228,45 @@ final class TunnelsViewControllerTests: XCTestCase {
         )
 
         controller.loadView()
+        wait(for: [bridge.startEntered], timeout: 1)
+
+        let browser = try XCTUnwrap(controller.browserPaneViewControllerForTesting)
+        let overlay = try XCTUnwrap(
+            browser.view.firstSubview(withIdentifier: "Stacio.Browser.stateOverlay")
+        )
+        let message = try XCTUnwrap(
+            browser.view.firstSubview(withIdentifier: "Stacio.Browser.stateMessage") as? NSTextField
+        )
+        XCTAssertEqual(controller.tunnelStatusTextForTesting, "正在建立 SSH 远端浏览通道...")
+        XCTAssertEqual(browser.statusTextForTesting, "正在建立 SSH 远端浏览通道...")
+        XCTAssertEqual(browser.proxyConfigurationCountForTesting, 0)
+        XCTAssertNil(browser.webView.url)
+        XCTAssertFalse(overlay.isHidden)
+        XCTAssertEqual(message.stringValue, "正在建立 SSH 远端浏览通道...")
+        XCTAssertTrue(bridge.snapshotWasCapturedOnMainThread)
+        XCTAssertFalse(bridge.startWasCalledOnMainThread)
+        XCTAssertEqual(bridge.receivedLiveSessionContext?.config.host, context.config.host)
+
+        bridge.resumeStart()
+        wait(for: [bridge.startReturned], timeout: 1)
+    }
+
+    func testRemoteNetworkBrowserStopsDynamicTunnelOnCleanup() throws {
+        let bridge = RecordingTunnelRuntimeBridge()
+        let controller = RemoteNetworkBrowserViewController(
+            runtimeBridge: bridge,
+            localPortProvider: { 18080 },
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
+        )
+
+        controller.loadView()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18080_"))
         controller.stopRemoteBrowserProxy()
         controller.stopRemoteBrowserProxy()
 
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), ["remote_browser_18080"])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID])
         XCTAssertEqual(bridge.stoppedStates, [.running])
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("已停止"))
     }
@@ -1196,14 +1281,17 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18080_"))
         controller.stopRemoteBrowserProxy()
         controller.stopRemoteBrowserProxy()
 
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), ["remote_browser_18080", "remote_browser_18080"])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID, profileID])
         XCTAssertEqual(bridge.stoppedStates, [.running, .running])
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("已停止"))
     }
@@ -1217,7 +1305,7 @@ final class TunnelsViewControllerTests: XCTestCase {
                     message: "stale stopped"
                 ),
                 TunnelRuntimeStatus(
-                    profileId: "remote_browser_18080",
+                    profileId: matchingTunnelProfileIDToken,
                     state: .stopped,
                     message: "stopped"
                 )
@@ -1226,14 +1314,17 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18080_"))
         controller.stopRemoteBrowserProxy()
         controller.stopRemoteBrowserProxy()
 
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), ["remote_browser_18080", "remote_browser_18080"])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID, profileID])
         XCTAssertEqual(bridge.stoppedStates, [.running, .running])
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("已停止"))
     }
@@ -1244,16 +1335,61 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { ports.removeFirst() },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
+        let firstProfileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
         controller.loadView()
+        let secondProfileID = try XCTUnwrap(bridge.startedProfiles.last?.id)
 
-        XCTAssertEqual(bridge.startedProfiles.map(\.id), ["remote_browser_18080", "remote_browser_18081"])
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), ["remote_browser_18080"])
+        XCTAssertTrue(firstProfileID.hasPrefix("remote_browser_18080_"))
+        XCTAssertTrue(secondProfileID.hasPrefix("remote_browser_18081_"))
+        XCTAssertEqual(bridge.startedProfiles.map(\.id), [firstProfileID, secondProfileID])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [firstProfileID])
         XCTAssertEqual(bridge.stoppedStates, [.running])
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("127.0.0.1:18081"))
+    }
+
+    func testRemoteNetworkBrowserDoesNotReplaceProxyWhenExistingProxyStopFails() throws {
+        let bridge = RecordingTunnelRuntimeBridge(
+            stopErrors: [
+                TunnelRuntimeBridgeError(message: "temporary close failure"),
+                nil
+            ]
+        )
+        var ports: [UInt16] = [18080, 18081]
+        let controller = RemoteNetworkBrowserViewController(
+            runtimeBridge: bridge,
+            localPortProvider: { ports.removeFirst() },
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
+        )
+
+        controller.loadView()
+        let firstProfileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        let existingBrowser = try XCTUnwrap(controller.browserPaneViewControllerForTesting)
+        controller.loadView()
+
+        XCTAssertEqual(bridge.startedProfiles.map(\.id), [firstProfileID])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [firstProfileID])
+        XCTAssertTrue(controller.browserPaneViewControllerForTesting === existingBrowser)
+        XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("停止失败"))
+
+        controller.loadView()
+        let secondProfileID = try XCTUnwrap(bridge.startedProfiles.last?.id)
+
+        XCTAssertEqual(
+            bridge.startedProfiles.map(\.id),
+            [firstProfileID, secondProfileID]
+        )
+        XCTAssertEqual(
+            bridge.stoppedProfiles.map(\.id),
+            [firstProfileID, firstProfileID]
+        )
+        XCTAssertTrue(secondProfileID.hasPrefix("remote_browser_18081_"))
+        XCTAssertFalse(controller.browserPaneViewControllerForTesting === existingBrowser)
     }
 
     func testRemoteNetworkBrowserRetiresOldBrowserPaneWhenReloadingView() throws {
@@ -1262,7 +1398,8 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { ports.removeFirst() },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
@@ -1291,12 +1428,44 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
 
         let browser = try XCTUnwrap(controller.browserPaneViewControllerForTesting)
+        XCTAssertEqual(browser.proxyConfigurationCountForTesting, 0)
+        XCTAssertNil(browser.webView.url)
+        XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("启动失败"))
+    }
+
+    func testRemoteNetworkBrowserStopsStartedProxyWhenPollingFails() throws {
+        let bridge = RecordingTunnelRuntimeBridge(
+            startStatuses: [
+                TunnelRuntimeStatus(
+                    profileId: matchingTunnelProfileIDToken,
+                    state: .starting,
+                    message: "starting"
+                )
+            ],
+            pollErrors: [TunnelRuntimeBridgeError(message: "poll unavailable")]
+        )
+        let controller = RemoteNetworkBrowserViewController(
+            runtimeBridge: bridge,
+            localPortProvider: { 18080 },
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
+        )
+
+        controller.loadView()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18080_"))
+
+        let browser = try XCTUnwrap(controller.browserPaneViewControllerForTesting)
+        XCTAssertEqual(bridge.polledProfileIDs, [profileID])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID])
+        XCTAssertEqual(bridge.stoppedStates, [.starting])
         XCTAssertEqual(browser.proxyConfigurationCountForTesting, 0)
         XCTAssertNil(browser.webView.url)
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("启动失败"))
@@ -1315,17 +1484,21 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = RemoteNetworkBrowserViewController(
             runtimeBridge: bridge,
             localPortProvider: { 18080 },
-            initialURL: try XCTUnwrap(URL(string: "http://app.internal"))
+            initialURL: try XCTUnwrap(URL(string: "http://app.internal")),
+            startsProxyAsynchronously: false
         )
 
         controller.loadView()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18080_"))
         controller.stopRemoteBrowserProxy()
 
         let browser = try XCTUnwrap(controller.browserPaneViewControllerForTesting)
-        XCTAssertEqual(bridge.startedProfiles.map(\.id), ["remote_browser_18080"])
+        XCTAssertEqual(bridge.startedProfiles.map(\.id), [profileID])
         XCTAssertEqual(browser.proxyConfigurationCountForTesting, 0)
         XCTAssertNil(browser.webView.url)
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID])
+        XCTAssertEqual(bridge.stoppedStates, [.running])
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("状态不匹配"))
         XCTAssertTrue(controller.tunnelStatusTextForTesting.contains("remote_browser_old"))
     }
@@ -1346,7 +1519,8 @@ final class TunnelsViewControllerTests: XCTestCase {
         let controller = InspectorViewController(
             transferHistoryStore: NoOpSCPTransferHistoryStore(),
             remoteBrowserRuntimeBridge: bridge,
-            remoteBrowserLocalPortProvider: { 18081 }
+            remoteBrowserLocalPortProvider: { 18081 },
+            remoteBrowserStartsProxyAsynchronously: false
         )
         controller.loadView()
         controller.selectBrowserTab()
@@ -1376,10 +1550,59 @@ final class TunnelsViewControllerTests: XCTestCase {
             transferHistoryStore: NoOpSCPTransferHistoryStore(),
             tunnelLiveSessionContextProvider: { currentContext },
             tunnelLiveBridge: liveBridge,
-            remoteBrowserLocalPortProvider: { ports.removeFirst() }
+            remoteBrowserLocalPortProvider: { ports.removeFirst() },
+            remoteBrowserStartsProxyAsynchronously: false
         )
         controller.loadView()
         controller.selectBrowserTab()
+        let firstProfileID = try XCTUnwrap(liveBridge.startedProfiles.first?.id)
+
+        currentContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "second.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:second"
+        )
+        controller.refreshCurrentTerminalContextPanels()
+        let secondProfileID = try XCTUnwrap(liveBridge.startedProfiles.last?.id)
+
+        XCTAssertEqual(liveBridge.startedConfigs.map(\.host), ["first.example.com", "second.example.com"])
+        XCTAssertTrue(firstProfileID.hasPrefix("remote_browser_18083_"))
+        XCTAssertTrue(secondProfileID.hasPrefix("remote_browser_18084_"))
+        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), [firstProfileID, secondProfileID])
+        XCTAssertEqual(liveBridge.expectedFingerprints, ["SHA256:first", "SHA256:second"])
+    }
+
+    func testInspectorDefersBrowserProxyReloadUntilBrowserBecomesVisible() throws {
+        var currentContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "first.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:first"
+        )
+        let liveBridge = RecordingLiveTunnelCoreBridge()
+        var ports: [UInt16] = [18085, 18086]
+        let controller = InspectorViewController(
+            transferHistoryStore: NoOpSCPTransferHistoryStore(),
+            tunnelLiveSessionContextProvider: { currentContext },
+            tunnelLiveBridge: liveBridge,
+            remoteBrowserLocalPortProvider: { ports.removeFirst() },
+            remoteBrowserStartsProxyAsynchronously: false
+        )
+        controller.loadView()
+        controller.selectBrowserTab()
+        let firstProfileID = try XCTUnwrap(liveBridge.startedProfiles.first?.id)
+        controller.selectDiagnosticsTab()
 
         currentContext = TunnelLiveSessionContext(
             config: SshConnectionConfig(
@@ -1394,9 +1617,15 @@ final class TunnelsViewControllerTests: XCTestCase {
         )
         controller.refreshCurrentTerminalContextPanels()
 
+        XCTAssertEqual(liveBridge.startedConfigs.map(\.host), ["first.example.com"])
+
+        controller.selectBrowserTab()
+        let secondProfileID = try XCTUnwrap(liveBridge.startedProfiles.last?.id)
+
         XCTAssertEqual(liveBridge.startedConfigs.map(\.host), ["first.example.com", "second.example.com"])
-        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), ["remote_browser_18083", "remote_browser_18084"])
-        XCTAssertEqual(liveBridge.expectedFingerprints, ["SHA256:first", "SHA256:second"])
+        XCTAssertTrue(firstProfileID.hasPrefix("remote_browser_18085_"))
+        XCTAssertTrue(secondProfileID.hasPrefix("remote_browser_18086_"))
+        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), [firstProfileID, secondProfileID])
     }
 
     func testDisconnectingRuntimeStopsRemoteBrowserProxyTunnel() throws {
@@ -1411,6 +1640,7 @@ final class TunnelsViewControllerTests: XCTestCase {
             tunnelLiveSessionContextProvider: { context },
             remoteBrowserRuntimeBridge: bridge,
             remoteBrowserLocalPortProvider: { 18082 },
+            remoteBrowserStartsProxyAsynchronously: false,
             remoteFilesBridge: NoOpRemoteFilesBridge()
         )
         let binding = InspectorViewController.RemoteFilesBinding(
@@ -1421,12 +1651,14 @@ final class TunnelsViewControllerTests: XCTestCase {
         controller.loadView()
         try controller.selectFilesTabAndLoadCurrentDirectory(binding: binding)
         controller.selectBrowserTab()
+        let profileID = try XCTUnwrap(bridge.startedProfiles.first?.id)
+        XCTAssertTrue(profileID.hasPrefix("remote_browser_18082_"))
 
-        XCTAssertEqual(bridge.startedProfiles.map(\.id), ["remote_browser_18082"])
+        XCTAssertEqual(bridge.startedProfiles.map(\.id), [profileID])
 
         XCTAssertTrue(controller.disconnectFilesBindingIfNeeded(runtimeID: "runtime-target"))
 
-        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), ["remote_browser_18082"])
+        XCTAssertEqual(bridge.stoppedProfiles.map(\.id), [profileID])
         XCTAssertEqual(bridge.stoppedStates, [.running])
         XCTAssertTrue(controller.remoteBrowserViewController?.tunnelStatusTextForTesting.contains("已停止") == true)
     }
@@ -1700,6 +1932,8 @@ private final class RecordingTunnelProfileDeletionConfirmation: TunnelProfileDel
     }
 }
 
+private let matchingTunnelProfileIDToken = "__matching_tunnel_profile_id__"
+
 private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
     var startedProfiles: [TunnelProfile] = []
     var stoppedProfiles: [TunnelProfile] = []
@@ -1711,6 +1945,7 @@ private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
     private var stopErrors: [Error?]
     private var stopStatuses: [TunnelRuntimeStatus]
     private var polledStatuses: [TunnelRuntimeStatus]
+    private var pollErrors: [Error?]
 
     init(
         startError: Error? = nil,
@@ -1718,7 +1953,8 @@ private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
         startStatuses: [TunnelRuntimeStatus] = [],
         stopErrors: [Error?] = [],
         stopStatuses: [TunnelRuntimeStatus] = [],
-        polledStatuses: [TunnelRuntimeStatus] = []
+        polledStatuses: [TunnelRuntimeStatus] = [],
+        pollErrors: [Error?] = []
     ) {
         self.startError = startError
         self.startErrors = startErrors
@@ -1726,6 +1962,7 @@ private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
         self.stopErrors = stopErrors
         self.stopStatuses = stopStatuses
         self.polledStatuses = polledStatuses
+        self.pollErrors = pollErrors
     }
 
     func start(profile: TunnelProfile) throws -> TunnelRuntimeStatus {
@@ -1737,7 +1974,7 @@ private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
             throw error
         }
         if !startStatuses.isEmpty {
-            return startStatuses.removeFirst()
+            return resolvedStatus(startStatuses.removeFirst(), profileID: profile.id)
         }
         return TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
     }
@@ -1749,17 +1986,91 @@ private final class RecordingTunnelRuntimeBridge: TunnelRuntimeBridging {
             throw error
         }
         if !stopStatuses.isEmpty {
-            return stopStatuses.removeFirst()
+            return resolvedStatus(stopStatuses.removeFirst(), profileID: profile.id)
         }
         return TunnelRuntimeStatus(profileId: profile.id, state: .stopped, message: "stopped")
     }
 
     func poll(profileID: String) throws -> TunnelRuntimeStatus {
         polledProfileIDs.append(profileID)
+        if !pollErrors.isEmpty, let error = pollErrors.removeFirst() {
+            throw error
+        }
         if !polledStatuses.isEmpty {
-            return polledStatuses.removeFirst()
+            return resolvedStatus(polledStatuses.removeFirst(), profileID: profileID)
         }
         return TunnelRuntimeStatus(profileId: profileID, state: .running, message: "running")
+    }
+
+    private func resolvedStatus(_ status: TunnelRuntimeStatus, profileID: String) -> TunnelRuntimeStatus {
+        guard status.profileId == matchingTunnelProfileIDToken else {
+            return status
+        }
+        return TunnelRuntimeStatus(profileId: profileID, state: status.state, message: status.message)
+    }
+}
+
+private final class BlockingStartTunnelRuntimeBridge: TunnelRuntimeBridging {
+    let startEntered = XCTestExpectation(description: "Remote browser proxy start entered")
+    let startReturned = XCTestExpectation(description: "Remote browser proxy start returned")
+    private let liveSessionContext: TunnelLiveSessionContext
+    private let startGate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var capturedOnMainThread = false
+    private var startedOnMainThread = true
+    private var receivedContext: TunnelLiveSessionContext?
+
+    init(liveSessionContext: TunnelLiveSessionContext) {
+        self.liveSessionContext = liveSessionContext
+    }
+
+    var snapshotWasCapturedOnMainThread: Bool {
+        lock.withLock { capturedOnMainThread }
+    }
+
+    var startWasCalledOnMainThread: Bool {
+        lock.withLock { startedOnMainThread }
+    }
+
+    var receivedLiveSessionContext: TunnelLiveSessionContext? {
+        lock.withLock { receivedContext }
+    }
+
+    func captureLiveSessionContext() -> TunnelLiveSessionContext? {
+        lock.withLock {
+            capturedOnMainThread = Thread.isMainThread
+        }
+        return liveSessionContext
+    }
+
+    func start(profile: TunnelProfile) throws -> TunnelRuntimeStatus {
+        try start(profile: profile, liveSessionContext: nil)
+    }
+
+    func start(
+        profile: TunnelProfile,
+        liveSessionContext: TunnelLiveSessionContext?
+    ) throws -> TunnelRuntimeStatus {
+        lock.withLock {
+            startedOnMainThread = Thread.isMainThread
+            receivedContext = liveSessionContext
+        }
+        startEntered.fulfill()
+        startGate.wait()
+        startReturned.fulfill()
+        return TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
+    }
+
+    func poll(profileID: String) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profileID, state: .running, message: "running")
+    }
+
+    func stop(profile: TunnelProfile, state: TunnelState) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profile.id, state: .stopped, message: "stopped")
+    }
+
+    func resumeStart() {
+        startGate.signal()
     }
 }
 
@@ -1816,6 +2127,7 @@ private struct TunnelRuntimeBridgeError: Error {
 private final class RecordingLiveTunnelCoreBridge: LiveTunnelCoreBridging {
     var startedConfigs: [SshConnectionConfig] = []
     var startedProfiles: [TunnelProfile] = []
+    var startedProxyJumps: [SshProxyJumpRuntimeConfig] = []
     var expectedFingerprints: [String] = []
 
     func checkLocalPortAvailable(_ profile: TunnelProfile) throws {}
@@ -1829,6 +2141,18 @@ private final class RecordingLiveTunnelCoreBridge: LiveTunnelCoreBridging {
         startedConfigs.append(config)
         startedProfiles.append(profile)
         expectedFingerprints.append(expectedFingerprintSHA256)
+        return TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
+    }
+
+    func startLiveLocalTunnelRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus {
+        startedConfigs.append(config)
+        startedProfiles.append(profile)
+        startedProxyJumps.append(proxyJump)
         return TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
     }
 

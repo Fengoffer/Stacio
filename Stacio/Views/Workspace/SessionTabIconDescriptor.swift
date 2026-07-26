@@ -8,6 +8,7 @@ public struct SessionTabIconDescriptor: Equatable {
     public let backgroundColor: NSColor
     public let foregroundColor: NSColor
     private let resourceIconID: String?
+    private let symbolName: String?
 
     public init(
         identifier: String,
@@ -15,7 +16,8 @@ public struct SessionTabIconDescriptor: Equatable {
         shortLabel: String,
         backgroundColor: NSColor,
         foregroundColor: NSColor = .white,
-        resourceIconID: String? = nil
+        resourceIconID: String? = nil,
+        symbolName: String? = nil
     ) {
         self.identifier = identifier
         self.accessibilityLabel = accessibilityLabel
@@ -23,6 +25,7 @@ public struct SessionTabIconDescriptor: Equatable {
         self.backgroundColor = backgroundColor
         self.foregroundColor = foregroundColor
         self.resourceIconID = resourceIconID
+        self.symbolName = symbolName
     }
 
     public static let sshDefault = SessionTabIconDescriptor(
@@ -41,6 +44,35 @@ public struct SessionTabIconDescriptor: Equatable {
             backgroundColor: .clear,
             resourceIconID: definition.id
         )
+    }
+
+    public static func transferProtocol(_ protocolName: String) -> SessionTabIconDescriptor {
+        switch protocolName.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
+        case "SCP":
+            return SessionTabIconDescriptor(
+                identifier: "scp-transfer",
+                accessibilityLabel: "SCP 文件传输",
+                shortLabel: "",
+                backgroundColor: .clear,
+                symbolName: "arrow.up.arrow.down.square.fill"
+            )
+        case "SFTP":
+            return SessionTabIconDescriptor(
+                identifier: "sftp-transfer",
+                accessibilityLabel: "SFTP 文件传输",
+                shortLabel: "",
+                backgroundColor: .clear,
+                symbolName: "folder.fill"
+            )
+        default:
+            return SessionTabIconDescriptor(
+                identifier: "file-transfer",
+                accessibilityLabel: "文件传输",
+                shortLabel: "",
+                backgroundColor: .clear,
+                symbolName: "doc.on.doc.fill"
+            )
+        }
     }
 
     public static func graphicsProtocol(_ protocolName: String) -> SessionTabIconDescriptor {
@@ -76,6 +108,16 @@ public struct SessionTabIconDescriptor: Equatable {
     }
 
     public func image(size: NSSize = NSSize(width: 18, height: 18)) -> NSImage {
+        if let symbolName,
+           let image = NSImage(
+               systemSymbolName: symbolName,
+               accessibilityDescription: accessibilityLabel
+           ) {
+            image.isTemplate = true
+            image.size = size
+            image.accessibilityDescription = accessibilityLabel
+            return image
+        }
         if let resourceIconID,
            let image = SessionIconCatalog.image(for: resourceIconID, size: size) {
             image.accessibilityDescription = accessibilityLabel

@@ -71,6 +71,62 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("/srv/app/current.log"))
     }
 
+    func testSCPFilesPaneUsesLocalAndRemoteColumnsWithStableMinimumWidths() throws {
+        let bridge = RetryingRemoteFilesBridge(results: [
+            .success([
+                RemoteFileEntry(kind: .directory, path: "/srv/app/releases", size: 0, linkTarget: nil)
+            ])
+        ])
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "scp_split_layout",
+            context: Self.liveContext(),
+            title: "远端文件",
+            bridge: bridge,
+            transferScheduler: nil,
+            initialRemotePath: "/srv/app",
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+
+        pane.loadView()
+        pane.view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 640)
+        pane.view.layoutSubtreeIfNeeded()
+
+        let splitView = pane.fileTransferSplitViewForTesting
+        XCTAssertEqual(splitView.arrangedSubviews.count, 2)
+        XCTAssertTrue(splitView.arrangedSubviews[0] === pane.localFilesViewControllerForTesting.view)
+        XCTAssertGreaterThanOrEqual(
+            pane.localFilesViewControllerForTesting.view.frame.width,
+            280
+        )
+        XCTAssertGreaterThanOrEqual(splitView.arrangedSubviews[1].frame.width, 360)
+        XCTAssertEqual(pane.localFilesViewControllerForTesting.title, "本地文件")
+        XCTAssertEqual(pane.localFilesViewControllerForTesting.runtimeID, "scp_split_layout_local")
+        XCTAssertTrue(pane.filesViewControllerForTesting.visibleTextSnapshot.contains("releases"))
+    }
+
+    func testSFTPFilesPaneUsesSFTPEngineAndPreservesRemoteListing() throws {
+        let bridge = RetryingRemoteFilesBridge(results: [
+            .success([
+                RemoteFileEntry(kind: .file, path: "~/config.json", size: 12, linkTarget: nil)
+            ])
+        ])
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "sftp_split_layout",
+            context: Self.liveContext(),
+            title: "SFTP 文件",
+            bridge: SFTPRemoteFilesBridgeAdapter(base: bridge),
+            transferScheduler: nil,
+            remoteProtocolName: "SFTP",
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+
+        pane.loadView()
+
+        XCTAssertEqual(pane.filesViewControllerForTesting.engineSummaryText, L10n.Files.sftpEngine)
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("config.json"))
+        XCTAssertEqual(bridge.events, ["sftp:~"])
+    }
+
     func testInitialLoadFailureShowsSanitizedChineseErrorAndRetryRestoresListing() throws {
         let bridge = RetryingRemoteFilesBridge(results: [
             .failure(SensitiveInitialListingError(
@@ -118,6 +174,81 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(pane.visibleTextSnapshotForTesting.localizedCaseInsensitiveContains("SFTP"))
     }
 
+    func testSCPConnectionStateCoversFileWorkspaceUntilInitialListingSucceeds() throws {
+        let bridge = BlockingInitialRemoteFilesBridge(
+            result: .success([
+                RemoteFileEntry(kind: .file, path: "/srv/app/current.log", size: 64, linkTarget: nil)
+            ])
+        )
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "scp_connecting",
+            context: Self.liveContext(),
+            title: "远端文件",
+            bridge: bridge,
+            transferScheduler: nil,
+            initialRemotePath: "/srv/app",
+            initialLoadPresentation: .connectionState,
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+
+        pane.loadView()
+
+        XCTAssertTrue(pane.isInitialConnectionStateVisibleForTesting)
+        XCTAssertTrue(pane.isFilesWorkspaceHiddenForTesting)
+        XCTAssertEqual(
+            pane.visibleTextSnapshotForTesting,
+            "正在连接...\nSCP · deploy@files.example.com:22"
+        )
+        XCTAssertTrue(bridge.waitUntilStarted())
+
+        bridge.release()
+
+        XCTAssertTrue(waitUntil {
+            pane.isInitialConnectionStateVisibleForTesting == false
+                && pane.visibleTextSnapshotForTesting.contains("current.log")
+        })
+        XCTAssertFalse(pane.isFilesWorkspaceHiddenForTesting)
+        XCTAssertNil(pane.initialLoadError)
+    }
+
+    func testSCPConnectionFailureRetryRestoresFilesWorkspace() throws {
+        let bridge = RetryingRemoteFilesBridge(results: [
+            .failure(SensitiveInitialListingError(message: "Permission denied for scp-password")),
+            .success([
+                RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+            ])
+        ])
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "scp_failure_retry",
+            context: Self.liveContext(),
+            title: "远端文件",
+            bridge: bridge,
+            transferScheduler: nil,
+            initialLoadPresentation: .connectionState,
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+
+        pane.loadView()
+
+        XCTAssertTrue(waitUntil {
+            pane.isInitialConnectionStateVisibleForTesting
+                && pane.visibleTextSnapshotForTesting.contains("连接失败")
+        })
+        let retryButton = try XCTUnwrap(
+            pane.view.firstSubview(withIdentifier: "Stacio.ConnectionState.retry") as? NSButton
+        )
+        XCTAssertFalse(retryButton.isHidden)
+
+        retryButton.performClick(nil)
+
+        XCTAssertTrue(waitUntil {
+            pane.isInitialConnectionStateVisibleForTesting == false
+                && pane.visibleTextSnapshotForTesting.contains("app.log")
+        })
+        XCTAssertFalse(pane.isFilesWorkspaceHiddenForTesting)
+        XCTAssertNil(pane.initialLoadError)
+    }
+
     func testRightWorkspacePresentsEditorBesideFilesWithoutCoveringFileList() throws {
         let fileURL = try makeTemporaryFile(name: "config.json", contents: #"{"enabled": false}"#)
         let bridge = RetryingRemoteFilesBridge(results: [
@@ -148,6 +279,7 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
         let filesFrame = filesView.convert(filesView.bounds, to: pane.view)
         let editorFrame = editor.view.convert(editor.view.bounds, to: pane.view)
+        let rightWorkspaceWidth = splitView.bounds.width
 
         XCTAssertEqual(splitView.arrangedSubviews.count, 2)
         XCTAssertTrue(splitView.arrangedSubviews[0] === editor.view)
@@ -155,7 +287,7 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(filesFrame.intersects(editorFrame))
         XCTAssertLessThan(editorFrame.minX, filesFrame.minX)
         XCTAssertGreaterThanOrEqual(filesFrame.width, 240)
-        XCTAssertGreaterThanOrEqual(editorFrame.width, pane.view.bounds.width * 0.7 - splitView.dividerThickness)
+        XCTAssertGreaterThanOrEqual(editorFrame.width, rightWorkspaceWidth * 0.6)
         XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("logs"))
         XCTAssertNotNil(pane.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
@@ -175,7 +307,15 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
 
         pane.loadView()
         pane.presentTextEditorForTesting(localURL: fileURL, saveHandler: nil)
-        pane.textEditorViewControllerForTesting?.requestAIForActiveDocumentForTesting()
+        let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
+
+        XCTAssertEqual(editor.activeFileNameForTesting, "nginx.conf")
+        XCTAssertTrue(waitUntil {
+            editor.hasPendingLocalDocumentLoadsForTesting == false
+                && editor.canEditTextForTesting
+                && editor.currentTextForTesting == "server { listen 80; }\n"
+        })
+        editor.requestAIForActiveDocumentForTesting()
 
         let prompt = try XCTUnwrap(prompts.first)
         XCTAssertTrue(prompt.contains("nginx.conf"))
@@ -224,7 +364,7 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         )
         let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
         let editorFrame = editor.view.convert(editor.view.bounds, to: pane.view)
-        XCTAssertGreaterThanOrEqual(editorFrame.width, pane.view.bounds.width * 0.7 - splitView.dividerThickness)
+        XCTAssertGreaterThanOrEqual(editorFrame.width, splitView.bounds.width * 0.6)
     }
 
     func testRightWorkspaceAllowsEditorToExpandUntilFilesPaneIsNarrow() throws {
@@ -253,7 +393,10 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         let editorFrame = editor.view.convert(editor.view.bounds, to: pane.view)
 
         XCTAssertLessThanOrEqual(filesFrame.width, 300)
-        XCTAssertGreaterThanOrEqual(editorFrame.width, 890)
+        XCTAssertGreaterThanOrEqual(
+            editorFrame.width,
+            splitView.bounds.width - filesFrame.width - splitView.dividerThickness - 1
+        )
         XCTAssertLessThan(editorFrame.minX, filesFrame.minX)
         XCTAssertFalse(filesFrame.intersects(editorFrame))
     }
@@ -494,7 +637,24 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
             saveHandler: nil,
             closeConfirmer: confirmer
         )
-        pane.textEditorViewControllerForTesting?.replaceTextForTesting("debug=true\n")
+        let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
+        var dirtyEvents = [editor.hasUnsavedChangesForTesting]
+        editor.onDirtyStateChanged = { dirtyEvents.append($0) }
+        XCTAssertEqual(editor.activeFileNameForTesting, "app.conf")
+        XCTAssertTrue(waitUntil {
+            editor.hasPendingLocalDocumentLoadsForTesting == false
+                && editor.canEditTextForTesting
+                && editor.currentTextForTesting == "debug=false\n"
+        })
+        XCTAssertFalse(editor.hasUnsavedChangesForTesting)
+        XCTAssertTrue(editor.dirtyTabTitlesForTesting.isEmpty)
+
+        editor.replaceTextForTesting("debug=true\n")
+
+        XCTAssertEqual(dirtyEvents.first, false)
+        XCTAssertEqual(dirtyEvents.last, true)
+        XCTAssertTrue(editor.hasUnsavedChangesForTesting)
+        XCTAssertEqual(editor.dirtyTabTitlesForTesting, ["app.conf"])
 
         XCTAssertFalse(pane.closeRightWorkspaceForTesting())
 
@@ -761,6 +921,24 @@ private final class RetryingRemoteFilesBridge: RemoteFilesBridging {
         }
     }
 
+    func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        events.append("sftp:\(remotePath)")
+        guard !results.isEmpty else {
+            return []
+        }
+        switch results.removeFirst() {
+        case let .success(entries):
+            return entries
+        case let .failure(error):
+            throw error
+        }
+    }
+
     func createLiveRemoteDirectory(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -791,6 +969,82 @@ private final class RetryingRemoteFilesBridge: RemoteFilesBridging {
         remotePath: String,
         mode: String
     ) throws {}
+}
+
+private final class BlockingInitialRemoteFilesBridge: RemoteFilesBridging {
+    private let result: Result<[RemoteFileEntry], Error>
+    private let started = DispatchSemaphore(value: 0)
+    private let releaseGate = DispatchSemaphore(value: 0)
+
+    init(result: Result<[RemoteFileEntry], Error>) {
+        self.result = result
+    }
+
+    func waitUntilStarted(timeout: TimeInterval = 1) -> Bool {
+        started.wait(timeout: .now() + timeout) == .success
+    }
+
+    func release() {
+        releaseGate.signal()
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        []
+    }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try performInitialListing()
+    }
+
+    func listLiveFTPDirectory(
+        config: FtpConnectionConfig,
+        secret: FtpAuthSecret,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try performInitialListing()
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {}
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {}
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {}
+
+    private func performInitialListing() throws -> [RemoteFileEntry] {
+        started.signal()
+        _ = releaseGate.wait(timeout: .now() + 2)
+        return try result.get()
+    }
 }
 
 private final class DelayedRemoteFilesPaneReadBridge: RemoteFilesBridging {

@@ -126,7 +126,7 @@ pub fn preview_legacy_ini_import(
 
         let Some(parsed_target) = parse_legacy_ini_session_target(raw_value.trim())? else {
             warnings.push(format!(
-                "{raw_name} 已跳过；当前仅导入 SSH、FTP、Telnet 和 VNC 会话"
+                "{raw_name} 已跳过；当前仅导入 SSH、SFTP、SCP、FTP、Telnet 和 VNC 会话"
             ));
             continue;
         };
@@ -215,7 +215,10 @@ fn stacio_json_preview_session(
     let (config_json, ignored_configuration) = sanitized_import_config_json(exported.config_json);
     let session = exported.session;
     let protocol = session.protocol.trim().to_ascii_lowercase();
-    if !matches!(protocol.as_str(), "ssh" | "ftp" | "telnet" | "vnc") {
+    if !matches!(
+        protocol.as_str(),
+        "ssh" | "sftp" | "scp" | "ftp" | "telnet" | "vnc"
+    ) {
         return (None, ignored_configuration);
     }
     let Some(port) = u16::try_from(session.port).ok().filter(|port| *port > 0) else {
@@ -394,7 +397,7 @@ fn sanitized_url_userinfo(userinfo: &str) -> Result<(Option<String>, bool), Sess
 
 fn default_import_port(protocol: &str) -> Option<u16> {
     match protocol {
-        "ssh" => Some(22),
+        "ssh" | "sftp" | "scp" => Some(22),
         "ftp" => Some(21),
         "telnet" => Some(23),
         "vnc" => Some(5900),
@@ -830,5 +833,62 @@ mod import_tests {
             .any(|warning| warning.contains("URL 用户信息包含密码，已忽略")));
         assert!(!serialized.contains("super-secret"));
         assert!(!serialized.contains("ftp-secret"));
+    }
+
+    #[test]
+    fn previews_legacy_ini_supports_sftp_and_scp_with_ssh_port_defaults() {
+        let text = "Production/SFTP=sftp://deploy@sftp.example.com\n\
+                    Production/SCP=scp://deploy@scp.example.com";
+
+        let preview = preview_legacy_ini_import(text, vec![]).expect("preview");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].protocol, "sftp");
+        assert_eq!(preview.sessions[0].port, 22);
+        assert_eq!(preview.sessions[1].protocol, "scp");
+        assert_eq!(preview.sessions[1].port, 22);
+        assert!(preview.warnings.is_empty());
+    }
+
+    #[test]
+    fn previews_stacio_json_supports_sftp_and_scp_sessions() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [
+                {
+                    "id": "sftp_session",
+                    "folder_id": null,
+                    "name": "SFTP",
+                    "protocol": "sftp",
+                    "host": "sftp.example.com",
+                    "port": 22,
+                    "username": "deploy",
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                },
+                {
+                    "id": "scp_session",
+                    "folder_id": null,
+                    "name": "SCP",
+                    "protocol": "scp",
+                    "host": "scp.example.com",
+                    "port": 22,
+                    "username": "deploy",
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                }
+            ]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].protocol, "sftp");
+        assert_eq!(preview.sessions[1].protocol, "scp");
     }
 }

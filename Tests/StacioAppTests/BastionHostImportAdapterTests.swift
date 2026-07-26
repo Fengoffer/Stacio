@@ -87,4 +87,34 @@ final class BastionHostImportAdapterTests: XCTestCase {
         )
         XCTAssertTrue(try XCTUnwrap(enriched.sessions.first?.configJSON).contains("sangfor"))
     }
+
+    func testTopsecCompositeUsernameIsDetectedAndExpandedIntoTargetMetadata() throws {
+        let source = ExternalSessionImportPayload(
+            sessions: [
+                ExternalImportedSession(
+                    name: "Asset",
+                    folderPath: nil,
+                    protocolName: "ssh",
+                    host: "bastion.example.com",
+                    port: 2222,
+                    username: "opaque-account@default@SSH@ops@10.0.0.8@22",
+                    privateKeyPath: nil,
+                    credential: nil
+                )
+            ],
+            warnings: []
+        )
+
+        let enriched = BastionHostImportAdapter.addingDetectedVendorMetadata(
+            to: source,
+            sourceName: "Asset.xsh",
+            contents: "[CONNECTION:AUTHENTICATION]\nUserName=opaque-account@default@SSH@ops@10.0.0.8@22"
+        )
+        let config = try XCTUnwrap(enriched.sessions.first?.configJSON)
+
+        XCTAssertTrue(config.contains("\"bastionVendor\":\"topsec\""))
+        XCTAssertTrue(config.contains("\"bastionTargetHost\":\"10.0.0.8\""))
+        XCTAssertTrue(config.contains("\"bastionTargetPort\":22"))
+        XCTAssertTrue(config.contains("\"bastionTargetUsername\":\"ops\""))
+    }
 }

@@ -83,6 +83,8 @@ fileprivate func stacioUserFacingRuntimeMessage(_ message: String, prefix: Strin
         return "远程路径不安全"
     case "FILES_REMOTE_COMMAND_FAILED":
         return "远程文件操作失败"
+    case "FILES_READ_SESSION_NOT_FOUND":
+        return "远端文件读取会话已关闭，请重新打开文件"
     case "FILES_REMOTE_LIST_PARSE_FAILED":
         return "远程目录列表解析失败"
     default:

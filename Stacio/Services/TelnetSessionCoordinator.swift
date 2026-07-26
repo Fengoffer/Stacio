@@ -1,6 +1,10 @@
 import Foundation
 import StacioCoreBindings
 
+private struct TelnetUncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 public enum TelnetSessionError: LocalizedError, Equatable {
     case startFailed(message: String)
 
@@ -36,6 +40,17 @@ public struct CoreBridgeTelnetRuntimeStarter: TelnetRuntimeStarting {
 public protocol TelnetSessionStarting: AnyObject {
     @discardableResult
     func start(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus
+
+    @discardableResult
+    func openSessionTab(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus
+}
+
+@MainActor
+public extension TelnetSessionStarting {
+    @discardableResult
+    func openSessionTab(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus {
+        try start(config: config, title: title)
+    }
 }
 
 @MainActor
@@ -61,14 +76,7 @@ public final class TelnetSessionCoordinator: TelnetSessionStarting {
     public func start(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus {
         let status: LiveShellStatus
         do {
-            status = try runtimeStarter.startLiveTelnetShellRuntime(
-                config: config,
-                cols: defaultCols,
-                rows: defaultRows
-            )
-            guard status.status == "running" else {
-                throw TelnetSessionError.startFailed(message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic))
-            }
+            status = try startRuntime(config: config)
         } catch {
             throw TelnetSessionError.startFailed(message: Self.diagnosticMessage(for: error))
         }
@@ -76,7 +84,79 @@ public final class TelnetSessionCoordinator: TelnetSessionStarting {
         return status
     }
 
-    public static func diagnosticMessage(for error: Error) -> String {
+    @discardableResult
+    public func openSessionTab(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus {
+        guard let workspace else {
+            throw RemoteTerminalLifecycleError.reconnectUnavailable
+        }
+        let pane = workspace.openConnectingRemoteShell(
+            title: title,
+            reconnecter: nil,
+            connectionKind: .telnet,
+            liveSessionContext: nil
+        )
+        pane.setConnectionEndpoint(Self.endpointDescription(for: config))
+        let pendingStatus = LiveShellStatus(
+            runtimeId: pane.runtimeID,
+            status: "connecting",
+            diagnostic: L10n.TerminalLifecycle.connecting
+        )
+        startRuntimeInBackground(config: config) { [weak pane] result in
+            switch result {
+            case let .success(status):
+                pane?.attachConnectedRuntime(status: status)
+            case let .failure(error):
+                pane?.displayConnectionFailure(Self.diagnosticMessage(for: error))
+            }
+        }
+        return pendingStatus
+    }
+
+    private func startRuntime(config: TelnetConnectionConfig) throws -> LiveShellStatus {
+        let status = try runtimeStarter.startLiveTelnetShellRuntime(
+            config: config,
+            cols: defaultCols,
+            rows: defaultRows
+        )
+        guard status.status == "running" else {
+            throw TelnetSessionError.startFailed(
+                message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic)
+            )
+        }
+        return status
+    }
+
+    private func startRuntimeInBackground(
+        config: TelnetConnectionConfig,
+        completion: @escaping @MainActor (Result<LiveShellStatus, Error>) -> Void
+    ) {
+        let runtimeStarter = TelnetUncheckedSendable(value: runtimeStarter)
+        let defaultCols = defaultCols
+        let defaultRows = defaultRows
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result: Result<LiveShellStatus, Error>
+            do {
+                let status = try runtimeStarter.value.startLiveTelnetShellRuntime(
+                    config: config,
+                    cols: defaultCols,
+                    rows: defaultRows
+                )
+                guard status.status == "running" else {
+                    throw TelnetSessionError.startFailed(
+                        message: Self.diagnosticMessage(forStatusDiagnostic: status.diagnostic)
+                    )
+                }
+                result = .success(status)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    nonisolated public static func diagnosticMessage(for error: Error) -> String {
         if case let TelnetSessionError.startFailed(message) = error {
             return message
         }
@@ -95,8 +175,14 @@ public final class TelnetSessionCoordinator: TelnetSessionStarting {
         return "Telnet 连接失败：\(RuntimeDiagnosticFormatter.userMessage(for: error))"
     }
 
-    private static func diagnosticMessage(forStatusDiagnostic diagnostic: String) -> String {
+    nonisolated private static func diagnosticMessage(forStatusDiagnostic diagnostic: String) -> String {
         let message = RuntimeDiagnosticFormatter.userMessage(diagnostic)
         return "Telnet 连接失败：\(message.isEmpty ? "Telnet 运行时未进入运行状态。" : message)"
+    }
+
+    private static func endpointDescription(for config: TelnetConnectionConfig) -> String {
+        let host = "\(config.host):\(config.port)"
+        let username = config.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return username.isEmpty ? host : "\(username)@\(host)"
     }
 }

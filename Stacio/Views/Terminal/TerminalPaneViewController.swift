@@ -60,6 +60,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     public var keyboardFocusView: NSView { terminalView }
     public var onUserInput: ((TerminalPaneViewController, [UInt8]) -> Bool)?
     public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
+    public var onKeyboardFocusRequested: (() -> Void)?
     public var onCommandSubmitted: ((TerminalPaneViewController, String) -> Void)?
     public var onCommandFinished: ((TerminalPaneViewController) -> Void)?
     public private(set) var currentLocalDirectory: String?
@@ -138,6 +139,9 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     public override func loadView() {
         let container = TerminalFocusContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
+        container.onTerminalFocusRequested = { [weak self] in
+            self?.onKeyboardFocusRequested?()
+        }
         container.onEffectiveAppearanceChanged = { [weak self] in
             self?.terminalEffectiveAppearanceDidChange()
         }

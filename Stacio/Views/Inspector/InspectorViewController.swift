@@ -2,6 +2,10 @@ import AppKit
 import StacioAgentBridge
 import StacioCoreBindings
 
+private struct InspectorUncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 public final class InspectorViewController: NSViewController {
     private static let headerTopMargin: CGFloat = 18
     private static let headerHorizontalMargin: CGFloat = 12
@@ -45,6 +49,17 @@ public final class InspectorViewController: NSViewController {
             case .macros: L10n.Inspector.macros
             case .commandHistory: L10n.Inspector.commandHistory
             case .ai: L10n.AI.title
+            }
+        }
+
+        var workspaceCapability: WorkspaceCapability? {
+            switch self {
+            case .files: .files
+            case .tunnels: .tunnels
+            case .browser: .browser
+            case .logs: .diagnostics
+            case .ai: .ai
+            case .macros, .commandHistory: nil
             }
         }
     }
@@ -93,13 +108,19 @@ public final class InspectorViewController: NSViewController {
     private let transferHistoryStore: SCPTransferHistoryStoring?
     private let tunnelProfileStore: TunnelProfileStoring?
     private let tunnelLiveSessionContextProvider: () -> TunnelLiveSessionContext?
+    private let workspaceSessionProtocolProvider: () -> WorkspaceSessionProtocol
     private let remoteFilePathTerminalSender: (String) -> Void
     private let filesEmbeddedCapabilityOpenHandler: () -> Void
     private let filesEmbeddedCapabilityCloseHandler: (CGFloat) -> Void
     private let tunnelLiveBridge: LiveTunnelCoreBridging
     private let remoteBrowserRuntimeBridge: TunnelRuntimeBridging?
+    private let remoteChromiumRuntime: RemoteChromiumRuntimeControlling?
     private let remoteBrowserLocalPortProvider: () -> UInt16
+    private let remoteBrowserStartsProxyAsynchronously: Bool
     private let remoteFilesBridge: RemoteFilesBridging
+    private let filesTransferSchedulerOverride: SCPTransferScheduling?
+    private let remoteBrowserDownloadDestinationPicker: RemoteFileDownloadDestinationPicking
+    private let remoteBrowserDownloadLog: StacioLogWriting
     private let commandHistoryProvider: () -> [TerminalCommandHistoryEntry]
     private let commandHistoryPasteHandler: (String) -> Void
     private let terminalMacroProvider: () -> [TerminalMacroRecord]
@@ -131,6 +152,8 @@ public final class InspectorViewController: NSViewController {
     private var pendingDirectoryFollowWorkItem: DispatchWorkItem?
     private var lastRequestedRemoteFilesPath: String?
     private let directoryFollowDebounceInterval: TimeInterval = 0.08
+    private var aiContextNeedsRefresh = false
+    private var remoteBrowserContextNeedsRefresh = false
     public private(set) var transferQueueViewController: TransferQueueViewController?
     public private(set) var transferQueueCoordinator: TransferQueueCoordinator?
     public private(set) var tunnelsViewController: TunnelsViewController?
@@ -148,14 +171,20 @@ public final class InspectorViewController: NSViewController {
         agentAuditStore: AgentActionAuditListing? = nil,
         importReportStore: ImportReportListing? = nil,
         aiAssistantViewController: AIAssistantPanelViewController? = nil,
+        workspaceSessionProtocolProvider: @escaping () -> WorkspaceSessionProtocol = { .noSession },
         tunnelLiveSessionContextProvider: @escaping () -> TunnelLiveSessionContext? = { nil },
         remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in },
         filesEmbeddedCapabilityOpenHandler: @escaping () -> Void = {},
         filesEmbeddedCapabilityCloseHandler: @escaping (CGFloat) -> Void = { _ in },
         tunnelLiveBridge: LiveTunnelCoreBridging = CoreLiveTunnelBridge(),
         remoteBrowserRuntimeBridge: TunnelRuntimeBridging? = nil,
+        remoteChromiumRuntime: RemoteChromiumRuntimeControlling? = nil,
         remoteBrowserLocalPortProvider: @escaping () -> UInt16 = RemoteNetworkBrowserViewController.availableLoopbackPortForInspector,
+        remoteBrowserStartsProxyAsynchronously: Bool = true,
         remoteFilesBridge: RemoteFilesBridging = CoreBridgeRemoteFilesBridge(),
+        filesTransferSchedulerOverride: SCPTransferScheduling? = nil,
+        remoteBrowserDownloadDestinationPicker: RemoteFileDownloadDestinationPicking = AppKitRemoteFileDownloadDestinationPicker(),
+        remoteBrowserDownloadLog: StacioLogWriting = StacioLogStore.shared,
         commandHistoryProvider: @escaping () -> [TerminalCommandHistoryEntry] = { [] },
         commandHistoryPasteHandler: @escaping (String) -> Void = { _ in },
         terminalMacroProvider: @escaping () -> [TerminalMacroRecord] = { [] },
@@ -178,14 +207,20 @@ public final class InspectorViewController: NSViewController {
         self.agentAuditStore = agentAuditStore
         self.importReportStore = importReportStore
         self.aiAssistantViewController = aiAssistantViewController
+        self.workspaceSessionProtocolProvider = workspaceSessionProtocolProvider
         self.tunnelLiveSessionContextProvider = tunnelLiveSessionContextProvider
         self.remoteFilePathTerminalSender = remoteFilePathTerminalSender
         self.filesEmbeddedCapabilityOpenHandler = filesEmbeddedCapabilityOpenHandler
         self.filesEmbeddedCapabilityCloseHandler = filesEmbeddedCapabilityCloseHandler
         self.tunnelLiveBridge = tunnelLiveBridge
         self.remoteBrowserRuntimeBridge = remoteBrowserRuntimeBridge
+        self.remoteChromiumRuntime = remoteChromiumRuntime
         self.remoteBrowserLocalPortProvider = remoteBrowserLocalPortProvider
+        self.remoteBrowserStartsProxyAsynchronously = remoteBrowserStartsProxyAsynchronously
         self.remoteFilesBridge = remoteFilesBridge
+        self.filesTransferSchedulerOverride = filesTransferSchedulerOverride
+        self.remoteBrowserDownloadDestinationPicker = remoteBrowserDownloadDestinationPicker
+        self.remoteBrowserDownloadLog = remoteBrowserDownloadLog
         self.commandHistoryProvider = commandHistoryProvider
         self.commandHistoryPasteHandler = commandHistoryPasteHandler
         self.terminalMacroProvider = terminalMacroProvider
@@ -313,7 +348,8 @@ public final class InspectorViewController: NSViewController {
             liveSessionRuntimeIDProvider: { [weak self] in
                 self?.remoteFilesBinding?.runtimeID
             },
-            transferScheduler: transferQueueCoordinator,
+            transferScheduler: filesTransferSchedulerOverride ?? transferQueueCoordinator,
+            downloadDestinationPicker: remoteBrowserDownloadDestinationPicker,
             remoteEditSessionIDProvider: { [weak self] in
                 self?.remoteFilesBinding?.runtimeID ?? "inspector"
             }
@@ -340,8 +376,11 @@ public final class InspectorViewController: NSViewController {
         )
         let remoteBrowser = RemoteNetworkBrowserViewController(
             runtimeBridge: remoteBrowserBridge,
-            localPortProvider: remoteBrowserLocalPortProvider
+            localPortProvider: remoteBrowserLocalPortProvider,
+            startsProxyAsynchronously: remoteBrowserStartsProxyAsynchronously,
+            remoteChromiumRuntime: remoteChromiumRuntime
         )
+        remoteBrowser.remoteDownloadDelegate = self
         remoteBrowserViewController = remoteBrowser
 
         let aiAssistant = aiAssistantViewController ?? makeDefaultAIAssistantViewController()
@@ -474,6 +513,7 @@ public final class InspectorViewController: NSViewController {
         updateEditorActionControls(.closed)
         didFinishInitialSectionSetup = true
         view = container
+        refreshWorkspaceCapabilities()
     }
 
     public override func viewDidLayout() {
@@ -589,6 +629,21 @@ public final class InspectorViewController: NSViewController {
         switchToSection(section)
     }
 
+    public func refreshWorkspaceCapabilities() {
+        guard isViewLoaded else { return }
+        for section in Section.allCases {
+            let isEnabled = allowsWorkspaceSection(section)
+            sectionControl.setEnabled(isEnabled, forSegment: section.rawValue)
+            sectionControl.setToolTip(
+                isEnabled ? section.label : L10n.Workbench.sshSessionRequiredTooltip,
+                forSegment: section.rawValue
+            )
+        }
+        if allowsWorkspaceSection(currentSection) == false {
+            switchToSection(.macros)
+        }
+    }
+
     public func selectFilesTabForTesting() {
         switchToSection(.files)
     }
@@ -635,6 +690,7 @@ public final class InspectorViewController: NSViewController {
 
     @discardableResult
     public func selectFilesTabAndLoadCurrentDirectory(remotePath: String = "~") throws -> [RemoteFileEntry] {
+        guard allowsWorkspaceSection(.files) else { return [] }
         cancelPendingDirectoryFollow()
         remoteFilesBinding = nil
         isRemoteFilesBindingDisconnected = false
@@ -649,6 +705,7 @@ public final class InspectorViewController: NSViewController {
 
     @discardableResult
     public func selectFilesTabAndLoadCurrentDirectory(binding: RemoteFilesBinding) throws -> [RemoteFileEntry] {
+        guard allowsWorkspaceSection(.files) else { return [] }
         cancelPendingDirectoryFollow()
         remoteFilesBinding = binding
         isRemoteFilesBindingDisconnected = false
@@ -664,6 +721,7 @@ public final class InspectorViewController: NSViewController {
     }
 
     public func showFilesInitialLoadError(_ error: Error) {
+        guard allowsWorkspaceSection(.files) else { return }
         switchToSection(.files)
         filesCoordinator?.showInitialLoadError(error)
     }
@@ -793,9 +851,23 @@ public final class InspectorViewController: NSViewController {
     }
 
     public func refreshCurrentTerminalContextPanels() {
-        reloadCommandHistory()
-        aiAssistantViewController?.followCurrentTerminalContext()
-        remoteBrowserViewController?.reloadForCurrentRemoteContext()
+        if currentSection == .commandHistory {
+            reloadCommandHistory()
+        }
+
+        if currentSection == .ai {
+            aiAssistantViewController?.followCurrentTerminalContext()
+            aiContextNeedsRefresh = false
+        } else {
+            aiContextNeedsRefresh = true
+        }
+
+        if currentSection == .browser {
+            remoteBrowserViewController?.reloadForCurrentRemoteContext()
+            remoteBrowserContextNeedsRefresh = false
+        } else {
+            remoteBrowserContextNeedsRefresh = true
+        }
     }
 
     public func reloadTerminalMacros() {
@@ -981,6 +1053,7 @@ public final class InspectorViewController: NSViewController {
     }
 
     private func showAIAssistantForFileQuestion(_ question: String) {
+        guard allowsWorkspaceSection(.ai) else { return }
         selectAIAssistantTab()
         aiAssistantViewController?.refreshForCurrentContext()
         aiAssistantViewController?.prefillQuestion(question)
@@ -1033,11 +1106,16 @@ public final class InspectorViewController: NSViewController {
     }
 
     private func switchToSection(_ section: Section) {
+        guard allowsWorkspaceSection(section) else {
+            sectionControl.selectedSegment = currentSection.rawValue
+            return
+        }
         guard currentSection != section || contentContainer.subviews.isEmpty else {
             return
         }
         if currentSection == .files,
            section != .files,
+           allowsWorkspaceSection(currentSection),
            filesViewController?.closeEmbeddedEditorIfNeeded() == false
         {
             sectionControl.selectedSegment = currentSection.rawValue
@@ -1056,6 +1134,7 @@ public final class InspectorViewController: NSViewController {
             return
         }
 
+        let wasViewLoaded = controller.isViewLoaded
         let childView = controller.view
         childView.translatesAutoresizingMaskIntoConstraints = true
         childView.autoresizingMask = [.width, .height]
@@ -1065,7 +1144,33 @@ public final class InspectorViewController: NSViewController {
         loadCurrentFilesDirectoryIfNeeded(for: section)
         loadDiagnosticsActivityIfNeeded(for: section)
         loadCommandHistoryIfNeeded(for: section)
+        refreshDeferredTerminalContextIfNeeded(for: section, wasViewLoaded: wasViewLoaded)
         synchronizeHeaderHorizontalLayout()
+    }
+
+    private func allowsWorkspaceSection(_ section: Section) -> Bool {
+        guard let capability = section.workspaceCapability else { return true }
+        return WorkspaceCapabilityPolicy.allows(
+            capability,
+            for: workspaceSessionProtocolProvider()
+        )
+    }
+
+    private func refreshDeferredTerminalContextIfNeeded(for section: Section, wasViewLoaded: Bool) {
+        switch section {
+        case .ai:
+            if wasViewLoaded, aiContextNeedsRefresh {
+                aiAssistantViewController?.followCurrentTerminalContext()
+            }
+            aiContextNeedsRefresh = false
+        case .browser:
+            if wasViewLoaded, remoteBrowserContextNeedsRefresh {
+                remoteBrowserViewController?.reloadForCurrentRemoteContext()
+            }
+            remoteBrowserContextNeedsRefresh = false
+        default:
+            break
+        }
     }
 
     private func updateContentContainerTopConstraint(for section: Section) {
@@ -1366,6 +1471,57 @@ public final class InspectorViewController: NSViewController {
             button.heightAnchor.constraint(equalToConstant: 26)
         ])
         return button
+    }
+}
+
+extension InspectorViewController: RemoteChromiumDownloadDelegate {
+    public func remoteChromiumDidCompleteDownload(_ download: RemoteChromiumDownload) {
+        guard let filesCoordinator,
+              let remoteBrowserViewController
+        else {
+            return
+        }
+        let downloadLog = remoteBrowserDownloadLog
+        let acknowledge = {
+            Self.acknowledgeRemoteChromiumDownload(
+                download,
+                using: remoteBrowserViewController,
+                log: downloadLog
+            )
+        }
+        let result = filesCoordinator.scheduleRemoteBrowserDownload(
+            download,
+            onLocalTransferVerified: acknowledge
+        )
+        if result == .discarded {
+            acknowledge()
+        }
+    }
+
+    private static func acknowledgeRemoteChromiumDownload(
+        _ download: RemoteChromiumDownload,
+        using remoteBrowserViewController: RemoteNetworkBrowserViewController,
+        log: StacioLogWriting
+    ) {
+        let logBox = InspectorUncheckedSendable(value: log)
+        let accepted = remoteBrowserViewController.acknowledgeRemoteChromiumDownload(
+            download,
+            completion: { result in
+                guard case let .failure(error) = result else { return }
+                logBox.value.append(
+                    level: .warning,
+                    category: "Browser",
+                    message: "remote.browser.download.cleanup.failed path=\(download.remotePath) error=\(RuntimeDiagnosticFormatter.userMessage(for: error))"
+                )
+            }
+        )
+        if accepted == false {
+            log.append(
+                level: .warning,
+                category: "Browser",
+                message: "remote.browser.download.cleanup.not-accepted path=\(download.remotePath)"
+            )
+        }
     }
 }
 

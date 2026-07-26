@@ -2435,6 +2435,46 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.terminalOutputTranscript.contains("FengLee@FengStor:~$ "))
     }
 
+    func testConnectionFailureKeepsUnifiedStateVisibleAndRetryRestoresTerminal() throws {
+        let reconnecter = RecordingRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_recovered", status: "running", diagnostic: "running")
+        )
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "pending_ssh_failure_state",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            bridge: RecordingRemoteTerminalBridge(outputBatches: []),
+            reconnecter: reconnecter,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.displayConnectionStarting()
+        controller.displayConnectionFailure("SSH 连接超时")
+
+        XCTAssertEqual(controller.lifecycleState, .disconnected)
+        XCTAssertTrue(controller.isConnectionStateVisibleForTesting)
+        XCTAssertFalse(controller.isLifecycleBarVisibleForTesting)
+        XCTAssertTrue(controller.isTerminalContentHiddenForTesting)
+        XCTAssertEqual(
+            controller.connectionStateVisibleTextForTesting,
+            "连接失败：SSH 连接超时\nSSH · deploy@example.com"
+        )
+        XCTAssertTrue(controller.view.firstSubview(withIdentifier: "Stacio.ConnectionState.failureIcon")?.isHidden == false)
+        let retryButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.ConnectionState.retry") as? NSButton
+        )
+        XCTAssertFalse(retryButton.isHidden)
+
+        retryButton.performClick(nil)
+
+        XCTAssertEqual(controller.lifecycleState, .running)
+        XCTAssertEqual(controller.runtimeID, "term_recovered")
+        XCTAssertFalse(controller.isConnectionStateVisibleForTesting)
+        XCTAssertFalse(controller.isTerminalContentHiddenForTesting)
+        XCTAssertEqual(reconnecter.reconnectedTitles, ["deploy@example.com"])
+    }
+
     func testTransientInitialSSHFailureStaysConnectingWhileAutomaticRetryIsPending() {
         let controller = RemoteTerminalPaneViewController(
             runtimeID: "pending_ssh_transient",
@@ -2585,7 +2625,123 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.lifecycleState, .connecting)
         XCTAssertEqual(controller.lifecycleMessageForTesting, L10n.TerminalLifecycle.connecting)
-        XCTAssertTrue(controller.isLifecycleBarVisibleForTesting)
+        XCTAssertFalse(controller.isLifecycleBarVisibleForTesting)
+        XCTAssertTrue(controller.isConnectionStateVisibleForTesting)
+        XCTAssertTrue(controller.isTerminalContentHiddenForTesting)
+        XCTAssertEqual(
+            controller.connectionStateVisibleTextForTesting,
+            "正在连接...\nSSH · deploy@example.com"
+        )
+    }
+
+    func testConnectionStateDoesNotTruncateEndpointWhenWorkspaceHasEnoughWidth() throws {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 560))
+        let stateView = SessionConnectionStateView(
+            protocolName: "SSH",
+            endpoint: "deploy@192.168.124.100:22"
+        )
+        container.addSubview(stateView)
+        NSLayoutConstraint.activate([
+            stateView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stateView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stateView.topAnchor.constraint(equalTo: container.topAnchor),
+            stateView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        stateView.setPresented(true, animated: false)
+        container.layoutSubtreeIfNeeded()
+
+        let endpointLabel = try XCTUnwrap(
+            stateView.firstSubview(withIdentifier: "Stacio.ConnectionState.endpoint") as? NSTextField
+        )
+        let requiredWidth = ceil(try XCTUnwrap(endpointLabel.cell).cellSize.width)
+        XCTAssertGreaterThanOrEqual(endpointLabel.frame.width, requiredWidth)
+        let initialEndpointWidth = endpointLabel.frame.width
+
+        for _ in 0..<20 {
+            stateView.update(
+                phase: .connecting,
+                protocolName: "SSH",
+                endpoint: "deploy@192.168.124.100:22"
+            )
+        }
+        container.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThanOrEqual(endpointLabel.frame.width, requiredWidth)
+        XCTAssertEqual(endpointLabel.frame.width, initialEndpointWidth, accuracy: 0.5)
+    }
+
+    func testPendingSSHSuppressesConfiguredLineInfoGutterUntilRuntimeIsConnected() {
+        let suiteName = "StacioPendingRemoteTerminalGutter-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalLineNumbersEnabled = true
+            settings.terminalTimestampsEnabled = true
+        }
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "pending_ssh_gutter",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            settingsStore: settingsStore,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.displayConnectionStarting()
+
+        XCTAssertTrue(controller.isConnectionStateVisibleForTesting)
+        XCTAssertEqual(controller.lineInfoGutterLayoutWidthForTesting, 0)
+        XCTAssertEqual(controller.lineInfoGutterVisibleTextForTesting, "")
+
+        controller.attachConnectedRuntime(
+            status: LiveShellStatus(runtimeId: "term_ssh_gutter", status: "running", diagnostic: "running")
+        )
+        controller.view.layoutSubtreeIfNeeded()
+
+        XCTAssertFalse(controller.isConnectionStateVisibleForTesting)
+        XCTAssertFalse(controller.isTerminalContentHiddenForTesting)
+        XCTAssertGreaterThan(controller.lineInfoGutterLayoutWidthForTesting, 0)
+    }
+
+    func testBackgroundReconnectReplacesTerminalWithReconnectStateUntilRuntimeReturns() throws {
+        let reconnecter = ControlledBackgroundRemoteTerminalReconnecter()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_before_reconnect",
+            title: "deploy@example.com",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            bridge: RecordingRemoteTerminalBridge(outputBatches: []),
+            reconnecter: reconnecter,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        let status = try controller.reconnectTerminal()
+
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertEqual(controller.lifecycleState, .reconnecting)
+        XCTAssertTrue(controller.isConnectionStateVisibleForTesting)
+        XCTAssertTrue(controller.isTerminalContentHiddenForTesting)
+        XCTAssertEqual(
+            controller.connectionStateVisibleTextForTesting,
+            "正在重连...\nSSH · deploy@example.com"
+        )
+        XCTAssertTrue(waitForRemoteTerminalCondition {
+            reconnecter.pendingCompletionCount == 1
+        })
+
+        reconnecter.complete(
+            at: 0,
+            with: .success(
+                LiveShellStatus(runtimeId: "term_after_reconnect", status: "running", diagnostic: "running")
+            )
+        )
+
+        XCTAssertEqual(controller.runtimeID, "term_after_reconnect")
+        XCTAssertEqual(controller.lifecycleState, .running)
+        XCTAssertFalse(controller.isConnectionStateVisibleForTesting)
+        XCTAssertFalse(controller.isTerminalContentHiddenForTesting)
     }
 
     func testStoppedSSHSessionEnterRequestsTabCloseInsteadOfClosingSerialSessions() {
@@ -3185,17 +3341,61 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         assertTerminalUsesSystemAdaptiveColors(controller.terminalView)
     }
 
-    func testRemoteTerminalContextMenuContainsPasteAndAskAI() {
+    func testRemoteTerminalContextMenuContainsPasteAndAskAI() throws {
+        var request: TerminalAIContextRequest?
         let controller = RemoteTerminalPaneViewController(
             runtimeID: "term_remote",
             title: "deploy@example.com",
             eventSink: RecordingRemoteTerminalEventSink()
         )
+        controller.onAIContextRequest = { request = $0 }
 
         controller.loadView()
         let menu = controller.terminalContextMenuForTesting(selectedText: "error line")
 
         XCTAssertEqual(menu.items.map(\.title), ["粘贴", "询问 AI", "解释选中内容"])
+        let askItem = try XCTUnwrap(menu.item(withTitle: L10n.AI.askFromTerminal))
+        let action = try XCTUnwrap(askItem.action)
+        XCTAssertTrue(askItem.isEnabled)
+        XCTAssertTrue(NSApplication.shared.sendAction(action, to: askItem.target, from: askItem))
+        XCTAssertEqual(
+            request,
+            TerminalAIContextRequest(runtimeID: "term_remote", selectedText: "error line")
+        )
+    }
+
+    func testRestrictedRemoteTerminalContextMenusDisableAIActionsWithPolicyTooltip() throws {
+        for (runtimeID, title, connectionKind) in [
+            ("term_serial", "串口控制台", RemoteTerminalConnectionKind.serial),
+            ("term_telnet", "Telnet 控制台", RemoteTerminalConnectionKind.telnet)
+        ] {
+            var request: TerminalAIContextRequest?
+            let controller = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: title,
+                connectionKind: connectionKind,
+                eventSink: RecordingRemoteTerminalEventSink()
+            )
+            controller.onAIContextRequest = { request = $0 }
+
+            controller.loadView()
+            let menu = controller.terminalContextMenuForTesting(selectedText: "permission denied")
+
+            XCTAssertFalse(menu.autoenablesItems, title)
+            for itemTitle in [L10n.AI.askFromTerminal, L10n.AI.explainSelection] {
+                let item = try XCTUnwrap(menu.item(withTitle: itemTitle))
+                XCTAssertFalse(item.isEnabled, "\(title): \(itemTitle)")
+                XCTAssertEqual(
+                    item.toolTip,
+                    L10n.Workbench.sshSessionRequiredTooltip,
+                    "\(title): \(itemTitle)"
+                )
+            }
+            let askItem = try XCTUnwrap(menu.item(withTitle: L10n.AI.askFromTerminal))
+            let action = try XCTUnwrap(askItem.action)
+            XCTAssertTrue(NSApplication.shared.sendAction(action, to: askItem.target, from: askItem))
+            XCTAssertNil(request, title)
+        }
     }
 
     func testRemoteTerminalContextMenuPasteItemPastesClipboard() throws {

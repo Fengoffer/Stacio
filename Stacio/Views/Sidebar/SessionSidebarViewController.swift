@@ -1,6 +1,40 @@
 import AppKit
 import StacioCoreBindings
 
+public enum SessionSidebarRemovedProtocolError: LocalizedError, Equatable {
+    case ftp
+
+    public var errorDescription: String? {
+        switch self {
+        case .ftp:
+            return "FTP 会话已移除，无法打开。请改用 SFTP 或 SCP 创建安全文件传输会话。"
+        }
+    }
+}
+
+public enum SessionSidebarRemovedProtocolExportNotice: Equatable {
+    case skipped(count: Int)
+    case blocked(count: Int)
+
+    public var messageText: String {
+        switch self {
+        case let .skipped(count):
+            return "已跳过 \(count) 个已移除的 FTP 会话"
+        case .blocked:
+            return "无法导出已移除的 FTP 会话"
+        }
+    }
+
+    public var informativeText: String {
+        switch self {
+        case .skipped:
+            return "导出文件仅包含可用会话。请将旧 FTP 会话迁移为 SFTP 或 SCP，或删除旧 FTP 会话。"
+        case let .blocked(count):
+            return "所选范围仅包含 \(count) 个已移除的 FTP 会话。请先迁移为 SFTP 或 SCP 会话，或删除旧 FTP 会话。"
+        }
+    }
+}
+
 @MainActor
 public final class SessionSidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private static let sidebarItemPasteboardType = NSPasteboard.PasteboardType("cn.stacio.session-sidebar-item")
@@ -24,6 +58,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
     private let settingsStore: AppSettingsStore
     private let licenseAccess: any LicenseFeatureAccessProviding
+    private let removedProtocolExportNoticeHandler: (SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void
     private var activePingRuns: [String: SessionSidebarPingRunning] = [:]
     private var activePingPresenters: [String: SessionSidebarPingProgressPresenting] = [:]
     private var allNodes: [NSObject] = []
@@ -66,7 +101,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore = QuickConnectPromptPrefillStore(),
         clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
         settingsStore: AppSettingsStore = .shared,
-        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider()
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
+        removedProtocolExportNoticeHandler: ((SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void)? = nil
     ) {
         self.sessionStore = sessionStore
         self.onOpenSession = onOpenSession
@@ -87,6 +123,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.clipboardDismissalStore = clipboardDismissalStore
         self.settingsStore = settingsStore
         self.licenseAccess = licenseAccess
+        self.removedProtocolExportNoticeHandler = removedProtocolExportNoticeHandler
+            ?? Self.presentRemovedProtocolExportNotice
         showsRecentSessions = settingsStore.snapshot().sessionSidebarShowRecentSessions
         super.init(nibName: nil, bundle: nil)
     }
@@ -107,7 +145,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     public override func loadView() {
-        let container = NSVisualEffectView()
+        let container = SessionSidebarAppearanceRefreshView()
         container.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.applySidebarSurface(container)
 
@@ -436,6 +474,16 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         } ?? []
     }
 
+    @discardableResult
+    public func performContextMenuItemForTesting(row: Int, title: String) -> Bool {
+        guard let item = contextMenu(forRow: row)?.items.first(where: { $0.title == title }),
+              let action = item.action
+        else {
+            return false
+        }
+        return NSApplication.shared.sendAction(action, to: item.target, from: item)
+    }
+
     public func performSidebarDropForTesting(
         kind: String,
         id: String,
@@ -539,6 +587,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     public var isNewGroupButtonHiddenForTesting: Bool {
         newGroupButton?.isHidden ?? true
+    }
+
+    public func sessionProtocolIconSymbolNameForTesting(_ protocolName: String) -> String {
+        sessionProtocolIconDescriptor(for: protocolName).symbolName
     }
 
     public func reloadSessions() {
@@ -675,11 +727,17 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         container.layer?.cornerCurve = .continuous
         StacioDesignSystem.setLayerBackgroundColor(
             container,
-            color: StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.72)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.controlBackgroundColor,
+                alpha: 0.72
+            )
         )
         StacioDesignSystem.setLayerBorderColor(
             container,
-            color: StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.34)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.separatorColor,
+                alpha: 0.34
+            )
         )
         container.layer?.borderWidth = 1
 
@@ -826,9 +884,11 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         case "vnc":
             return ("rectangle.connected.to.line.below", "VNC")
         case "scp":
-            return ("arrow.left.arrow.right.square", "SCP")
+            return ("arrow.up.arrow.down.square.fill", "SCP")
+        case "sftp":
+            return ("externaldrive.connected.to.line.below", "SFTP")
         case "ftp":
-            return ("externaldrive.connected.to.line.below", "FTP")
+            return ("exclamationmark.triangle", "FTP（已移除）")
         case "telnet":
             return ("terminal", "Telnet")
         case "browser", "web":
@@ -938,7 +998,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         if let session = outlineView.item(atRow: row) as? SessionSidebarSessionNode {
             return makeContextMenu(
                 for: session.session,
-                includesManagementActions: session.isPersistedRepresentation
+                includesManagementActions: session.includesManagementActionsInContextMenu
             )
         }
         if let folder = outlineView.item(atRow: row) as? SessionSidebarFolderNode,
@@ -964,7 +1024,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             return menu
         }
         menu.addItem(.separator())
-        [
+        let managementActions: [(String, SessionSidebarContextMenuAction)] = [
             (L10n.Sidebar.renameSession, SessionSidebarContextMenuAction.rename),
             (L10n.Sidebar.editSession, .edit),
             (L10n.Sidebar.deleteSession, .delete),
@@ -972,17 +1032,38 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             (L10n.Sidebar.moveSession, .move),
             (L10n.Sidebar.saveSessionToFile, .saveToFile),
             (L10n.Sidebar.createDesktopShortcut, .createDesktopShortcut)
-        ].forEach { title, action in
+        ]
+        managementActions.filter { _, action in
+            shouldIncludeManagementAction(action, for: session)
+        }.forEach { title, action in
             menu.addItem(makeContextMenuItem(title: title, action: action, session: session))
         }
-        menu.addItem(.separator())
-        [
+        let configurationActions: [(String, SessionSidebarContextMenuAction)] = [
             (L10n.Sidebar.saveAsDefaultPreset, SessionSidebarContextMenuAction.saveAsDefaultPreset),
             (L10n.Sidebar.copySessionSettings, .copySettings)
-        ].forEach { title, action in
+        ].filter { _, action in
+            shouldIncludeManagementAction(action, for: session)
+        }
+        if configurationActions.isEmpty == false {
+            menu.addItem(.separator())
+        }
+        configurationActions.forEach { title, action in
             menu.addItem(makeContextMenuItem(title: title, action: action, session: session))
         }
         return menu
+    }
+
+    private func shouldIncludeManagementAction(
+        _ action: SessionSidebarContextMenuAction,
+        for session: SessionRecord
+    ) -> Bool {
+        guard isRemovedFTPSession(session) else { return true }
+        switch action {
+        case .edit, .duplicate, .saveToFile, .createDesktopShortcut, .saveAsDefaultPreset, .copySettings:
+            return false
+        default:
+            return true
+        }
     }
 
     private func makeContextMenu(for folder: SessionSidebarFolderNode) -> NSMenu {
@@ -1241,6 +1322,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func performContextMenuAction(_ action: SessionSidebarContextMenuAction, session: SessionRecord) {
+        guard shouldIncludeManagementAction(action, for: session) else {
+            return
+        }
         switch action {
         case .execute:
             open(session)
@@ -1286,6 +1370,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func open(_ session: SessionRecord) {
+        guard isRemovedFTPSession(session) == false else {
+            errorPresenter.present(
+                SessionSidebarRemovedProtocolError.ftp,
+                context: .openSession,
+                parentWindow: view.window
+            )
+            return
+        }
         do {
             try onOpenSession(session)
         } catch {
@@ -1397,7 +1489,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func editSession(_ session: SessionRecord) {
-        guard let sessionStore,
+        guard isRemovedFTPSession(session) == false,
+              let sessionStore,
               let draft = sessionEditor.makeSessionDraft(
                 existingSession: session,
                 selectedFolderID: session.folderId,
@@ -1434,7 +1527,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func duplicateSession(_ session: SessionRecord) {
-        guard let sessionStore else {
+        guard isRemovedFTPSession(session) == false,
+              let sessionStore
+        else {
             return
         }
 
@@ -1444,6 +1539,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         } catch {
             errorPresenter.present(error, context: .duplicateSession, parentWindow: view.window)
         }
+    }
+
+    private func isRemovedFTPSession(_ session: SessionRecord) -> Bool {
+        session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ftp"
     }
 
     private func moveSession(_ session: SessionRecord) {
@@ -1469,19 +1568,33 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     private func exportSessions() {
         guard licenseAccess.isEnabled(.sessionBulkIO) else { return }
-        guard let sessionStore,
-              let destinationURL = operationsPresenter.chooseExportDestination(
-                suggestedName: L10n.Sidebar.exportSessionsSuggestedName,
-                parentWindow: view.window
-              )
-        else {
+        guard let sessionStore else {
             return
         }
 
         do {
-            let json = try sessionStore.exportSessionsJSON()
-            try json.write(to: destinationURL, atomically: true, encoding: .utf8)
+            let preparedExport = try exportJSONExcludingRemovedFTP(sessionStore.exportSessionsJSON())
+            guard preparedExport.supportedSessionCount > 0 || preparedExport.removedFTPCount == 0 else {
+                removedProtocolExportNoticeHandler(
+                    .blocked(count: preparedExport.removedFTPCount),
+                    view.window
+                )
+                return
+            }
+            guard let destinationURL = operationsPresenter.chooseExportDestination(
+                suggestedName: L10n.Sidebar.exportSessionsSuggestedName,
+                parentWindow: view.window
+            ) else {
+                return
+            }
+            try preparedExport.json.write(to: destinationURL, atomically: true, encoding: .utf8)
             operationsPresenter.presentExportComplete(destinationURL: destinationURL, parentWindow: view.window)
+            if preparedExport.removedFTPCount > 0 {
+                removedProtocolExportNoticeHandler(
+                    .skipped(count: preparedExport.removedFTPCount),
+                    view.window
+                )
+            }
         } catch {
             errorPresenter.present(error, context: .exportSessions, parentWindow: view.window)
         }
@@ -1558,21 +1671,99 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private func exportFolder(_ folderNode: SessionSidebarFolderNode) {
         guard licenseAccess.isEnabled(.sessionBulkIO) else { return }
         guard let sessionStore,
-              let folder = folderNode.folder,
-              let destinationURL = operationsPresenter.chooseFolderExportDestination(
-                folder: folder,
-                parentWindow: view.window
-              )
+              let folder = folderNode.folder
         else {
             return
         }
 
         do {
-            let json = try sessionStore.exportSessionFolderJSON(folderID: folder.id)
-            try json.write(to: destinationURL, atomically: true, encoding: .utf8)
+            let preparedExport = try exportJSONExcludingRemovedFTP(
+                sessionStore.exportSessionFolderJSON(folderID: folder.id)
+            )
+            guard preparedExport.supportedSessionCount > 0 || preparedExport.removedFTPCount == 0 else {
+                removedProtocolExportNoticeHandler(
+                    .blocked(count: preparedExport.removedFTPCount),
+                    view.window
+                )
+                return
+            }
+            guard let destinationURL = operationsPresenter.chooseFolderExportDestination(
+                folder: folder,
+                parentWindow: view.window
+            ) else {
+                return
+            }
+            try preparedExport.json.write(to: destinationURL, atomically: true, encoding: .utf8)
             operationsPresenter.presentExportComplete(destinationURL: destinationURL, parentWindow: view.window)
+            if preparedExport.removedFTPCount > 0 {
+                removedProtocolExportNoticeHandler(
+                    .skipped(count: preparedExport.removedFTPCount),
+                    view.window
+                )
+            }
         } catch {
             errorPresenter.present(error, context: .exportSessions, parentWindow: view.window)
+        }
+    }
+
+    private struct PreparedSessionExport {
+        let json: String
+        let supportedSessionCount: Int
+        let removedFTPCount: Int
+    }
+
+    private func exportJSONExcludingRemovedFTP(_ json: String) throws -> PreparedSessionExport {
+        let data = Data(json.utf8)
+        guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessions = object["sessions"] as? [[String: Any]]
+        else {
+            throw CocoaError(.propertyListReadCorrupt)
+        }
+        let supportedSessions = sessions.filter { session in
+            guard let protocolName = session["protocol"] as? String else { return true }
+            return protocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "ftp"
+        }
+        let removedFTPCount = sessions.count - supportedSessions.count
+        guard removedFTPCount > 0 else {
+            return PreparedSessionExport(
+                json: json,
+                supportedSessionCount: supportedSessions.count,
+                removedFTPCount: 0
+            )
+        }
+        object["sessions"] = supportedSessions
+        let filteredData = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        guard let filteredJSON = String(data: filteredData, encoding: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+        return PreparedSessionExport(
+            json: filteredJSON,
+            supportedSessionCount: supportedSessions.count,
+            removedFTPCount: removedFTPCount
+        )
+    }
+
+    private static func presentRemovedProtocolExportNotice(
+        _ notice: SessionSidebarRemovedProtocolExportNotice,
+        parentWindow: NSWindow?
+    ) {
+        let alert = NSAlert()
+        switch notice {
+        case .skipped:
+            alert.alertStyle = .informational
+        case .blocked:
+            alert.alertStyle = .warning
+        }
+        alert.messageText = notice.messageText
+        alert.informativeText = notice.informativeText
+        alert.addButton(withTitle: L10n.Common.ok)
+        if let parentWindow {
+            alert.beginSheetModal(for: parentWindow)
+        } else {
+            alert.runModal()
         }
     }
 
@@ -2355,6 +2546,17 @@ private final class SessionSidebarHeaderHoverView: NSView {
     }
 }
 
+private final class SessionSidebarAppearanceRefreshView: NSVisualEffectView, StacioEffectiveAppearanceRefreshHandling {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        stacioRefreshEffectiveAppearance()
+    }
+
+    func stacioRefreshEffectiveAppearance() {
+        StacioDesignSystem.refreshDynamicLayerColors(in: self)
+    }
+}
+
 private final class SessionSidebarFolderCellView: NSTableCellView {
     private weak var folderContainer: NSView?
     private weak var folderIconView: NSImageView?
@@ -2396,11 +2598,17 @@ private final class SessionSidebarFolderCellView: NSTableCellView {
 
         StacioDesignSystem.setLayerBackgroundColor(
             folderContainer,
-            color: StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.58)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.controlBackgroundColor,
+                alpha: 0.58
+            )
         )
         StacioDesignSystem.setLayerBorderColor(
             folderContainer,
-            color: StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.12)
+            color: StacioDesignSystem.dynamicColor(
+                StacioDesignSystem.theme.separatorColor,
+                alpha: 0.12
+            )
         )
         folderContainer.layer?.borderWidth = 1
         folderIconView.contentTintColor = StacioDesignSystem.theme.accentColor
@@ -2515,6 +2723,16 @@ private final class SessionSidebarSessionNode: NSObject {
         self.session = session
         self.displayStyle = displayStyle
         self.isPersistedRepresentation = isPersistedRepresentation
+    }
+
+    var includesManagementActionsInContextMenu: Bool {
+        if isPersistedRepresentation {
+            return true
+        }
+        if case .recent = displayStyle {
+            return true
+        }
+        return false
     }
 
     var title: String {

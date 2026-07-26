@@ -136,7 +136,7 @@ private extension Array {
     }
 }
 
-public enum RemoteTextEditorCloseDecision {
+public enum RemoteTextEditorCloseDecision: Equatable {
     case save
     case discard
     case cancel
@@ -162,6 +162,11 @@ public enum RemoteTextEditorSaveState: Equatable {
     }
 }
 
+public typealias RemoteTextEditorAsyncSaveHandler = (
+    _ text: String,
+    _ completion: @escaping @MainActor (Result<Void, Error>) -> Void
+) -> Void
+
 public enum RemoteTextEditorError: Error, LocalizedError, Equatable {
     case nonUTF8Text(String)
     case openFailed(String, String)
@@ -177,24 +182,38 @@ public enum RemoteTextEditorError: Error, LocalizedError, Equatable {
 }
 
 public struct RemoteTextEditorDocumentDescriptor: Equatable {
+    public let documentID: String
+    public let monacoURI: String
     public let remotePath: String
     public let fileName: String
     public let content: String
+    public let encodingDisplayName: String
     public let contentKind: RemoteFileContentKind
     public let previewSource: String?
     public let byteCount: UInt64
 
     public init(
+        documentID: String? = nil,
+        monacoURI: String? = nil,
         remotePath: String,
         fileName: String,
         content: String,
+        encodingDisplayName: String = "UTF-8",
         contentKind: RemoteFileContentKind = .text,
         previewSource: String? = nil,
         byteCount: UInt64 = 0
     ) {
+        let fallbackIdentity = FileTransferDocumentIdentity.remote(
+            runtimeID: "legacy",
+            path: remotePath,
+            fileName: fileName
+        )
+        self.documentID = documentID ?? fallbackIdentity.documentID
+        self.monacoURI = monacoURI ?? fallbackIdentity.monacoURI
         self.remotePath = remotePath
         self.fileName = fileName
         self.content = content
+        self.encodingDisplayName = encodingDisplayName
         self.contentKind = contentKind
         self.previewSource = previewSource
         self.byteCount = byteCount
@@ -236,9 +255,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     public var onDirtyStateChanged: ((Bool) -> Void)?
     public var onActiveDocumentChanged: ((String, Bool) -> Void)?
     public var onCloseRequested: (() -> Void)?
+    public var onWindowCloseReady: (() -> Void)?
     public var onAIQuestionRequested: ((String) -> Void)?
 
     private let settingsStore: AppSettingsStore
+    private let localTextIO: FileTransferLocalTextIO
     private var webView: WKWebView?
     private var scriptMessageHandler: RemoteTextEditorScriptMessageHandler?
     private var settingsObserver: NSObjectProtocol?
@@ -255,6 +276,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private weak var minimapButton: NSButton?
     private var editorFunctionCallsForTestingStorage: [String] = []
     private var editorFunctionScriptsForTestingStorage: [String] = []
+    private var pendingTabCloseDocumentIDs = Set<String>()
+    private var pendingWindowCloseDocumentIDs = Set<String>()
+    private var pendingSavedCloseHandshakes: [String: PendingSavedCloseHandshake] = [:]
+    private var pendingLocalDocumentLoadIDs = Set<String>()
+    private var hasPendingWindowClose = false
+    private var isEvaluatingWindowClose = false
 
     public init(
         localURL: URL,
@@ -264,6 +291,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     ) {
         self.localURL = localURL
         self.settingsStore = settingsStore
+        self.localTextIO = .live
         self.editorOptionsDefaults = editorOptionsDefaults
         self.editorDisplayOptions = RemoteTextEditorDisplayOptions.load(defaults: editorOptionsDefaults)
         let document = Self.makeDocument(localURL: localURL, onSave: onSave)
@@ -271,6 +299,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         self.activeDocumentID = document.id
         super.init(nibName: nil, bundle: nil)
         title = localURL.lastPathComponent
+        beginLoadingLocalDocument(localURL: localURL, onSave: onSave)
     }
 
     public init(
@@ -281,9 +310,36 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     ) {
         self.localURL = URL(fileURLWithPath: document.remotePath)
         self.settingsStore = settingsStore
+        self.localTextIO = .live
         self.editorOptionsDefaults = editorOptionsDefaults
         self.editorDisplayOptions = RemoteTextEditorDisplayOptions.load(defaults: editorOptionsDefaults)
-        let editorDocument = Self.makeDocument(document: document, onSaveText: onSaveText)
+        let editorDocument = Self.makeDocument(
+            document: document,
+            onSaveText: onSaveText,
+            onSaveTextAsync: nil
+        )
+        self.documents = [editorDocument]
+        self.activeDocumentID = editorDocument.id
+        super.init(nibName: nil, bundle: nil)
+        title = document.fileName
+    }
+
+    public init(
+        document: RemoteTextEditorDocumentDescriptor,
+        settingsStore: AppSettingsStore = .shared,
+        editorOptionsDefaults: UserDefaults = .standard,
+        onSaveTextAsync: @escaping RemoteTextEditorAsyncSaveHandler
+    ) {
+        self.localURL = URL(fileURLWithPath: document.remotePath)
+        self.settingsStore = settingsStore
+        self.localTextIO = .live
+        self.editorOptionsDefaults = editorOptionsDefaults
+        self.editorDisplayOptions = RemoteTextEditorDisplayOptions.load(defaults: editorOptionsDefaults)
+        let editorDocument = Self.makeDocument(
+            document: document,
+            onSaveText: nil,
+            onSaveTextAsync: onSaveTextAsync
+        )
         self.documents = [editorDocument]
         self.activeDocumentID = editorDocument.id
         super.init(nibName: nil, bundle: nil)
@@ -364,7 +420,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     public var encodingTextForTesting: String {
-        activeDocument?.canEdit == true ? "UTF-8" : "-"
+        activeDocument?.canEdit == true ? activeDocument?.encodingDisplayName ?? "-" : "-"
     }
 
     public var canEditTextForTesting: Bool {
@@ -377,6 +433,14 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     public var tabTitlesForTesting: [String] {
         documents.map(\.fileName)
+    }
+
+    public var documentIDsForTesting: [String] {
+        documents.map(\.id)
+    }
+
+    public var documentMonacoURIsForTesting: [String] {
+        documents.map(\.monacoURI)
     }
 
     public var dirtyTabTitlesForTesting: [String] {
@@ -460,6 +524,10 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         activeDocument?.saveStatusIsError ?? false
     }
 
+    public var hasPendingLocalDocumentLoadsForTesting: Bool {
+        pendingLocalDocumentLoadIDs.isEmpty == false
+    }
+
     public func performSave() throws {
         guard let activeDocument else {
             return
@@ -521,11 +589,14 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         activateDocument(id: document.id)
     }
 
-    public func closeDocumentForTesting(fileName: String) {
+    public func closeDocumentForTesting(
+        fileName: String,
+        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
+    ) {
         guard let document = documents.first(where: { $0.fileName == fileName }) else {
             return
         }
-        closeDocument(id: document.id)
+        closeDocument(id: document.id, closeConfirmer: closeConfirmer)
     }
 
     public func openDocument(localURL: URL, onSave: ((URL) throws -> Void)? = nil) {
@@ -536,17 +607,41 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         let document = Self.makeDocument(localURL: localURL, onSave: onSave)
         documents.append(document)
         activateDocument(id: document.id)
+        beginLoadingLocalDocument(localURL: localURL, onSave: onSave)
     }
 
     public func openDocument(
         _ descriptor: RemoteTextEditorDocumentDescriptor,
         onSaveText: ((String) throws -> Void)? = nil
     ) {
-        if let existing = documents.first(where: { $0.path == descriptor.remotePath }) {
+        if let existing = documents.first(where: { $0.id == descriptor.documentID }) {
+            Self.unregisterRemotePreviewSource(descriptor.previewSource)
             activateDocument(id: existing.id)
             return
         }
-        let document = Self.makeDocument(document: descriptor, onSaveText: onSaveText)
+        let document = Self.makeDocument(
+            document: descriptor,
+            onSaveText: onSaveText,
+            onSaveTextAsync: nil
+        )
+        documents.append(document)
+        activateDocument(id: document.id)
+    }
+
+    public func openDocument(
+        _ descriptor: RemoteTextEditorDocumentDescriptor,
+        onSaveTextAsync: @escaping RemoteTextEditorAsyncSaveHandler
+    ) {
+        if let existing = documents.first(where: { $0.id == descriptor.documentID }) {
+            Self.unregisterRemotePreviewSource(descriptor.previewSource)
+            activateDocument(id: existing.id)
+            return
+        }
+        let document = Self.makeDocument(
+            document: descriptor,
+            onSaveText: nil,
+            onSaveTextAsync: onSaveTextAsync
+        )
         documents.append(document)
         activateDocument(id: document.id)
     }
@@ -594,32 +689,66 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         parentWindow: NSWindow?,
         closeConfirmer: RemoteTextEditorCloseConfirming
     ) -> Bool {
+        guard hasPendingWindowClose == false,
+              pendingTabCloseDocumentIDs.isEmpty
+        else {
+            return false
+        }
         let dirtyDocumentIDs = documents.filter(\.isDirty).map(\.id)
         guard dirtyDocumentIDs.isEmpty == false else {
             return true
         }
+        var decisions: [(documentID: String, decision: RemoteTextEditorCloseDecision)] = []
         for documentID in dirtyDocumentIDs {
             guard let document = document(id: documentID) else {
                 continue
             }
-            switch closeConfirmer.confirmClose(fileName: document.fileName, parentWindow: parentWindow) {
-            case .save:
-                do {
-                    try saveDocument(id: documentID)
-                } catch {
-                    presentSaveError(error, parentWindow: parentWindow)
-                    return false
-                }
-            case .discard:
-                continue
-            case .cancel:
+            let decision = closeConfirmer.confirmClose(fileName: document.fileName, parentWindow: parentWindow)
+            guard decision != .cancel else {
+                return false
+            }
+            decisions.append((documentID, decision))
+        }
+
+        let asyncSaveDocumentIDs = Set(decisions.compactMap { item -> String? in
+            guard item.decision == .save,
+                  document(id: item.documentID)?.onSaveTextAsync != nil
+            else { return nil }
+            return item.documentID
+        })
+        hasPendingWindowClose = asyncSaveDocumentIDs.isEmpty == false
+        pendingWindowCloseDocumentIDs = asyncSaveDocumentIDs
+        isEvaluatingWindowClose = true
+        for item in decisions where item.decision == .save {
+            do {
+                try saveDocument(id: item.documentID)
+            } catch {
+                cancelPendingWindowClose()
+                isEvaluatingWindowClose = false
+                presentSaveError(error, parentWindow: parentWindow)
                 return false
             }
         }
-        return true
+        isEvaluatingWindowClose = false
+
+        let asyncSaveFailedOrChanged = asyncSaveDocumentIDs.contains { documentID in
+            guard let document = document(id: documentID) else { return true }
+            return document.saveState == .failed || (document.saveState != .saving && document.isDirty)
+        }
+        if asyncSaveFailedOrChanged {
+            cancelPendingWindowClose()
+            return false
+        }
+        if hasPendingWindowClose, pendingWindowCloseDocumentIDs.isEmpty {
+            hasPendingWindowClose = false
+        }
+        return hasPendingWindowClose == false
     }
 
     deinit {
+        for document in documents {
+            Self.unregisterRemotePreviewSource(document.previewSource)
+        }
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }
@@ -628,15 +757,17 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     private static func makeDocument(
         localURL: URL,
-        onSave: ((URL) throws -> Void)?
+        onSave _: ((URL) throws -> Void)?
     ) -> RemoteTextEditorDocument {
+        let identity = FileTransferDocumentIdentity.local(url: localURL)
         let fileName = localURL.lastPathComponent
         let contentKind = StacioFileDisplay.contentKind(forFileName: fileName)
         if let displayMode = RemoteTextEditorDocumentDisplayMode(contentKind: contentKind),
            displayMode != .text
         {
             return RemoteTextEditorDocument(
-                id: UUID().uuidString,
+                id: identity.documentID,
+                monacoURI: identity.monacoURI,
                 localURL: localURL,
                 fileName: fileName,
                 path: localURL.path,
@@ -647,6 +778,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
                 canEdit: false,
                 errorText: nil,
                 onSaveText: nil,
+                onSaveTextAsync: nil,
+                encodingDisplayName: "-",
                 saveState: .saved,
                 displayMode: displayMode,
                 previewSource: mediaPreviewSource(for: localURL, contentKind: contentKind),
@@ -654,44 +787,21 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             )
         }
 
-        let data = (try? Data(contentsOf: localURL)) ?? Data()
-        guard data.contains(0) == false,
-              let text = String(data: data, encoding: .utf8)
-        else {
-            return RemoteTextEditorDocument(
-                id: UUID().uuidString,
-                localURL: localURL,
-                fileName: fileName,
-                path: localURL.path,
-                byteCount: UInt64(data.count),
-                text: "",
-                originalText: "",
-                languageIdentifier: StacioFileDisplay.languageIdentifier(forFileName: fileName),
-                canEdit: false,
-                errorText: RemoteTextEditorError.nonUTF8Text(fileName).localizedDescription,
-                onSaveText: nil,
-                saveState: .saved,
-                displayMode: .text,
-                previewSource: nil,
-                fileSizeText: fileSizeText(for: localURL)
-            )
-        }
-
         return RemoteTextEditorDocument(
-            id: UUID().uuidString,
+            id: identity.documentID,
+            monacoURI: identity.monacoURI,
             localURL: localURL,
             fileName: fileName,
             path: localURL.path,
-            byteCount: UInt64(data.count),
-            text: text,
-            originalText: text,
-            languageIdentifier: StacioFileDisplay.languageIdentifier(forFileName: fileName, content: text),
-            canEdit: true,
+            byteCount: localFileByteCount(at: localURL),
+            text: "",
+            originalText: "",
+            languageIdentifier: StacioFileDisplay.languageIdentifier(forFileName: fileName),
+            canEdit: false,
             errorText: nil,
-            onSaveText: { text in
-                try text.write(to: localURL, atomically: true, encoding: .utf8)
-                try onSave?(localURL)
-            },
+            onSaveText: nil,
+            onSaveTextAsync: nil,
+            encodingDisplayName: "-",
             saveState: .saved,
             displayMode: .text,
             previewSource: nil,
@@ -699,15 +809,130 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         )
     }
 
+    private func beginLoadingLocalDocument(
+        localURL: URL,
+        onSave: ((URL) throws -> Void)?
+    ) {
+        let identity = FileTransferDocumentIdentity.local(url: localURL)
+        guard let current = document(id: identity.documentID),
+              current.displayMode == .text,
+              pendingLocalDocumentLoadIDs.insert(identity.documentID).inserted
+        else { return }
+        localTextIO.load(url: localURL) { [weak self] result in
+            guard let self else { return }
+            self.pendingLocalDocumentLoadIDs.remove(identity.documentID)
+            guard let index = self.documents.firstIndex(where: { $0.id == identity.documentID }) else {
+                return
+            }
+            switch result {
+            case .success(let loaded):
+                self.documents[index] = Self.makeLoadedLocalTextDocument(
+                    localURL: localURL,
+                    loaded: loaded,
+                    localTextIO: self.localTextIO,
+                    onSave: onSave
+                )
+            case .failure(let error):
+                self.documents[index] = Self.makeFailedLocalTextDocument(
+                    localURL: localURL,
+                    byteCount: current.byteCount,
+                    message: RuntimeDiagnosticFormatter.userMessage(for: error)
+                )
+            }
+            self.markDirtyIfNeeded()
+            self.syncWorkspaceToWebView()
+        }
+    }
+
+    private static func makeLoadedLocalTextDocument(
+        localURL: URL,
+        loaded: FileTransferLocalTextReadResult,
+        localTextIO: FileTransferLocalTextIO,
+        onSave: ((URL) throws -> Void)?
+    ) -> RemoteTextEditorDocument {
+        guard let textDocument = loaded.document else {
+            return makeFailedLocalTextDocument(
+                localURL: localURL,
+                byteCount: loaded.byteCount,
+                message: RemoteTextEditorError.nonUTF8Text(localURL.lastPathComponent).localizedDescription
+            )
+        }
+        let identity = FileTransferDocumentIdentity.local(url: localURL)
+        let fileName = localURL.lastPathComponent
+        return RemoteTextEditorDocument(
+            id: identity.documentID,
+            monacoURI: identity.monacoURI,
+            localURL: localURL,
+            fileName: fileName,
+            path: localURL.path,
+            byteCount: loaded.byteCount,
+            text: textDocument.text,
+            originalText: textDocument.text,
+            languageIdentifier: StacioFileDisplay.languageIdentifier(
+                forFileName: fileName,
+                content: textDocument.text
+            ),
+            canEdit: true,
+            errorText: nil,
+            onSaveText: nil,
+            onSaveTextAsync: { updatedText, completion in
+                localTextIO.save(
+                    document: textDocument,
+                    updatedText: updatedText,
+                    fileName: fileName,
+                    url: localURL,
+                    afterWrite: { try onSave?(localURL) },
+                    completion: completion
+                )
+            },
+            encodingDisplayName: textDocument.encoding.displayName,
+            saveState: .saved,
+            displayMode: .text,
+            previewSource: nil,
+            fileSizeText: fileSizeText(byteCount: loaded.byteCount)
+        )
+    }
+
+    private static func makeFailedLocalTextDocument(
+        localURL: URL,
+        byteCount: UInt64,
+        message: String
+    ) -> RemoteTextEditorDocument {
+        let identity = FileTransferDocumentIdentity.local(url: localURL)
+        let fileName = localURL.lastPathComponent
+        return RemoteTextEditorDocument(
+            id: identity.documentID,
+            monacoURI: identity.monacoURI,
+            localURL: localURL,
+            fileName: fileName,
+            path: localURL.path,
+            byteCount: byteCount,
+            text: "",
+            originalText: "",
+            languageIdentifier: StacioFileDisplay.languageIdentifier(forFileName: fileName),
+            canEdit: false,
+            errorText: message,
+            onSaveText: nil,
+            onSaveTextAsync: nil,
+            encodingDisplayName: "-",
+            saveState: .saved,
+            displayMode: .text,
+            previewSource: nil,
+            fileSizeText: fileSizeText(byteCount: byteCount)
+        )
+    }
+
     private static func makeDocument(
         document: RemoteTextEditorDocumentDescriptor,
-        onSaveText: ((String) throws -> Void)?
+        onSaveText: ((String) throws -> Void)?,
+        onSaveTextAsync: RemoteTextEditorAsyncSaveHandler?
     ) -> RemoteTextEditorDocument {
         let displayMode = RemoteTextEditorDocumentDisplayMode(contentKind: document.contentKind) ?? .text
         let localURL = URL(fileURLWithPath: document.remotePath)
         if displayMode != .text {
             return RemoteTextEditorDocument(
-                id: UUID().uuidString,
+                id: document.documentID,
+                monacoURI: document.monacoURI,
                 localURL: localURL,
                 fileName: document.fileName,
                 path: document.remotePath,
@@ -718,6 +943,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
                 canEdit: false,
                 errorText: nil,
                 onSaveText: nil,
+                onSaveTextAsync: nil,
+                encodingDisplayName: "-",
                 saveState: .saved,
                 displayMode: displayMode,
                 previewSource: document.previewSource,
@@ -726,7 +953,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
 
         return RemoteTextEditorDocument(
-            id: UUID().uuidString,
+            id: document.documentID,
+            monacoURI: document.monacoURI,
             localURL: localURL,
             fileName: document.fileName,
             path: document.remotePath,
@@ -740,6 +968,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             canEdit: true,
             errorText: nil,
             onSaveText: onSaveText,
+            onSaveTextAsync: onSaveTextAsync,
+            encodingDisplayName: document.encodingDisplayName,
             saveState: .saved,
             displayMode: .text,
             previewSource: nil,
@@ -753,8 +983,14 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         message: String,
         byteCount: UInt64
     ) -> RemoteTextEditorDocument {
-        RemoteTextEditorDocument(
-            id: UUID().uuidString,
+        let identity = FileTransferDocumentIdentity.remote(
+            runtimeID: "legacy",
+            path: remotePath,
+            fileName: fileName
+        )
+        return RemoteTextEditorDocument(
+            id: identity.documentID,
+            monacoURI: identity.monacoURI,
             localURL: URL(fileURLWithPath: remotePath),
             fileName: fileName,
             path: remotePath,
@@ -765,6 +1001,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             canEdit: false,
             errorText: RemoteTextEditorError.openFailed(fileName, message).localizedDescription,
             onSaveText: nil,
+            onSaveTextAsync: nil,
+            encodingDisplayName: "-",
             saveState: .failed,
             displayMode: .text,
             previewSource: nil,
@@ -1105,14 +1343,22 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             guard let id = payload?["id"] as? String,
                   let content = payload?["content"] as? String
             else { return }
-            updateDocumentText(id: id, text: content)
+            updateDocumentText(
+                id: id,
+                text: content,
+                revision: (payload?["revision"] as? NSNumber)?.intValue
+            )
         case "save":
             var saveTargetID = activeDocumentID
             if let id = payload?["id"] as? String,
                let content = payload?["content"] as? String
             {
                 saveTargetID = id
-                updateDocumentText(id: id, text: content)
+                updateDocumentText(
+                    id: id,
+                    text: content,
+                    revision: (payload?["revision"] as? NSNumber)?.intValue
+                )
             }
             do {
                 try saveDocument(id: saveTargetID)
@@ -1132,29 +1378,58 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             handleSwitchTabRequest(
                 targetID: targetID,
                 currentID: payload?["currentID"] as? String,
-                content: payload?["content"] as? String
+                content: payload?["content"] as? String,
+                revision: (payload?["revision"] as? NSNumber)?.intValue
             )
         case "closeTab":
             if let currentID = payload?["currentID"] as? String,
                let content = payload?["content"] as? String
             {
-                updateDocumentText(id: currentID, text: content)
+                updateDocumentText(
+                    id: currentID,
+                    text: content,
+                    revision: (payload?["revision"] as? NSNumber)?.intValue
+                )
             }
             guard let targetID = payload?["targetID"] as? String else { return }
             closeDocument(id: targetID)
+        case "closeHandshake":
+            handleSavedCloseHandshake(payload)
         default:
             break
         }
     }
 
-    private func updateDocumentText(id: String, text: String, syncTabs: Bool = true) {
+    private func updateDocumentText(
+        id: String,
+        text: String,
+        revision: Int? = nil,
+        syncTabs: Bool = true
+    ) {
         guard let index = documents.firstIndex(where: { $0.id == id }),
               documents[index].canEdit
         else {
             return
         }
+        if let revision, revision < documents[index].revision {
+            return
+        }
+        let textChanged = documents[index].text != text
+        let revisionAdvanced = revision.map { $0 > documents[index].revision } ?? textChanged
+        if textChanged || revisionAdvanced {
+            pendingTabCloseDocumentIDs.remove(id)
+            pendingSavedCloseHandshakes.removeValue(forKey: id)
+            cancelPendingWindowClose()
+        }
         documents[index].text = text
-        documents[index].saveState = documents[index].isDirty ? .dirty : .saved
+        if let revision {
+            documents[index].revision = revision
+        } else if textChanged {
+            documents[index].revision += 1
+        }
+        if documents[index].saveState != .saving {
+            documents[index].saveState = documents[index].isDirty ? .dirty : .saved
+        }
         documents[index].saveFailureMessage = nil
         markDirtyIfNeeded()
         if syncTabs {
@@ -1175,12 +1450,17 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         documents[index].languageIdentifier = normalizedLanguage
     }
 
-    private func handleSwitchTabRequest(targetID: String, currentID: String?, content: String?) {
+    private func handleSwitchTabRequest(
+        targetID: String,
+        currentID: String?,
+        content: String?,
+        revision: Int? = nil
+    ) {
         guard documents.contains(where: { $0.id == targetID }) else {
             return
         }
         if let currentID, let content {
-            updateDocumentText(id: currentID, text: content, syncTabs: false)
+            updateDocumentText(id: currentID, text: content, revision: revision, syncTabs: false)
         }
         activateDocument(id: targetID)
     }
@@ -1194,21 +1474,35 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         syncActiveDocumentToWebView()
     }
 
-    private func closeDocument(id: String) {
+    private func closeDocument(
+        id: String,
+        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
+    ) {
         guard documents.count > 1,
               let index = documents.firstIndex(where: { $0.id == id })
         else {
             onCloseRequested?()
             return
         }
+        guard pendingTabCloseDocumentIDs.contains(id) == false else {
+            return
+        }
         if documents[index].isDirty {
-            let confirmer = AppKitRemoteTextEditorCloseConfirmer()
+            let confirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
             switch confirmer.confirmClose(fileName: documents[index].fileName, parentWindow: view.window) {
             case .save:
+                let waitsForAsyncSave = documents[index].onSaveTextAsync != nil
+                if waitsForAsyncSave {
+                    pendingTabCloseDocumentIDs.insert(id)
+                }
                 do {
                     try saveDocument(id: id)
                 } catch {
+                    pendingTabCloseDocumentIDs.remove(id)
                     presentSaveError(error, parentWindow: view.window)
+                    return
+                }
+                if waitsForAsyncSave {
                     return
                 }
             case .discard:
@@ -1218,7 +1512,17 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
                 return
             }
         }
-        let wasActive = documents[index].id == activeDocumentID
+        removeDocument(id: id)
+    }
+
+    private func removeDocument(id: String) {
+        guard documents.count > 1,
+              let index = documents.firstIndex(where: { $0.id == id })
+        else { return }
+        pendingTabCloseDocumentIDs.remove(id)
+        pendingWindowCloseDocumentIDs.remove(id)
+        let wasActive = id == activeDocumentID
+        Self.unregisterRemotePreviewSource(documents[index].previewSource)
         documents.remove(at: index)
         if wasActive {
             let nextIndex = min(index, documents.count - 1)
@@ -1228,6 +1532,15 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         syncWorkspaceToWebView()
     }
 
+    private static func unregisterRemotePreviewSource(_ source: String?) {
+        guard let source,
+              let url = URL(string: source),
+              url.scheme == RemoteFileOnlineMediaRegistry.scheme
+                || (url.scheme == "http" && url.host == "127.0.0.1")
+        else { return }
+        RemoteFileOnlineMediaRegistry.shared.unregister(url: url)
+    }
+
     private func saveDocument(id: String) throws {
         guard let index = documents.firstIndex(where: { $0.id == id }) else {
             return
@@ -1235,16 +1548,33 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard documents[index].canEdit else {
             throw RemoteTextEditorError.nonUTF8Text(documents[index].fileName)
         }
+        guard documents[index].saveState != .saving else { return }
         let text = documents[index].text
+        let revision = documents[index].revision
+        let saveRequestID = UUID()
+        documents[index].saveRequestID = saveRequestID
         documents[index].saveState = .saving
         documents[index].saveFailureMessage = nil
         markDirtyIfNeeded()
         syncTabStateToWebView()
+        if let asyncSave = documents[index].onSaveTextAsync {
+            asyncSave(text) { [weak self] result in
+                self?.finishAsyncSave(
+                    documentID: id,
+                    requestID: saveRequestID,
+                    savedText: text,
+                    savedRevision: revision,
+                    result: result
+                )
+            }
+            return
+        }
         do {
             try documents[index].onSaveText?(text)
         } catch {
             documents[index].saveState = .failed
             documents[index].saveFailureMessage = RuntimeDiagnosticFormatter.userMessage(for: error)
+            documents[index].saveRequestID = nil
             markDirtyIfNeeded()
             syncTabStateToWebView()
             throw error
@@ -1252,8 +1582,127 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         documents[index].originalText = text
         documents[index].saveState = .saved
         documents[index].saveFailureMessage = nil
+        documents[index].saveRequestID = nil
         markDirtyIfNeeded()
         syncTabStateToWebView()
+    }
+
+    private func finishAsyncSave(
+        documentID: String,
+        requestID: UUID,
+        savedText: String,
+        savedRevision: Int,
+        result: Result<Void, Error>
+    ) {
+        guard let index = documents.firstIndex(where: { $0.id == documentID }),
+              documents[index].saveRequestID == requestID
+        else { return }
+        documents[index].saveRequestID = nil
+        let wasPendingTabClose = pendingTabCloseDocumentIDs.contains(documentID)
+        let wasPendingWindowClose = hasPendingWindowClose
+            && pendingWindowCloseDocumentIDs.contains(documentID)
+        switch result {
+        case .success:
+            documents[index].originalText = savedText
+            documents[index].saveState = documents[index].isDirty ? .dirty : .saved
+            documents[index].saveFailureMessage = nil
+            if documents[index].isDirty {
+                pendingTabCloseDocumentIDs.remove(documentID)
+                cancelPendingWindowClose()
+            } else if wasPendingTabClose || wasPendingWindowClose {
+                beginSavedCloseHandshake(
+                    documentID: documentID,
+                    savedText: savedText,
+                    savedRevision: savedRevision
+                )
+            }
+        case .failure(let error):
+            pendingTabCloseDocumentIDs.remove(documentID)
+            pendingSavedCloseHandshakes.removeValue(forKey: documentID)
+            documents[index].saveState = .failed
+            documents[index].saveFailureMessage = RuntimeDiagnosticFormatter.userMessage(for: error)
+            cancelPendingWindowClose()
+        }
+        markDirtyIfNeeded()
+        syncTabStateToWebView()
+    }
+
+    private func beginSavedCloseHandshake(
+        documentID: String,
+        savedText: String,
+        savedRevision: Int
+    ) {
+        guard isEditorReady, isViewLoaded, webView != nil else {
+            finishSavedClose(documentID: documentID)
+            return
+        }
+        let requestID = UUID().uuidString
+        pendingSavedCloseHandshakes[documentID] = PendingSavedCloseHandshake(
+            requestID: requestID,
+            savedText: savedText,
+            savedRevision: savedRevision
+        )
+        callEditorFunction(
+            "confirmSavedContentBeforeClose",
+            payload: EditorCloseHandshakeRequestPayload(
+                documentID: documentID,
+                requestID: requestID
+            )
+        )
+    }
+
+    private func handleSavedCloseHandshake(_ payload: [String: Any]?) {
+        guard let documentID = payload?["id"] as? String,
+              let requestID = payload?["requestID"] as? String,
+              let content = payload?["content"] as? String,
+              let revision = (payload?["revision"] as? NSNumber)?.intValue,
+              let pending = pendingSavedCloseHandshakes[documentID],
+              pending.requestID == requestID,
+              let index = documents.firstIndex(where: { $0.id == documentID })
+        else { return }
+        pendingSavedCloseHandshakes.removeValue(forKey: documentID)
+
+        guard content == pending.savedText,
+              revision == pending.savedRevision,
+              documents[index].text == pending.savedText,
+              documents[index].revision == pending.savedRevision
+        else {
+            pendingTabCloseDocumentIDs.remove(documentID)
+            documents[index].text = content
+            documents[index].revision = max(documents[index].revision, revision)
+            documents[index].saveState = documents[index].isDirty ? .dirty : .saved
+            documents[index].saveFailureMessage = nil
+            cancelPendingWindowClose()
+            markDirtyIfNeeded()
+            syncTabStateToWebView()
+            return
+        }
+        finishSavedClose(documentID: documentID)
+    }
+
+    private func finishSavedClose(documentID: String) {
+        let shouldRemoveTab = pendingTabCloseDocumentIDs.remove(documentID) != nil
+        if hasPendingWindowClose, pendingWindowCloseDocumentIDs.contains(documentID) {
+            pendingWindowCloseDocumentIDs.remove(documentID)
+        }
+        if shouldRemoveTab {
+            removeDocument(id: documentID)
+        }
+        if hasPendingWindowClose,
+           pendingWindowCloseDocumentIDs.isEmpty,
+           isEvaluatingWindowClose == false
+        {
+            hasPendingWindowClose = false
+            onWindowCloseReady?()
+        }
+    }
+
+    private func cancelPendingWindowClose() {
+        hasPendingWindowClose = false
+        pendingWindowCloseDocumentIDs.removeAll()
+        pendingSavedCloseHandshakes = pendingSavedCloseHandshakes.filter {
+            pendingTabCloseDocumentIDs.contains($0.key)
+        }
     }
 
     private func aiQuestionForActiveDocument() -> String? {
@@ -1593,6 +2042,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       post('save', {
         id: activeDocumentID,
         content: editor ? editor.getValue() : document.content,
+        revision: Number.isInteger(document.revision) ? document.revision : 0,
         fileName: document.fileName || ''
       });
     }
@@ -1608,7 +2058,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       if (languageSelect) {
         languageSelect.disabled = Boolean(mode) || !document || !document.canEdit;
       }
-      window.document.getElementById('encoding').textContent = document && document.canEdit ? 'UTF-8' : '-';
+      window.document.getElementById('encoding').textContent = document && document.canEdit ? (document.encodingDisplayName || 'UTF-8') : '-';
       setSaveStateDisplay(
         document ? (document.saveStateText || (document.isDirty ? '未保存改动' : '已保存')) : '已保存',
         Boolean(document && document.saveStateIsError)
@@ -1617,7 +2067,23 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     function updateTabs(payloadDocuments = documents, payloadActiveID = activeDocumentID) {
-      documents = payloadDocuments;
+      const existingDocuments = new Map(documents.map(document => [document.id, document]));
+      documents = payloadDocuments.map(incoming => {
+        const existing = existingDocuments.get(incoming.id);
+        const incomingRevision = Number.isInteger(incoming.revision) ? incoming.revision : 0;
+        const existingRevision = existing && Number.isInteger(existing.revision) ? existing.revision : 0;
+        if (!existing || existingRevision <= incomingRevision) {
+          return incoming;
+        }
+        return {
+          ...incoming,
+          content: existing.content,
+          revision: existingRevision,
+          isDirty: existing.isDirty,
+          saveStateText: existing.saveStateText,
+          saveStateIsError: existing.saveStateIsError
+        };
+      });
       activeDocumentID = payloadActiveID;
       const tabs = window.document.getElementById('tabs');
       tabs.innerHTML = documents.map(document => {
@@ -1630,6 +2096,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         ensureActiveTabVisible();
         updateTabScrollButtons();
       });
+      updateStatus();
     }
 
     function renderTabState() {
@@ -1675,12 +2142,41 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       const document = activeDocument();
       const content = editor ? editor.getValue() : '';
       if (document && document.canEdit) {
+        if (content !== document.content) {
+          document.revision = (Number.isInteger(document.revision) ? document.revision : 0) + 1;
+        }
         document.content = content;
         document.isDirty = document.content !== document.originalContent;
         document.saveStateText = document.isDirty ? '未保存改动' : '已保存';
         document.saveStateIsError = false;
       }
-      return { id: activeDocumentID, content };
+      return {
+        id: activeDocumentID,
+        content,
+        revision: document && Number.isInteger(document.revision) ? document.revision : 0
+      };
+    }
+
+    function confirmSavedContentBeforeClose(payload) {
+      if (!payload || !payload.documentID || !payload.requestID) { return; }
+      const document = documents.find(candidate => candidate.id === payload.documentID);
+      if (!document) { return; }
+      let content = document.content || '';
+      if (document.id === activeDocumentID && editor && document.canEdit) {
+        const editorContent = editor.getValue();
+        if (editorContent !== content) {
+          document.revision = (Number.isInteger(document.revision) ? document.revision : 0) + 1;
+          document.content = editorContent;
+          document.isDirty = document.content !== document.originalContent;
+        }
+        content = editorContent;
+      }
+      post('closeHandshake', {
+        id: document.id,
+        requestID: payload.requestID,
+        content,
+        revision: Number.isInteger(document.revision) ? document.revision : 0
+      });
     }
 
     function setActiveLanguage(languageIdentifier) {
@@ -1721,7 +2217,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       if (switchToTab(targetID)) {
         event.preventDefault();
         event.stopPropagation();
-        post('switchTab', { targetID, currentID: snapshot.id, content: snapshot.content });
+        post('switchTab', {
+          targetID,
+          currentID: snapshot.id,
+          content: snapshot.content,
+          revision: snapshot.revision
+        });
         return true;
       }
       return false;
@@ -1759,7 +2260,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         event.preventDefault();
         event.stopPropagation();
         const snapshot = snapshotActiveEditorContent();
-        post('closeTab', { targetID: closeButton.getAttribute('data-close'), currentID: snapshot.id, content: snapshot.content });
+        post('closeTab', {
+          targetID: closeButton.getAttribute('data-close'),
+          currentID: snapshot.id,
+          content: snapshot.content,
+          revision: snapshot.revision
+        });
         return;
       }
       activateTabFromEvent(event);
@@ -1920,7 +2426,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       }
       preview.style.display = 'none';
       preview.innerHTML = '';
-      const uri = monaco.Uri.file(document.path || document.fileName || 'untitled');
+      const uri = monaco.Uri.parse(document.monacoURI || `stacio-document:untitled/${encodeURIComponent(document.fileName || 'untitled')}`);
       const model = monaco.editor.createModel(document.content || '', language, uri);
       monaco.editor.setModelLanguage(model, language);
       const oldModel = editor.getModel();
@@ -1967,7 +2473,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       setTheme,
       applyDisplayOptions,
       runEditorAction,
-      saveActiveDocument
+      saveActiveDocument,
+      confirmSavedContentBeforeClose
     };
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabsPointerDown, { capture: true });
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);
@@ -2011,12 +2518,17 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         if (suppressChange) { return; }
         const document = activeDocument();
         if (!document || !document.canEdit) { return; }
+        document.revision = (Number.isInteger(document.revision) ? document.revision : 0) + 1;
         document.content = editor.getValue();
         document.isDirty = document.content !== document.originalContent;
         document.saveStateText = document.isDirty ? '未保存改动' : '已保存';
         document.saveStateIsError = false;
         updateTabs(documents, activeDocumentID);
-        post('changed', { id: document.id, content: document.content });
+        post('changed', {
+          id: document.id,
+          content: document.content,
+          revision: document.revision
+        });
       });
       editor.onDidChangeCursorPosition(updateStatus);
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
@@ -2036,6 +2548,9 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
 @MainActor
 public final class RemoteTextEditorWindowController: NSWindowController, NSWindowDelegate {
+    private static let initialContentSize = NSSize(width: 980, height: 720)
+    private static let minimumContentSize = NSSize(width: 720, height: 480)
+
     public let editorViewController: RemoteTextEditorViewController
     public var onClose: (@MainActor (RemoteTextEditorWindowController) -> Void)?
 
@@ -2048,14 +2563,16 @@ public final class RemoteTextEditorWindowController: NSWindowController, NSWindo
         self.editorViewController = editorViewController
         self.closeConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 980, height: 720),
+            contentRect: NSRect(origin: .zero, size: Self.initialContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = Self.windowTitle(fileName: editorViewController.activeFileNameForTesting, isDirty: false)
         window.contentViewController = editorViewController
-        window.minSize = NSSize(width: 560, height: 360)
+        window.contentMinSize = Self.minimumContentSize
+        window.setContentSize(Self.initialContentSize)
+        window.center()
         super.init(window: window)
         window.delegate = self
         editorViewController.onDirtyStateChanged = { [weak window, weak editorViewController] isDirty in
@@ -2066,6 +2583,9 @@ public final class RemoteTextEditorWindowController: NSWindowController, NSWindo
         editorViewController.onActiveDocumentChanged = { [weak window] fileName, isDirty in
             window?.title = Self.windowTitle(fileName: fileName, isDirty: isDirty)
             window?.isDocumentEdited = isDirty
+        }
+        editorViewController.onWindowCloseReady = { [weak self] in
+            self?.close()
         }
     }
 
@@ -2116,18 +2636,23 @@ public struct RemoteTextEditorBackupCandidate: Equatable {
 
 private struct RemoteTextEditorDocument {
     let id: String
+    let monacoURI: String
     let localURL: URL
     let fileName: String
     let path: String
     let byteCount: UInt64
     var text: String
     var originalText: String
+    var revision: Int = 0
     var languageIdentifier: String
     let canEdit: Bool
     let errorText: String?
     let onSaveText: ((String) throws -> Void)?
+    let onSaveTextAsync: RemoteTextEditorAsyncSaveHandler?
+    let encodingDisplayName: String
     var saveState: RemoteTextEditorSaveState
     var saveFailureMessage: String? = nil
+    var saveRequestID: UUID? = nil
     let displayMode: RemoteTextEditorDocumentDisplayMode
     let previewSource: String?
     let fileSizeText: String
@@ -2153,12 +2678,15 @@ private struct RemoteTextEditorDocument {
 
 private struct EditorDocumentPayload: Encodable {
     let id: String
+    let monacoURI: String
     let fileName: String
     let path: String
     let content: String
     let originalContent: String
+    let revision: Int
     let languageIdentifier: String
     let canEdit: Bool
+    let encodingDisplayName: String
     let isDirty: Bool
     let saveStateText: String
     let saveStateIsError: Bool
@@ -2169,12 +2697,15 @@ private struct EditorDocumentPayload: Encodable {
 
     init(document: RemoteTextEditorDocument) {
         id = document.id
+        monacoURI = document.monacoURI
         fileName = document.fileName
         path = document.path
         content = document.text
         originalContent = document.originalText
+        revision = document.revision
         languageIdentifier = document.languageIdentifier
         canEdit = document.canEdit
+        encodingDisplayName = document.encodingDisplayName
         isDirty = document.isDirty
         saveStateText = document.saveStatusText
         saveStateIsError = document.saveStatusIsError
@@ -2195,6 +2726,17 @@ private struct EditorWorkspacePayload: Encodable {
 private struct EditorTabsPayload: Encodable {
     let documents: [EditorDocumentPayload]
     let activeDocumentID: String
+}
+
+private struct EditorCloseHandshakeRequestPayload: Encodable {
+    let documentID: String
+    let requestID: String
+}
+
+private struct PendingSavedCloseHandshake {
+    let requestID: String
+    let savedText: String
+    let savedRevision: Int
 }
 
 private struct EditorActionPayload: Encodable {

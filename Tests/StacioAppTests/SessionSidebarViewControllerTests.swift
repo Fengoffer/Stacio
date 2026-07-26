@@ -252,6 +252,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             makeSession(id: "serial", protocolName: "serial", name: "Serial"),
             makeSession(id: "vnc", protocolName: "vnc", name: "VNC"),
             makeSession(id: "scp", protocolName: "scp", name: "SCP"),
+            makeSession(id: "sftp", protocolName: "sftp", name: "SFTP"),
             makeSession(id: "ftp", protocolName: "ftp", name: "FTP"),
             makeSession(id: "telnet", protocolName: "telnet", name: "Telnet"),
             makeSession(id: "browser", protocolName: "browser", name: "Browser"),
@@ -270,7 +271,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         controller.loadView()
 
-        let expectedLabels = ["SSH", "串口", "VNC", "SCP", "FTP", "Telnet", "浏览器", "文件", "Shell", "PRD"]
+        let expectedLabels = ["SSH", "串口", "VNC", "SCP", "SFTP", "FTP（已移除）", "Telnet", "浏览器", "文件", "Shell", "PRD"]
         var labels: [String] = []
         for index in sessions.indices {
             let sessionItem = controller.outlineView(controller.outlineView, child: index, ofItem: nil)
@@ -284,6 +285,18 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         }
 
         XCTAssertEqual(labels, expectedLabels)
+        XCTAssertNotEqual(
+            controller.sessionProtocolIconSymbolNameForTesting("scp"),
+            controller.sessionProtocolIconSymbolNameForTesting("sftp")
+        )
+        XCTAssertEqual(
+            controller.sessionProtocolIconSymbolNameForTesting("scp"),
+            "arrow.up.arrow.down.square.fill"
+        )
+        XCTAssertNotEqual(
+            controller.sessionProtocolIconSymbolNameForTesting("sftp"),
+            controller.sessionProtocolIconSymbolNameForTesting("ftp")
+        )
     }
 
     func testSidebarKeepsUngroupedSessionsAtRootBesideFoldersWithAlignedIcons() throws {
@@ -378,6 +391,37 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(container.layer?.borderWidth, 0)
         XCTAssertEqual(folderIcon.contentTintColor, .alternateSelectedControlTextColor)
         XCTAssertEqual(folderCell.textField?.textColor, .alternateSelectedControlTextColor)
+    }
+
+    func testFolderCardRefreshesSemanticColorsAcrossAppearances() throws {
+        let folder = SessionFolder(id: "folder_theme", parentId: nil, name: "Theme")
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(folders: [folder])
+        )
+
+        controller.loadView()
+
+        XCTAssertTrue(controller.view is StacioEffectiveAppearanceRefreshHandling)
+        let folderItem = controller.outlineView(controller.outlineView, child: 0, ofItem: nil)
+        let folderCell = try XCTUnwrap(
+            controller.outlineView(controller.outlineView, viewFor: nil, item: folderItem)
+        )
+        let container = try XCTUnwrap(
+            folderCell.firstSubview(withIdentifier: "Stacio.Sidebar.folderContainer")
+        )
+
+        folderCell.appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        StacioDesignSystem.refreshDynamicLayerColors(in: folderCell)
+        let lightBackground = try XCTUnwrap(container.layer?.backgroundColor)
+        let lightBorder = try XCTUnwrap(container.layer?.borderColor)
+
+        folderCell.appearance = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        StacioDesignSystem.refreshDynamicLayerColors(in: folderCell)
+        let darkBackground = try XCTUnwrap(container.layer?.backgroundColor)
+        let darkBorder = try XCTUnwrap(container.layer?.borderColor)
+
+        XCTAssertNotEqual(lightBackground, darkBackground)
+        XCTAssertNotEqual(lightBorder, darkBorder)
     }
 
     func testSidebarLoadsNestedSessionFoldersAtLeastThreeLevels() throws {
@@ -919,7 +963,7 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         )
     }
 
-    func testRecentAndFavoriteShortcutMenusOnlyExposeConnectionActions() {
+    func testRecentShortcutMenuExposesFullSessionActionsWhileFavoriteStaysConnectionOnly() {
         let suiteName = "StacioSidebarVirtualMenuTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -940,18 +984,24 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             tags: ["favorite"],
             lastOpenedAt: "2026-07-15T12:00:00Z"
         )
+        let operations = RecordingSessionSidebarOperationsPresenter()
         let controller = SessionSidebarViewController(
             sessionStore: RecordingSessionSidebarStore(
                 folders: [],
                 sessionsByFolderID: [nil: [session]]
             ),
+            operationsPresenter: operations,
             settingsStore: settingsStore
         )
         controller.loadView()
 
+        let fullSessionActions = controller.contextMenuTitlesForTesting(id: session.id)
         let connectionActions = ["执行", "连接为...", "Ping 主机"]
-        XCTAssertEqual(controller.contextMenuTitlesForTesting(row: 1), connectionActions)
+        XCTAssertEqual(controller.contextMenuTitlesForTesting(row: 1), fullSessionActions)
         XCTAssertEqual(controller.contextMenuTitlesForTesting(row: 3), connectionActions)
+        XCTAssertTrue(controller.performContextMenuItemForTesting(row: 1, title: "重命名会话"))
+        XCTAssertEqual(operations.renameRequestSessionIDs, [session.id])
+        XCTAssertFalse(controller.performContextMenuItemForTesting(row: 3, title: "重命名会话"))
     }
 
     func testContextMenuExecuteAndConnectAsOpenRealSessions() {
@@ -1888,6 +1938,122 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         )
     }
 
+    func testLegacyFTPSessionCannotBeEditedOrDuplicated() {
+        let legacyFTP = makeSession(
+            id: "session_ftp_legacy",
+            protocolName: "ftp",
+            name: "Legacy FTP"
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [legacyFTP]]
+        )
+        let editor = RecordingSessionEditor(
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Should Not Save",
+                protocol: "ssh",
+                host: "server.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionEditor: editor,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+
+        controller.performEditSessionForTesting(id: legacyFTP.id)
+        controller.performDuplicateSessionForTesting(id: legacyFTP.id)
+
+        XCTAssertTrue(editor.requests.isEmpty)
+        XCTAssertTrue(store.updatedRequests.isEmpty)
+        XCTAssertTrue(store.duplicatedRequests.isEmpty)
+        let menuTitles = controller.contextMenuTitlesForTesting(id: legacyFTP.id)
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.editSession))
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.duplicateSession))
+    }
+
+    func testOpeningLegacyFTPSessionShowsRemovalGuidanceWithoutStartingRuntime() {
+        let legacyFTP = makeSession(
+            id: "session_ftp_legacy",
+            protocolName: "ftp",
+            name: "Legacy FTP"
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [legacyFTP]]
+        )
+        let errorPresenter = RecordingSessionSidebarErrorPresenter()
+        var openedSessionIDs: [String] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            onOpenSession: { openedSessionIDs.append($0.id) },
+            errorPresenter: errorPresenter,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+
+        controller.performOpenSessionForTesting(id: legacyFTP.id)
+
+        XCTAssertTrue(openedSessionIDs.isEmpty)
+        XCTAssertEqual(errorPresenter.contexts, [.openSession])
+        XCTAssertEqual(
+            errorPresenter.errors.first?.localizedDescription,
+            "FTP 会话已移除，无法打开。请改用 SFTP 或 SCP 创建安全文件传输会话。"
+        )
+    }
+
+    func testLegacyFTPSessionCannotPropagateConfigurationThroughContextMenu() {
+        let legacyFTP = makeSession(
+            id: "ftp_legacy",
+            protocolName: "ftp",
+            name: "Legacy FTP"
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [legacyFTP]]
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter()
+        let shortcutCreator = RecordingSessionSidebarShortcutCreator()
+        let presetStore = RecordingSessionSidebarDefaultPresetStore()
+        let settingsCopier = RecordingSessionSidebarSettingsCopier()
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            shortcutCreator: shortcutCreator,
+            defaultPresetStore: presetStore,
+            settingsCopier: settingsCopier,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+
+        let menuTitles = controller.contextMenuTitlesForTesting(id: legacyFTP.id)
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.saveSessionToFile))
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.createDesktopShortcut))
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.saveAsDefaultPreset))
+        XCTAssertFalse(menuTitles.contains(L10n.Sidebar.copySessionSettings))
+
+        controller.performContextMenuActionForTesting(.saveToFile, id: legacyFTP.id)
+        controller.performContextMenuActionForTesting(.createDesktopShortcut, id: legacyFTP.id)
+        controller.performContextMenuActionForTesting(.saveAsDefaultPreset, id: legacyFTP.id)
+        controller.performContextMenuActionForTesting(.copySettings, id: legacyFTP.id)
+
+        XCTAssertTrue(operations.singleSessionExportRequestIDs.isEmpty)
+        XCTAssertTrue(operations.shortcutRequestIDs.isEmpty)
+        XCTAssertTrue(shortcutCreator.requests.isEmpty)
+        XCTAssertTrue(presetStore.requests.isEmpty)
+        XCTAssertTrue(operations.defaultPresetSavedSessionIDs.isEmpty)
+        XCTAssertTrue(settingsCopier.texts.isEmpty)
+        XCTAssertEqual(operations.settingsCopiedCount, 0)
+    }
+
     func testMoveSessionUsesPresenterDestinationAndRefreshesOutline() {
         let production = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
         let original = SessionRecord(
@@ -2013,6 +2179,172 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             try String(contentsOf: destinationURL, encoding: .utf8),
             #"{"format":"stacio.sessions.v1","sessions":[]}"#
         )
+    }
+
+    func testExportSessionsFiltersLegacyFTPFromMixedExport() throws {
+        let destinationURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("json")
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+        let ssh = makeSession(id: "ssh", protocolName: "ssh", name: "SSH")
+        let legacyFTP = makeSession(id: "ftp", protocolName: " FTP ", name: "Legacy FTP")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [ssh, legacyFTP]],
+            exportJSON: #"{"format":"stacio.sessions.v1","folders":[],"sessions":[{"id":"session_ssh","protocol":"ssh"},{"id":"session_ftp","protocol":" FTP "}]}"#
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(exportURL: destinationURL)
+        var notices: [SessionSidebarRemovedProtocolExportNotice] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            removedProtocolExportNoticeHandler: { notice, _ in notices.append(notice) }
+        )
+        controller.loadView()
+
+        controller.performExportSessionsForTesting()
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destinationURL)) as? [String: Any]
+        )
+        let exportedSessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
+        XCTAssertEqual(exportedSessions.compactMap { $0["id"] as? String }, [ssh.id])
+        XCTAssertEqual(store.exportCount, 1)
+        XCTAssertEqual(operations.completedExportURLs, [destinationURL])
+        XCTAssertEqual(notices, [.skipped(count: 1)])
+        XCTAssertEqual(notices.first?.messageText, "已跳过 1 个已移除的 FTP 会话")
+    }
+
+    func testExportSessionsFiltersFTPFromGeneratedJSONWhenSnapshotDiffers() throws {
+        let destinationURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("json")
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+        let snapshotSSH = makeSession(id: "snapshot", protocolName: "ssh", name: "Snapshot SSH")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [snapshotSSH]],
+            exportJSON: #"{"format":"stacio.sessions.v1","sessions":[{"id":"session_live_ssh","protocol":"ssh"},{"id":"session_live_ftp","protocol":" FTP "}]}"#
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(exportURL: destinationURL)
+        var notices: [SessionSidebarRemovedProtocolExportNotice] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            removedProtocolExportNoticeHandler: { notice, _ in notices.append(notice) }
+        )
+        controller.loadView()
+
+        controller.performExportSessionsForTesting()
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destinationURL)) as? [String: Any]
+        )
+        let exportedSessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
+        XCTAssertEqual(exportedSessions.compactMap { $0["id"] as? String }, ["session_live_ssh"])
+        XCTAssertEqual(notices, [.skipped(count: 1)])
+    }
+
+    func testExportSessionsBlocksFTPOnlyGeneratedJSONWhenSnapshotDiffers() {
+        let destinationURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("json")
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+        let snapshotSSH = makeSession(id: "snapshot", protocolName: "ssh", name: "Snapshot SSH")
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [snapshotSSH]],
+            exportJSON: #"{"format":"stacio.sessions.v1","folders":[],"sessions":[{"id":"session_ftp","protocol":"ftp"}]}"#
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(exportURL: destinationURL)
+        var notices: [SessionSidebarRemovedProtocolExportNotice] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            removedProtocolExportNoticeHandler: { notice, _ in notices.append(notice) }
+        )
+        controller.loadView()
+
+        controller.performExportSessionsForTesting()
+
+        XCTAssertEqual(store.exportCount, 1)
+        XCTAssertTrue(operations.exportSuggestedNames.isEmpty)
+        XCTAssertTrue(operations.completedExportURLs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationURL.path))
+        XCTAssertEqual(notices, [.blocked(count: 1)])
+        XCTAssertEqual(
+            notices.first?.informativeText,
+            "所选范围仅包含 1 个已移除的 FTP 会话。请先迁移为 SFTP 或 SCP 会话，或删除旧 FTP 会话。"
+        )
+    }
+
+    func testFolderExportFiltersLegacyFTPFromMixedExport() throws {
+        let destinationURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("json")
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let ssh = makeSession(id: "ssh", protocolName: "ssh", name: "SSH", folderID: folder.id)
+        let legacyFTP = makeSession(id: "ftp", protocolName: "ftp", name: "Legacy FTP", folderID: folder.id)
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [folder.id: [ssh, legacyFTP]],
+            folderExportJSON: #"{"format":"stacio.sessions.v1","folders":[{"id":"folder_prod"}],"sessions":[{"id":"session_ssh","protocol":"ssh"},{"id":"session_ftp","protocol":"ftp"}]}"#
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(folderExportURL: destinationURL)
+        var notices: [SessionSidebarRemovedProtocolExportNotice] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            removedProtocolExportNoticeHandler: { notice, _ in notices.append(notice) }
+        )
+        controller.loadView()
+
+        controller.performFolderContextMenuActionForTesting(.export, folderID: folder.id)
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: destinationURL)) as? [String: Any]
+        )
+        let exportedSessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
+        XCTAssertEqual(exportedSessions.compactMap { $0["id"] as? String }, [ssh.id])
+        XCTAssertEqual(store.exportedFolderIDs, [folder.id])
+        XCTAssertEqual(operations.completedExportURLs, [destinationURL])
+        XCTAssertEqual(notices, [.skipped(count: 1)])
+    }
+
+    func testFolderExportBlocksFTPOnlyGeneratedJSONWhenSnapshotDiffers() {
+        let destinationURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("json")
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let snapshotSSH = makeSession(id: "snapshot", protocolName: "ssh", name: "Snapshot SSH", folderID: folder.id)
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [folder.id: [snapshotSSH]],
+            folderExportJSON: #"{"format":"stacio.sessions.v1","folders":[{"id":"folder_prod"}],"sessions":[{"id":"session_ftp","protocol":"ftp"}]}"#
+        )
+        let operations = RecordingSessionSidebarOperationsPresenter(folderExportURL: destinationURL)
+        var notices: [SessionSidebarRemovedProtocolExportNotice] = []
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            removedProtocolExportNoticeHandler: { notice, _ in notices.append(notice) }
+        )
+        controller.loadView()
+
+        controller.performFolderContextMenuActionForTesting(.export, folderID: folder.id)
+
+        XCTAssertEqual(store.exportedFolderIDs, [folder.id])
+        XCTAssertTrue(operations.folderExportRequestIDs.isEmpty)
+        XCTAssertTrue(operations.completedExportURLs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationURL.path))
+        XCTAssertEqual(notices, [.blocked(count: 1)])
     }
 
     func testDeleteSessionConfirmsDeletesAndRefreshesOutline() {

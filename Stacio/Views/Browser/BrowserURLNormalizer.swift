@@ -1,6 +1,11 @@
 import Foundation
 
 enum BrowserURLNormalizer {
+    private static let ipv4TransportHostPrefix = "stacio-ipv4-"
+    private static let ipv6TransportHostPrefix = "stacio-ipv6-"
+    private static let transportHostSuffix = "-x.invalid"
+    private static let localhostTransportHost = "stacio-host-localhost-x.invalid"
+
     static func normalizedURL(_ value: String) -> URL? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -32,6 +37,135 @@ enum BrowserURLNormalizer {
             return nil
         }
         return isAllowedBrowserURL(url) ? url : nil
+    }
+
+    static func transportURL(for url: URL) -> URL {
+        guard let host = url.host,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            return url
+        }
+
+        if let encodedIPv4Host = encodedIPv4TransportHost(host) {
+            components.host = encodedIPv4Host
+            return components.url ?? url
+        }
+
+        if let encodedIPv6Host = encodedIPv6TransportHost(host) {
+            components.host = encodedIPv6Host
+            return components.url ?? url
+        }
+
+        if host.caseInsensitiveCompare("localhost") == .orderedSame {
+            components.host = localhostTransportHost
+            return components.url ?? url
+        }
+
+        if host.hasSuffix(".") {
+            let withoutRootLabel = String(host.dropLast())
+            if let encodedIPv4Host = encodedIPv4TransportHost(withoutRootLabel) {
+                components.host = encodedIPv4Host
+                return components.url ?? url
+            }
+            if withoutRootLabel.caseInsensitiveCompare("localhost") == .orderedSame {
+                components.host = localhostTransportHost
+                return components.url ?? url
+            }
+        }
+
+        return url
+    }
+
+    static func displayURL(for transportURL: URL) -> URL {
+        guard let host = transportURL.host,
+              var components = URLComponents(url: transportURL, resolvingAgainstBaseURL: false)
+        else {
+            return transportURL
+        }
+
+        if let decodedIPv4Host = decodedIPv4TransportHost(host) {
+            components.host = decodedIPv4Host
+            return components.url ?? transportURL
+        }
+
+        if let decodedIPv6Host = decodedIPv6TransportHost(host) {
+            components.percentEncodedHost = "[\(decodedIPv6Host)]"
+            return components.url ?? transportURL
+        }
+
+        if host.caseInsensitiveCompare(localhostTransportHost) == .orderedSame {
+            components.host = "localhost"
+            return components.url ?? transportURL
+        }
+
+        guard host.hasSuffix(".") else {
+            return transportURL
+        }
+        let withoutRootLabel = String(host.dropLast())
+        guard isIPv4Host(withoutRootLabel)
+                || withoutRootLabel.caseInsensitiveCompare("localhost") == .orderedSame
+        else {
+            return transportURL
+        }
+        components.host = withoutRootLabel
+        return components.url ?? transportURL
+    }
+
+    private static func encodedIPv4TransportHost(_ host: String) -> String? {
+        guard isIPv4Host(host) else {
+            return nil
+        }
+        let payload = host.replacingOccurrences(of: ".", with: "-")
+        return "\(ipv4TransportHostPrefix)\(payload)\(transportHostSuffix)"
+    }
+
+    private static func decodedIPv4TransportHost(_ host: String) -> String? {
+        let normalized = host.lowercased()
+        guard normalized.hasPrefix(ipv4TransportHostPrefix),
+              normalized.hasSuffix(transportHostSuffix)
+        else {
+            return nil
+        }
+        let payloadStart = normalized.index(normalized.startIndex, offsetBy: ipv4TransportHostPrefix.count)
+        let payloadEnd = normalized.index(normalized.endIndex, offsetBy: -transportHostSuffix.count)
+        let payload = normalized[payloadStart..<payloadEnd]
+        let octets = payload.split(separator: "-")
+        guard octets.count == 4,
+              octets.allSatisfy({ UInt8($0) != nil })
+        else {
+            return nil
+        }
+        return octets.map(String.init).joined(separator: ".")
+    }
+
+    private static func encodedIPv6TransportHost(_ host: String) -> String? {
+        let normalized = host.lowercased()
+        guard normalized.contains(":"),
+              normalized.allSatisfy({ $0.isHexDigit || $0 == ":" || $0 == "." })
+        else {
+            return nil
+        }
+        let payload = normalized.replacingOccurrences(of: ":", with: "-")
+        return "\(ipv6TransportHostPrefix)\(payload)\(transportHostSuffix)"
+    }
+
+    private static func decodedIPv6TransportHost(_ host: String) -> String? {
+        let normalized = host.lowercased()
+        guard normalized.hasPrefix(ipv6TransportHostPrefix),
+              normalized.hasSuffix(transportHostSuffix)
+        else {
+            return nil
+        }
+        let payloadStart = normalized.index(normalized.startIndex, offsetBy: ipv6TransportHostPrefix.count)
+        let payloadEnd = normalized.index(normalized.endIndex, offsetBy: -transportHostSuffix.count)
+        let payload = normalized[payloadStart..<payloadEnd]
+        guard !payload.isEmpty,
+              payload.allSatisfy({ $0.isHexDigit || $0 == "-" || $0 == "." })
+        else {
+            return nil
+        }
+        let decoded = payload.replacingOccurrences(of: "-", with: ":")
+        return decoded.contains(":") ? decoded : nil
     }
 
     private static func isAllowedBrowserURL(_ url: URL) -> Bool {
@@ -148,9 +282,25 @@ enum BrowserURLNormalizer {
         return String(authority[..<colonIndex])
     }
 
-    private static func isLoopbackHost(_ host: String) -> Bool {
+    static func isLoopbackHost(_ host: String) -> Bool {
         let normalized = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
         return normalized == "localhost" || normalized == "::1" || normalized.hasPrefix("127.")
+    }
+
+    private static func isIPv4Host(_ host: String) -> Bool {
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4 else {
+            return false
+        }
+        return octets.allSatisfy { octet in
+            guard !octet.isEmpty,
+                  octet.allSatisfy(\.isNumber),
+                  let value = UInt8(octet)
+            else {
+                return false
+            }
+            return String(value) == octet || octet == "0"
+        }
     }
 
     private static func isPrivateIPv4Host(_ host: String) -> Bool {

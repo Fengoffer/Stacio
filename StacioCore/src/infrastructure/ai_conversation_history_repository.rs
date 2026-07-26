@@ -74,7 +74,6 @@ impl AIConversationHistoryRepository {
             .execute("DELETE FROM ai_conversation_history", [])?;
         Ok(())
     }
-
 }
 
 fn read_ai_conversation_history_item(

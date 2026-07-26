@@ -1482,7 +1482,7 @@ public final class FreePlanNoticeWindowController: NSWindowController, NSTableVi
     // Keep this snapshot aligned with the feature table on stacio.cn/pricing.html.
     private static let featureRows: [FreePlanFeatureRow] = [
         .group("基础远程工作流"),
-        .feature("SSH、Telnet、VNC、FTP、SCP、串口和本地终端", freeIncluded: true, professionalIncluded: true),
+        .feature("SSH、Telnet、VNC、SFTP、SCP、串口和本地终端", freeIncluded: true, professionalIncluded: true),
         .feature("会话保存、分组、标签页和基础分屏", freeIncluded: true, professionalIncluded: true),
         .feature("Keychain 凭据保存与敏感信息脱敏", freeIncluded: true, professionalIncluded: true),
         .feature("远程目录浏览、单文件上传下载、文本编辑和预览", freeIncluded: true, professionalIncluded: true),

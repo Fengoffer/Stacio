@@ -372,8 +372,14 @@ final class RemoteSSHSessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(workspace.pendingTitles, ["deploy@example.com"])
         XCTAssertTrue(workspace.openedStatuses.isEmpty)
         let pane = try XCTUnwrap(workspace.openedPanes.first)
+        pane.loadView()
         XCTAssertEqual(pane.lifecycleState, .connecting)
         XCTAssertEqual(pane.lifecycleMessageForTesting, L10n.TerminalLifecycle.connecting)
+        XCTAssertTrue(pane.isConnectionStateVisibleForTesting)
+        XCTAssertEqual(
+            pane.connectionStateVisibleTextForTesting,
+            "正在连接...\nSSH · deploy@example.com:22"
+        )
     }
 
     func testStartAlsoReturnsBeforeSlowRuntimeStartAndShowsConnectingPane() throws {

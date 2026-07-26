@@ -9640,6 +9640,16 @@ public func chmodLiveRemotePath(config: SshConnectionConfig, secret: SshAuthSecr
     )
 }
 }
+public func chmodLiveSftpPath(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, mode: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_chmod_live_sftp_path(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),
+        FfiConverterString.lower(mode),$0
+    )
+}
+}
 public func clearAiConversationHistory(databasePath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_clear_ai_conversation_history(
         FfiConverterString.lower(databasePath),$0
@@ -9658,6 +9668,16 @@ public func clearKnownHostRecord(databasePath: String, host: String, port: UInt1
         FfiConverterString.lower(databasePath),
         FfiConverterString.lower(host),
         FfiConverterUInt16.lower(port),$0
+    )
+}
+}
+/**
+ * Closes an SCP/SFTP read session. Closing an unknown id is intentionally
+ * idempotent so media/editor teardown can race safely with navigation.
+ */
+public func closeLiveRemoteFileReadSession(sessionId: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_close_live_remote_file_read_session(
+        FfiConverterString.lower(sessionId),$0
     )
 }
 }
@@ -9710,6 +9730,16 @@ public func copyLiveRemotePath(config: SshConnectionConfig, secret: SshAuthSecre
     )
 }
 }
+public func copyLiveSftpPath(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, fromPath: String, toPath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_copy_live_sftp_path(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(fromPath),
+        FfiConverterString.lower(toPath),$0
+    )
+}
+}
 public func createLiveFtpDirectory(config: FtpConnectionConfig, secret: FtpAuthSecret, remotePath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_create_live_ftp_directory(
         FfiConverterTypeFtpConnectionConfig_lower(config),
@@ -9720,6 +9750,15 @@ public func createLiveFtpDirectory(config: FtpConnectionConfig, secret: FtpAuthS
 }
 public func createLiveRemoteDirectory(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_create_live_remote_directory(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),$0
+    )
+}
+}
+public func createLiveSftpDirectory(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_create_live_sftp_directory(
         FfiConverterTypeSshConnectionConfig_lower(config),
         FfiConverterTypeSshAuthSecret_lower(secret),
         FfiConverterString.lower(expectedFingerprintSha256),
@@ -9771,6 +9810,16 @@ public func deleteLiveFtpPath(config: FtpConnectionConfig, secret: FtpAuthSecret
 }
 public func deleteLiveRemotePath(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, recursive: Bool)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_delete_live_remote_path(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),
+        FfiConverterBool.lower(recursive),$0
+    )
+}
+}
+public func deleteLiveSftpPath(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, recursive: Bool)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_delete_live_sftp_path(
         FfiConverterTypeSshConnectionConfig_lower(config),
         FfiConverterTypeSshAuthSecret_lower(secret),
         FfiConverterString.lower(expectedFingerprintSha256),
@@ -9953,6 +10002,16 @@ public func listLiveRemoteDirectory(config: SshConnectionConfig, secret: SshAuth
     )
 })
 }
+public func listLiveSftpDirectory(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String)throws  -> [RemoteFileEntry]  {
+    return try  FfiConverterSequenceTypeRemoteFileEntry.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_list_live_sftp_directory(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),$0
+    )
+})
+}
 public func listScpTransferEvents(databasePath: String, jobId: String)throws  -> [ScpTransferEventRecord]  {
     return try  FfiConverterSequenceTypeScpTransferEventRecord.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_list_scp_transfer_events(
@@ -10049,6 +10108,34 @@ public func moveSessionRecord(databasePath: String, id: String, targetFolderId: 
         FfiConverterString.lower(databasePath),
         FfiConverterString.lower(id),
         FfiConverterOptionString.lower(targetFolderId),$0
+    )
+})
+}
+/**
+ * Opens an authenticated SCP/libssh2 session for repeated remote reads.
+ *
+ * The returned opaque id is intentionally independent from a terminal runtime
+ * id. File previews can outlive a terminal tab briefly, and closing the read
+ * handle therefore owns the connection lifetime explicitly.
+ */
+public func openLiveRemoteFileReadSession(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_open_live_remote_file_read_session(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),$0
+    )
+})
+}
+/**
+ * Opens an authenticated SFTP/libssh2 session for repeated remote reads.
+ */
+public func openLiveSftpFileReadSession(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_open_live_sftp_file_read_session(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),$0
     )
 })
 }
@@ -10188,6 +10275,31 @@ public func readLiveRemoteFile(config: SshConnectionConfig, secret: SshAuthSecre
     )
 })
 }
+/**
+ * Reads a byte range through an already-authenticated SCP/SFTP session.
+ */
+public func readLiveRemoteFileSession(sessionId: String, remotePath: String, offset: UInt64, length: UInt64?)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_read_live_remote_file_session(
+        FfiConverterString.lower(sessionId),
+        FfiConverterString.lower(remotePath),
+        FfiConverterUInt64.lower(offset),
+        FfiConverterOptionUInt64.lower(length),$0
+    )
+})
+}
+public func readLiveSftpFile(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, offset: UInt64, length: UInt64?)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_read_live_sftp_file(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),
+        FfiConverterUInt64.lower(offset),
+        FfiConverterOptionUInt64.lower(length),$0
+    )
+})
+}
 public func recordAgentActionEvent(databasePath: String, event: AgentActionAuditEvent)throws  -> AgentActionAuditRecord  {
     return try  FfiConverterTypeAgentActionAuditRecord_lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_record_agent_action_event(
@@ -10258,6 +10370,16 @@ public func renameLiveRemotePath(config: SshConnectionConfig, secret: SshAuthSec
     )
 }
 }
+public func renameLiveSftpPath(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, fromPath: String, toPath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_rename_live_sftp_path(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(fromPath),
+        FfiConverterString.lower(toPath),$0
+    )
+}
+}
 public func renameSessionFolder(databasePath: String, id: String, name: String)throws  -> SessionFolder  {
     return try  FfiConverterTypeSessionFolder_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
     uniffi_stacio_core_fn_func_rename_session_folder(
@@ -10314,6 +10436,16 @@ public func runLiveScpTransferWithResume(config: SshConnectionConfig, secret: Ss
     )
 })
 }
+public func runLiveSftpTransfer(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, job: ScpTransferJob)throws  -> [ScpTransferProgress]  {
+    return try  FfiConverterSequenceTypeScpTransferProgress.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_run_live_sftp_transfer(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterTypeScpTransferJob_lower(job),$0
+    )
+})
+}
 public func saveCredentialRecord(databasePath: String, draft: CredentialDraft)throws  -> CredentialRecord  {
     return try  FfiConverterTypeCredentialRecord_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
     uniffi_stacio_core_fn_func_save_credential_record(
@@ -10340,6 +10472,18 @@ public func saveTunnelProfileRecord(databasePath: String, record: TunnelProfileR
 public func searchLiveRemoteFiles(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, keyword: String, depth: UInt32)throws  -> [RemoteFileEntry]  {
     return try  FfiConverterSequenceTypeRemoteFileEntry.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_search_live_remote_files(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),
+        FfiConverterString.lower(keyword),
+        FfiConverterUInt32.lower(depth),$0
+    )
+})
+}
+public func searchLiveSftpFiles(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, keyword: String, depth: UInt32)throws  -> [RemoteFileEntry]  {
+    return try  FfiConverterSequenceTypeRemoteFileEntry.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_search_live_sftp_files(
         FfiConverterTypeSshConnectionConfig_lower(config),
         FfiConverterTypeSshAuthSecret_lower(secret),
         FfiConverterString.lower(expectedFingerprintSha256),
@@ -10384,6 +10528,16 @@ public func startLiveLocalTunnelRuntime(config: SshConnectionConfig, secret: Ssh
         FfiConverterTypeSshConnectionConfig_lower(config),
         FfiConverterTypeSshAuthSecret_lower(secret),
         FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterTypeTunnelProfile_lower(profile),$0
+    )
+})
+}
+public func startLiveLocalTunnelRuntimeWithProxyJump(config: SshConnectionConfig, secret: SshAuthSecret, proxyJump: SshProxyJumpRuntimeConfig, profile: TunnelProfile)throws  -> TunnelRuntimeStatus  {
+    return try  FfiConverterTypeTunnelRuntimeStatus_lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_start_live_local_tunnel_runtime_with_proxy_jump(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterTypeSshProxyJumpRuntimeConfig_lower(proxyJump),
         FfiConverterTypeTunnelProfile_lower(profile),$0
     )
 })
@@ -10522,6 +10676,17 @@ public func writeLiveRemoteFile(config: SshConnectionConfig, secret: SshAuthSecr
     )
 })
 }
+public func writeLiveSftpFile(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, remotePath: String, contents: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_write_live_sftp_file(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterString.lower(remotePath),
+        FfiConverterData.lower(contents),$0
+    )
+})
+}
 public func writeTerminalInput(runtimeId: String, bytes: Data)throws   {try rustCallWithError(FfiConverterTypeTerminalRuntimeError_lift) {
     uniffi_stacio_core_fn_func_write_terminal_input(
         FfiConverterString.lower(runtimeId),
@@ -10586,6 +10751,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_chmod_live_remote_path() != 37448) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_chmod_live_sftp_path() != 54978) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_clear_ai_conversation_history() != 27265) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10593,6 +10761,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_clear_known_host_record() != 50373) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_close_live_remote_file_read_session() != 19356) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_close_live_ssh_shell() != 39842) {
@@ -10613,10 +10784,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_copy_live_remote_path() != 51694) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_copy_live_sftp_path() != 34909) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_create_live_ftp_directory() != 27806) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_create_live_remote_directory() != 8774) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_create_live_sftp_directory() != 3063) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_create_session_folder() != 10568) {
@@ -10635,6 +10812,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_delete_live_remote_path() != 14006) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_delete_live_sftp_path() != 11700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_delete_session_folder() != 63365) {
@@ -10706,6 +10886,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_list_live_remote_directory() != 40519) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_list_live_sftp_directory() != 20917) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_list_scp_transfer_events() != 33943) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10743,6 +10926,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_move_session_record() != 42239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_open_live_remote_file_read_session() != 20923) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_open_live_sftp_file_read_session() != 28800) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_open_local_shell_runtime() != 48836) {
@@ -10793,6 +10982,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_read_live_remote_file() != 49909) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_read_live_remote_file_session() != 29529) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_read_live_sftp_file() != 29646) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_record_agent_action_event() != 62172) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10817,6 +11012,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_rename_live_remote_path() != 17270) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_rename_live_sftp_path() != 7137) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_rename_session_folder() != 33688) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10835,6 +11033,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_run_live_scp_transfer_with_resume() != 32331) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_run_live_sftp_transfer() != 34131) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_save_credential_record() != 32125) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10845,6 +11046,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_search_live_remote_files() != 39864) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_search_live_sftp_files() != 3883) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_serialize_macro_recording() != 48936) {
@@ -10860,6 +11064,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_start_live_local_tunnel_runtime() != 51032) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_start_live_local_tunnel_runtime_with_proxy_jump() != 15586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_start_live_serial_shell_runtime() != 61953) {
@@ -10908,6 +11115,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_write_live_remote_file() != 61782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_write_live_sftp_file() != 1601) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_write_terminal_input() != 13989) {
@@ -10959,6 +11169,8 @@ fileprivate func stacioUserFacingRuntimeMessage(_ message: String, prefix: Strin
         return "远程路径不安全"
     case "FILES_REMOTE_COMMAND_FAILED":
         return "远程文件操作失败"
+    case "FILES_READ_SESSION_NOT_FOUND":
+        return "远端文件读取会话已关闭，请重新打开文件"
     case "FILES_REMOTE_LIST_PARSE_FAILED":
         return "远程目录列表解析失败"
     default:

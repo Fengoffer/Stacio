@@ -1,6 +1,6 @@
 use crate::{
     domain::{
-        files::{parse_ftp_list_listing, RemoteFileEntry},
+        files::{parse_ftp_list_listing, parse_ftp_mlsd_listing, RemoteFileEntry},
         ftp::{validate_ftp_config, FtpAuthSecret, FtpConnectionConfig},
         ssh::{redact_ssh_diagnostic, SshRuntimeError},
     },
@@ -53,12 +53,36 @@ impl FtpControlClient {
         remote_path: &str,
     ) -> Result<Vec<RemoteFileEntry>, SshRuntimeError> {
         let path = normalized_path(remote_path)?;
+        if let Some(listing) = self.read_directory_data(&format!("MLSD {path}"), true)? {
+            if let Ok(entries) = parse_ftp_mlsd_listing(&path, &listing) {
+                return Ok(entries);
+            }
+        }
+        let listing = self
+            .read_directory_data(&format!("LIST {path}"), false)?
+            .ok_or_else(|| SshRuntimeError::Transport {
+                message: "FTP_LIST_UNSUPPORTED".to_string(),
+            })?;
+        parse_ftp_list_listing(&path, &listing).map_err(|_| SshRuntimeError::Transport {
+            message: "FTP_LIST_PARSE_FAILED".to_string(),
+        })
+    }
+
+    fn read_directory_data(
+        &mut self,
+        command: &str,
+        allows_unsupported: bool,
+    ) -> Result<Option<String>, SshRuntimeError> {
         let (host, port) = self.enter_passive_mode()?;
         let mut data_stream = TcpStream::connect((host.as_str(), port))
             .map_err(|error| ftp_transport_error(&error.to_string()))?;
-        self.write_command(&format!("LIST {path}"))?;
+        self.write_command(command)?;
         let preliminary = self.read_response()?;
         if preliminary.code != 125 && preliminary.code != 150 {
+            let _ = data_stream.shutdown(Shutdown::Both);
+            if allows_unsupported && matches!(preliminary.code, 500 | 501 | 502 | 504) {
+                return Ok(None);
+            }
             return Err(ftp_status_error(preliminary.code));
         }
         let mut listing = String::new();
@@ -67,9 +91,7 @@ impl FtpControlClient {
             .map_err(|error| ftp_transport_error(&error.to_string()))?;
         let _ = data_stream.shutdown(Shutdown::Both);
         self.expect_response(&[226, 250])?;
-        parse_ftp_list_listing(&path, &listing).map_err(|_| SshRuntimeError::Transport {
-            message: "FTP_LIST_PARSE_FAILED".to_string(),
-        })
+        Ok(Some(listing))
     }
 
     pub fn retrieve_file(&mut self, remote_path: &str) -> Result<Vec<u8>, SshRuntimeError> {

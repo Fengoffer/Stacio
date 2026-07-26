@@ -121,6 +121,44 @@ public final class CoreBridgeFTPTransferBridge: FTPTransferBridging {
     }
 }
 
+public protocol SFTPTransferBridging {
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress]
+    func cancelLiveSFTPTransfer(jobID: String) -> Bool
+}
+
+public extension SFTPTransferBridging {
+    func cancelLiveSFTPTransfer(jobID: String) -> Bool {
+        false
+    }
+}
+
+public struct CoreBridgeSFTPTransferBridge: SFTPTransferBridging {
+    public init() {}
+
+    public func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        try CoreBridge.runLiveSFTPTransfer(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job
+        )
+    }
+
+    public func cancelLiveSFTPTransfer(jobID: String) -> Bool {
+        (try? CoreBridge.cancelLiveSCPTransfer(jobID: jobID)) ?? false
+    }
+}
+
 public protocol SCPTransferHistoryStoring {
     func recordJob(sessionID: String?, job: ScpTransferJob, status: String, bytesDone: UInt64) throws
     func appendProgress(_ progress: ScpTransferProgress) throws -> ScpTransferEventRecord
@@ -255,6 +293,7 @@ public final class TransferQueueCoordinator {
     public var onSnapshotChanged: ((TransferQueueSnapshot) -> Void)?
 
     private let bridge: SCPTransferBridging
+    private let sftpBridge: SFTPTransferBridging
     private let ftpBridge: FTPTransferBridging
     private let historyStore: SCPTransferHistoryStoring
     private let completionNotificationPresenter: TransferCompletionNotificationPresenting
@@ -270,6 +309,12 @@ public final class TransferQueueCoordinator {
     private var retryableTransfersByJobID: [String: ScheduledSCPTransfer] = [:]
     private var retryableFTPTransfersByJobID: [String: ScheduledFTPTransfer] = [:]
     private var completionByJobID: [String: (ScpTransferProgress) -> Void] = [:]
+    private struct OrchestratedRetry {
+        let runtimeIDs: Set<String>
+        let retry: () -> Bool
+        let discard: () -> Void
+    }
+    private var orchestratedRetriesByJobID: [String: OrchestratedRetry] = [:]
     private var queuedScheduledJobIDs: [String] = []
     private var runningJobIDs: [String] = []
     private var runningSCPJobIDs = Set<String>()
@@ -278,6 +323,9 @@ public final class TransferQueueCoordinator {
     private var stoppedJobIDs = Set<String>()
     private var runTokensByJobID: [String: UUID] = [:]
     private var drainingRunTokensByJobID: [String: UUID] = [:]
+    private var drainingCancellationCompletionsByJobID: [String: (ScpTransferProgress) -> Void] = [:]
+    private var drainingCancellationProgressByJobID: [String: ScpTransferProgress] = [:]
+    private var drainingUsesWorkerResultJobIDs = Set<String>()
     private var pendingRequeueByJobID: [String: PendingTransferRequeue] = [:]
     private var runtimeIDByJobID: [String: String] = [:]
     private var priorRuntimeIDsByCurrentRuntimeID: [String: Set<String>] = [:]
@@ -295,6 +343,7 @@ public final class TransferQueueCoordinator {
 
     public init(
         bridge: SCPTransferBridging = CoreBridgeSCPTransferBridge(),
+        sftpBridge: SFTPTransferBridging = CoreBridgeSFTPTransferBridge(),
         ftpBridge: FTPTransferBridging = CoreBridgeFTPTransferBridge(),
         historyStore: SCPTransferHistoryStoring = NoOpSCPTransferHistoryStore(),
         completionNotificationPresenter: TransferCompletionNotificationPresenting? = nil,
@@ -304,6 +353,7 @@ public final class TransferQueueCoordinator {
         monotonicTimeProvider: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.bridge = bridge
+        self.sftpBridge = sftpBridge
         self.ftpBridge = ftpBridge
         self.historyStore = historyStore
         self.completionNotificationPresenter = completionNotificationPresenter
@@ -382,7 +432,8 @@ public final class TransferQueueCoordinator {
             secret: secret,
             expectedFingerprintSHA256: expectedFingerprintSHA256,
             job: job,
-            resumeOptions: resumeOptions(requestedOffset: 0, forceRestart: false)
+            resumeOptions: resumeOptions(requestedOffset: 0, forceRestart: false),
+            transport: .scp
         )
         retryableTransfersByJobID[job.id] = scheduledTransfersByJobID[job.id]
         completionByJobID[job.id] = completion
@@ -431,6 +482,50 @@ public final class TransferQueueCoordinator {
         startNextScheduledTransferIfNeeded()
     }
 
+    public func registerOrchestratedRetry(
+        jobID: String,
+        runtimeIDs: Set<String>,
+        retry: @escaping () -> Bool,
+        discard: @escaping () -> Void
+    ) {
+        orchestratedRetriesByJobID[jobID] = OrchestratedRetry(
+            runtimeIDs: runtimeIDs,
+            retry: retry,
+            discard: discard
+        )
+    }
+
+    public func unregisterOrchestratedRetry(jobID: String) {
+        orchestratedRetriesByJobID[jobID] = nil
+    }
+
+    public func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)? = nil
+    ) {
+        guard !isActiveScheduledTransfer(jobID: job.id) else {
+            return
+        }
+        enqueueTransfer(runtimeID: runtimeID, job: job)
+        scheduledTransfersByJobID[job.id] = ScheduledSCPTransfer(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            resumeOptions: resumeOptions(requestedOffset: 0, forceRestart: false),
+            transport: .sftp
+        )
+        retryableTransfersByJobID[job.id] = scheduledTransfersByJobID[job.id]
+        completionByJobID[job.id] = completion
+        queuedScheduledJobIDs.append(job.id)
+        refreshQueueView()
+        startNextScheduledTransferIfNeeded()
+    }
+
     public func scheduleLiveFTPTransfer(
         config: FtpConnectionConfig,
         secret: FtpAuthSecret,
@@ -449,13 +544,39 @@ public final class TransferQueueCoordinator {
     @discardableResult
     public func disconnectTransfers(runtimeID: String) -> [String] {
         dismissTransferNotifications(runtimeID: runtimeID, removesRuntimeAliases: true)
+        let orchestrationJobIDs = orchestratedRetriesByJobID.compactMap { jobID, orchestration in
+            orchestration.runtimeIDs.contains(runtimeID) ? jobID : nil
+        }
+        for jobID in orchestrationJobIDs {
+            discardOrchestratedRetry(jobID: jobID)
+        }
         let jobIDs = orderedJobIDs.filter { runtimeIDByJobID[$0] == runtimeID }
         guard jobIDs.isEmpty == false else {
             return []
         }
         for jobID in jobIDs {
-            moveActiveWorkerToDrainingState(jobID: jobID)
+            let latest = progressByJobID[jobID]?.last
+            let canceled = ScpTransferProgress(
+                jobId: jobID,
+                bytesDone: latest?.bytesDone ?? 0,
+                bytesTotal: jobsByID[jobID]?.bytesTotal ?? latest?.bytesTotal ?? 0,
+                status: "canceled"
+            )
+            let completion = completionByJobID[jobID]
+            var immediateCompletion: (() -> Void)?
+            if let cancellationAccepted = moveActiveWorkerToDrainingState(jobID: jobID) {
+                if let completion {
+                    drainingCancellationCompletionsByJobID[jobID] = completion
+                    drainingCancellationProgressByJobID[jobID] = canceled
+                    if cancellationAccepted == false {
+                        drainingUsesWorkerResultJobIDs.insert(jobID)
+                    }
+                }
+            } else {
+                immediateCompletion = { completion?(canceled) }
+            }
             removeTransfer(jobID: jobID)
+            immediateCompletion?()
         }
         refreshQueueView()
         stopProgressPollingIfIdle()
@@ -643,6 +764,9 @@ public final class TransferQueueCoordinator {
     }
 
     public func restoreHistory() throws {
+        let orchestratedRetries = Array(orchestratedRetriesByJobID.values)
+        orchestratedRetriesByJobID = [:]
+        orchestratedRetries.forEach { $0.discard() }
         let records = Self.restorableHistoryRecords(from: try historyStore.listJobs())
         orderedJobIDs = []
         jobsByID = [:]
@@ -663,6 +787,9 @@ public final class TransferQueueCoordinator {
         canceledJobIDs = []
         runTokensByJobID = [:]
         drainingRunTokensByJobID = [:]
+        drainingCancellationCompletionsByJobID = [:]
+        drainingCancellationProgressByJobID = [:]
+        drainingUsesWorkerResultJobIDs = []
         pendingRequeueByJobID = [:]
         runtimeIDByJobID = [:]
         priorRuntimeIDsByCurrentRuntimeID = [:]
@@ -742,6 +869,7 @@ public final class TransferQueueCoordinator {
         _ = try? historyStore.clearFinishedJobs()
         orderedJobIDs.removeAll { finished.contains($0) }
         for jobID in finished {
+            discardOrchestratedRetry(jobID: jobID)
             moveActiveWorkerToDrainingState(jobID: jobID)
             jobsByID[jobID] = nil
             progressByJobID[jobID] = nil
@@ -792,6 +920,10 @@ public final class TransferQueueCoordinator {
               Self.retryableStatuses.contains(status)
         else {
             return false
+        }
+
+        if let orchestration = orchestratedRetriesByJobID[jobID] {
+            return orchestration.retry()
         }
 
         return requeueRetryableTransfer(jobID: jobID, bytesDone: progressByJobID[jobID]?.last?.bytesDone ?? 0)
@@ -918,6 +1050,28 @@ public final class TransferQueueCoordinator {
 
         let bytesDone = latest?.bytesDone ?? 0
         let hasActiveWorker = runTokensByJobID[jobID] != nil
+        let isCancellation = ["canceled", "cancelled"].contains(status.lowercased())
+        let cancellationCompletion = isCancellation
+            ? completionByJobID[jobID]
+            : nil
+        if runningJobIDs.contains(jobID),
+           let scheduledTransfer = scheduledTransfersByJobID[jobID]
+        {
+            let accepted: Bool
+            switch scheduledTransfer.transport {
+            case .scp:
+                accepted = bridge.cancelLiveSCPTransfer(jobID: jobID)
+            case .sftp:
+                accepted = sftpBridge.cancelLiveSFTPTransfer(jobID: jobID)
+            }
+            guard accepted else { return false }
+        }
+        if runningJobIDs.contains(jobID),
+           scheduledFTPTransfersByJobID[jobID] != nil,
+           ftpBridge.cancelLiveFTPTransfer(jobID: jobID) == false
+        {
+            return false
+        }
         pendingRequeueByJobID[jobID] = nil
         _ = endTransferTiming(jobID: jobID)
         let interrupted = ScpTransferProgress(
@@ -942,24 +1096,15 @@ public final class TransferQueueCoordinator {
             stoppedJobIDs.remove(jobID)
         }
 
-        if runningJobIDs.contains(jobID),
-           scheduledTransfersByJobID[jobID] != nil
-        {
-            _ = bridge.cancelLiveSCPTransfer(jobID: jobID)
-        }
-        if runningJobIDs.contains(jobID),
-           scheduledFTPTransfersByJobID[jobID] != nil
-        {
-            _ = ftpBridge.cancelLiveFTPTransfer(jobID: jobID)
-        }
-
         queuedScheduledJobIDs.removeAll { $0 == jobID }
         scheduledTransfersByJobID[jobID] = nil
         scheduledFTPTransfersByJobID[jobID] = nil
         if !keepsRetryableTransfer {
             retryableTransfersByJobID[jobID] = nil
             retryableFTPTransfersByJobID[jobID] = nil
-            completionByJobID[jobID] = nil
+            if !(isCancellation && hasActiveWorker) {
+                completionByJobID[jobID] = nil
+            }
         }
         runningSCPJobIDs.remove(jobID)
         if hasActiveWorker == false {
@@ -970,6 +1115,10 @@ public final class TransferQueueCoordinator {
         progressByJobID[jobID] = [interrupted]
         _ = try? historyStore.appendProgress(interrupted)
         refreshQueueView()
+        if isCancellation && hasActiveWorker == false {
+            completionByJobID[jobID] = nil
+            cancellationCompletion?(interrupted)
+        }
         startNextScheduledTransferIfNeeded()
         return true
     }
@@ -983,15 +1132,25 @@ public final class TransferQueueCoordinator {
         runningSCPJobIDs.insert(jobID)
         startProgressPollingIfNeeded()
 
-        let task = Task.detached(priority: .utility) { [bridge] in
+        let task = Task.detached(priority: .utility) { [bridge, sftpBridge] in
             Result {
-                try bridge.runLiveSCPTransfer(
-                    config: scheduledTransfer.config,
-                    secret: scheduledTransfer.secret,
-                    expectedFingerprintSHA256: scheduledTransfer.expectedFingerprintSHA256,
-                    job: scheduledTransfer.job,
-                    resumeOptions: scheduledTransfer.resumeOptions
-                )
+                switch scheduledTransfer.transport {
+                case .scp:
+                    return try bridge.runLiveSCPTransfer(
+                        config: scheduledTransfer.config,
+                        secret: scheduledTransfer.secret,
+                        expectedFingerprintSHA256: scheduledTransfer.expectedFingerprintSHA256,
+                        job: scheduledTransfer.job,
+                        resumeOptions: scheduledTransfer.resumeOptions
+                    )
+                case .sftp:
+                    return try sftpBridge.runLiveSFTPTransfer(
+                        config: scheduledTransfer.config,
+                        secret: scheduledTransfer.secret,
+                        expectedFingerprintSHA256: scheduledTransfer.expectedFingerprintSHA256,
+                        job: scheduledTransfer.job
+                    )
+                }
             }
         }
         Task { @MainActor [weak self] in
@@ -1083,6 +1242,15 @@ public final class TransferQueueCoordinator {
     ) {
         if drainingRunTokensByJobID[jobID] == runToken {
             drainingRunTokensByJobID[jobID] = nil
+            let completion = drainingCancellationCompletionsByJobID.removeValue(forKey: jobID)
+            let fallbackProgress = drainingCancellationProgressByJobID.removeValue(forKey: jobID)
+            let usesWorkerResult = drainingUsesWorkerResultJobIDs.remove(jobID) != nil
+            let progress = usesWorkerResult
+                ? drainingTerminalProgress(result: result, fallback: fallbackProgress)
+                : fallbackProgress
+            if let progress {
+                completion?(progress)
+            }
             startNextScheduledTransferIfNeeded()
             return
         }
@@ -1107,7 +1275,16 @@ public final class TransferQueueCoordinator {
             return
         }
 
-        if canceledJobIDs.contains(jobID) || pausedJobIDs.contains(jobID) || stoppedJobIDs.contains(jobID) {
+        if canceledJobIDs.contains(jobID) {
+            let interrupted = progressByJobID[jobID]?.last
+            let completion = completionByJobID.removeValue(forKey: jobID)
+            if let interrupted {
+                completion?(interrupted)
+            }
+            startNextScheduledTransferIfNeeded()
+            return
+        }
+        if pausedJobIDs.contains(jobID) || stoppedJobIDs.contains(jobID) {
             startNextScheduledTransferIfNeeded()
             return
         }
@@ -1390,20 +1567,53 @@ public final class TransferQueueCoordinator {
         runningJobIDs.count + drainingRunTokensByJobID.count
     }
 
-    private func moveActiveWorkerToDrainingState(jobID: String) {
+    @discardableResult
+    private func moveActiveWorkerToDrainingState(jobID: String) -> Bool? {
         guard let runToken = runTokensByJobID[jobID] else {
-            return
+            return nil
         }
-        if runningJobIDs.contains(jobID), scheduledTransfersByJobID[jobID] != nil {
-            _ = bridge.cancelLiveSCPTransfer(jobID: jobID)
+        var cancellationAccepted: Bool?
+        if runningJobIDs.contains(jobID), let scheduledTransfer = scheduledTransfersByJobID[jobID] {
+            switch scheduledTransfer.transport {
+            case .scp:
+                cancellationAccepted = bridge.cancelLiveSCPTransfer(jobID: jobID)
+            case .sftp:
+                cancellationAccepted = sftpBridge.cancelLiveSFTPTransfer(jobID: jobID)
+            }
         }
         if runningJobIDs.contains(jobID), scheduledFTPTransfersByJobID[jobID] != nil {
-            _ = ftpBridge.cancelLiveFTPTransfer(jobID: jobID)
+            cancellationAccepted = ftpBridge.cancelLiveFTPTransfer(jobID: jobID)
         }
         drainingRunTokensByJobID[jobID] = runToken
+        return cancellationAccepted ?? false
+    }
+
+    private func drainingTerminalProgress(
+        result: Result<[ScpTransferProgress], Error>,
+        fallback: ScpTransferProgress?
+    ) -> ScpTransferProgress? {
+        switch result {
+        case .success(let progressEvents):
+            if let terminal = progressEvents.last(where: {
+                $0.jobId == fallback?.jobId
+                    && ["completed", "failed", "canceled", "cancelled"].contains($0.status.lowercased())
+            }) {
+                return terminal
+            }
+        case .failure:
+            break
+        }
+        guard let fallback else { return nil }
+        return ScpTransferProgress(
+            jobId: fallback.jobId,
+            bytesDone: fallback.bytesDone,
+            bytesTotal: fallback.bytesTotal,
+            status: "failed"
+        )
     }
 
     private func removeTransfer(jobID: String) {
+        discardOrchestratedRetry(jobID: jobID)
         orderedJobIDs.removeAll { $0 == jobID }
         jobsByID[jobID] = nil
         progressByJobID[jobID] = nil
@@ -1426,6 +1636,10 @@ public final class TransferQueueCoordinator {
         runtimeIDByJobID[jobID] = nil
         timingByJobID[jobID] = nil
         terminalObservationByJobID[jobID] = nil
+    }
+
+    private func discardOrchestratedRetry(jobID: String) {
+        orchestratedRetriesByJobID.removeValue(forKey: jobID)?.discard()
     }
 
     private func persistProgress(_ progressEvents: [ScpTransferProgress], message: String? = nil) {
@@ -1631,12 +1845,18 @@ private struct PendingTransferRequeue {
     let forceRestart: Bool
 }
 
+private enum SecureTransferTransport: Sendable {
+    case scp
+    case sftp
+}
+
 private struct ScheduledSCPTransfer: Sendable {
     let config: SshConnectionConfig
     let secret: SshAuthSecret
     let expectedFingerprintSHA256: String
     let job: ScpTransferJob
     let resumeOptions: ScpResumeOptions
+    let transport: SecureTransferTransport
 
     func withResumeOptions(_ resumeOptions: ScpResumeOptions) -> ScheduledSCPTransfer {
         ScheduledSCPTransfer(
@@ -1644,7 +1864,8 @@ private struct ScheduledSCPTransfer: Sendable {
             secret: secret,
             expectedFingerprintSHA256: expectedFingerprintSHA256,
             job: job,
-            resumeOptions: resumeOptions
+            resumeOptions: resumeOptions,
+            transport: transport
         )
     }
 }

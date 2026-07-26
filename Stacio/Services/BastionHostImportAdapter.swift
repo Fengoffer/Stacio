@@ -15,6 +15,24 @@ public enum BastionHostVendor: String, CaseIterable, Codable, Sendable {
     case beyondTrust = "beyondtrust"
     case custom
 
+    public var displayName: String {
+        switch self {
+        case .jumpServer: return "JumpServer"
+        case .topsec: return "天融信"
+        case .sangfor: return "深信服"
+        case .qianxin: return "奇安信"
+        case .qihoo360: return "360 企业安全"
+        case .dbappsecurity: return "安恒信息"
+        case .alibabaCloud: return "阿里云堡垒机"
+        case .tencentCloud: return "腾讯云堡垒机"
+        case .huaweiCloud: return "华为云堡垒机"
+        case .teleport: return "Teleport"
+        case .cyberArk: return "CyberArk"
+        case .beyondTrust: return "BeyondTrust"
+        case .custom: return "其他 / 自定义"
+        }
+    }
+
     public static func identify(_ value: String) -> BastionHostVendor {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let aliases: [String: BastionHostVendor] = [
@@ -50,7 +68,64 @@ public enum BastionHostVendor: String, CaseIterable, Codable, Sendable {
             (.beyondTrust, ["beyondtrust"]),
             (.qihoo360, ["360堡垒机", "360企业安全"])
         ]
-        return markers.first(where: { marker in marker.1.contains(where: haystack.contains) })?.0
+        if let matched = markers.first(where: { marker in marker.1.contains(where: haystack.contains) })?.0 {
+            return matched
+        }
+        return TopsecBastionRoute.first(in: contents) == nil ? nil : .topsec
+    }
+}
+
+struct TopsecBastionRoute: Equatable, Sendable {
+    let accountID: String
+    let tenant: String
+    let protocolName: String
+    let targetUsername: String
+    let targetHost: String
+    let targetPort: UInt16
+
+    init?(compositeUsername: String) {
+        let components = compositeUsername
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "@", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard components.count >= 6,
+              let targetPort = UInt16(components[components.count - 1]),
+              targetPort > 0
+        else { return nil }
+
+        let protocolName = components[components.count - 4].lowercased()
+        let targetUsername = components[components.count - 3]
+        let targetHost = components[components.count - 2]
+        let tenant = components[components.count - 5]
+        let accountID = components.dropLast(5).joined(separator: "@")
+        guard ["ssh", "sftp"].contains(protocolName),
+              accountID.isEmpty == false,
+              tenant.isEmpty == false,
+              targetUsername.isEmpty == false,
+              targetHost.isEmpty == false
+        else { return nil }
+
+        self.accountID = accountID
+        self.tenant = tenant
+        self.protocolName = protocolName
+        self.targetUsername = targetUsername
+        self.targetHost = targetHost
+        self.targetPort = targetPort
+    }
+
+    static func first(in contents: String) -> TopsecBastionRoute? {
+        for rawLine in contents.components(separatedBy: .newlines) {
+            let value: Substring
+            if let separator = rawLine.firstIndex(of: "=") {
+                value = rawLine[rawLine.index(after: separator)...]
+            } else {
+                value = rawLine[...]
+            }
+            if let route = TopsecBastionRoute(compositeUsername: String(value)) {
+                return route
+            }
+        }
+        return nil
     }
 }
 
@@ -142,12 +217,34 @@ public enum BastionHostImportAdapter {
         sourceName: String,
         contents: String
     ) -> ExternalSessionImportPayload {
-        guard let vendor = BastionHostVendor.detect(sourceName: sourceName, contents: contents) else {
+        let vendor = BastionHostVendor.detect(sourceName: sourceName, contents: contents)
+            ?? (payload.sessions.contains { session in
+                session.username.flatMap(TopsecBastionRoute.init(compositeUsername:)) != nil
+            } ? .topsec : nil)
+        guard let vendor else {
             return payload
         }
+        return addingVendorMetadata(to: payload, vendor: vendor, format: "external_session")
+    }
+
+    static func addingVendorMetadata(
+        to payload: ExternalSessionImportPayload,
+        vendor: BastionHostVendor,
+        format: String
+    ) -> ExternalSessionImportPayload {
         let sessions = payload.sessions.map { session in
             guard session.configJSON == nil else { return session }
-            let metadata = ["bastionVendor": vendor.rawValue, "bastionFormat": "external_session"]
+            var metadata: [String: Any] = [
+                "bastionVendor": vendor.rawValue,
+                "bastionFormat": format
+            ]
+            if vendor == .topsec,
+               let route = session.username.flatMap(TopsecBastionRoute.init(compositeUsername:)) {
+                metadata["bastionTargetHost"] = route.targetHost
+                metadata["bastionTargetPort"] = route.targetPort
+                metadata["bastionTargetUsername"] = route.targetUsername
+                metadata["bastionAccountId"] = route.accountID
+            }
             let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
             return ExternalImportedSession(
                 name: session.name,

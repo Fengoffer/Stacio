@@ -223,6 +223,16 @@ enum RuntimeDiagnosticFormatter {
             return "远程文件操作失败"
         case "FILES_REMOTE_LIST_PARSE_FAILED":
             return "远程目录列表解析失败"
+        case "FILES_SFTP_OPERATION_FAILED":
+            return "SFTP 文件操作失败"
+        case "SFTP_TRANSFER_CANCELLED":
+            return "SFTP 文件传输已取消"
+        case "FTP_TRANSFER_CANCELLED":
+            return "FTP 文件传输已取消"
+        case "FTP_LIST_UNSUPPORTED":
+            return "FTP 服务器不支持目录列表"
+        case "FTP_LIST_PARSE_FAILED":
+            return "FTP 目录列表解析失败"
         default:
             return nil
         }

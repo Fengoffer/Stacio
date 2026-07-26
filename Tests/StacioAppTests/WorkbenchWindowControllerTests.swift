@@ -2300,6 +2300,305 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(multiExec.toolTip, L10n.Workbench.multiExecTooltip)
     }
 
+    func testWorkspaceCapabilityToolbarAndPanelItemsFollowCurrentSessionProtocol() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        let capabilityIdentifiers = [
+            "Stacio.Toolbar.files",
+            "Stacio.Toolbar.browser",
+            "Stacio.Toolbar.tunnels",
+            "Stacio.Toolbar.deviceDashboard",
+            "Stacio.Toolbar.aiAssistant"
+        ]
+        let enabledTooltips = [
+            "Stacio.Toolbar.files": L10n.Inspector.files,
+            "Stacio.Toolbar.browser": L10n.Inspector.browser,
+            "Stacio.Toolbar.tunnels": L10n.Workbench.tunnels,
+            "Stacio.Toolbar.deviceDashboard": L10n.Workbench.toggleDeviceDashboard,
+            "Stacio.Toolbar.aiAssistant": L10n.AI.assistant
+        ]
+
+        func assertCapabilityItems(enabled: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+            toolbar.validateVisibleItems()
+            for identifier in capabilityIdentifiers {
+                let item = try XCTUnwrap(
+                    toolbar.items.first { $0.itemIdentifier.rawValue == identifier },
+                    file: file,
+                    line: line
+                )
+                XCTAssertEqual(item.isEnabled, enabled, identifier, file: file, line: line)
+                XCTAssertEqual(
+                    item.toolTip,
+                    enabled ? enabledTooltips[identifier] : L10n.Workbench.sshSessionRequiredTooltip,
+                    identifier,
+                    file: file,
+                    line: line
+                )
+            }
+
+            let panelsItem = try XCTUnwrap(
+                toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem,
+                file: file,
+                line: line
+            )
+            let menu = try XCTUnwrap(panelsItem.menu, file: file, line: line)
+            menu.delegate?.menuWillOpen?(menu)
+            for title in [
+                L10n.Inspector.files,
+                L10n.Inspector.browser,
+                L10n.Workbench.tunnels,
+                L10n.Workbench.deviceDashboard,
+                L10n.Inspector.logs,
+                L10n.AI.title
+            ] {
+                let item = try XCTUnwrap(menu.item(withTitle: title), file: file, line: line)
+                XCTAssertEqual(item.isEnabled, enabled, title, file: file, line: line)
+                XCTAssertEqual(
+                    item.toolTip,
+                    enabled ? nil : L10n.Workbench.sshSessionRequiredTooltip,
+                    title,
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_serial", status: "running", diagnostic: "running"),
+            title: "串口",
+            connectionKind: .serial
+        )
+        try assertCapabilityItems(enabled: false)
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_telnet", status: "running", diagnostic: "running"),
+            title: "Telnet",
+            connectionKind: .telnet
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = try workspace.openRemoteFilesSession(
+            context: workbenchLiveContext(host: "scp.example.com"),
+            title: "SCP",
+            bridge: filesBridge,
+            transferScheduler: nil
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = try workspace.openSFTPFilesSession(
+            context: workbenchLiveContext(host: "sftp.example.com"),
+            title: "SFTP",
+            bridge: filesBridge
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = workspace.openConnectingGraphicsSession(
+            title: "VNC",
+            protocolName: "VNC",
+            host: "vnc.example.com",
+            port: 5900
+        )
+        try assertCapabilityItems(enabled: false)
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ssh", status: "running", diagnostic: "running"),
+            title: "SSH",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "ssh.example.com")
+        )
+        try assertCapabilityItems(enabled: true)
+    }
+
+    func testMixedProtocolPaneFocusImmediatelyRefreshesToolbarAndInspectorCapabilities() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_ssh", status: "running", diagnostic: "running"),
+            title: "生产 SSH",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_serial", status: "running", diagnostic: "running"),
+            title: "串口控制台",
+            connectionKind: .serial
+        )
+        try workspace.startMultiExecSession(targetIDs: ["term_focus_ssh", "term_focus_serial"])
+        let sshPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_ssh"))
+        let serialPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_serial"))
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let aiItem = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.aiAssistant" }
+        )
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let aiSegment = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.AI.title))
+        window.contentView?.layoutSubtreeIfNeeded()
+        func focus(_ pane: RemoteTerminalPaneViewController) throws {
+            let container = try XCTUnwrap(pane.view as? TerminalFocusContainerView)
+            container.layoutSubtreeIfNeeded()
+            let point = pane.terminalView.convert(NSPoint(x: 1, y: 1), to: container)
+            XCTAssertNotNil(container.hitTest(point))
+            XCTAssertIdentical(window.firstResponder, pane.terminalView)
+        }
+
+        try focus(serialPane)
+        XCTAssertFalse(aiItem.isEnabled)
+        XCTAssertEqual(aiItem.toolTip, L10n.Workbench.sshSessionRequiredTooltip)
+        XCTAssertFalse(inspector.sectionControlForTesting.isEnabled(forSegment: aiSegment))
+        XCTAssertEqual(
+            inspector.sectionControlForTesting.toolTip(forSegment: aiSegment),
+            L10n.Workbench.sshSessionRequiredTooltip
+        )
+
+        try focus(sshPane)
+        XCTAssertTrue(aiItem.isEnabled)
+        XCTAssertEqual(aiItem.toolTip, L10n.AI.assistant)
+        XCTAssertTrue(inspector.sectionControlForTesting.isEnabled(forSegment: aiSegment))
+        XCTAssertEqual(inspector.sectionControlForTesting.toolTip(forSegment: aiSegment), L10n.AI.title)
+    }
+
+    func testUnsupportedRemoteSessionActionsAndInspectorSectionsCannotBypassCapabilityPolicy() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let restrictedSections = [
+            L10n.Inspector.files,
+            L10n.Inspector.tunnels,
+            L10n.Inspector.browser,
+            L10n.Inspector.logs,
+            L10n.AI.title
+        ]
+
+        func assertRestrictedCapabilitiesBlocked(
+            _ sessionProtocol: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws {
+            inspector.selectTerminalMacrosTab()
+            let dashboardState = workspace.isDeviceMetricsDashboardEnabled
+
+            controller.showFilesFromToolbar(nil)
+            controller.showBrowserFromToolbar(nil)
+            controller.showTunnelsFromToolbar(nil)
+            controller.toggleDeviceDashboardFromToolbar(nil)
+            controller.showDiagnosticsFromToolbar(nil)
+            controller.showAIAssistantFromToolbar(nil)
+            workspace.toggleDeviceMetricsDashboardVisibility()
+            workspace.requestAIForCurrentTerminalForTesting(selectedText: "blocked")
+
+            XCTAssertTrue(
+                controller.contentSplitViewController.splitViewItems[2].isCollapsed,
+                sessionProtocol,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                workspace.isDeviceMetricsDashboardEnabled,
+                dashboardState,
+                sessionProtocol,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(inspector.selectedTabLabel, L10n.Inspector.macros, sessionProtocol, file: file, line: line)
+
+            for label in restrictedSections {
+                let index = try XCTUnwrap(
+                    inspector.sectionLabelsForTesting.firstIndex(of: label),
+                    file: file,
+                    line: line
+                )
+                XCTAssertFalse(
+                    inspector.sectionControlForTesting.isEnabled(forSegment: index),
+                    "\(sessionProtocol): \(label)",
+                    file: file,
+                    line: line
+                )
+                inspector.selectSectionForTesting(index)
+                XCTAssertEqual(
+                    inspector.selectedTabLabel,
+                    L10n.Inspector.macros,
+                    "\(sessionProtocol): \(label)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_serial_guard", status: "running", diagnostic: "running"),
+            title: "Serial",
+            connectionKind: .serial
+        )
+        try assertRestrictedCapabilitiesBlocked("serial")
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_telnet_guard", status: "running", diagnostic: "running"),
+            title: "Telnet",
+            connectionKind: .telnet
+        )
+        try assertRestrictedCapabilitiesBlocked("telnet")
+
+        _ = try workspace.openRemoteFilesSession(
+            context: workbenchLiveContext(host: "scp-guard.example.com"),
+            title: "SCP",
+            bridge: filesBridge,
+            transferScheduler: nil
+        )
+        try assertRestrictedCapabilitiesBlocked("scp")
+
+        _ = try workspace.openSFTPFilesSession(
+            context: workbenchLiveContext(host: "sftp-guard.example.com"),
+            title: "SFTP",
+            bridge: filesBridge
+        )
+        try assertRestrictedCapabilitiesBlocked("sftp")
+
+        _ = workspace.openConnectingGraphicsSession(
+            title: "VNC",
+            protocolName: "VNC",
+            host: "vnc-guard.example.com",
+            port: 5900
+        )
+        try assertRestrictedCapabilitiesBlocked("vnc")
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ssh_guard", status: "running", diagnostic: "running"),
+            title: "SSH",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "ssh-guard.example.com")
+        )
+        for label in restrictedSections {
+            let index = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: label))
+            XCTAssertTrue(inspector.sectionControlForTesting.isEnabled(forSegment: index), label)
+            inspector.selectSectionForTesting(index)
+            XCTAssertEqual(inspector.selectedTabLabel, label)
+        }
+    }
+
     func testLicensedActionsCannotBeInvokedWithoutEntitlements() throws {
         let workspace = WorkspaceViewController()
         let controller = WorkbenchWindowController(
@@ -4526,16 +4825,161 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let status = try controller.openSavedSession(session)
 
         let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
-        XCTAssertEqual(status.runtimeId, "graphics_vnc_test")
-        XCTAssertEqual(status.status, "running")
-        XCTAssertEqual(status.diagnostic, "已启动 Stacio 内置 VNC 适配器，正在建立图形连接。")
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertEqual(status.diagnostic, L10n.TerminalLifecycle.connecting)
+        XCTAssertEqual(pane.runtimeID, status.runtimeId)
+        XCTAssertTrue(pane.isConnectionStateVisibleForTesting)
+        XCTAssertEqual(
+            pane.visibleTextSnapshotForTesting,
+            "正在连接...\nVNC · desktop.example.com:5900"
+        )
+
+        XCTAssertTrue(waitUntil {
+            pane.runtimeID == "graphics_vnc_test" && graphicsRuntime.requests.count == 1
+        })
+
         XCTAssertEqual(pane.runtimeID, "graphics_vnc_test")
         XCTAssertEqual(graphicsRuntime.requests.map(\.protocolName), ["VNC"])
         XCTAssertEqual(graphicsRuntime.requests.map(\.adapterPath), ["/Applications/Stacio.app/Contents/Adapters/vnc"])
         XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [["desktop.example.com:5900"]])
+        XCTAssertFalse(pane.isConnectionStateVisibleForTesting)
         XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("正在建立图形连接"))
         XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("尚未建立图形连接"))
         XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchVNCStartFailureKeepsUnifiedConnectionStateVisible() throws {
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_unused",
+                status: "running",
+                diagnostic: "unused"
+            ),
+            startError: TestWorkbenchError.failed
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_failure_state",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        _ = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(waitUntil {
+            pane.isConnectionStateVisibleForTesting
+                && pane.visibleTextSnapshotForTesting.contains("连接失败")
+        })
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("VNC · desktop.example.com:5900"))
+        XCTAssertFalse(pane.hasVisibleDiagnosticChromeForTesting)
+    }
+
+    func testWorkbenchVNCNonRunningRuntimeStatusKeepsUnifiedConnectionStateVisible() throws {
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_failed_status",
+                status: "failed",
+                diagnostic: "VNC 连接超时"
+            )
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_failed_status",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        _ = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(waitUntil {
+            pane.isConnectionStateVisibleForTesting
+                && pane.visibleTextSnapshotForTesting.contains("VNC 连接超时")
+        })
+        XCTAssertFalse(pane.hasVisibleDiagnosticChromeForTesting)
+    }
+
+    func testClosingPendingVNCSessionStopsLateStartedRuntime() throws {
+        let startGate = DispatchSemaphore(value: 0)
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_late",
+                status: "running",
+                diagnostic: "connected"
+            ),
+            startGate: startGate
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_late",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
+        workspace.closeCurrentTerminal()
+        startGate.signal()
+
+        XCTAssertTrue(waitUntil { graphicsRuntime.stoppedRuntimeIDs == ["graphics_vnc_late"] })
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(pane.runtimeID, status.runtimeId)
     }
 
     func testWorkbenchOpenSavedVNCSessionPassesSavedPasswordToPackagedAdapterWithoutLeakingIt() throws {
@@ -4583,7 +5027,12 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let status = try controller.openSavedSession(session)
 
         let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
-        XCTAssertEqual(status.runtimeId, "graphics_vnc_password")
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertTrue(pane.isConnectionStateVisibleForTesting)
+        XCTAssertTrue(waitUntil {
+            pane.runtimeID == "graphics_vnc_password" && graphicsRuntime.requests.count == 1
+        })
         XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [[
             "--password",
             "vnc-secret",
@@ -4651,7 +5100,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
         let status = try controller.openSavedSession(staleCredentialSession)
 
-        XCTAssertEqual(status.runtimeId, "graphics_vnc_prompted")
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
         XCTAssertEqual(prompt.requests.map(\.protocolName), ["VNC"])
         XCTAssertEqual(prompt.requests.map(\.account), ["admin@desktop.example.com"])
         let updatedSession = try XCTUnwrap(CoreBridge.listAllSessionRecords(databasePath: tempURL.path).first)
@@ -4661,6 +5111,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             try keychainStore.readSecret(id: credentialID, account: "admin@desktop.example.com"),
             "prompted-vnc-secret"
         )
+        XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
         let arguments = try XCTUnwrap(graphicsRuntime.requests.first?.arguments)
         XCTAssertEqual(Array(arguments.suffix(3)), ["--password", "prompted-vnc-secret", "desktop.example.com:5900"])
     }
@@ -5059,7 +5510,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertTrue(starter.startedConfigs.isEmpty)
     }
 
-    func testWorkbenchOpenSavedFTPSessionUsesEmbeddedFTPFilesPane() throws {
+    func testWorkbenchRejectsLegacyFTPSessionWithoutStartingRuntime() throws {
         let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
             RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
         ])
@@ -5067,20 +5518,13 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
         )
         let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
-        try keychainStore.save(
-            KeychainCredential(
-                id: "cred_ftp",
-                account: "deploy@ftp.example.com",
-                secret: "ftp-password"
-            )
-        )
+        let recentRecorder = RecordingSavedSessionOpenRecorder()
         let controller = WorkbenchWindowController(
             workspaceViewController: workspace,
             remoteFilesBridge: filesBridge,
             remoteSessionStarter: starter,
-            ftpCredentialResolver: FTPCredentialResolver(store: keychainStore),
-            plaintextProtocolSessionConfirmation: RecordingPlaintextProtocolSessionConfirmation(shouldOpen: true)
+            plaintextProtocolSessionConfirmation: RecordingPlaintextProtocolSessionConfirmation(shouldOpen: true),
+            savedSessionOpenRecorder: recentRecorder
         )
         let session = SessionRecord(
             id: "session_ftp",
@@ -5097,54 +5541,18 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
 
         controller.loadWindow()
-        let status = try controller.openSavedSession(session)
-
-        XCTAssertTrue(status.runtimeId.hasPrefix("ftp_"))
-        XCTAssertEqual(status.status, "running")
-        XCTAssertEqual(status.diagnostic, "内置 FTP 文件面板已打开")
-        XCTAssertEqual(filesBridge.ftpHosts, ["ftp.example.com"])
-        XCTAssertEqual(filesBridge.ftpUsernames, ["deploy"])
-        XCTAssertEqual(filesBridge.ftpSecrets, ["ftp-password"])
-        XCTAssertTrue(workspace.currentTerminalPane is RemoteFilesPaneViewController)
-        XCTAssertTrue(starter.startedConfigs.isEmpty)
-    }
-
-    func testWorkbenchOpenSavedFTPSessionCancelingPlaintextWarningDoesNotOpenFilesOrMarkOpened() {
-        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
-            RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
-        ])
-        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let recentRecorder = RecordingSavedSessionOpenRecorder()
-        let confirmation = RecordingPlaintextProtocolSessionConfirmation(shouldOpen: false)
-        let controller = WorkbenchWindowController(
-            workspaceViewController: workspace,
-            remoteFilesBridge: filesBridge,
-            plaintextProtocolSessionConfirmation: confirmation,
-            savedSessionOpenRecorder: recentRecorder,
-            databasePathProvider: { "/tmp/stacio-test.sqlite" }
-        )
-        let session = SessionRecord(
-            id: "session_ftp_plaintext",
-            folderId: nil,
-            name: "FTP 文件",
-            protocol: "ftp",
-            host: "ftp.example.com",
-            port: 21,
-            username: "deploy",
-            privateKeyPath: nil,
-            credentialId: "cred_ftp",
-            tags: [],
-            lastOpenedAt: nil
-        )
-
         XCTAssertThrowsError(try controller.openSavedSession(session)) { error in
-            XCTAssertTrue(error is CancellationError)
+            XCTAssertEqual(
+                error as? WorkbenchSessionOpenError,
+                .protocolRemoved("FTP", replacement: "SFTP")
+            )
         }
-        XCTAssertEqual(confirmation.requestedProtocols, ["FTP"])
-        XCTAssertTrue(confirmation.requestedMessages.first?.contains("FTP 不加密") ?? false)
-        XCTAssertTrue(confirmation.requestedMessages.first?.contains("受信任网络") ?? false)
-        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+
         XCTAssertTrue(filesBridge.ftpHosts.isEmpty)
+        XCTAssertTrue(filesBridge.ftpUsernames.isEmpty)
+        XCTAssertTrue(filesBridge.ftpSecrets.isEmpty)
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
         XCTAssertTrue(recentRecorder.requests.isEmpty)
     }
 
@@ -6489,6 +6897,12 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
 
         controller.loadWindow()
+        let forwardRemoteSelection = workspace.onCurrentRemoteTerminalChanged
+        var deliveredRemoteRuntimeIDs: [String?] = []
+        workspace.onCurrentRemoteTerminalChanged = { pane in
+            deliveredRemoteRuntimeIDs.append(pane?.runtimeID)
+            forwardRemoteSelection?(pane)
+        }
         workspace.openRemoteShell(
             status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
             title: "deploy@example.com",
@@ -6503,7 +6917,29 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         try workspace.splitCurrentTerminal()
         XCTAssertFalse(workspace.currentTerminalPane === boundPane)
 
+        // The tab controller may have queued a selection callback while the
+        // split was being installed.  Drain the main queue before exercising
+        // the still-bound pane so that stale callbacks cannot be hidden by
+        // the directory-follow update below.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(
+            controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath,
+            "/srv/app"
+        )
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(inspector.isFilesTabBound(to: InspectorViewController.RemoteFilesBinding(
+            runtimeID: boundPane.runtimeID,
+            context: context,
+            remotePath: "/srv/app"
+        )))
+
         boundPane.sendInput(Array("cd /srv/releases\n".utf8))
+        XCTAssertEqual(boundPane.currentRemoteDirectory, "/srv/releases")
+        XCTAssertTrue(inspector.isFilesTabBound(to: InspectorViewController.RemoteFilesBinding(
+            runtimeID: boundPane.runtimeID,
+            context: context,
+            remotePath: "/srv/releases"
+        )))
 
         XCTAssertTrue(waitUntil {
             filesBridge.liveRemotePaths.last == "/srv/releases"
@@ -6511,6 +6947,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         })
         XCTAssertEqual(filesBridge.liveRemotePaths.last, "/srv/releases")
         XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/srv/releases")
+        XCTAssertEqual(deliveredRemoteRuntimeIDs.compactMap { $0 }, ["term_remote"])
     }
 
     func testWorkbenchInspectorFilesRebindsToSelectedConnectedSSHTab() throws {
@@ -7958,20 +8395,45 @@ private final class RecordingSerialSessionStarter: SerialSessionStarting {
 
 private final class RecordingGraphicsRuntimeManager: GraphicsRuntimeManaging {
     private let status: GraphicsRuntimeStatus
-    private(set) var requests: [GraphicsRuntimeStartRequest] = []
-    private(set) var stoppedRuntimeIDs: [String] = []
+    private let startGate: DispatchSemaphore?
+    private let startError: Error?
+    private let lock = NSLock()
+    private var recordedRequests: [GraphicsRuntimeStartRequest] = []
+    private var recordedStoppedRuntimeIDs: [String] = []
 
-    init(status: GraphicsRuntimeStatus) {
+    var requests: [GraphicsRuntimeStartRequest] {
+        lock.withLock { recordedRequests }
+    }
+
+    var stoppedRuntimeIDs: [String] {
+        lock.withLock { recordedStoppedRuntimeIDs }
+    }
+
+    init(
+        status: GraphicsRuntimeStatus,
+        startGate: DispatchSemaphore? = nil,
+        startError: Error? = nil
+    ) {
         self.status = status
+        self.startGate = startGate
+        self.startError = startError
     }
 
     func start(request: GraphicsRuntimeStartRequest) throws -> GraphicsRuntimeStatus {
-        requests.append(request)
+        lock.withLock {
+            recordedRequests.append(request)
+        }
+        _ = startGate?.wait(timeout: .now() + 2)
+        if let startError {
+            throw startError
+        }
         return status
     }
 
     func stop(runtimeID: String) -> GraphicsRuntimeStatus {
-        stoppedRuntimeIDs.append(runtimeID)
+        lock.withLock {
+            recordedStoppedRuntimeIDs.append(runtimeID)
+        }
         return GraphicsRuntimeStatus(
             runtimeID: runtimeID,
             status: "closed",

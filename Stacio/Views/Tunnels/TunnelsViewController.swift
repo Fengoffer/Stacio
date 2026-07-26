@@ -30,9 +30,26 @@ public protocol LiveTunnelCoreBridging {
         expectedFingerprintSHA256: String,
         profile: TunnelProfile
     ) throws -> TunnelRuntimeStatus
+    func startLiveLocalTunnelRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus
     func pollLiveTunnelRuntime(profileID: String) throws -> TunnelRuntimeStatus
     func closeLiveTunnelRuntime(profileID: String) throws -> TunnelRuntimeStatus
     func stopTunnelRuntime(state: TunnelState) throws -> TunnelState
+}
+
+public extension LiveTunnelCoreBridging {
+    func startLiveLocalTunnelRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus {
+        throw SshRuntimeError.Transport(message: "ProxyJump tunnel runtime is not supported by this bridge")
+    }
 }
 
 public struct CoreLiveTunnelBridge: LiveTunnelCoreBridging {
@@ -56,6 +73,20 @@ public struct CoreLiveTunnelBridge: LiveTunnelCoreBridging {
         )
     }
 
+    public func startLiveLocalTunnelRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus {
+        try CoreBridge.startLiveLocalTunnelRuntimeWithProxyJump(
+            config: config,
+            secret: secret,
+            proxyJump: proxyJump,
+            profile: profile
+        )
+    }
+
     public func pollLiveTunnelRuntime(profileID: String) throws -> TunnelRuntimeStatus {
         try CoreBridge.pollLiveTunnelRuntime(profileID: profileID)
     }
@@ -70,13 +101,29 @@ public struct CoreLiveTunnelBridge: LiveTunnelCoreBridging {
 }
 
 public protocol TunnelRuntimeBridging {
+    func captureLiveSessionContext() -> TunnelLiveSessionContext?
     func start(profile: TunnelProfile) throws -> TunnelRuntimeStatus
+    func start(
+        profile: TunnelProfile,
+        liveSessionContext: TunnelLiveSessionContext?
+    ) throws -> TunnelRuntimeStatus
     func start(record: TunnelProfileRecord) throws -> TunnelRuntimeStatus
     func poll(profileID: String) throws -> TunnelRuntimeStatus
     func stop(profile: TunnelProfile, state: TunnelState) throws -> TunnelRuntimeStatus
 }
 
 public extension TunnelRuntimeBridging {
+    func captureLiveSessionContext() -> TunnelLiveSessionContext? {
+        nil
+    }
+
+    func start(
+        profile: TunnelProfile,
+        liveSessionContext: TunnelLiveSessionContext?
+    ) throws -> TunnelRuntimeStatus {
+        try start(profile: profile)
+    }
+
     func start(record: TunnelProfileRecord) throws -> TunnelRuntimeStatus {
         try start(profile: record.profile)
     }
@@ -107,6 +154,17 @@ public struct CoreBridgeTunnelRuntimeBridge: TunnelRuntimeBridging {
         try start(profile: profile, context: liveSessionContextProvider())
     }
 
+    public func captureLiveSessionContext() -> TunnelLiveSessionContext? {
+        liveSessionContextProvider()
+    }
+
+    public func start(
+        profile: TunnelProfile,
+        liveSessionContext: TunnelLiveSessionContext?
+    ) throws -> TunnelRuntimeStatus {
+        try start(profile: profile, context: liveSessionContext)
+    }
+
     public func start(record: TunnelProfileRecord) throws -> TunnelRuntimeStatus {
         let context = try liveSessionContextProvider()
             ?? makeLiveSessionContext(fromEndpointSessionID: record.endpointSessionId)
@@ -123,6 +181,14 @@ public struct CoreBridgeTunnelRuntimeBridge: TunnelRuntimeBridging {
             )
         }
 
+        if let proxyJump = context.proxyJump {
+            return try liveBridge.startLiveLocalTunnelRuntimeWithProxyJump(
+                config: context.config,
+                secret: context.secret,
+                proxyJump: proxyJump,
+                profile: profile
+            )
+        }
         return try liveBridge.startLiveLocalTunnelRuntime(
             config: context.config,
             secret: context.secret,
@@ -159,7 +225,7 @@ public struct CoreBridgeTunnelRuntimeBridge: TunnelRuntimeBridging {
         connectTimeoutMs: UInt32?
     ) throws -> SshConnectionConfig {
         let normalizedProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalizedProtocol == "ssh" || normalizedProtocol == "scp" else {
+        guard normalizedProtocol == "ssh" || normalizedProtocol == "sftp" || normalizedProtocol == "scp" else {
             throw TunnelEndpointSessionResolutionError.unsupportedProtocol(session.protocol)
         }
         guard session.port > 0, session.port <= UInt32(UInt16.max) else {

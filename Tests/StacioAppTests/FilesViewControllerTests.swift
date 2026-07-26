@@ -6,6 +6,27 @@ import StacioCoreBindings
 
 @MainActor
 final class FilesViewControllerTests: XCTestCase {
+    private static let persistedPreferenceKeys = [
+        "Stacio.FilesPanel.sortMode",
+        "Stacio.FilesPanel.showHiddenFiles"
+    ]
+
+    override func setUp() {
+        super.setUp()
+        clearPersistedFilePanelPreferences()
+    }
+
+    override func tearDown() {
+        clearPersistedFilePanelPreferences()
+        super.tearDown()
+    }
+
+    private func clearPersistedFilePanelPreferences() {
+        for key in Self.persistedPreferenceKeys {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
     func testDirectoryFollowDefaultReadsSettingsStore() throws {
         let suiteName = "StacioFilesDefaultsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -980,6 +1001,39 @@ final class FilesViewControllerTests: XCTestCase {
             "/Users/alice/build.zip",
             "/Users/alice/config.json"
         ])
+    }
+
+    func testDroppedFinderFilesOnRemoteDirectoryRowUseThatDirectory() {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setRemoteEntries([
+            RemoteFileEntry(kind: .directory, path: "/srv/app/releases", size: 0, linkTarget: nil)
+        ], remotePath: "/srv/app")
+        var droppedUploads: [(remoteDirectory: String, localPaths: [String])] = []
+        controller.onUploadDroppedFiles = { remoteDirectory, localPaths in
+            droppedUploads.append((remoteDirectory, localPaths))
+        }
+
+        controller.performDropLocalFilesForTesting(["/Users/alice/build.zip"], onRemoteRow: 0)
+
+        XCTAssertEqual(droppedUploads.map(\.remoteDirectory), ["/srv/app/releases"])
+        XCTAssertEqual(droppedUploads.first?.localPaths, ["/Users/alice/build.zip"])
+    }
+
+    func testDroppedFinderFilesOnRemoteFileRowFallBackToCurrentDirectory() {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/srv/app/current.log", size: 64, linkTarget: nil)
+        ], remotePath: "/srv/app")
+        var remoteDirectories: [String] = []
+        controller.onUploadDroppedFiles = { remoteDirectory, _ in
+            remoteDirectories.append(remoteDirectory)
+        }
+
+        controller.performDropLocalFilesForTesting(["/Users/alice/build.zip"], onRemoteRow: 0)
+
+        XCTAssertEqual(remoteDirectories, ["/srv/app"])
     }
 
     func testFilesPanelRootAcceptsFinderFileDropsForUpload() {
@@ -2461,7 +2515,14 @@ final class FilesViewControllerTests: XCTestCase {
             saveHandler: nil as RemoteEditSaveHandler?,
             closeConfirmer: FilesViewControllerRecordingRemoteTextEditorCloseConfirmer(decision: .cancel)
         )
-        controller.filesViewController?.embeddedEditorViewControllerForTesting?.replaceTextForTesting("enabled=true\n")
+        let editor = try XCTUnwrap(controller.filesViewController?.embeddedEditorViewControllerForTesting)
+        XCTAssertTrue(waitUntil {
+            editor.hasPendingLocalDocumentLoadsForTesting == false
+                && editor.canEditTextForTesting
+                && editor.currentTextForTesting == "enabled=false\n"
+        })
+        XCTAssertFalse(editor.hasUnsavedChangesForTesting)
+        editor.replaceTextForTesting("enabled=true\n")
 
         let didDisconnect = controller.disconnectFilesBindingIfNeeded(runtimeID: "runtime-target")
 

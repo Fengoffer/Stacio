@@ -397,7 +397,7 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         let firstFeatureCell = try XCTUnwrap(
             table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NSTableCellView
         )
-        XCTAssertEqual(firstFeatureCell.textField?.stringValue, "SSH、Telnet、VNC、FTP、SCP、串口和本地终端")
+        XCTAssertEqual(firstFeatureCell.textField?.stringValue, "SSH、Telnet、VNC、SFTP、SCP、串口和本地终端")
         let professionalFeatureCell = try XCTUnwrap(
             table.view(atColumn: 0, row: 8, makeIfNecessary: true) as? NSTableCellView
         )

@@ -202,7 +202,7 @@ enum SessionSidebarSessionFormMode: Equatable {
     var hostPlaceholder: String {
         switch self {
         case .network, .ftp:
-            return "api.example.com"
+            return "192.168.1.10"
         case .serial:
             return "/dev/cu.usbserial-001"
         case .browser:
@@ -549,7 +549,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private let selectedFolderID: String?
     private let draftFactory: SessionSidebarSessionDraftFactory
     private let nameField = NSTextField(string: "")
-    private let hostField = NSComboBox()
+    private let networkHostField = NSTextField(string: "")
+    private let serialDevicePathField = NSComboBox()
     private let portField = NSComboBox()
     private let usernameField = NSTextField(string: "")
     private let authPopup = NSPopUpButton()
@@ -580,6 +581,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private var shouldShowValidationFeedback = false
     private var lastAutofilledName: String?
     private let serialDevicePathProvider: () -> [String]
+    private let namePlaceholder: String
+    private let networkHostPlaceholder: String
     private var serialDevicePathSuggestions: [String] = []
     private var serialPortSuggestions: [String] = []
 
@@ -593,9 +596,12 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         self.selectedFolderID = selectedFolderID
         self.draftFactory = draftFactory
         self.serialDevicePathProvider = serialDevicePathProvider
+        namePlaceholder = Self.namePlaceholderCandidates.randomElement() ?? "应用服务器"
+        networkHostPlaceholder = Self.networkHostPlaceholderCandidates.randomElement() ?? "192.168.1.10"
         let components = Self.makeFormView(
             nameField: nameField,
-            hostField: hostField,
+            networkHostField: networkHostField,
+            serialDevicePathField: serialDevicePathField,
             portField: portField,
             usernameField: usernameField,
             authPopup: authPopup,
@@ -626,7 +632,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         super.init()
 
         nameField.stringValue = existingSession?.name ?? ""
-        hostField.stringValue = existingSession?.host ?? ""
+        networkHostField.stringValue = existingSession?.host ?? ""
+        serialDevicePathField.stringValue = existingSession?.host ?? ""
         portField.stringValue = String(existingSession?.port ?? 22)
         usernameField.stringValue = existingSession?.username ?? ""
         privateKeyField.stringValue = existingSession?.privateKeyPath ?? ""
@@ -639,17 +646,19 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             L10n.SessionSettings.privateKeyAuth
         ])
         authPopup.selectItem(at: Self.popupIndex(for: SessionSidebarSessionDraftFactory.authMode(for: existingSession)))
-        nameField.placeholderString = "生产 API"
-        hostField.placeholderString = "例如：server.example.com"
+        nameField.placeholderString = namePlaceholder
+        networkHostField.placeholderString = networkHostPlaceholder
+        serialDevicePathField.placeholderString = SessionSidebarSessionFormMode.serial.hostPlaceholder
         portField.placeholderString = "22"
-        hostField.completes = true
+        serialDevicePathField.completes = true
         portField.completes = true
         usernameField.placeholderString = L10n.SessionSettings.optionalUser
         privateKeyField.placeholderString = "~/.ssh/id_ed25519"
         credentialSecretField.placeholderString = L10n.SessionSettings.passwordOrPassphrase
         tagsField.placeholderString = "生产, 接口"
         nameField.setAccessibilityIdentifier("Stacio.SessionEditor.name")
-        hostField.setAccessibilityIdentifier("Stacio.SessionEditor.host")
+        networkHostField.setAccessibilityIdentifier("Stacio.SessionEditor.host")
+        serialDevicePathField.setAccessibilityIdentifier("Stacio.SessionEditor.serialDevicePath")
         portField.setAccessibilityIdentifier("Stacio.SessionEditor.port")
         usernameField.setAccessibilityIdentifier("Stacio.SessionEditor.username")
         privateKeyField.setAccessibilityIdentifier("Stacio.SessionEditor.privateKey")
@@ -659,7 +668,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
         [
             nameField,
-            hostField,
+            networkHostField,
+            serialDevicePathField,
             portField,
             usernameField,
             privateKeyField,
@@ -696,7 +706,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     }
 
     var initialFirstResponder: NSView {
-        existingSession == nil ? hostField : nameField
+        existingSession == nil ? activeHostField : nameField
     }
 
     func draft() throws -> SessionDraft? {
@@ -743,7 +753,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private var formValues: SessionSidebarSessionFormValues {
         let username = mode.stripsSecrets ? "" : usernameField.stringValue
         let authMode = mode.stripsSecrets ? .agent : mode.forcedAuthMode ?? Self.authMode(for: authPopup.indexOfSelectedItem)
-        let host = mode == .shell ? "localhost" : hostField.stringValue
+        let host = mode == .shell ? "localhost" : activeHostField.stringValue
         let rawPort = mode.hiddenPortValue ?? portField.stringValue
         let port = mode.treatsEmptyPortAsZero && rawPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "0"
@@ -768,7 +778,9 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         refreshSerialChoicesIfNeeded()
         hostLabel.stringValue = mode.hostLabel
         portLabel.stringValue = mode.portLabel
-        hostField.placeholderString = mode.hostPlaceholder
+        networkHostField.isHidden = mode == .serial
+        serialDevicePathField.isHidden = mode != .serial
+        networkHostField.placeholderString = networkHostPlaceholder(for: mode)
         portField.placeholderString = mode.portPlaceholder
         hostRow.isHidden = mode.hidesHost
         portRow.isHidden = mode.hidesPort
@@ -814,7 +826,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             if !serialDevicePathSuggestions.isEmpty || !serialPortSuggestions.isEmpty {
                 serialDevicePathSuggestions = []
                 serialPortSuggestions = []
-                hostField.removeAllItems()
+                serialDevicePathField.removeAllItems()
                 portField.removeAllItems()
             }
             return
@@ -823,8 +835,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         let devicePaths = SerialConnectionSupport.preferredDevicePaths(from: serialDevicePathProvider())
         if devicePaths != serialDevicePathSuggestions {
             serialDevicePathSuggestions = devicePaths
-            hostField.removeAllItems()
-            hostField.addItems(withObjectValues: devicePaths)
+            serialDevicePathField.removeAllItems()
+            serialDevicePathField.addItems(withObjectValues: devicePaths)
         }
 
         let baudRates = SerialConnectionSupport.baudRateOptions
@@ -839,12 +851,12 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     private func autoSelectSerialDevicePathIfNeeded() {
         guard mode == .serial,
-              hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              serialDevicePathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let firstDevicePath = serialDevicePathSuggestions.first
         else {
             return
         }
-        hostField.stringValue = firstDevicePath
+        serialDevicePathField.stringValue = firstDevicePath
         if nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
             nameField.stringValue == lastAutofilledName {
             nameField.stringValue = firstDevicePath
@@ -857,7 +869,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     }
 
     private func autofillNameFromHostIfNeeded(changedControl: NSControl?) {
-        guard changedControl === hostField else {
+        guard changedControl === activeHostField else {
             if changedControl === nameField {
                 let trimmedName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmedName != lastAutofilledName {
@@ -867,7 +879,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             return
         }
 
-        let trimmedHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedHost = activeHostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedHost.isEmpty else {
             return
         }
@@ -881,7 +893,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private func configureKeyViewLoop() {
         let controls: [NSView] = [
             nameField,
-            hostField,
+            activeHostField,
             portField,
             usernameField,
             authPopup,
@@ -897,7 +909,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     private static func makeFormView(
         nameField: NSTextField,
-        hostField: NSTextField,
+        networkHostField: NSTextField,
+        serialDevicePathField: NSComboBox,
         portField: NSTextField,
         usernameField: NSTextField,
         authPopup: NSPopUpButton,
@@ -908,8 +921,25 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         tagColorButtons: inout [NSButton],
         tagColorSample: NSTextField
     ) -> FormComponents {
+        let hostInput = NSView()
+        hostInput.translatesAutoresizingMaskIntoConstraints = false
+        networkHostField.translatesAutoresizingMaskIntoConstraints = false
+        serialDevicePathField.translatesAutoresizingMaskIntoConstraints = false
+        serialDevicePathField.isHidden = true
+        hostInput.addSubview(networkHostField)
+        hostInput.addSubview(serialDevicePathField)
+        NSLayoutConstraint.activate([
+            networkHostField.leadingAnchor.constraint(equalTo: hostInput.leadingAnchor),
+            networkHostField.trailingAnchor.constraint(equalTo: hostInput.trailingAnchor),
+            networkHostField.centerYAnchor.constraint(equalTo: hostInput.centerYAnchor),
+            networkHostField.heightAnchor.constraint(equalToConstant: 36),
+            serialDevicePathField.leadingAnchor.constraint(equalTo: hostInput.leadingAnchor),
+            serialDevicePathField.trailingAnchor.constraint(equalTo: hostInput.trailingAnchor),
+            serialDevicePathField.centerYAnchor.constraint(equalTo: hostInput.centerYAnchor),
+            serialDevicePathField.heightAnchor.constraint(equalToConstant: 36)
+        ])
         let nameRow = row(label: L10n.SessionSettings.name, field: nameField)
-        let hostRow = row(label: L10n.SessionSettings.host, field: hostField)
+        let hostRow = row(label: L10n.SessionSettings.host, field: hostInput)
         let portRow = row(label: L10n.SessionSettings.port, field: portField)
         let userRow = row(label: L10n.SessionSettings.user, field: usernameField)
         let authRow = row(label: L10n.SessionSettings.auth, field: authPopup)
@@ -957,7 +987,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
         let grid = NSGridView(views: [
             [nameRow.label, nameField],
-            [hostRow.label, hostField],
+            [hostRow.label, hostInput],
             [portRow.label, portField],
             [userRow.label, usernameField],
             [authRow.label, authPopup],
@@ -991,7 +1021,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
         [
             nameField,
-            hostField,
+            hostInput,
             portField,
             usernameField,
             authPopup,
@@ -1040,7 +1070,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             ],
             formControls: [
                 nameField,
-                hostField,
+                hostInput,
                 portField,
                 usernameField,
                 authPopup,
@@ -1126,7 +1156,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     private func applyValues(_ values: SessionSidebarSessionFormValues, resetsMissingTagColor: Bool) {
         nameField.stringValue = values.name
-        hostField.stringValue = values.host
+        activeHostField.stringValue = values.host
         portField.stringValue = values.port
         usernameField.stringValue = values.username
         authPopup.selectItem(at: Self.popupIndex(for: values.authMode))
@@ -1144,14 +1174,14 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     func setConnectionValues(devicePath: String, baudRate: UInt32) {
         shouldShowValidationFeedback = true
-        hostField.stringValue = devicePath
+        serialDevicePathField.stringValue = devicePath
         portField.stringValue = baudRate == 0 ? "" : String(baudRate)
         refreshFormState()
     }
 
     func typeHostForTesting(_ value: String) {
-        hostField.stringValue = value
-        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: hostField))
+        activeHostField.stringValue = value
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: activeHostField))
     }
 
     func typeNameForTesting(_ value: String) {
@@ -1194,6 +1224,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     func applyMode(_ mode: SessionSidebarSessionFormMode) {
         self.mode = mode
+        configureKeyViewLoop()
         refreshFormState()
     }
 
@@ -1229,7 +1260,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     var currentValues: SessionSidebarSessionFormValues {
         SessionSidebarSessionFormValues(
             name: nameField.stringValue,
-            host: hostField.stringValue,
+            host: activeHostField.stringValue,
             port: portField.stringValue,
             username: usernameField.stringValue,
             authMode: Self.authMode(for: authPopup.indexOfSelectedItem),
@@ -1242,11 +1273,13 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     }
 
     var hostValueForTesting: String {
-        hostField.stringValue
+        activeHostField.stringValue
     }
 
     var hostSuggestionsForTesting: [String] {
-        (0..<hostField.numberOfItems).compactMap { hostField.itemObjectValue(at: $0) as? String }
+        (0..<serialDevicePathField.numberOfItems).compactMap {
+            serialDevicePathField.itemObjectValue(at: $0) as? String
+        }
     }
 
     var portSuggestionsForTesting: [String] {
@@ -1300,7 +1333,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     var textFieldHeightsForTesting: [CGFloat] {
         [
             nameField,
-            hostField,
+            networkHostField,
+            serialDevicePathField,
             portField,
             usernameField,
             privateKeyField,
@@ -1312,7 +1346,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     var textFieldsUseNativeBezelForTesting: Bool {
         [
             nameField,
-            hostField,
+            networkHostField,
+            serialDevicePathField,
             portField,
             usernameField,
             privateKeyField,
@@ -1433,7 +1468,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     var formFieldLeadingEdgesAreAlignedForTesting: Bool {
         let fields: [NSView] = [
             nameField,
-            hostField,
+            activeHostField,
             portField,
             usernameField,
             authPopup,
@@ -1522,7 +1557,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private var editableFieldsForTesting: [NSTextField] {
         [
             nameField,
-            hostField,
+            networkHostField,
+            serialDevicePathField,
             portField,
             usernameField,
             privateKeyField,
@@ -1542,7 +1578,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     var keyViewLoopIdentifiersForTesting: [String] {
         let controls: [NSView] = [
             nameField,
-            hostField,
+            activeHostField,
             portField,
             usernameField,
             authPopup,
@@ -1610,6 +1646,69 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private var tagColorPresetColors: [NSColor] {
         Self.tagColorPresetColors
     }
+
+    private var activeHostField: NSTextField {
+        mode == .serial ? serialDevicePathField : networkHostField
+    }
+
+    private func networkHostPlaceholder(for mode: SessionSidebarSessionFormMode) -> String {
+        switch mode {
+        case .network, .ftp:
+            return networkHostPlaceholder
+        default:
+            return mode.hostPlaceholder
+        }
+    }
+
+    var activeHostControlForTesting: NSTextField {
+        activeHostField
+    }
+
+    var namePlaceholderForTesting: String {
+        nameField.placeholderString ?? ""
+    }
+
+    var hostPlaceholderForTesting: String {
+        activeHostField.placeholderString ?? ""
+    }
+
+    var namePlaceholderCandidatesForTesting: [String] {
+        Self.namePlaceholderCandidates
+    }
+
+    var networkHostPlaceholderCandidatesForTesting: [String] {
+        Self.networkHostPlaceholderCandidates
+    }
+
+    private static let namePlaceholderCandidates = [
+        "应用服务器",
+        "数据库服务器",
+        "测试服务器",
+        "开发服务器",
+        "Web 虚拟机",
+        "缓存服务器",
+        "文件服务器",
+        "日志服务器",
+        "备份服务器",
+        "运维跳板机",
+        "监控服务器",
+        "容器节点"
+    ]
+
+    private static let networkHostPlaceholderCandidates = [
+        "192.168.1.10",
+        "192.168.10.25",
+        "192.168.100.20",
+        "192.168.50.8",
+        "172.16.10.100",
+        "172.20.30.40",
+        "172.31.8.16",
+        "172.18.5.25",
+        "10.10.100.53",
+        "10.0.10.20",
+        "10.20.30.40",
+        "10.100.20.15"
+    ]
 }
 
 private extension NSColor {

@@ -5,6 +5,7 @@ final class StacioPinnedSplitView: NSSplitView {
     var afterSetPosition: ((NSSplitView, CGFloat, Int) -> Void)?
     var afterLayout: ((NSSplitView) -> Void)?
     private(set) var isPerformingLayoutForTesting = false
+    private(set) var isTrackingUserDividerDrag = false
     var isPerformingLayoutPass: Bool { isPerformingLayoutForTesting }
     private var isAfterLayoutCallbackScheduled = false
 
@@ -29,6 +30,12 @@ final class StacioPinnedSplitView: NSSplitView {
             scheduleAfterLayoutCallback()
         }
         super.layout()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isTrackingUserDividerDrag = true
+        defer { isTrackingUserDividerDrag = false }
+        super.mouseDown(with: event)
     }
 
     private func scheduleAfterLayoutCallback() {

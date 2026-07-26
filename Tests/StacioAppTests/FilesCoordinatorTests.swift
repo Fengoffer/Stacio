@@ -15,9 +15,13 @@ final class FilesCoordinatorTests: XCTestCase {
     }
 
     private func liveContext() -> TunnelLiveSessionContext {
+        liveContext(host: "example.com")
+    }
+
+    private func liveContext(host: String) -> TunnelLiveSessionContext {
         TunnelLiveSessionContext(
             config: SshConnectionConfig(
-                host: "example.com",
+                host: host,
                 port: 22,
                 username: "deploy",
                 authMethod: .agent,
@@ -25,6 +29,37 @@ final class FilesCoordinatorTests: XCTestCase {
             ),
             secret: .agent,
             expectedFingerprintSHA256: "SHA256:test"
+        )
+    }
+
+    private static let remoteChromiumLaunchOutput = """
+    __STACIO_CHROMIUM_PID__=4242
+    __STACIO_CHROMIUM_DIR__=/tmp/stacio-chromium.AbC123
+    __STACIO_CHROMIUM_PORT__=43210
+    __STACIO_CHROMIUM_BINARY__=/usr/bin/chromium
+    """
+
+    private static func remoteChromiumSession() -> RemoteChromiumRuntimeSession {
+        RemoteChromiumRuntimeSession(
+            leaseID: UUID(uuidString: "A0A0A0A0-0000-4000-8000-000000000001")!,
+            remoteProcessID: 4_242,
+            remoteTemporaryDirectory: "/tmp/stacio-chromium.AbC123",
+            remoteDownloadsDirectory: "/tmp/stacio-chromium.AbC123/downloads",
+            localDebugPort: 19_090,
+            pageWebSocketURL: URL(string: "ws://127.0.0.1:19090/devtools/page/page-1")!,
+            downloadCapability: RemoteChromiumDownloadCapability(
+                sourceLiveSessionContext: TunnelLiveSessionContext(
+                    config: SshConnectionConfig(
+                        host: "example.com",
+                        port: 22,
+                        username: "deploy",
+                        authMethod: .agent,
+                        connectTimeoutMs: 10_000
+                    ),
+                    secret: .agent,
+                    expectedFingerprintSHA256: "SHA256:test"
+                )
+            )
         )
     }
 
@@ -136,6 +171,23 @@ final class FilesCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(promptedPolicy, .skip)
         XCTAssertEqual(fallback.requests.map(\.destinationPath), ["/srv/app/build.zip"])
+    }
+
+    func testConflictResolutionSessionCachesApplyToAllDecisionForBatch() {
+        let resolver = RecordingBatchConflictResolver(
+            decision: RemoteFileConflictDecision(policy: .overwrite, applyToAll: true)
+        )
+        let session = RemoteFileConflictResolutionSession(resolver: resolver)
+
+        XCTAssertEqual(
+            session.resolveConflict(destinationPath: "/srv/one.txt", direction: .upload, parentWindow: nil),
+            .overwrite
+        )
+        XCTAssertEqual(
+            session.resolveConflict(destinationPath: "/srv/two.txt", direction: .upload, parentWindow: nil),
+            .overwrite
+        )
+        XCTAssertEqual(resolver.requests, ["/srv/one.txt"])
     }
 
     func testCoordinatorKeepsEmptyStateWhenListingParseFails() {
@@ -726,6 +778,427 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(scheduler.jobs.first?.bytesTotal, 128)
         XCTAssertEqual(scheduler.configs.map(\.host), ["example.com"])
         XCTAssertEqual(scheduler.fingerprints, ["SHA256:test"])
+    }
+
+    func testCoordinatorDownloadsRemoteChromiumFileThenReportsVerifiedLocalTransferWithoutDeletingRemotePath() throws {
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("季度报告.pdf")
+        let remotePath = "/tmp/stacio-chromium.AbC123/downloads/550e8400-e29b-41d4-a716-446655440000"
+        let session = Self.remoteChromiumSession()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: remotePath,
+            suggestedFilename: "../../季度报告.pdf"
+        )
+        let bridge = RecordingRemoteFilesBridge()
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(
+            destinationPath: destinationURL.path
+        )
+        let files = FilesViewController()
+        files.loadView()
+        var verifiedDownloads: [RemoteChromiumDownload] = []
+        let coordinator = FilesCoordinator(
+            bridge: bridge,
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            transferScheduler: scheduler,
+            downloadDestinationPicker: destinationPicker
+        )
+
+        XCTAssertEqual(
+            coordinator.scheduleRemoteBrowserDownload(
+                download,
+                onLocalTransferVerified: { verifiedDownloads.append(download) }
+            ),
+            .scheduled
+        )
+        XCTAssertEqual(destinationPicker.suggestedFileNames, ["季度报告.pdf"])
+        let job = try XCTUnwrap(scheduler.jobs.first)
+        XCTAssertEqual(job.direction, .download)
+        XCTAssertEqual(job.sourcePath, remotePath)
+        XCTAssertEqual(job.destinationPath, destinationURL.path)
+        XCTAssertEqual(job.bytesTotal, 0)
+
+        try Data("downloaded".utf8).write(to: destinationURL)
+        scheduler.complete(jobID: job.id)
+        XCTAssertEqual(verifiedDownloads, [download])
+        XCTAssertFalse(bridge.events.contains("delete:\(remotePath):false"))
+    }
+
+    func testCoordinatorDiscardsRemoteChromiumDownloadWhenUserCancelsDestinationPicker() {
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(destinationPath: nil)
+        let files = FilesViewController()
+        files.loadView()
+        var didVerifyTransfer = false
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            transferScheduler: scheduler,
+            downloadDestinationPicker: destinationPicker
+        )
+        let session = Self.remoteChromiumSession()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-1",
+            suggestedFilename: "report.pdf"
+        )
+
+        XCTAssertEqual(
+            coordinator.scheduleRemoteBrowserDownload(
+                download,
+                onLocalTransferVerified: { didVerifyTransfer = true }
+            ),
+            .discarded
+        )
+        XCTAssertFalse(didVerifyTransfer)
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+    }
+
+    func testCoordinatorDoesNotVerifyFailedRemoteChromiumTransfer() throws {
+        let directory = try makeTemporaryDirectory()
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(
+            destinationPath: directory.appendingPathComponent("report.pdf").path
+        )
+        let files = FilesViewController()
+        files.loadView()
+        var didVerifyTransfer = false
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            transferScheduler: scheduler,
+            downloadDestinationPicker: destinationPicker
+        )
+        let session = Self.remoteChromiumSession()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-1",
+            suggestedFilename: "report.pdf"
+        )
+
+        XCTAssertEqual(
+            coordinator.scheduleRemoteBrowserDownload(
+                download,
+                onLocalTransferVerified: { didVerifyTransfer = true }
+            ),
+            .scheduled
+        )
+        let job = try XCTUnwrap(scheduler.jobs.first)
+        scheduler.fail(jobID: job.id)
+
+        XCTAssertFalse(didVerifyTransfer)
+    }
+
+    func testCoordinatorRejectsRemoteChromiumDownloadOutsideOwnedTemporaryDirectory() {
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(
+            destinationPath: "/Users/alice/Downloads/report.pdf"
+        )
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            transferScheduler: scheduler,
+            downloadDestinationPicker: destinationPicker
+        )
+        let session = Self.remoteChromiumSession()
+
+        XCTAssertEqual(
+            coordinator.scheduleRemoteBrowserDownload(
+                RemoteChromiumDownload(
+                    session: session,
+                    remotePath: "/tmp/report.pdf",
+                    suggestedFilename: "report.pdf"
+                ),
+                onLocalTransferVerified: {}
+            ),
+            .rejected
+        )
+        XCTAssertTrue(destinationPicker.suggestedFileNames.isEmpty)
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+    }
+
+    func testInspectorAcknowledgesRemoteChromiumDownloadOnlyAfterVerifiedLocalTransfer() throws {
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("report.pdf")
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(
+            destinationPath: destinationURL.path
+        )
+        let session = Self.remoteChromiumSession()
+        let runtime = RecordingFilesRemoteChromiumRuntime(session: session)
+        let inspector = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: runtime,
+            filesTransferSchedulerOverride: scheduler,
+            remoteBrowserDownloadDestinationPicker: destinationPicker
+        )
+        inspector.loadView()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-1",
+            suggestedFilename: "report.pdf"
+        )
+
+        inspector.remoteChromiumDidCompleteDownload(download)
+        XCTAssertTrue(runtime.acknowledgedDownloads.isEmpty)
+
+        let job = try XCTUnwrap(scheduler.jobs.first)
+        try Data("downloaded".utf8).write(to: destinationURL)
+        scheduler.complete(jobID: job.id)
+
+        XCTAssertEqual(runtime.acknowledgedDownloads, [download])
+    }
+
+    func testInspectorKeepsRemoteDownloadAcknowledgementAliveUntilTransferFinishes() throws {
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("report.pdf")
+        let scheduler = RecordingSCPTransferScheduler()
+        let destinationPicker = RecordingDownloadDestinationPicker(
+            destinationPath: destinationURL.path
+        )
+        let session = Self.remoteChromiumSession()
+        let runtime = RecordingFilesRemoteChromiumRuntime(session: session)
+        var inspector: InspectorViewController? = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: runtime,
+            filesTransferSchedulerOverride: scheduler,
+            remoteBrowserDownloadDestinationPicker: destinationPicker
+        )
+        inspector?.loadView()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-1",
+            suggestedFilename: "report.pdf"
+        )
+
+        inspector?.remoteChromiumDidCompleteDownload(download)
+        let inspectorLifetime = WeakFilesObjectBox(inspector)
+        inspector = nil
+        XCTAssertNil(inspectorLifetime.value)
+
+        let job = try XCTUnwrap(scheduler.jobs.first)
+        try Data("downloaded".utf8).write(to: destinationURL)
+        scheduler.complete(jobID: job.id)
+
+        XCTAssertEqual(runtime.acknowledgedDownloads, [download])
+    }
+
+    func testRemoteChromiumDownloadUsesItsSourceSSHContextAfterInspectorBindingSwitches() throws {
+        let sourceContext = liveContext(host: "source-a.internal")
+        let currentContext = liveContext(host: "current-b.internal")
+        let chromiumExecutor = FilesRemoteChromiumCommandExecutor(outputs: [
+            Self.remoteChromiumLaunchOutput,
+            ""
+        ])
+        let chromiumRuntime = RemoteChromiumRuntime(
+            commandExecutor: chromiumExecutor,
+            tunnelBridge: FilesRemoteChromiumTunnelBridge(),
+            pageEndpointResolver: { _ in URL(string: "ws://127.0.0.1:19090/devtools/page/1")! },
+            performsCleanupAsynchronously: false,
+            pollInterval: 0
+        )
+        let session = try chromiumRuntime.start(context: sourceContext, localPort: 19_090)
+        let scheduler = RecordingSCPTransferScheduler()
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { currentContext },
+            liveSessionRuntimeIDProvider: { "runtime-b" },
+            transferScheduler: scheduler,
+            downloadDestinationPicker: RecordingDownloadDestinationPicker(
+                destinationPath: "/Users/alice/Downloads/source-a.pdf"
+            )
+        )
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-source-a",
+            suggestedFilename: "source-a.pdf"
+        )
+
+        XCTAssertEqual(
+            coordinator.scheduleRemoteBrowserDownload(download, onLocalTransferVerified: {}),
+            .scheduled
+        )
+
+        XCTAssertEqual(scheduler.configs.map(\.host), ["source-a.internal"])
+        XCTAssertEqual(scheduler.runtimeIDs, ["source-a.internal"])
+        chromiumRuntime.stop(session: session)
+    }
+
+    func testDefaultTransferQueueOutlivesInspectorUntilRemoteBrowserDownloadFinishes() throws {
+        let transferStarted = expectation(description: "remote browser transfer started")
+        let bridge = BlockingFilesSCPTransferBridge(started: transferStarted)
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("report.pdf")
+        let session = Self.remoteChromiumSession()
+        let runtime = RecordingFilesRemoteChromiumRuntime(session: session)
+        var queueLifetime: WeakFilesObjectBox<TransferQueueCoordinator>?
+        var inspector: InspectorViewController? = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: runtime,
+            remoteBrowserDownloadDestinationPicker: RecordingDownloadDestinationPicker(
+                destinationPath: destinationURL.path
+            ),
+            transferQueueCoordinatorFactory: { queueView in
+                let coordinator = TransferQueueCoordinator(
+                    bridge: bridge,
+                    queueViewController: queueView
+                )
+                queueLifetime = WeakFilesObjectBox(coordinator)
+                return coordinator
+            }
+        )
+        inspector?.loadView()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-lifecycle",
+            suggestedFilename: "report.pdf"
+        )
+
+        inspector?.remoteChromiumDidCompleteDownload(download)
+        wait(for: [transferStarted], timeout: 1)
+        let inspectorLifetime = WeakFilesObjectBox(inspector)
+        inspector = nil
+
+        XCTAssertNil(inspectorLifetime.value)
+        XCTAssertNotNil(queueLifetime?.value, "An active browser download must own the production queue lifecycle.")
+
+        try Data("downloaded".utf8).write(to: destinationURL)
+        bridge.release()
+
+        XCTAssertTrue(waitUntil { runtime.acknowledgedDownloads == [download] })
+        XCTAssertTrue(waitUntil { queueLifetime?.value == nil })
+    }
+
+    func testRemoteBrowserDownloadExplicitlyRetainsSchedulerAfterInspectorCloses() throws {
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("report.pdf")
+        let driver = DeferredFilesTransferCompletionDriver()
+        var scheduler: DeferredFilesSCPTransferScheduler? = DeferredFilesSCPTransferScheduler(
+            driver: driver
+        )
+        let schedulerLifetime = WeakFilesObjectBox(scheduler)
+        let session = Self.remoteChromiumSession()
+        let runtime = RecordingFilesRemoteChromiumRuntime(session: session)
+        var inspector: InspectorViewController? = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: runtime,
+            filesTransferSchedulerOverride: scheduler,
+            remoteBrowserDownloadDestinationPicker: RecordingDownloadDestinationPicker(
+                destinationPath: destinationURL.path
+            )
+        )
+        inspector?.loadView()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-explicit-lifetime",
+            suggestedFilename: "report.pdf"
+        )
+
+        inspector?.remoteChromiumDidCompleteDownload(download)
+        let inspectorLifetime = WeakFilesObjectBox(inspector)
+        inspector = nil
+        scheduler = nil
+
+        XCTAssertNil(inspectorLifetime.value)
+        XCTAssertNotNil(schedulerLifetime.value, "The browser-download lifetime must retain its scheduler.")
+
+        try Data("downloaded".utf8).write(to: destinationURL)
+        driver.complete()
+
+        XCTAssertEqual(runtime.acknowledgedDownloads, [download])
+        XCTAssertNil(schedulerLifetime.value)
+    }
+
+    func testInspectorAcknowledgesDiscardedRemoteChromiumDownloadButKeepsFailedTransfer() throws {
+        let session = Self.remoteChromiumSession()
+        let canceledRuntime = RecordingFilesRemoteChromiumRuntime(session: session)
+        let canceledScheduler = RecordingSCPTransferScheduler()
+        let canceledInspector = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: canceledRuntime,
+            filesTransferSchedulerOverride: canceledScheduler,
+            remoteBrowserDownloadDestinationPicker: RecordingDownloadDestinationPicker(destinationPath: nil)
+        )
+        canceledInspector.loadView()
+        let canceledDownload = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-canceled",
+            suggestedFilename: "canceled.pdf"
+        )
+
+        canceledInspector.remoteChromiumDidCompleteDownload(canceledDownload)
+
+        XCTAssertEqual(canceledRuntime.acknowledgedDownloads, [canceledDownload])
+        XCTAssertTrue(canceledScheduler.jobs.isEmpty)
+
+        let directory = try makeTemporaryDirectory()
+        let failedRuntime = RecordingFilesRemoteChromiumRuntime(session: session)
+        let failedScheduler = RecordingSCPTransferScheduler()
+        let failedInspector = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: failedRuntime,
+            filesTransferSchedulerOverride: failedScheduler,
+            remoteBrowserDownloadDestinationPicker: RecordingDownloadDestinationPicker(
+                destinationPath: directory.appendingPathComponent("failed.pdf").path
+            )
+        )
+        failedInspector.loadView()
+        let failedDownload = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-failed",
+            suggestedFilename: "failed.pdf"
+        )
+
+        failedInspector.remoteChromiumDidCompleteDownload(failedDownload)
+        let failedJob = try XCTUnwrap(failedScheduler.jobs.first)
+        failedScheduler.fail(jobID: failedJob.id)
+
+        XCTAssertTrue(failedRuntime.acknowledgedDownloads.isEmpty)
+    }
+
+    func testInspectorReportsRemoteChromiumCleanupFailureToDiagnosticsLog() throws {
+        let directory = try makeTemporaryDirectory()
+        let destinationURL = directory.appendingPathComponent("report.pdf")
+        let scheduler = RecordingSCPTransferScheduler()
+        let session = Self.remoteChromiumSession()
+        let runtime = RecordingFilesRemoteChromiumRuntime(
+            session: session,
+            acknowledgementResult: .failure(RecordingFilesRemoteChromiumRuntimeError.cleanupFailed)
+        )
+        let logStore = RecordingStacioLogStore()
+        let inspector = InspectorViewController(
+            tunnelLiveSessionContextProvider: { self.liveContext() },
+            remoteChromiumRuntime: runtime,
+            filesTransferSchedulerOverride: scheduler,
+            remoteBrowserDownloadDestinationPicker: RecordingDownloadDestinationPicker(
+                destinationPath: destinationURL.path
+            ),
+            remoteBrowserDownloadLog: logStore
+        )
+        inspector.loadView()
+        let download = RemoteChromiumDownload(
+            session: session,
+            remotePath: session.remoteDownloadsDirectory + "/guid-1",
+            suggestedFilename: "report.pdf"
+        )
+
+        inspector.remoteChromiumDidCompleteDownload(download)
+        let job = try XCTUnwrap(scheduler.jobs.first)
+        try Data("downloaded".utf8).write(to: destinationURL)
+        scheduler.complete(jobID: job.id)
+
+        XCTAssertEqual(runtime.acknowledgedDownloads, [download])
+        XCTAssertTrue(logStore.lines.contains { $0.contains("remote.browser.download.cleanup.failed") })
     }
 
     func testCoordinatorSchedulesMultipleFileAndDirectoryDownloadsThroughEmbeddedSCPQueue() throws {
@@ -1613,8 +2086,84 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(bridge.events, [
             "read:/srv/app/config.json:0:all",
             "write:/srv/app/config.json:17",
-            "read:/srv/app/config.json:0:17"
+            "read:/srv/app/config.json:0:18"
         ])
+    }
+
+    func testCoordinatorRemoteDocumentSaveUsesSFTPWhenAvailable() throws {
+        let cacheRoot = try makeTemporaryDirectory()
+        let opener = RecordingRemoteEditOpener()
+        let bridge = RecordingRemoteFilesBridge(
+            remoteFileData: [
+                "/srv/app/config.json": Data(#"{"enabled":true}"#.utf8)
+            ],
+            persistsWrites: true,
+            supportsSFTPFileIO: true
+        )
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: bridge,
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 16, linkTarget: nil)
+        ])
+        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        files.performOpenRemoteEditForTesting()
+        XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
+
+        try opener.remoteDocumentRequests[0].saveHandler?(#"{"enabled":false}"#)
+
+        XCTAssertEqual(bridge.sftpWriteRequests.map(\.path), ["/srv/app/config.json"])
+        XCTAssertTrue(bridge.writeRequests.isEmpty)
+        XCTAssertEqual(bridge.events.suffix(2), [
+            "sftp-write:/srv/app/config.json:17",
+            "sftp-read:/srv/app/config.json:0:18"
+        ])
+    }
+
+    func testCoordinatorRemoteDocumentSavePreservesSFTPPermissionError() throws {
+        let cacheRoot = try makeTemporaryDirectory()
+        let opener = RecordingRemoteEditOpener()
+        let permissionError = SshRuntimeError.Transport(message: "FILES_PERMISSION_DENIED")
+        let bridge = RecordingRemoteFilesBridge(
+            remoteFileData: [
+                "/etc/ssh/sshd_config": Data("Port 22\n".utf8)
+            ],
+            persistsWrites: true,
+            supportsSFTPFileIO: true,
+            sftpOperationError: permissionError
+        )
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: bridge,
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/etc/ssh/sshd_config", size: 8, linkTarget: nil)
+        ])
+        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        files.performOpenRemoteEditForTesting()
+        XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
+
+        XCTAssertThrowsError(try opener.remoteDocumentRequests[0].saveHandler?("Port 2222\n")) { error in
+            XCTAssertEqual(error as? SshRuntimeError, permissionError)
+        }
+        XCTAssertTrue(bridge.writeRequests.isEmpty)
+        XCTAssertEqual(
+            RuntimeDiagnosticFormatter.userMessage(for: permissionError),
+            "文件传输权限不足"
+        )
     }
 
     func testCoordinatorRemoteDocumentSaveFailsWhenWriteBackVerificationDoesNotMatch() throws {
@@ -3026,6 +3575,43 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(scheduler.jobs.first?.bytesTotal, 32)
     }
 
+    func testCoordinatorChecksTheDirectoryUnderTheDropBeforeApplyingUploadConflictPolicy() throws {
+        let tempDirectory = try makeTemporaryDirectory()
+        let localFile = tempDirectory.appendingPathComponent("config.json")
+        try Data(repeating: 1, count: 32).write(to: localFile)
+        let bridge = RecordingRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/releases/config.json", size: 128, linkTarget: nil)
+        ])
+        let scheduler = RecordingSCPTransferScheduler()
+        let conflictResolver = RecordingRemoteFileConflictResolver(policy: .rename)
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: bridge,
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            transferScheduler: scheduler,
+            conflictResolver: conflictResolver
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .directory, path: "/srv/app/releases", size: 0, linkTarget: nil)
+        ], remotePath: "/srv/app")
+
+        files.performDropLocalFilesForTesting([localFile.path], onRemoteRow: 0)
+
+        XCTAssertTrue(waitUntil { scheduler.jobs.count == 1 })
+        XCTAssertEqual(bridge.events, ["live:/srv/app/releases"])
+        XCTAssertEqual(
+            conflictResolver.requests.map(\.destinationPath),
+            ["/srv/app/releases/config.json"]
+        )
+        XCTAssertEqual(
+            scheduler.jobs.first?.destinationPath,
+            "/srv/app/releases/config (imported).json"
+        )
+    }
+
     func testCoordinatorRefreshesCurrentDirectoryAfterSCPUploadCompletes() throws {
         let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
@@ -3101,10 +3687,11 @@ final class FilesCoordinatorTests: XCTestCase {
         let localFile = tempDirectory.appendingPathComponent("release.tar.gz")
         try Data(repeating: 1, count: 48).write(to: localFile)
         let scheduler = RecordingSCPTransferScheduler()
+        let bridge = RecordingRemoteFilesBridge()
         let files = FilesViewController()
         files.loadView()
         let coordinator = FilesCoordinator(
-            bridge: RecordingRemoteFilesBridge(),
+            bridge: bridge,
             filesViewController: files
         )
 
@@ -3116,6 +3703,9 @@ final class FilesCoordinatorTests: XCTestCase {
             transferScheduler: scheduler
         )
 
+        XCTAssertTrue(waitUntil { scheduler.jobs.count == 1 })
+        XCTAssertEqual(bridge.events, ["live:/srv/releases"])
+        XCTAssertEqual(bridge.liveHosts, ["example.com"])
         XCTAssertEqual(scheduler.runtimeIDs, ["term_runtime"])
         XCTAssertEqual(scheduler.jobs.first?.direction, .upload)
         XCTAssertEqual(scheduler.jobs.first?.sourcePath, localFile.path)
@@ -3706,6 +4296,8 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
     var liveHosts: [String] = []
     var readRequests: [(path: String, offset: UInt64, length: UInt64?)] = []
     var writeRequests: [(path: String, contents: Data)] = []
+    var sftpWriteRequests: [(path: String, contents: Data)] = []
+    var onDelete: ((String, Bool) -> Void)?
     var debugDescription: String { events.joined(separator: " ") }
     private let entries: [RemoteFileEntry]
     private let searchEntries: [RemoteFileEntry]
@@ -3713,6 +4305,8 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
     private let error: Error?
     private let operationError: Error?
     private let persistsWrites: Bool
+    private let supportsSFTPFileIO: Bool
+    private let sftpOperationError: Error?
 
     init(
         entries: [RemoteFileEntry] = [],
@@ -3720,7 +4314,9 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         remoteFileData: [String: Data] = [:],
         error: Error? = nil,
         operationError: Error? = nil,
-        persistsWrites: Bool = true
+        persistsWrites: Bool = true,
+        supportsSFTPFileIO: Bool = false,
+        sftpOperationError: Error? = nil
     ) {
         self.entries = entries
         self.searchEntries = searchEntries
@@ -3728,6 +4324,8 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         self.error = error
         self.operationError = operationError
         self.persistsWrites = persistsWrites
+        self.supportsSFTPFileIO = supportsSFTPFileIO
+        self.sftpOperationError = sftpOperationError
     }
 
     private func recordEvent(_ event: String) {
@@ -3822,6 +4420,7 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         recursive: Bool
     ) throws {
         recordEvent("delete:\(remotePath):\(recursive)")
+        onDelete?(remotePath, recursive)
         liveHosts.append(config.host)
         if let operationError {
             throw operationError
@@ -3899,6 +4498,44 @@ private final class RecordingRemoteFilesBridge: RemoteFilesBridging, CustomDebug
         if persistsWrites {
             remoteFileData[remotePath] = contents
         }
+        return UInt64(contents.count)
+    }
+
+    func readLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        guard supportsSFTPFileIO else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-read")
+        }
+        recordEvent("sftp-read:\(remotePath):\(offset):\(length.map(String.init) ?? "all")")
+        if let sftpOperationError { throw sftpOperationError }
+        guard let data = remoteFileData[remotePath] else {
+            throw MissingRemoteFileDataError(path: remotePath)
+        }
+        let start = min(Int(offset), data.count)
+        let end = length.map { min(data.count, start + Int($0)) } ?? data.count
+        return Data(data[start..<end])
+    }
+
+    func writeLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64 {
+        guard supportsSFTPFileIO else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-write")
+        }
+        recordEvent("sftp-write:\(remotePath):\(contents.count)")
+        if let sftpOperationError { throw sftpOperationError }
+        sftpWriteRequests.append((remotePath, contents))
+        if persistsWrites { remoteFileData[remotePath] = contents }
         return UInt64(contents.count)
     }
 
@@ -4502,6 +5139,32 @@ private final class RecordingRemoteFileConflictResolver: RemoteFileConflictResol
     }
 }
 
+private final class RecordingBatchConflictResolver: RemoteFileConflictResolving {
+    private let decision: RemoteFileConflictDecision?
+    private(set) var requests: [String] = []
+
+    init(decision: RemoteFileConflictDecision?) {
+        self.decision = decision
+    }
+
+    func resolveConflict(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> ScpConflictPolicy? {
+        decision?.policy
+    }
+
+    func resolveConflictDecision(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> RemoteFileConflictDecision? {
+        requests.append(destinationPath)
+        return decision
+    }
+}
+
 private final class RecordingSCPTransferScheduler: SCPTransferScheduling {
     var runtimeIDs: [String] = []
     var configs: [SshConnectionConfig] = []
@@ -4799,6 +5462,195 @@ private final class RecordingDownloadDestinationPicker: RemoteFileDownloadDestin
     func pickDownloadDirectory(parentWindow: NSWindow?) -> String? {
         pickDirectoryCount += 1
         return destinationDirectory
+    }
+}
+
+private enum RecordingFilesRemoteChromiumRuntimeError: Error {
+    case cleanupFailed
+}
+
+private final class FilesRemoteChromiumCommandExecutor: RemoteChromiumCommandExecuting {
+    private var outputs: [String]
+
+    init(outputs: [String]) {
+        self.outputs = outputs
+    }
+
+    func execute(
+        command: String,
+        context: TunnelLiveSessionContext,
+        timeout: TimeInterval
+    ) throws -> String {
+        outputs.isEmpty ? "" : outputs.removeFirst()
+    }
+}
+
+private final class FilesRemoteChromiumTunnelBridge: TunnelRuntimeBridging {
+    func start(profile: TunnelProfile) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
+    }
+
+    func start(
+        profile: TunnelProfile,
+        liveSessionContext: TunnelLiveSessionContext?
+    ) throws -> TunnelRuntimeStatus {
+        try start(profile: profile)
+    }
+
+    func start(record: TunnelProfileRecord) throws -> TunnelRuntimeStatus {
+        try start(profile: record.profile)
+    }
+
+    func poll(profileID: String) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profileID, state: .running, message: "running")
+    }
+
+    func stop(profile: TunnelProfile, state: TunnelState) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profile.id, state: .stopped, message: "stopped")
+    }
+}
+
+private final class BlockingFilesSCPTransferBridge: SCPTransferBridging, @unchecked Sendable {
+    private let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+
+    init(started: XCTestExpectation) {
+        self.started = started
+    }
+
+    func release() {
+        gate.signal()
+    }
+
+    func runLiveSCPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        started.fulfill()
+        guard gate.wait(timeout: .now() + 2) == .success else {
+            throw RecordingFilesRemoteChromiumRuntimeError.cleanupFailed
+        }
+        return [
+            ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: max(1, job.bytesTotal),
+                bytesTotal: max(1, job.bytesTotal),
+                status: "completed"
+            )
+        ]
+    }
+}
+
+@MainActor
+private final class DeferredFilesTransferCompletionDriver {
+    var completion: (() -> Void)?
+
+    func complete() {
+        completion?()
+        completion = nil
+    }
+}
+
+@MainActor
+private final class DeferredFilesSCPTransferScheduler: SCPTransferScheduling {
+    private let driver: DeferredFilesTransferCompletionDriver
+    private var scheduledCompletion: ((ScpTransferProgress) -> Void)?
+    private var scheduledJob: ScpTransferJob?
+
+    init(driver: DeferredFilesTransferCompletionDriver) {
+        self.driver = driver
+    }
+
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduledJob = job
+        scheduledCompletion = completion
+        driver.completion = { [weak self] in
+            guard let self, let job = self.scheduledJob else { return }
+            let progress = ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: max(1, job.bytesTotal),
+                bytesTotal: max(1, job.bytesTotal),
+                status: "completed"
+            )
+            self.scheduledCompletion?(progress)
+            self.scheduledCompletion = nil
+            self.scheduledJob = nil
+        }
+    }
+
+    func scheduleLiveTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduleLiveTransfer(
+            runtimeID: config.host,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: completion
+        )
+    }
+
+    func disconnectTransfers(runtimeID: String) -> [String] { [] }
+    func cancelTransfer(jobID: String) -> Bool { false }
+    func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
+}
+
+private final class WeakFilesObjectBox<Object: AnyObject> {
+    weak var value: Object?
+
+    init(_ value: Object?) {
+        self.value = value
+    }
+}
+
+private final class RecordingFilesRemoteChromiumRuntime: RemoteChromiumRuntimeControlling {
+    let session: RemoteChromiumRuntimeSession
+    let acknowledgementResult: Result<Void, Error>
+    private(set) var acknowledgedDownloads: [RemoteChromiumDownload] = []
+
+    init(
+        session: RemoteChromiumRuntimeSession,
+        acknowledgementResult: Result<Void, Error> = .success(())
+    ) {
+        self.session = session
+        self.acknowledgementResult = acknowledgementResult
+    }
+
+    func start(
+        context: TunnelLiveSessionContext,
+        localPort: UInt16
+    ) throws -> RemoteChromiumRuntimeSession {
+        session
+    }
+
+    func stop(session: RemoteChromiumRuntimeSession) {}
+
+    func retainDownload(_ download: RemoteChromiumDownload) -> Bool {
+        download.isCanonical(for: session)
+    }
+
+    func acknowledgeDownload(
+        _ download: RemoteChromiumDownload,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) -> Bool {
+        guard download.isCanonical(for: session) else { return false }
+        acknowledgedDownloads.append(download)
+        completion(acknowledgementResult)
+        return true
     }
 }
 

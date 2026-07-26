@@ -1,6 +1,26 @@
 import AppKit
 
+public enum RemoteFilesInitialLoadPresentation: Equatable {
+    case immediate
+    case connectionState
+}
+
+/// Controls whether the pane is the Inspector-backed remote browser used by
+/// normal SSH sessions or the standalone WinSCP/Xftp-style transfer browser
+/// used by SCP/SFTP file sessions.
+public enum RemoteFilesPanePresentationMode: Equatable {
+    case inspector
+    case transferBrowser
+}
+
 public final class RemoteFilesPaneViewController: NSViewController {
+    private enum FileTransferLayout {
+        static let minimumLocalWidth: CGFloat = 280
+        static let minimumRemoteWidth: CGFloat = 360
+        static let preferredLocalWidth: CGFloat = 380
+        static let defaultLocalWidthFraction: CGFloat = 0.34
+    }
+
     private enum RightWorkspaceLayout {
         static let storedCapabilityWidthKey = "Stacio.RemoteFiles.rightCapabilityWidth"
         static let userSetCapabilityWidthKey = "Stacio.RemoteFiles.rightCapabilityWidth.userSet"
@@ -12,18 +32,26 @@ public final class RemoteFilesPaneViewController: NSViewController {
 
     public let runtimeID: String
     public let context: TunnelLiveSessionContext?
-    public let ftpContext: FTPLiveSessionContext?
     public private(set) var initialLoadError: Error?
     public var currentRemotePath: String {
+        if let independentTransferBrowser {
+            return independentTransferBrowser.currentRemotePath
+        }
         guard isViewLoaded else { return initialRemotePath }
         return filesViewController.currentRemotePath
     }
 
     private let filesViewController = FilesViewController()
+    private let localFilesViewController: LocalFilePaneViewController
+    private let fileTransferSplitView = NSSplitView()
+    private let remoteWorkspaceContainer = NSView()
     private let workspaceSplitView = NSSplitView()
     private let bridge: RemoteFilesBridging
+    private let initialLoadPresentation: RemoteFilesInitialLoadPresentation
+    private let presentationMode: RemoteFilesPanePresentationMode
+    private let connectionStateView: SessionConnectionStateView
+    private let remoteProtocolName: String
     private var transferScheduler: SCPTransferScheduling?
-    private var ftpTransferScheduler: FTPTransferScheduling?
     private let rightCapabilityWidthDefaults: UserDefaults
     private let initialRemotePath: String
     private let remoteFilePathTerminalSender: (String) -> Void
@@ -40,7 +68,12 @@ public final class RemoteFilesPaneViewController: NSViewController {
     private var rightFilesWidthBeforeCollapse: CGFloat?
     private var needsInitialCapabilitySplitPosition = false
     private var isApplyingProgrammaticCapabilitySplitPosition = false
+    private var needsInitialFileTransferSplitPosition = true
+    private var isApplyingProgrammaticFileTransferSplitPosition = false
+    private var localPaneWidthConstraints: [NSLayoutConstraint] = []
+    private var localPaneCurrentWidthConstraint: NSLayoutConstraint?
     private var rightWorkspaceOpenRequestIDs: Set<UUID> = []
+    private var independentTransferBrowser: IndependentFileTransferBrowserViewController?
 
     public init(
         runtimeID: String,
@@ -48,40 +81,31 @@ public final class RemoteFilesPaneViewController: NSViewController {
         title: String,
         bridge: RemoteFilesBridging,
         transferScheduler: SCPTransferScheduling?,
+        remoteProtocolName: String = "SCP",
         initialRemotePath: String = "~",
+        initialLoadPresentation: RemoteFilesInitialLoadPresentation = .immediate,
         rightCapabilityWidthDefaults: UserDefaults = .standard,
+        presentationMode: RemoteFilesPanePresentationMode = .inspector,
         remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in }
     ) {
         self.runtimeID = runtimeID
         self.context = context
-        self.ftpContext = nil
+        self.localFilesViewController = LocalFilePaneViewController(
+            runtimeID: "\(runtimeID)_local",
+            directoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            title: "本地文件"
+        )
         self.bridge = bridge
+        self.initialLoadPresentation = initialLoadPresentation
+        self.presentationMode = presentationMode
+        self.remoteProtocolName = remoteProtocolName
+        self.connectionStateView = SessionConnectionStateView(
+            protocolName: remoteProtocolName,
+            endpoint: "\(context.config.username)@\(context.config.host):\(context.config.port)"
+        )
         self.transferScheduler = transferScheduler
-        self.ftpTransferScheduler = nil
         self.rightCapabilityWidthDefaults = rightCapabilityWidthDefaults
         self.initialRemotePath = Self.normalizedInitialRemotePath(initialRemotePath)
-        self.remoteFilePathTerminalSender = remoteFilePathTerminalSender
-        super.init(nibName: nil, bundle: nil)
-        self.title = title
-    }
-
-    public init(
-        runtimeID: String,
-        ftpContext: FTPLiveSessionContext,
-        title: String,
-        bridge: RemoteFilesBridging,
-        ftpTransferScheduler: FTPTransferScheduling? = nil,
-        rightCapabilityWidthDefaults: UserDefaults = .standard,
-        remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in }
-    ) {
-        self.runtimeID = runtimeID
-        self.context = nil
-        self.ftpContext = ftpContext
-        self.bridge = bridge
-        self.transferScheduler = nil
-        self.ftpTransferScheduler = ftpTransferScheduler
-        self.rightCapabilityWidthDefaults = rightCapabilityWidthDefaults
-        self.initialRemotePath = "~"
         self.remoteFilePathTerminalSender = remoteFilePathTerminalSender
         super.init(nibName: nil, bundle: nil)
         self.title = title
@@ -93,12 +117,27 @@ public final class RemoteFilesPaneViewController: NSViewController {
     }
 
     public override func loadView() {
+        if presentationMode == .transferBrowser {
+            loadIndependentTransferBrowserView()
+            return
+        }
         let container = RemoteFilesShortcutRootView()
         container.onToggleFilesSidebar = { [weak self] in
             self?.toggleFilesSidebar()
         }
         container.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.applyWorkspaceSurface(container)
+
+        fileTransferSplitView.isVertical = true
+        fileTransferSplitView.dividerStyle = .thin
+        fileTransferSplitView.translatesAutoresizingMaskIntoConstraints = false
+        fileTransferSplitView.setAccessibilityIdentifier("Stacio.RemoteFiles.fileTransferSplit")
+        fileTransferSplitView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        fileTransferSplitView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        fileTransferSplitView.delegate = self
+
+        remoteWorkspaceContainer.translatesAutoresizingMaskIntoConstraints = false
+        remoteWorkspaceContainer.setAccessibilityIdentifier("Stacio.RemoteFiles.remoteWorkspace")
 
         workspaceSplitView.isVertical = true
         workspaceSplitView.dividerStyle = .thin
@@ -108,65 +147,260 @@ public final class RemoteFilesPaneViewController: NSViewController {
         workspaceSplitView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         workspaceSplitView.delegate = self
 
+        addChild(localFilesViewController)
+        localFilesViewController.view.translatesAutoresizingMaskIntoConstraints = false
+        localFilesViewController.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        localFilesViewController.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
         addChild(filesViewController)
         filesViewController.view.translatesAutoresizingMaskIntoConstraints = false
         filesViewController.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         filesViewController.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        if ftpContext != nil {
-            filesViewController.setEngineSummary(L10n.Files.ftpEngine)
+        if remoteProtocolName == "SFTP" {
+            filesViewController.setEngineSummary(L10n.Files.sftpEngine)
         }
         filesViewController.onSendPathToTerminal = { [remoteFilePathTerminalSender] path in
             remoteFilePathTerminalSender(path)
         }
-        container.addSubview(workspaceSplitView)
+        remoteWorkspaceContainer.addSubview(workspaceSplitView)
+        if initialLoadPresentation == .connectionState {
+            remoteWorkspaceContainer.addSubview(connectionStateView)
+        }
         workspaceSplitView.addArrangedSubview(filesViewController.view)
+        fileTransferSplitView.addArrangedSubview(localFilesViewController.view)
+        fileTransferSplitView.addArrangedSubview(remoteWorkspaceContainer)
+        fileTransferSplitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        fileTransferSplitView.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+        installFileTransferWidthConstraints()
+        container.addSubview(fileTransferSplitView)
         NSLayoutConstraint.activate([
-            workspaceSplitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            workspaceSplitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            workspaceSplitView.topAnchor.constraint(equalTo: container.topAnchor),
-            workspaceSplitView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            fileTransferSplitView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            fileTransferSplitView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            fileTransferSplitView.topAnchor.constraint(equalTo: container.topAnchor),
+            fileTransferSplitView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            workspaceSplitView.leadingAnchor.constraint(equalTo: remoteWorkspaceContainer.leadingAnchor),
+            workspaceSplitView.trailingAnchor.constraint(equalTo: remoteWorkspaceContainer.trailingAnchor),
+            workspaceSplitView.topAnchor.constraint(equalTo: remoteWorkspaceContainer.topAnchor),
+            workspaceSplitView.bottomAnchor.constraint(equalTo: remoteWorkspaceContainer.bottomAnchor)
         ])
+        if initialLoadPresentation == .connectionState {
+            NSLayoutConstraint.activate([
+                connectionStateView.leadingAnchor.constraint(equalTo: remoteWorkspaceContainer.leadingAnchor),
+                connectionStateView.trailingAnchor.constraint(equalTo: remoteWorkspaceContainer.trailingAnchor),
+                connectionStateView.topAnchor.constraint(equalTo: remoteWorkspaceContainer.topAnchor),
+                connectionStateView.bottomAnchor.constraint(equalTo: remoteWorkspaceContainer.bottomAnchor)
+            ])
+        }
 
         let coordinator = FilesCoordinator(
             bridge: bridge,
             filesViewController: filesViewController,
             liveSessionContextProvider: { [context] in context },
             liveSessionRuntimeIDProvider: { [runtimeID] in runtimeID },
-            ftpSessionContextProvider: { [ftpContext] in ftpContext },
+            ftpSessionContextProvider: { nil },
             transferScheduler: transferScheduler,
-            ftpTransferScheduler: ftpTransferScheduler,
+            ftpTransferScheduler: nil,
             remoteEditOpener: RemoteFilesPaneRemoteEditOpener(filesPane: self),
             remoteEditSessionIDProvider: { [runtimeID] in runtimeID }
         )
         filesCoordinator = coordinator
+        localFilesViewController.onRemoteSelectionsDropped = { [weak self] selections, directoryURL in
+            guard let self else { return }
+            self.filesCoordinator?.scheduleDownloads(selections, to: directoryURL) { [weak self] in
+                self?.localFilesViewController.refreshDirectory()
+            }
+        }
         view = container
 
-        do {
-            filesViewController.setCurrentRemotePath(initialRemotePath)
-            try coordinator.loadCurrentLiveDirectory(remotePath: initialRemotePath)
-        } catch {
-            initialLoadError = error
-            coordinator.showInitialLoadError(error)
+        filesViewController.setCurrentRemotePath(initialRemotePath)
+        connectionStateView.setRetryAction(
+            title: L10n.Files.retry,
+            action: initialLoadPresentation == .connectionState ? { [weak self] in
+                self?.startInitialConnectionLoad()
+            } : nil
+        )
+        if initialLoadPresentation == .connectionState {
+            startInitialConnectionLoad()
+        } else {
+            do {
+                try coordinator.loadCurrentLiveDirectory(remotePath: initialRemotePath)
+            } catch {
+                initialLoadError = error
+                coordinator.showInitialLoadError(error)
+            }
         }
     }
 
     public override func viewDidLayout() {
         super.viewDidLayout()
+        independentTransferBrowser?.view.layoutSubtreeIfNeeded()
+        applyInitialFileTransferSplitPositionIfNeeded()
         applyInitialCapabilitySplitPositionIfNeeded()
     }
 
+    private func loadIndependentTransferBrowserView() {
+        let browser: IndependentFileTransferBrowserViewController
+        if let context {
+            browser = IndependentFileTransferBrowserViewController(
+                runtimeID: runtimeID,
+                context: context,
+                title: title ?? "远端文件",
+                bridge: bridge,
+                transferScheduler: transferScheduler,
+                remoteProtocolName: remoteProtocolName,
+                initialRemotePath: initialRemotePath,
+                initialLoadPresentation: initialLoadPresentation,
+                localFilesViewController: localFilesViewController,
+                remoteFilePathTerminalSender: remoteFilePathTerminalSender
+            )
+        } else {
+            preconditionFailure("A transfer browser requires an SSH context")
+        }
+        browser.onEntriesLoaded = { [weak self] entries, path in
+            guard let self else { return }
+            self.filesViewController.setCurrentRemotePath(path)
+            self.filesViewController.setRemoteEntries(entries, remotePath: path)
+        }
+        browser.onLoadError = { [weak self] error in
+            self?.initialLoadError = error
+        }
+        if remoteProtocolName == "SFTP" {
+            filesViewController.setEngineSummary(L10n.Files.sftpEngine)
+        }
+        filesViewController.setCurrentRemotePath(initialRemotePath)
+        filesViewController.onUploadDroppedFiles = { [weak browser] remoteDirectory, paths in
+            browser?.uploadLocalPaths(paths, to: remoteDirectory)
+        }
+        independentTransferBrowser = browser
+        addChild(browser)
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        StacioDesignSystem.applyWorkspaceSurface(root)
+        browser.view.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(browser.view)
+        NSLayoutConstraint.activate([
+            browser.view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            browser.view.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            browser.view.topAnchor.constraint(equalTo: root.topAnchor),
+            browser.view.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+        view = root
+    }
+
     public var visibleTextSnapshotForTesting: String {
-        filesViewController.visibleTextSnapshot
+        if let independentTransferBrowser {
+            if independentTransferBrowser.isInitialConnectionStateVisibleForTesting {
+                return independentTransferBrowser.visibleTextSnapshotForTesting
+            }
+            return filesViewController.visibleTextSnapshot
+        }
+        if connectionStateView.isHidden == false,
+           initialLoadPresentation == .connectionState
+        {
+            return connectionStateView.visibleTextForTesting
+        }
+        return filesViewController.visibleTextSnapshot
+    }
+
+    public var isInitialConnectionStateVisibleForTesting: Bool {
+        if let independentTransferBrowser {
+            return independentTransferBrowser.isInitialConnectionStateVisibleForTesting
+        }
+        return initialLoadPresentation == .connectionState && connectionStateView.isHidden == false
+    }
+
+    public var isFilesWorkspaceHiddenForTesting: Bool {
+        if let independentTransferBrowser {
+            return independentTransferBrowser.isFilesWorkspaceHiddenForTesting
+        }
+        return workspaceSplitView.isHidden
     }
 
     public var filesViewControllerForTesting: FilesViewController {
         filesViewController
     }
 
+    public var localFilesViewControllerForTesting: LocalFilePaneViewController {
+        localFilesViewController
+    }
+
+    public var independentTransferBrowserForTesting: IndependentFileTransferBrowserViewController? {
+        independentTransferBrowser
+    }
+
+    func setFileTransferRemoteDeviceActions(
+        optionsProvider: @escaping () -> [FileTransferRemoteDeviceOption],
+        connectHandler: @escaping (String) -> Void,
+        createHandler: @escaping () -> Void
+    ) {
+        independentTransferBrowser?.remoteDeviceOptionsProvider = optionsProvider
+        independentTransferBrowser?.onRequestConnectRemoteDevice = connectHandler
+        independentTransferBrowser?.onRequestCreateRemoteDevice = createHandler
+    }
+
+    func markPrimaryFileTransferRemoteDevice(sessionID: String) {
+        independentTransferBrowser?.markPrimaryRemoteDevice(sessionID: sessionID)
+    }
+
+    @discardableResult
+    func attachFileTransferRemoteDevice(
+        _ configuration: FileTransferRemotePaneConfiguration
+    ) -> IndependentFileTransferRemotePaneViewController? {
+        independentTransferBrowser?.attachRemoteDevice(configuration)
+    }
+
+    public var fileTransferSplitViewForTesting: NSSplitView {
+        if let independentTransferBrowser {
+            return independentTransferBrowser.fileTransferSplitViewForTesting
+        }
+        return fileTransferSplitView
+    }
+
     public func closeRemoteFilesRuntime() {
+        if let independentTransferBrowser {
+            independentTransferBrowser.closeRuntime()
+            clearTransientOpenProgress()
+            return
+        }
         _ = transferScheduler?.disconnectTransfers(runtimeID: runtimeID)
-        _ = ftpTransferScheduler?.disconnectTransfers(runtimeID: runtimeID)
         clearTransientOpenProgress()
+    }
+
+    private func finishInitialConnection(error: Error?) {
+        initialLoadError = error
+        if let error {
+            workspaceSplitView.isHidden = true
+            let diagnostic = FilesCoordinator.remoteListingErrorMessage(for: error)
+            let message = diagnostic.hasPrefix(L10n.TerminalLifecycle.connectionFailed)
+                ? diagnostic
+                : L10n.TerminalLifecycle.connectionFailedMessage(diagnostic)
+            connectionStateView.update(phase: .failed(message: message))
+            connectionStateView.setPresented(true, animated: view.window != nil)
+        } else {
+            workspaceSplitView.isHidden = false
+            connectionStateView.update(phase: .connecting)
+            connectionStateView.setPresented(false, animated: view.window != nil)
+        }
+    }
+
+    private func startInitialConnectionLoad() {
+        guard initialLoadPresentation == .connectionState,
+              let filesCoordinator
+        else { return }
+        initialLoadError = nil
+        workspaceSplitView.isHidden = true
+        connectionStateView.update(phase: .connecting)
+        connectionStateView.setPresented(true, animated: view.window != nil)
+        filesCoordinator.refreshCurrentLiveDirectory(
+            remotePath: initialRemotePath,
+            presentation: .initialConnection,
+            onSuccess: { [weak self] _ in
+                self?.finishInitialConnection(error: nil)
+            },
+            onFailure: { [weak self] _, error in
+                self?.finishInitialConnection(error: error)
+            }
+        )
     }
 
     public var textEditorViewControllerForTesting: RemoteTextEditorViewController? {
@@ -519,6 +753,56 @@ public final class RemoteFilesPaneViewController: NSViewController {
         }
     }
 
+    private func applyInitialFileTransferSplitPositionIfNeeded() {
+        guard needsInitialFileTransferSplitPosition,
+              fileTransferSplitView.arrangedSubviews.count == 2
+        else {
+            return
+        }
+        if fileTransferSplitView.bounds.width <= 0, view.bounds.width > 0 {
+            fileTransferSplitView.frame = view.bounds
+            fileTransferSplitView.layoutSubtreeIfNeeded()
+        }
+        let availableWidth = fileTransferSplitView.bounds.width
+        guard availableWidth > 0 else { return }
+        let dividerWidth = fileTransferSplitView.dividerThickness
+        let maximumLocalWidth = availableWidth - dividerWidth - FileTransferLayout.minimumRemoteWidth
+        guard maximumLocalWidth >= FileTransferLayout.minimumLocalWidth else {
+            return
+        }
+        let requestedWidth = max(
+            FileTransferLayout.preferredLocalWidth,
+            availableWidth * FileTransferLayout.defaultLocalWidthFraction
+        )
+        let localWidth = min(max(requestedWidth, FileTransferLayout.minimumLocalWidth), maximumLocalWidth)
+        withProgrammaticFileTransferSplitPosition {
+            localPaneCurrentWidthConstraint?.constant = localWidth
+            fileTransferSplitView.setPosition(localWidth, ofDividerAt: 0)
+            fileTransferSplitView.adjustSubviews()
+            view.layoutSubtreeIfNeeded()
+        }
+        needsInitialFileTransferSplitPosition = false
+    }
+
+    private func installFileTransferWidthConstraints() {
+        NSLayoutConstraint.deactivate(localPaneWidthConstraints)
+        let localMinimum = localFilesViewController.view.widthAnchor.constraint(
+            greaterThanOrEqualToConstant: FileTransferLayout.minimumLocalWidth
+        )
+        let remoteMinimum = remoteWorkspaceContainer.widthAnchor.constraint(
+            greaterThanOrEqualToConstant: FileTransferLayout.minimumRemoteWidth
+        )
+        let localCurrent = localFilesViewController.view.widthAnchor.constraint(
+            equalToConstant: FileTransferLayout.preferredLocalWidth
+        )
+        localMinimum.priority = .defaultHigh
+        remoteMinimum.priority = .defaultHigh
+        localCurrent.priority = NSLayoutConstraint.Priority(751)
+        localPaneCurrentWidthConstraint = localCurrent
+        localPaneWidthConstraints = [localMinimum, remoteMinimum, localCurrent]
+        NSLayoutConstraint.activate(localPaneWidthConstraints)
+    }
+
     private func applyInitialCapabilitySplitPositionIfNeeded() {
         guard needsInitialCapabilitySplitPosition,
               workspaceSplitView.arrangedSubviews.count == 2
@@ -600,6 +884,14 @@ public final class RemoteFilesPaneViewController: NSViewController {
         action()
     }
 
+    private func withProgrammaticFileTransferSplitPosition(_ action: () -> Void) {
+        isApplyingProgrammaticFileTransferSplitPosition = true
+        defer {
+            isApplyingProgrammaticFileTransferSplitPosition = false
+        }
+        action()
+    }
+
     private static func normalizedInitialRemotePath(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "~" : trimmed
@@ -612,6 +904,24 @@ extension RemoteFilesPaneViewController: NSSplitViewDelegate {
         constrainSplitPosition proposedPosition: CGFloat,
         ofSubviewAt dividerIndex: Int
     ) -> CGFloat {
+        if splitView === fileTransferSplitView,
+           dividerIndex == 0,
+           splitView.arrangedSubviews.count == 2
+        {
+            let dividerWidth = splitView.dividerThickness
+            let maximumLocalWidth = splitView.bounds.width
+                - dividerWidth
+                - FileTransferLayout.minimumRemoteWidth
+            guard maximumLocalWidth >= FileTransferLayout.minimumLocalWidth else {
+                return proposedPosition
+            }
+            let localWidth = min(
+                max(proposedPosition, FileTransferLayout.minimumLocalWidth),
+                maximumLocalWidth
+            )
+            localPaneCurrentWidthConstraint?.constant = localWidth
+            return localWidth
+        }
         guard splitView === workspaceSplitView,
               dividerIndex == 0,
               splitView.arrangedSubviews.count == 2

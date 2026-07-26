@@ -253,7 +253,7 @@ impl SessionRepository {
         let mut statement = self.connection.prepare(
             "SELECT id, config_json
              FROM sessions
-             WHERE LOWER(TRIM(protocol)) IN ('ssh', 'scp')
+             WHERE LOWER(TRIM(protocol)) IN ('ssh', 'sftp', 'scp')
              ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -891,7 +891,7 @@ fn protocol_config_json_for_session_with_override(
         .to_ascii_lowercase()
         .replace('-', "_");
     let config = match protocol.as_str() {
-        "ssh" | "scp" => serialize_protocol_config(NetworkAuthSessionConfig {
+        "ssh" | "sftp" | "scp" => serialize_protocol_config(NetworkAuthSessionConfig {
             kind: &protocol,
             host: &session.host,
             port: session.port,
@@ -901,6 +901,7 @@ fn protocol_config_json_for_session_with_override(
             session_icon_id: session_icon_id_for_session(config_json_override)?,
             tag_style: tag_style_for_session(config_json_override)?,
             automation: automation_metadata_for_session(config_json_override)?,
+            bastion: bastion_metadata_for_session(config_json_override)?,
         })?,
         "telnet" => serialize_protocol_config(NetworkSessionConfig {
             kind: "telnet",
@@ -1071,6 +1072,98 @@ fn automation_metadata_for_session(
     }))
 }
 
+fn bastion_metadata_for_session(
+    config_json_override: Option<&str>,
+) -> Result<Option<BastionSessionMetadata>, SessionError> {
+    let Some(config_json) = config_json_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let override_config = serde_json::from_str::<BastionSessionMetadataOverride>(config_json)
+        .map_err(|error| SessionError::Database {
+            message: error.to_string(),
+        })?;
+    let Some(vendor) = override_config
+        .bastion_vendor
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "jumpserver"
+                    | "topsec"
+                    | "sangfor"
+                    | "qianxin"
+                    | "360"
+                    | "dbappsecurity"
+                    | "alibaba_cloud"
+                    | "tencent_cloud"
+                    | "huawei_cloud"
+                    | "teleport"
+                    | "cyberark"
+                    | "beyondtrust"
+                    | "custom"
+            )
+        })
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(BastionSessionMetadata {
+        bastion_vendor: vendor,
+        bastion_vendor_identifier: normalize_bastion_metadata_string(
+            override_config.bastion_vendor_identifier,
+            128,
+        ),
+        bastion_format: override_config
+            .bastion_format
+            .and_then(normalize_bastion_metadata_token),
+        bastion_target_host: normalize_bastion_metadata_string(
+            override_config.bastion_target_host,
+            1_024,
+        ),
+        bastion_target_port: override_config
+            .bastion_target_port
+            .filter(|port| (1..=65_535).contains(port)),
+        bastion_target_username: normalize_bastion_metadata_string(
+            override_config.bastion_target_username,
+            1_024,
+        ),
+        bastion_asset_id: normalize_bastion_metadata_string(override_config.bastion_asset_id, 512),
+        bastion_account_id: normalize_bastion_metadata_string(
+            override_config.bastion_account_id,
+            512,
+        ),
+    }))
+}
+
+fn normalize_bastion_metadata_string(
+    value: Option<String>,
+    maximum_length: usize,
+) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() || value.len() > maximum_length || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value)
+}
+
+fn normalize_bastion_metadata_token(value: String) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
 fn normalize_session_environment(value: &str) -> Option<String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "production" | "prod" => Some("production".to_string()),
@@ -1203,6 +1296,8 @@ struct NetworkAuthSessionConfig<'a> {
     tag_style: Option<TagStyleConfig>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     automation: Option<SessionAutomationMetadata>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    bastion: Option<BastionSessionMetadata>,
 }
 
 #[derive(Serialize)]
@@ -1273,6 +1368,39 @@ struct SessionAutomationOverride {
     post_connect_script: Option<String>,
     environment_variables: Option<Vec<String>>,
     connect_timeout_ms: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BastionSessionMetadata {
+    bastion_vendor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_vendor_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_target_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_target_port: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_target_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_asset_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion_account_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BastionSessionMetadataOverride {
+    bastion_vendor: Option<String>,
+    bastion_vendor_identifier: Option<String>,
+    bastion_format: Option<String>,
+    bastion_target_host: Option<String>,
+    bastion_target_port: Option<u32>,
+    bastion_target_username: Option<String>,
+    bastion_asset_id: Option<String>,
+    bastion_account_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

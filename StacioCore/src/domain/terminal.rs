@@ -128,7 +128,9 @@ mod tests {
         registry
             .set_output_paused(runtime.id.clone(), false)
             .expect("resume output");
-        let resumed = registry.take_output_batch(runtime.id).expect("take resumed output");
+        let resumed = registry
+            .take_output_batch(runtime.id)
+            .expect("take resumed output");
 
         assert_eq!(resumed.bytes, b"hello".to_vec());
         assert_eq!(resumed.dropped_byte_count, 0);

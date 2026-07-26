@@ -62,7 +62,80 @@ public protocol RemoteFilesBridging {
         offset: UInt64,
         length: UInt64?
     ) throws -> Data
+    func openLiveRemoteFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession?
+    func openLiveSFTPFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession?
     func writeLiveRemoteFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64
+    func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry]
+    func searchLiveSFTPFiles(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        keyword: String,
+        depth: UInt32
+    ) throws -> [RemoteFileEntry]
+    func createLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws
+    func renameLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws
+    func deleteLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws
+    func chmodLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws
+    func copyLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws
+    func readLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data
+    func writeLiveSFTPFile(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
         expectedFingerprintSHA256: String,
@@ -234,6 +307,56 @@ public final class CoreBridgeRemoteFilesBridge: RemoteFilesBridging {
         )
     }
 
+    public func openLiveRemoteFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        let sessionID = try CoreBridge.openLiveRemoteFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256
+        )
+        return RemoteFileReadSession(
+            read: { remotePath, offset, length in
+                try CoreBridge.readLiveRemoteFileSession(
+                    sessionID: sessionID,
+                    remotePath: remotePath,
+                    offset: offset,
+                    length: length
+                )
+            },
+            close: {
+                try? CoreBridge.closeLiveRemoteFileReadSession(sessionID: sessionID)
+            }
+        )
+    }
+
+    public func openLiveSFTPFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        let sessionID = try CoreBridge.openLiveSFTPFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256
+        )
+        return RemoteFileReadSession(
+            read: { remotePath, offset, length in
+                try CoreBridge.readLiveRemoteFileSession(
+                    sessionID: sessionID,
+                    remotePath: remotePath,
+                    offset: offset,
+                    length: length
+                )
+            },
+            close: {
+                try? CoreBridge.closeLiveRemoteFileReadSession(sessionID: sessionID)
+            }
+        )
+    }
+
     public func writeLiveRemoteFile(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -242,6 +365,150 @@ public final class CoreBridgeRemoteFilesBridge: RemoteFilesBridging {
         contents: Data
     ) throws -> UInt64 {
         try CoreBridge.writeLiveRemoteFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            contents: contents
+        )
+    }
+
+    public func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try CoreBridge.listLiveSFTPDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
+    public func searchLiveSFTPFiles(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        keyword: String,
+        depth: UInt32
+    ) throws -> [RemoteFileEntry] {
+        try CoreBridge.searchLiveSFTPFiles(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            keyword: keyword,
+            depth: depth
+        )
+    }
+
+    public func createLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {
+        try CoreBridge.createLiveSFTPDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
+    public func renameLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try CoreBridge.renameLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public func deleteLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {
+        try CoreBridge.deleteLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            recursive: recursive
+        )
+    }
+
+    public func chmodLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {
+        try CoreBridge.chmodLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            mode: mode
+        )
+    }
+
+    public func copyLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try CoreBridge.copyLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public func readLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        try CoreBridge.readLiveSFTPFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            offset: offset,
+            length: length
+        )
+    }
+
+    public func writeLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64 {
+        try CoreBridge.writeLiveSFTPFile(
             config: config,
             secret: secret,
             expectedFingerprintSHA256: expectedFingerprintSHA256,
@@ -350,6 +617,22 @@ public extension RemoteFilesBridging {
         throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("ssh-read")
     }
 
+    func openLiveRemoteFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        nil
+    }
+
+    func openLiveSFTPFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        nil
+    }
+
     func writeLiveRemoteFile(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -358,6 +641,96 @@ public extension RemoteFilesBridging {
         contents: Data
     ) throws -> UInt64 {
         throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("ssh-write")
+    }
+
+    func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-list")
+    }
+
+    func searchLiveSFTPFiles(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        keyword: String,
+        depth: UInt32
+    ) throws -> [RemoteFileEntry] {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-search")
+    }
+
+    func createLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-create")
+    }
+
+    func renameLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-rename")
+    }
+
+    func deleteLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-delete")
+    }
+
+    func chmodLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-chmod")
+    }
+
+    func copyLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-copy")
+    }
+
+    func readLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-read")
+    }
+
+    func writeLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64 {
+        throw WorkbenchSessionOpenError.protocolRuntimeUnavailable("sftp-write")
     }
 
     func listLiveFTPDirectory(
@@ -404,6 +777,186 @@ public extension RemoteFilesBridging {
     }
 }
 
+public final class SFTPRemoteFilesBridgeAdapter: RemoteFilesBridging {
+    private let base: RemoteFilesBridging
+
+    public init(base: RemoteFilesBridging) {
+        self.base = base
+    }
+
+    public func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        try base.parseRemoteListing(input)
+    }
+
+    public func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try base.listLiveSFTPDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
+    public func searchLiveRemoteFiles(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        keyword: String,
+        depth: UInt32
+    ) throws -> [RemoteFileEntry] {
+        try base.searchLiveSFTPFiles(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            keyword: keyword,
+            depth: depth
+        )
+    }
+
+    public func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {
+        try base.createLiveSFTPDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
+    public func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try base.renameLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {
+        try base.deleteLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            recursive: recursive
+        )
+    }
+
+    public func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {
+        try base.chmodLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            mode: mode
+        )
+    }
+
+    public func copyLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try base.copyLiveSFTPPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public func readLiveRemoteFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        try base.readLiveSFTPFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            offset: offset,
+            length: length
+        )
+    }
+
+    public func openLiveRemoteFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        try base.openLiveSFTPFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256
+        )
+    }
+
+    public func openLiveSFTPFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> RemoteFileReadSession? {
+        try base.openLiveSFTPFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256
+        )
+    }
+
+    public func writeLiveRemoteFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64 {
+        try base.writeLiveSFTPFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            contents: contents
+        )
+    }
+}
+
 public struct FTPLiveSessionContext {
     public let config: FtpConnectionConfig
     public let secret: FtpAuthSecret
@@ -415,7 +968,29 @@ public struct FTPLiveSessionContext {
 }
 
 @MainActor
-public protocol SCPTransferScheduling: AnyObject {
+public protocol TransferRetryOrchestrationScheduling: AnyObject {
+    func registerOrchestratedRetry(
+        jobID: String,
+        runtimeIDs: Set<String>,
+        retry: @escaping () -> Bool,
+        discard: @escaping () -> Void
+    )
+    func unregisterOrchestratedRetry(jobID: String)
+}
+
+public extension TransferRetryOrchestrationScheduling {
+    func registerOrchestratedRetry(
+        jobID: String,
+        runtimeIDs: Set<String>,
+        retry: @escaping () -> Bool,
+        discard: @escaping () -> Void
+    ) {}
+
+    func unregisterOrchestratedRetry(jobID: String) {}
+}
+
+@MainActor
+public protocol SCPTransferScheduling: TransferRetryOrchestrationScheduling {
     func scheduleLiveTransfer(
         runtimeID: String,
         config: SshConnectionConfig,
@@ -432,6 +1007,7 @@ public protocol SCPTransferScheduling: AnyObject {
         completion: ((ScpTransferProgress) -> Void)?
     )
     func disconnectTransfers(runtimeID: String) -> [String]
+    func cancelTransfer(jobID: String) -> Bool
     func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64)
 }
 
@@ -498,10 +1074,134 @@ public extension SCPTransferScheduling {
         []
     }
 
+    func cancelTransfer(jobID: String) -> Bool {
+        false
+    }
+
     func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
 }
 
 extension TransferQueueCoordinator: SCPTransferScheduling {}
+
+@MainActor
+public protocol SFTPTransferScheduling: TransferRetryOrchestrationScheduling {
+    func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    )
+    func disconnectTransfers(runtimeID: String) -> [String]
+    func cancelTransfer(jobID: String) -> Bool
+    func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64)
+}
+
+public extension SFTPTransferScheduling {
+    func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) {
+        scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: nil
+        )
+    }
+
+    func disconnectTransfers(runtimeID: String) -> [String] {
+        []
+    }
+
+    func cancelTransfer(jobID: String) -> Bool {
+        false
+    }
+
+    func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
+}
+
+extension TransferQueueCoordinator: SFTPTransferScheduling {}
+
+@MainActor
+public final class SFTPTransferSchedulerAdapter: SCPTransferScheduling {
+    private weak var scheduler: SFTPTransferScheduling?
+
+    public init(scheduler: SFTPTransferScheduling) {
+        self.scheduler = scheduler
+    }
+
+    public func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduler?.scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: completion
+        )
+    }
+
+    public func scheduleLiveTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduleLiveTransfer(
+            runtimeID: config.host,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: completion
+        )
+    }
+
+    public func disconnectTransfers(runtimeID: String) -> [String] {
+        scheduler?.disconnectTransfers(runtimeID: runtimeID) ?? []
+    }
+
+    public func cancelTransfer(jobID: String) -> Bool {
+        scheduler?.cancelTransfer(jobID: jobID) ?? false
+    }
+
+    public func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {
+        scheduler?.updateScheduledTransferEstimatedByteTotal(jobID: jobID, bytesTotal: bytesTotal)
+    }
+
+    public func registerOrchestratedRetry(
+        jobID: String,
+        runtimeIDs: Set<String>,
+        retry: @escaping () -> Bool,
+        discard: @escaping () -> Void
+    ) {
+        scheduler?.registerOrchestratedRetry(
+            jobID: jobID,
+            runtimeIDs: runtimeIDs,
+            retry: retry,
+            discard: discard
+        )
+    }
+
+    public func unregisterOrchestratedRetry(jobID: String) {
+        scheduler?.unregisterOrchestratedRetry(jobID: jobID)
+    }
+}
 
 @MainActor
 public protocol FTPTransferScheduling: AnyObject {
@@ -615,6 +1315,68 @@ public enum LocalUploadSizeProvider {
 
 public protocol RemoteFileConflictResolving {
     func resolveConflict(destinationPath: String, direction: ScpDirection, parentWindow: NSWindow?) -> ScpConflictPolicy?
+    func resolveConflictDecision(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> RemoteFileConflictDecision?
+}
+
+public struct RemoteFileConflictDecision: Equatable, Sendable {
+    public let policy: ScpConflictPolicy
+    public let applyToAll: Bool
+
+    public init(policy: ScpConflictPolicy, applyToAll: Bool) {
+        self.policy = policy
+        self.applyToAll = applyToAll
+    }
+}
+
+public extension RemoteFileConflictResolving {
+    func resolveConflictDecision(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> RemoteFileConflictDecision? {
+        resolveConflict(
+            destinationPath: destinationPath,
+            direction: direction,
+            parentWindow: parentWindow
+        ).map { RemoteFileConflictDecision(policy: $0, applyToAll: false) }
+    }
+}
+
+public final class RemoteFileConflictResolutionSession: @unchecked Sendable {
+    private let resolver: RemoteFileConflictResolving
+    private let lock = NSLock()
+    private var appliedPolicy: ScpConflictPolicy?
+
+    public init(resolver: RemoteFileConflictResolving) {
+        self.resolver = resolver
+    }
+
+    public func resolveConflict(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> ScpConflictPolicy? {
+        lock.lock()
+        let cachedPolicy = appliedPolicy
+        lock.unlock()
+        if let cachedPolicy { return cachedPolicy }
+
+        guard let decision = resolver.resolveConflictDecision(
+            destinationPath: destinationPath,
+            direction: direction,
+            parentWindow: parentWindow
+        ) else { return nil }
+        if decision.applyToAll {
+            lock.lock()
+            appliedPolicy = decision.policy
+            lock.unlock()
+        }
+        return decision.policy
+    }
 }
 
 public struct AppKitRemoteFileConflictResolver: RemoteFileConflictResolving {
@@ -625,9 +1387,21 @@ public struct AppKitRemoteFileConflictResolver: RemoteFileConflictResolving {
         direction: ScpDirection,
         parentWindow: NSWindow?
     ) -> ScpConflictPolicy? {
+        resolveConflictDecision(
+            destinationPath: destinationPath,
+            direction: direction,
+            parentWindow: parentWindow
+        )?.policy
+    }
+
+    public func resolveConflictDecision(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> RemoteFileConflictDecision? {
         if !Thread.isMainThread {
             return DispatchQueue.main.sync {
-                resolveConflict(
+                resolveConflictDecision(
                     destinationPath: destinationPath,
                     direction: direction,
                     parentWindow: parentWindow
@@ -642,16 +1416,27 @@ public struct AppKitRemoteFileConflictResolver: RemoteFileConflictResolving {
         alert.addButton(withTitle: L10n.Files.overwrite)
         alert.addButton(withTitle: L10n.Files.renameCopy)
         alert.addButton(withTitle: L10n.Files.skip)
+        let applyToAll = NSButton(
+            checkboxWithTitle: "应用到本次传输的所有冲突",
+            target: nil,
+            action: nil
+        )
+        alert.accessoryView = applyToAll
+        let policy: ScpConflictPolicy
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            return .keepBoth
+            policy = .keepBoth
         case .alertSecondButtonReturn:
-            return .overwrite
+            policy = .overwrite
         case .alertThirdButtonReturn:
-            return .rename
+            policy = .rename
         default:
-            return .skip
+            policy = .skip
         }
+        return RemoteFileConflictDecision(
+            policy: policy,
+            applyToAll: applyToAll.state == .on
+        )
     }
 }
 
@@ -676,6 +1461,21 @@ public struct SettingsBackedRemoteFileConflictResolver: RemoteFileConflictResolv
             return policy
         }
         return fallback.resolveConflict(
+            destinationPath: destinationPath,
+            direction: direction,
+            parentWindow: parentWindow
+        )
+    }
+
+    public func resolveConflictDecision(
+        destinationPath: String,
+        direction: ScpDirection,
+        parentWindow: NSWindow?
+    ) -> RemoteFileConflictDecision? {
+        if let policy = settingsStore.snapshot().filesTransferConflictPolicy.scpConflictPolicy {
+            return RemoteFileConflictDecision(policy: policy, applyToAll: true)
+        }
+        return fallback.resolveConflictDecision(
             destinationPath: destinationPath,
             direction: direction,
             parentWindow: parentWindow
@@ -1112,6 +1912,7 @@ public struct AppKitRemoteFileOperationPrompt: RemoteFileOperationPrompting {
 
 public enum RemoteFileErrorContext: Equatable {
     case refresh
+    case download
     case createDirectory
     case createFile
     case rename
@@ -1127,6 +1928,8 @@ public enum RemoteFileErrorContext: Equatable {
         switch self {
         case .refresh:
             return L10n.Files.refreshFailedTitle
+        case .download:
+            return "下载远端文件失败"
         case .createDirectory:
             return L10n.Files.createDirectoryFailedTitle
         case .createFile:
@@ -1179,6 +1982,12 @@ public enum FilesCoordinatorError: Error, LocalizedError, Equatable {
             return L10n.Files.missingLiveSSHContext
         }
     }
+}
+
+public enum RemoteBrowserDownloadSchedulingResult: Equatable {
+    case scheduled
+    case discarded
+    case rejected
 }
 
 public protocol RemoteEditOpening: AnyObject {
@@ -1545,6 +2354,39 @@ private struct UncheckedSendableBox<Value>: @unchecked Sendable {
     }
 }
 
+@MainActor
+private final class RemoteBrowserDownloadTransferLifetime {
+    private var scheduler: SCPTransferScheduling?
+    private var onLocalTransferVerified: (() -> Void)?
+
+    init(
+        scheduler: SCPTransferScheduling,
+        onLocalTransferVerified: @escaping () -> Void
+    ) {
+        self.scheduler = scheduler
+        self.onLocalTransferVerified = onLocalTransferVerified
+    }
+
+    func handle(_ progress: ScpTransferProgress, destinationPath: String) {
+        switch progress.status.lowercased() {
+        case "completed":
+            if FileManager.default.fileExists(atPath: destinationPath) {
+                onLocalTransferVerified?()
+            }
+            finish()
+        case "failed", "canceled", "cancelled", "stopped":
+            finish()
+        default:
+            break
+        }
+    }
+
+    private func finish() {
+        onLocalTransferVerified = nil
+        scheduler = nil
+    }
+}
+
 public enum RemoteFileBackupNaming {
     public static func backupFileName(
         originalFileName: String,
@@ -1576,6 +2418,7 @@ public final class FilesCoordinator {
     enum DirectoryRefreshPresentation: Equatable {
         case interactive
         case backgroundFollow
+        case initialConnection
     }
 
     private let bridge: RemoteFilesBridging
@@ -1942,7 +2785,7 @@ public final class FilesCoordinator {
         }
     }
 
-    private static func remoteListingErrorMessage(for error: Error) -> String {
+    static func remoteListingErrorMessage(for error: Error) -> String {
         if let filesError = error as? FilesError {
             switch filesError {
             case .InvalidListingRow, .InvalidFileKind, .InvalidFileSize:
@@ -1994,6 +2837,174 @@ public final class FilesCoordinator {
                 secret: context.secret,
                 expectedFingerprintSHA256: context.expectedFingerprintSHA256,
                 job: job
+            )
+        }
+    }
+
+    /// Saves a file produced by the SSH-hosted Chromium runtime. The browser
+    /// runtime remains the sole owner of remote temporary-file cleanup.
+    @discardableResult
+    public func scheduleRemoteBrowserDownload(
+        _ download: RemoteChromiumDownload,
+        onLocalTransferVerified: @escaping () -> Void
+    ) -> RemoteBrowserDownloadSchedulingResult {
+        let remotePath = download.remotePath
+        guard Self.isOwnedRemoteBrowserDownloadPath(remotePath) else {
+            appLog?.append(
+                level: .warning,
+                category: "Browser",
+                message: "remote.browser.download.rejected path=\(remotePath)"
+            )
+            return .rejected
+        }
+        guard let context = download.sourceLiveSessionContext else {
+            appLog?.append(
+                level: .warning,
+                category: "Browser",
+                message: "remote.browser.download.rejected-unbound-context path=\(remotePath)"
+            )
+            return .rejected
+        }
+        guard let transferScheduler
+        else {
+            present(FilesCoordinatorError.missingLiveSSHContext, context: .download)
+            return .rejected
+        }
+
+        let sanitizedSuggestedFileName = BrowserDownloadDestinationResolver.sanitizedFilename(
+            download.suggestedFilename
+        )
+        let destinationFileName = sanitizedSuggestedFileName.isEmpty
+            ? suggestedDownloadFileName(for: remotePath)
+            : sanitizedSuggestedFileName
+        guard let destinationPath = downloadDestinationPicker.pickDownloadDestination(
+            suggestedFileName: destinationFileName,
+            parentWindow: filesViewController?.view.window
+        ),
+        let resolvedDestinationPath = resolveDestinationPathIfNeeded(
+            destinationPath,
+            direction: .download,
+            conflictExists: FileManager.default.fileExists(atPath: destinationPath)
+        ) else {
+            return .discarded
+        }
+
+        let job = ScpTransferJob(
+            id: "remote_browser_download_\(UUID().uuidString)",
+            direction: .download,
+            sourcePath: remotePath,
+            destinationPath: resolvedDestinationPath,
+            bytesTotal: 0
+        )
+        let runtimeID = context.config.host
+        let transferLifetime = RemoteBrowserDownloadTransferLifetime(
+            scheduler: transferScheduler,
+            onLocalTransferVerified: onLocalTransferVerified
+        )
+        transferScheduler.scheduleLiveTransfer(
+            runtimeID: runtimeID,
+            config: context.config,
+            secret: context.secret,
+            expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+            job: job,
+            completion: { progress in
+                transferLifetime.handle(progress, destinationPath: resolvedDestinationPath)
+            }
+        )
+        return .scheduled
+    }
+
+    private static func isOwnedRemoteBrowserDownloadPath(_ path: String) -> Bool {
+        path.range(
+            of: #"^/tmp/stacio-chromium\.[A-Za-z0-9]{6,64}/downloads/[^/\x00-\x1F\x7F]+$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    /// Schedules a drop from the remote pane into a concrete local directory.
+    /// Unlike the toolbar download action this never opens a save panel: the
+    /// directory under the pointer is the destination and the remote basename
+    /// is preserved. Directory jobs are handled recursively by the selected
+    /// transport engine.
+    public func scheduleDownloads(
+        _ selections: [RemoteFileSelection],
+        to localDirectory: URL,
+        completion: (() -> Void)? = nil
+    ) {
+        let directory = localDirectory.standardizedFileURL
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            return
+        }
+
+        let plannedDownloads = selections.compactMap { selection -> PlannedDownload? in
+            let name = suggestedDownloadFileName(for: selection.path)
+            let destinationPath = directory.appendingPathComponent(name, isDirectory: selection.isDirectory).path
+            guard let resolvedDestinationPath = resolveDestinationPathIfNeeded(
+                destinationPath,
+                direction: .download,
+                conflictExists: FileManager.default.fileExists(atPath: destinationPath)
+            ) else {
+                return nil
+            }
+            return PlannedDownload(selection: selection, destinationPath: resolvedDestinationPath)
+        }
+        guard plannedDownloads.isEmpty == false else {
+            return
+        }
+
+        if let context = ftpSessionContextProvider(),
+           let ftpTransferScheduler
+        {
+            let runtimeID = ftpRemoteEditRuntimeID(for: context)
+            for plannedDownload in plannedDownloads {
+                let job = ScpTransferJob(
+                    id: "ftp_download_\(UUID().uuidString)",
+                    direction: .download,
+                    sourcePath: plannedDownload.selection.path,
+                    destinationPath: plannedDownload.destinationPath,
+                    bytesTotal: plannedDownload.selection.size
+                )
+                ftpTransferScheduler.scheduleLiveFTPTransfer(
+                    runtimeID: runtimeID,
+                    config: context.config,
+                    secret: context.secret,
+                    job: job,
+                    completion: { progress in
+                        guard progress.status == "completed" else { return }
+                        completion?()
+                    }
+                )
+            }
+            return
+        }
+
+        guard let context = liveSessionContextProvider(),
+              let transferScheduler
+        else {
+            return
+        }
+        let runtimeID = liveSessionRuntimeID(for: context)
+        for plannedDownload in plannedDownloads {
+            let job = ScpTransferJob(
+                id: "scp_download_\(UUID().uuidString)",
+                direction: .download,
+                sourcePath: plannedDownload.selection.path,
+                destinationPath: plannedDownload.destinationPath,
+                bytesTotal: plannedDownload.selection.size
+            )
+            transferScheduler.scheduleLiveTransfer(
+                runtimeID: runtimeID,
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                job: job,
+                completion: { progress in
+                    guard progress.status == "completed" else { return }
+                    completion?()
+                }
             )
         }
     }
@@ -2051,6 +3062,9 @@ public final class FilesCoordinator {
                     progressValue: nil
                 )
                 onFailure?(normalizedPath, FilesCoordinatorError.missingLiveSSHContext)
+            case .initialConnection:
+                filesViewController?.setRemoteListingError(message)
+                onFailure?(normalizedPath, FilesCoordinatorError.missingLiveSSHContext)
             }
             return
         }
@@ -2066,9 +3080,7 @@ public final class FilesCoordinator {
             sshContext: sshContext
         )
         let cachedEntries = cacheKey.flatMap { directoryListingCache[$0] }
-        if let cachedEntries,
-           presentation == .interactive
-        {
+        if let cachedEntries, presentation == .interactive {
             filesViewController?.setRemoteEntries(
                 cachedEntries,
                 remotePath: normalizedPath,
@@ -2079,7 +3091,7 @@ public final class FilesCoordinator {
                 message: "正在跟随终端目录：\(normalizedPath)",
                 progressValue: nil
             )
-        } else {
+        } else if presentation == .interactive {
             filesViewController?.setRemoteListingLoading(remotePath: normalizedPath)
         }
 
@@ -2152,7 +3164,7 @@ public final class FilesCoordinator {
                             Self.remoteListingErrorMessage(for: error)
                         ].joined(separator: " ")
                     )
-                } else if cachedEntries != nil {
+                } else if cachedEntries != nil, presentation == .interactive {
                     self.filesViewController?.finishRemoteListingRefresh()
                     self.appLog?.append(
                         level: StacioLogLevel.warning,
@@ -2165,7 +3177,11 @@ public final class FilesCoordinator {
                     )
                 } else {
                     self.filesViewController?.setRemoteListingError(Self.remoteListingErrorMessage(for: error))
-                    self.present(error, context: .refresh)
+                    if presentation == .interactive {
+                        self.present(error, context: .refresh)
+                    } else if presentation == .initialConnection {
+                        onFailure?(normalizedPath, error)
+                    }
                 }
             }
         }
@@ -2452,31 +3468,32 @@ public final class FilesCoordinator {
         transferScheduler: FTPTransferScheduling
     ) {
         let destinationPath = remoteDestinationPath(directory: remoteDirectory, fileName: localFile.fileName)
-        guard let resolvedDestinationPath = resolveDestinationPathIfNeeded(
-            destinationPath,
+        resolveRemoteUploadDestination(
+            destinationPath: destinationPath,
+            remoteDirectory: remoteDirectory,
+            fileName: localFile.fileName,
             direction: .upload,
-            conflictExists: filesViewController?.containsRemoteEntry(named: localFile.fileName) ?? false
-        ) else {
-            return
+            ftpContext: context
+        ) { [weak self] resolvedDestinationPath in
+            guard let self, let resolvedDestinationPath else { return }
+            let job = ScpTransferJob(
+                id: "ftp_upload_\(UUID().uuidString)",
+                direction: .upload,
+                sourcePath: localFile.path,
+                destinationPath: resolvedDestinationPath,
+                bytesTotal: localFile.size
+            )
+            transferScheduler.scheduleLiveFTPTransfer(
+                runtimeID: self.ftpRemoteEditRuntimeID(for: context),
+                config: context.config,
+                secret: context.secret,
+                job: job,
+                completion: { [weak self] progress in
+                    self?.refreshRemoteDirectoryAfterUploadCompletion(progress, remoteDirectory: remoteDirectory)
+                }
+            )
+            self.estimateUploadSizeIfNeeded(localFile: localFile, jobID: job.id, scheduler: transferScheduler)
         }
-
-        let job = ScpTransferJob(
-            id: "ftp_upload_\(UUID().uuidString)",
-            direction: .upload,
-            sourcePath: localFile.path,
-            destinationPath: resolvedDestinationPath,
-            bytesTotal: localFile.size
-        )
-        transferScheduler.scheduleLiveFTPTransfer(
-            runtimeID: ftpRemoteEditRuntimeID(for: context),
-            config: context.config,
-            secret: context.secret,
-            job: job,
-            completion: { [weak self] progress in
-                self?.refreshRemoteDirectoryAfterUploadCompletion(progress, remoteDirectory: remoteDirectory)
-            }
-        )
-        estimateUploadSizeIfNeeded(localFile: localFile, jobID: job.id, scheduler: transferScheduler)
     }
 
     public func scheduleDroppedUploads(
@@ -2561,32 +3578,33 @@ public final class FilesCoordinator {
         transferScheduler: SCPTransferScheduling
     ) {
         let destinationPath = remoteDestinationPath(directory: remoteDirectory, fileName: localFile.fileName)
-        guard let resolvedDestinationPath = resolveDestinationPathIfNeeded(
-            destinationPath,
+        resolveRemoteUploadDestination(
+            destinationPath: destinationPath,
+            remoteDirectory: remoteDirectory,
+            fileName: localFile.fileName,
             direction: .upload,
-            conflictExists: filesViewController?.containsRemoteEntry(named: localFile.fileName) ?? false
-        ) else {
-            return
+            sshContext: context
+        ) { [weak self] resolvedDestinationPath in
+            guard let self, let resolvedDestinationPath else { return }
+            let job = ScpTransferJob(
+                id: "scp_upload_\(UUID().uuidString)",
+                direction: .upload,
+                sourcePath: localFile.path,
+                destinationPath: resolvedDestinationPath,
+                bytesTotal: localFile.size
+            )
+            transferScheduler.scheduleLiveTransfer(
+                runtimeID: runtimeID,
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                job: job,
+                completion: { [weak self] progress in
+                    self?.refreshRemoteDirectoryAfterUploadCompletion(progress, remoteDirectory: remoteDirectory)
+                }
+            )
+            self.estimateUploadSizeIfNeeded(localFile: localFile, jobID: job.id, scheduler: transferScheduler)
         }
-
-        let job = ScpTransferJob(
-            id: "scp_upload_\(UUID().uuidString)",
-            direction: .upload,
-            sourcePath: localFile.path,
-            destinationPath: resolvedDestinationPath,
-            bytesTotal: localFile.size
-        )
-        transferScheduler.scheduleLiveTransfer(
-            runtimeID: runtimeID,
-            config: context.config,
-            secret: context.secret,
-            expectedFingerprintSHA256: context.expectedFingerprintSHA256,
-            job: job,
-            completion: { [weak self] progress in
-                self?.refreshRemoteDirectoryAfterUploadCompletion(progress, remoteDirectory: remoteDirectory)
-            }
-        )
-        estimateUploadSizeIfNeeded(localFile: localFile, jobID: job.id, scheduler: transferScheduler)
     }
 
     private func refreshRemoteDirectoryAfterUploadCompletion(
@@ -2691,6 +3709,103 @@ public final class FilesCoordinator {
             return nil
         }
         return CoreBridge.resolveSCPConflictPath(destinationPath: destinationPath, policy: policy)
+    }
+
+    /// Resolves an upload destination against the directory under the pointer.
+    /// The visible table only represents the current directory, so a drop onto
+    /// a child directory must be checked with a fresh listing before applying
+    /// the conflict policy. This keeps a stale parent listing from causing an
+    /// accidental overwrite (or an unnecessary prompt).
+    private func resolveRemoteUploadDestination(
+        destinationPath: String,
+        remoteDirectory: String,
+        fileName: String,
+        direction: ScpDirection,
+        ftpContext: FTPLiveSessionContext? = nil,
+        sshContext: TunnelLiveSessionContext? = nil,
+        completion: @escaping (String?) -> Void
+    ) {
+        remoteEntryExists(
+            named: fileName,
+            in: remoteDirectory,
+            ftpContext: ftpContext,
+            sshContext: sshContext
+        ) { [weak self] result in
+            guard let self else {
+                completion(nil)
+                return
+            }
+            switch result {
+            case .success(let exists):
+                completion(self.resolveDestinationPathIfNeeded(
+                    destinationPath,
+                    direction: direction,
+                    conflictExists: exists
+                ))
+            case .failure(let error):
+                self.present(error, context: .refresh)
+                completion(nil)
+            }
+        }
+    }
+
+    private func remoteEntryExists(
+        named fileName: String,
+        in remoteDirectory: String,
+        ftpContext: FTPLiveSessionContext?,
+        sshContext: TunnelLiveSessionContext?,
+        completion: @escaping (Result<Bool, Error>) -> Void
+    ) {
+        let normalizedDirectory = Self.normalizedRemoteDirectoryPath(remoteDirectory)
+        let normalizedCurrentPath = Self.normalizedRemoteDirectoryPath(
+            filesViewController?.currentRemotePath ?? "~"
+        )
+        if normalizedDirectory == normalizedCurrentPath {
+            completion(.success(filesViewController?.containsRemoteEntry(named: fileName) ?? false))
+            return
+        }
+
+        let resolvedFTPContext = ftpContext ?? ftpSessionContextProvider()
+        let resolvedSSHContext = sshContext ?? liveSessionContextProvider()
+        guard resolvedFTPContext != nil || resolvedSSHContext != nil else {
+            completion(.failure(FilesCoordinatorError.missingLiveSSHContext))
+            return
+        }
+
+        let bridgeBox = UncheckedSendableBox(bridge)
+        let ftpContextBox = resolvedFTPContext.map(UncheckedSendableBox.init)
+        let sshContextBox = resolvedSSHContext.map(UncheckedSendableBox.init)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let entries: [RemoteFileEntry]
+                if let ftpContext = ftpContextBox?.value {
+                    entries = try bridgeBox.value.listLiveFTPDirectory(
+                        config: ftpContext.config,
+                        secret: ftpContext.secret,
+                        remotePath: normalizedDirectory
+                    )
+                } else if let sshContext = sshContextBox?.value {
+                    entries = try bridgeBox.value.listLiveRemoteDirectory(
+                        config: sshContext.config,
+                        secret: sshContext.secret,
+                        expectedFingerprintSHA256: sshContext.expectedFingerprintSHA256,
+                        remotePath: normalizedDirectory
+                    )
+                } else {
+                    throw FilesCoordinatorError.missingLiveSSHContext
+                }
+                let exists = entries.contains { entry in
+                    (entry.path as NSString).lastPathComponent == fileName
+                }
+                DispatchQueue.main.async {
+                    completion(.success(exists))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
     }
 
     private struct PlannedDownload {
@@ -3474,15 +4589,32 @@ public final class FilesCoordinator {
     ) -> URL {
         let fileName = (selection.path as NSString).lastPathComponent
         let mimeType = Self.mimeType(forFileName: fileName)
-        return RemoteFileOnlineMediaRegistry.shared.register(
-            fileName: fileName,
-            mimeType: mimeType,
-            byteCount: selection.size,
-            reader: { [bridge] offset, length in
+        let readSession = RemoteFileReadSession.deferred(
+            open: { [bridge] in
+                try bridge.openLiveRemoteFileReadSession(
+                    config: context.config,
+                    secret: context.secret,
+                    expectedFingerprintSHA256: context.expectedFingerprintSHA256
+                )
+            },
+            fallback: { [bridge] remotePath, offset, length in
                 try bridge.readLiveRemoteFile(
                     config: context.config,
                     secret: context.secret,
                     expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                    remotePath: remotePath,
+                    offset: offset,
+                    length: length
+                )
+            }
+        )
+        return RemoteFileOnlineMediaRegistry.shared.register(
+            fileName: fileName,
+            mimeType: mimeType,
+            byteCount: selection.size,
+            onInvalidate: { readSession.close() },
+            reader: { offset, length in
+                try readSession.read(
                     remotePath: selection.path,
                     offset: offset,
                     length: length
@@ -3501,24 +4633,67 @@ public final class FilesCoordinator {
             openedRemoteModifiedAt: parsedRemoteModifiedDate(from: selection.modifiedTime)
         )
         let data = Data(text.utf8)
-        _ = try bridge.writeLiveRemoteFile(
-            config: context.config,
-            secret: context.secret,
-            expectedFingerprintSHA256: context.expectedFingerprintSHA256,
-            remotePath: selection.path,
-            contents: data
-        )
-        let verificationData = try bridge.readLiveRemoteFile(
-            config: context.config,
-            secret: context.secret,
-            expectedFingerprintSHA256: context.expectedFingerprintSHA256,
-            remotePath: selection.path,
-            offset: 0,
-            length: UInt64(data.count)
-        )
+        let verificationLength = UInt64(data.count) + 1
+        let verificationData: Data
+        do {
+            let writtenByteCount = try bridge.writeLiveSFTPFile(
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                remotePath: selection.path,
+                contents: data
+            )
+            guard writtenByteCount == UInt64(data.count) else {
+                throw RemoteEditCacheError.remoteWriteVerificationFailed(selection.path)
+            }
+            verificationData = try bridge.readLiveSFTPFile(
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                remotePath: selection.path,
+                offset: 0,
+                length: verificationLength
+            )
+        } catch {
+            if Self.isRemotePermissionDenied(error) {
+                throw error
+            }
+            let writtenByteCount = try bridge.writeLiveRemoteFile(
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                remotePath: selection.path,
+                contents: data
+            )
+            guard writtenByteCount == UInt64(data.count) else {
+                throw RemoteEditCacheError.remoteWriteVerificationFailed(selection.path)
+            }
+            verificationData = try bridge.readLiveRemoteFile(
+                config: context.config,
+                secret: context.secret,
+                expectedFingerprintSHA256: context.expectedFingerprintSHA256,
+                remotePath: selection.path,
+                offset: 0,
+                length: verificationLength
+            )
+        }
         guard verificationData == data else {
             throw RemoteEditCacheError.remoteWriteVerificationFailed(selection.path)
         }
+    }
+
+    private static func isRemotePermissionDenied(_ error: Error) -> Bool {
+        if let sshError = error as? SshRuntimeError,
+           case .Transport(let message) = sshError,
+           message.uppercased().contains("FILES_PERMISSION_DENIED")
+        {
+            return true
+        }
+        let diagnostic = "\(error) \(error.localizedDescription)".lowercased()
+        return diagnostic.contains("files_permission_denied")
+            || diagnostic.contains("permission denied")
+            || diagnostic.contains("权限不足")
+            || diagnostic.contains("权限被拒绝")
     }
 
     private static func mimeType(forFileName fileName: String) -> String {

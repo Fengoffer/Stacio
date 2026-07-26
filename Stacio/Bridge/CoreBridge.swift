@@ -448,6 +448,20 @@ public enum CoreBridge {
         )
     }
 
+    public static func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try StacioCoreBindings.listLiveSftpDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
     public static func searchLiveRemoteFiles(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -457,6 +471,24 @@ public enum CoreBridge {
         depth: UInt32
     ) throws -> [RemoteFileEntry] {
         try StacioCoreBindings.searchLiveRemoteFiles(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            keyword: keyword,
+            depth: depth
+        )
+    }
+
+    public static func searchLiveSFTPFiles(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        keyword: String,
+        depth: UInt32
+    ) throws -> [RemoteFileEntry] {
+        try StacioCoreBindings.searchLiveSftpFiles(
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
@@ -546,6 +578,20 @@ public enum CoreBridge {
         )
     }
 
+    public static func createLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {
+        try StacioCoreBindings.createLiveSftpDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
     public static func renameLiveRemotePath(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -554,6 +600,22 @@ public enum CoreBridge {
         toPath: String
     ) throws {
         try StacioCoreBindings.renameLiveRemotePath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public static func renameLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try StacioCoreBindings.renameLiveSftpPath(
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
@@ -578,6 +640,22 @@ public enum CoreBridge {
         )
     }
 
+    public static func deleteLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {
+        try StacioCoreBindings.deleteLiveSftpPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            recursive: recursive
+        )
+    }
+
     public static func chmodLiveRemotePath(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -594,6 +672,22 @@ public enum CoreBridge {
         )
     }
 
+    public static func chmodLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {
+        try StacioCoreBindings.chmodLiveSftpPath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            mode: mode
+        )
+    }
+
     public static func copyLiveRemotePath(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -602,6 +696,22 @@ public enum CoreBridge {
         toPath: String
     ) throws {
         try StacioCoreBindings.copyLiveRemotePath(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            fromPath: fromPath,
+            toPath: toPath
+        )
+    }
+
+    public static func copyLiveSFTPPath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        try StacioCoreBindings.copyLiveSftpPath(
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
@@ -628,6 +738,66 @@ public enum CoreBridge {
         )
     }
 
+    public static func readLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        try StacioCoreBindings.readLiveSftpFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            offset: offset,
+            length: length
+        )
+    }
+
+    public static func openLiveRemoteFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> String {
+        try StacioCoreBindings.openLiveRemoteFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256
+        )
+    }
+
+    public static func openLiveSFTPFileReadSession(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String
+    ) throws -> String {
+        try StacioCoreBindings.openLiveSftpFileReadSession(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256
+        )
+    }
+
+    public static func readLiveRemoteFileSession(
+        sessionID: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        try StacioCoreBindings.readLiveRemoteFileSession(
+            sessionId: sessionID,
+            remotePath: remotePath,
+            offset: offset,
+            length: length
+        )
+    }
+
+    public static func closeLiveRemoteFileReadSession(sessionID: String) throws {
+        try StacioCoreBindings.closeLiveRemoteFileReadSession(sessionId: sessionID)
+    }
+
     public static func writeLiveRemoteFile(
         config: SshConnectionConfig,
         secret: SshAuthSecret,
@@ -636,6 +806,22 @@ public enum CoreBridge {
         contents: Data
     ) throws -> UInt64 {
         try StacioCoreBindings.writeLiveRemoteFile(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            remotePath: remotePath,
+            contents: contents
+        )
+    }
+
+    public static func writeLiveSFTPFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        contents: Data
+    ) throws -> UInt64 {
+        try StacioCoreBindings.writeLiveSftpFile(
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
@@ -665,6 +851,20 @@ public enum CoreBridge {
         job: ScpTransferJob
     ) throws -> [ScpTransferProgress] {
         try StacioCoreBindings.runLiveScpTransfer(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            job: job
+        )
+    }
+
+    public static func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        try StacioCoreBindings.runLiveSftpTransfer(
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
@@ -847,6 +1047,20 @@ public enum CoreBridge {
             config: config,
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
+            profile: profile
+        )
+    }
+
+    public static func startLiveLocalTunnelRuntimeWithProxyJump(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        proxyJump: SshProxyJumpRuntimeConfig,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus {
+        try StacioCoreBindings.startLiveLocalTunnelRuntimeWithProxyJump(
+            config: config,
+            secret: secret,
+            proxyJump: proxyJump,
             profile: profile
         )
     }

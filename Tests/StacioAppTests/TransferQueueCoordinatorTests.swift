@@ -722,6 +722,150 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertFalse(ftpBridge.debugDescription.contains("ftp-secret"))
     }
 
+    func testCoordinatorSchedulesLiveSFTPTransferThroughSFTPBridge() async {
+        let scpBridge = RecordingSCPTransferBridge()
+        let sftpBridge = RecordingSFTPTransferBridge(progress: [
+            ScpTransferProgress(
+                jobId: "sftp_background_upload",
+                bytesDone: 128,
+                bytesTotal: 128,
+                status: "completed"
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: scpBridge,
+            sftpBridge: sftpBridge,
+            queueViewController: queue
+        )
+        let config = SshConnectionConfig(
+            host: "sftp.example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+        let job = ScpTransferJob(
+            id: "sftp_background_upload",
+            direction: .upload,
+            sourcePath: "/Users/alice/build.zip",
+            destinationPath: "/srv/build.zip",
+            bytesTotal: 128
+        )
+
+        coordinator.scheduleLiveSFTPTransfer(
+            runtimeID: "sftp-pane-runtime",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+
+        let completed = await eventually {
+            queue.tableView.statusText(row: 0) == "已完成"
+        }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(sftpBridge.events, ["run:sftp_background_upload"])
+        XCTAssertEqual(scpBridge.events, [])
+        XCTAssertEqual(queue.tableView.progressText(row: 0), "100%")
+    }
+
+    func testCoordinatorCancelsRunningSFTPTransferThroughSFTPBridgeAndIgnoresLateCompletion() async {
+        let job = ScpTransferJob(
+            id: "sftp_background_cancel",
+            direction: .download,
+            sourcePath: "/srv/build.zip",
+            destinationPath: "/Users/alice/build.zip",
+            bytesTotal: 128
+        )
+        let scpBridge = RecordingSCPTransferBridge()
+        let sftpBridge = BlockingSFTPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 128,
+                    bytesTotal: 128,
+                    status: "completed"
+                )
+            ]
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: scpBridge,
+            sftpBridge: sftpBridge,
+            queueViewController: queue
+        )
+
+        coordinator.scheduleLiveSFTPTransfer(
+            runtimeID: "sftp-pane-runtime",
+            config: SshConnectionConfig(
+                host: "sftp.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job
+        )
+
+        let started = await eventually { sftpBridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(started)
+        XCTAssertTrue(coordinator.cancelTransfer(jobID: job.id))
+        XCTAssertEqual(sftpBridge.cancelledJobIDs, [job.id])
+        XCTAssertEqual(scpBridge.events, [])
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "已取消")
+
+        sftpBridge.release(jobID: job.id)
+
+        let finished = await eventually { sftpBridge.finishedJobIDs == [job.id] }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "已取消")
+    }
+
+    func testCoordinatorDisconnectDrainsSFTPTransferThroughSFTPBridgeOnly() async {
+        let job = ScpTransferJob(
+            id: "sftp_disconnect_draining",
+            direction: .download,
+            sourcePath: "/srv/archive.zip",
+            destinationPath: "/Users/alice/archive.zip",
+            bytesTotal: 128
+        )
+        let scpBridge = BlockingSCPTransferBridge(completionsByJobID: [job.id: []])
+        let sftpBridge = BlockingSFTPTransferBridge(completionsByJobID: [job.id: []])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: scpBridge,
+            sftpBridge: sftpBridge,
+            queueViewController: queue
+        )
+
+        coordinator.scheduleLiveSFTPTransfer(
+            runtimeID: "sftp-disconnect-runtime",
+            config: Self.crossDeviceContext(host: "sftp.example.com").config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:sftp",
+            job: job
+        )
+        let started = await eventually { sftpBridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(started)
+
+        XCTAssertEqual(
+            coordinator.disconnectTransfers(runtimeID: "sftp-disconnect-runtime"),
+            [job.id]
+        )
+
+        XCTAssertEqual(sftpBridge.cancelledJobIDs, [job.id])
+        XCTAssertTrue(scpBridge.cancelledJobIDs.isEmpty)
+        sftpBridge.release(jobID: job.id)
+        let finished = await eventually { sftpBridge.finishedJobIDs == [job.id] }
+        XCTAssertTrue(finished)
+    }
+
     func testCoordinatorCallsScheduledSCPCompletionAfterBackgroundTransferCompletes() async {
         let bridge = RecordingSequenceSCPTransferBridge(results: [
             .success([
@@ -1396,7 +1540,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             "progress:job_background_cancel:running:0",
             "progress:job_background_cancel:canceled:0"
         ])
-        XCTAssertEqual(completionStatuses, [])
+        XCTAssertEqual(completionStatuses, ["canceled"])
     }
 
     func testCoordinatorStopsProgressPollingWhenLastRunningSCPTransferIsCanceled() async {
@@ -2412,7 +2556,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
                 && bridge.startedJobIDs == [firstJob.id, secondJob.id]
         }
         XCTAssertTrue(secondStarted)
-        XCTAssertEqual(firstCompletionStatuses, [])
+        XCTAssertEqual(firstCompletionStatuses, ["canceled"])
         XCTAssertFalse(presenter.payloads.contains { $0.jobID == firstJob.id })
 
         bridge.release(jobID: secondJob.id)
@@ -2420,6 +2564,67 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             queue.tableView.statusText(row: 0) == "已完成"
         }
         XCTAssertTrue(secondCompleted)
+    }
+
+    func testCoordinatorDisconnectDeliversWorkerTerminalStateWhenCancellationIsRejectedWithoutRevivingUI() async {
+        let job = ScpTransferJob(
+            id: "job_disconnect_rejected_cancel",
+            direction: .upload,
+            sourcePath: "/local/report.txt",
+            destinationPath: "/srv/report.txt",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(
+            completionsByJobID: [
+                job.id: [
+                    ScpTransferProgress(
+                        jobId: job.id,
+                        bytesDone: 100,
+                        bytesTotal: 100,
+                        status: "completed"
+                    )
+                ]
+            ],
+            acceptsCancellation: false
+        )
+        let presenter = RecordingTransferCompletionNotificationPresenter()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            bridge: bridge,
+            completionNotificationPresenter: presenter,
+            queueViewController: queue
+        )
+        let config = SshConnectionConfig(
+            host: "example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+        var completionStatuses: [String] = []
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime-disconnect-rejected",
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test",
+            job: job,
+            completion: { completionStatuses.append($0.status) }
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+
+        XCTAssertEqual(
+            coordinator.disconnectTransfers(runtimeID: "runtime-disconnect-rejected"),
+            [job.id]
+        )
+        XCTAssertEqual(queue.snapshotForTesting.rows, [])
+        bridge.release(jobID: job.id)
+
+        let didComplete = await eventually { completionStatuses == ["completed"] }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(queue.snapshotForTesting.rows, [])
+        XCTAssertTrue(presenter.payloads.isEmpty)
     }
 
     func testCoordinatorCancelsRunningTransferThroughReattachedRuntimeID() async {
@@ -3081,6 +3286,60 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertFalse(queue.visibleTextSnapshot.localizedCaseInsensitiveContains("SFTP"))
     }
 
+    func testRestoreHistoryDiscardsEveryOrchestratedRetryBeforeCallbacksMutateRegistry() throws {
+        let replacementJob = ScpTransferJob(
+            id: "relay-restore-replacement",
+            direction: .download,
+            sourcePath: "/srv/replacement.bin",
+            destinationPath: "/tmp/replacement.bin",
+            bytesTotal: 128
+        )
+        let history = RecordingTransferHistoryStore(jobs: [
+            ScpTransferJobRecord(
+                job: replacementJob,
+                sessionId: nil,
+                status: "failed",
+                bytesDone: 0
+            )
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            historyStore: history,
+            queueViewController: queue
+        )
+        var discardedJobIDs: [String] = []
+        var retriedReplacement = false
+        for jobID in ["relay-restore-one", "relay-restore-two"] {
+            coordinator.registerOrchestratedRetry(
+                jobID: jobID,
+                runtimeIDs: ["runtime-restore"],
+                retry: { false },
+                discard: { [weak coordinator] in
+                    discardedJobIDs.append(jobID)
+                    coordinator?.unregisterOrchestratedRetry(jobID: jobID)
+                    guard jobID == "relay-restore-one" else { return }
+                    coordinator?.registerOrchestratedRetry(
+                        jobID: replacementJob.id,
+                        runtimeIDs: ["runtime-replacement"],
+                        retry: {
+                            retriedReplacement = true
+                            return true
+                        },
+                        discard: {}
+                    )
+                }
+            )
+        }
+
+        try coordinator.restoreHistory()
+
+        XCTAssertEqual(Set(discardedJobIDs), Set(["relay-restore-one", "relay-restore-two"]))
+        XCTAssertEqual(discardedJobIDs.count, 2)
+        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: replacementJob.id))
+        XCTAssertTrue(retriedReplacement)
+    }
+
     func testCoordinatorRestoresTransferHistoryIntoQueueView() throws {
         let bridge = RecordingSCPTransferBridge()
         let job = ScpTransferJob(
@@ -3599,6 +3858,1774 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(secondCompleted)
     }
+
+    func testCancellationDeliversTerminalCompletionForDependentCleanup() async {
+        let job = ScpTransferJob(
+            id: "job_cancel_cleanup_callback",
+            direction: .download,
+            sourcePath: "/srv/report.txt",
+            destinationPath: "/tmp/report.txt",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ]
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(bridge: bridge, queueViewController: queue)
+        var terminalProgress: ScpTransferProgress?
+
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime_cancel_cleanup",
+            config: Self.crossDeviceContext(host: "source.example.com").config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:source",
+            job: job,
+            completion: { terminalProgress = $0 }
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+
+        XCTAssertTrue(coordinator.cancelTransfer(jobID: job.id))
+
+        XCTAssertNil(terminalProgress, "dependent cleanup must wait until the worker has actually stopped")
+        bridge.release(jobID: job.id)
+        let didAcknowledgeCancellation = await eventually {
+            terminalProgress?.status == "canceled"
+        }
+        XCTAssertTrue(didAcknowledgeCancellation)
+        XCTAssertEqual(terminalProgress?.jobId, job.id)
+    }
+
+    func testRunningTransferCancellationRejectedByWorkerRemainsRetryable() async {
+        let job = ScpTransferJob(
+            id: "job_cancel_rejected",
+            direction: .download,
+            sourcePath: "/srv/report.txt",
+            destinationPath: "/tmp/report.txt",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(
+            completionsByJobID: [job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 100,
+                    bytesTotal: 100,
+                    status: "completed"
+                )
+            ]],
+            acceptsCancellation: false
+        )
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(bridge: bridge, queueViewController: queue)
+        var terminalProgress: ScpTransferProgress?
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime_cancel_rejected",
+            config: Self.crossDeviceContext(host: "source.example.com").config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:source",
+            job: job,
+            completion: { terminalProgress = $0 }
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+
+        XCTAssertFalse(coordinator.cancelTransfer(jobID: job.id))
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
+        XCTAssertNil(terminalProgress)
+
+        bridge.release(jobID: job.id)
+        let didComplete = await eventually { terminalProgress?.status == "completed" }
+        XCTAssertTrue(didComplete)
+    }
+
+    func testAcceptedCancellationClearsSinglePhaseRetryAfterOrchestratorUnregisters() async {
+        let job = ScpTransferJob(
+            id: "job_orchestrated_cancel",
+            direction: .download,
+            sourcePath: "/srv/report.txt",
+            destinationPath: "/tmp/report.txt",
+            bytesTotal: 100
+        )
+        let bridge = BlockingSCPTransferBridge(completionsByJobID: [
+            job.id: [
+                ScpTransferProgress(
+                    jobId: job.id,
+                    bytesDone: 0,
+                    bytesTotal: 100,
+                    status: "canceled"
+                )
+            ]
+        ])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(bridge: bridge, queueViewController: queue)
+        var orchestratedRetryCount = 0
+        coordinator.scheduleLiveTransfer(
+            runtimeID: "runtime_orchestrated_cancel",
+            config: Self.crossDeviceContext(host: "source.example.com").config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:source",
+            job: job,
+            completion: { [weak coordinator] progress in
+                if progress.status == "canceled" {
+                    coordinator?.unregisterOrchestratedRetry(jobID: job.id)
+                }
+            }
+        )
+        coordinator.registerOrchestratedRetry(
+            jobID: job.id,
+            runtimeIDs: ["runtime_orchestrated_cancel"],
+            retry: {
+                orchestratedRetryCount += 1
+                return true
+            },
+            discard: {}
+        )
+        let didStart = await eventually { bridge.startedJobIDs == [job.id] }
+        XCTAssertTrue(didStart)
+
+        XCTAssertTrue(coordinator.cancelTransfer(jobID: job.id))
+        bridge.release(jobID: job.id)
+        let didCancel = await eventually {
+            queue.snapshotForTesting.rows.first?.rawStatus == "canceled"
+        }
+        XCTAssertTrue(didCancel)
+
+        XCTAssertFalse(coordinator.retryFailedTransfer(jobID: job.id))
+        XCTAssertEqual(orchestratedRetryCount, 0)
+        XCTAssertEqual(bridge.startedJobIDs, [job.id])
+    }
+
+    func testOrchestratedCleanupRetryKeepsFailedRowRecoverableAndDoesNotOverwriteSuccessWithQueued() {
+        let job = ScpTransferJob(
+            id: "job_orchestrated_cleanup_retry",
+            direction: .upload,
+            sourcePath: "/tmp/report.txt",
+            destinationPath: "/srv/report.txt",
+            bytesTotal: 100
+        )
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(queueViewController: queue)
+        coordinator.enqueueTransfer(job: job)
+        coordinator.replaceProgressForTesting(jobID: job.id, status: "failed", bytesDone: 0)
+        var retryAttempts = 0
+        coordinator.registerOrchestratedRetry(
+            jobID: job.id,
+            runtimeIDs: ["source", "destination"],
+            retry: { [weak coordinator] in
+                retryAttempts += 1
+                if retryAttempts == 2 {
+                    coordinator?.replaceProgressForTesting(
+                        jobID: job.id,
+                        status: "completed",
+                        bytesDone: job.bytesTotal
+                    )
+                }
+                return true
+            },
+            discard: {}
+        )
+
+        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: job.id))
+        XCTAssertEqual(queue.snapshotForTesting.rows.first?.rawStatus, "failed")
+
+        coordinator.replaceProgressForTesting(jobID: job.id, status: "failed", bytesDone: 0)
+        XCTAssertTrue(coordinator.retryFailedTransfer(jobID: job.id))
+        XCTAssertEqual(retryAttempts, 2)
+        XCTAssertEqual(queue.snapshotForTesting.rows.first?.rawStatus, "completed")
+        XCTAssertFalse(queue.snapshotForTesting.rows.contains { $0.rawStatus == "queued" })
+    }
+
+    func testCrossDeviceTransferUsesRemoteCopyForSameHostAndKeepsConflictingName() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(
+                kind: .file,
+                path: "/archive/report.txt",
+                size: 10,
+                modifiedTime: nil,
+                linkTarget: nil,
+                owner: nil,
+                permissions: nil
+            )
+        ]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "source-runtime",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "destination-runtime",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .keepBoth,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didCopy = await eventually {
+            bridge.copiedPaths == [
+                CrossDeviceRecordingRemoteBridge.PathPair(
+                    from: "/incoming/report.txt",
+                    to: "/archive/report (2).txt"
+                )
+            ]
+        }
+        XCTAssertTrue(didCopy)
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+        XCTAssertEqual(statuses.last, .completed)
+    }
+
+    func testCrossDeviceSameHostReplaceUsesAtomicRemoteOperationWithoutPreDelete() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didComplete = await eventually { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        let copiedPath = bridge.copiedPaths.first?.to
+        XCTAssertNotEqual(copiedPath, "/archive/report.txt")
+        XCTAssertTrue(copiedPath?.contains(".stacio-transfer-") == true)
+        XCTAssertFalse(bridge.deletedPaths.contains("/archive/report.txt"))
+    }
+
+    func testSameHostReplaceDoesNotMergeStaleDirectoryChildren() async throws {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .directory, path: "/archive/site", size: 0, linkTarget: nil)
+        ]
+        bridge.directoryChildren = [
+            "/incoming/site": ["index.html", "assets/app.js"],
+            "/archive/site": ["old.html", "assets/legacy.js"]
+        ]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-directory-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-directory-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/site", size: 0, kind: .directory)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didComplete = await eventually { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(bridge.directoryChildren["/archive/site"], ["index.html", "assets/app.js"])
+        XCTAssertFalse(bridge.directoryChildren["/archive/site"]?.contains("old.html") == true)
+        XCTAssertFalse(bridge.directoryChildren.keys.contains { $0.contains(".stacio-transfer-") })
+        XCTAssertFalse(bridge.directoryChildren.keys.contains { $0.contains(".stacio-backup-") })
+    }
+
+    func testSameHostPromotionFailureRollsBackOriginalDestinationAndCleansStage() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 3, linkTarget: nil)
+        ]
+        bridge.directoryChildren = [
+            "/incoming/report.txt": ["new"],
+            "/archive/report.txt": ["old"]
+        ]
+        bridge.renameFailuresByDestination = ["/archive/report.txt": 1]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator()
+        let endpoint = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-rollback",
+            title: "服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 3)],
+            from: endpoint,
+            to: endpoint,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFail = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return true
+        }
+        XCTAssertTrue(didFail)
+        XCTAssertEqual(bridge.directoryChildren["/archive/report.txt"], ["old"])
+        XCTAssertFalse(bridge.directoryChildren.keys.contains { $0.contains(".stacio-transfer-") })
+        XCTAssertFalse(bridge.directoryChildren.keys.contains { $0.contains(".stacio-backup-") })
+    }
+
+    func testCrossDeviceTransferRejectsSourceEqualToDestinationBeforeMutation() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let endpoint = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-path-runtime",
+            title: "服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        let coordinator = coordinatorForSamePathTest()
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/archive/report.txt", size: 10)],
+            from: endpoint,
+            to: endpoint,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didRejectSamePath = await eventually {
+            guard let status = statuses.last else { return false }
+            if case .failed = status { return true }
+            return false
+        }
+        XCTAssertTrue(didRejectSamePath)
+        XCTAssertTrue(bridge.copiedPaths.isEmpty)
+        XCTAssertTrue(bridge.renamedPaths.isEmpty)
+        XCTAssertTrue(bridge.deletedPaths.isEmpty)
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+    }
+
+    func testCrossDeviceTransferRelaysSameAbsolutePathAcrossDifferentHosts() async {
+        let relayRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelaySamePath-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayRoot) }
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/srv"] = []
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        sourceScheduler.completesImmediately = true
+        sourceScheduler.materializesDownloads = true
+        let destinationScheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-path-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-path-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: destinationScheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: { relayRoot })
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/srv/a", size: 1)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/srv",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didScheduleRelay = await eventually { destinationScheduler.jobs.count == 1 }
+        XCTAssertTrue(didScheduleRelay)
+        XCTAssertEqual(sourceScheduler.jobs.map(\.sourcePath), ["/srv/a"])
+        XCTAssertEqual(destinationScheduler.jobs.map(\.destinationPath), ["/srv/a"])
+
+        destinationScheduler.completeLast(status: "completed")
+
+        let didComplete = await eventually { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+    }
+
+    func testCrossDeviceConflictDecisionAppliesToAllConflictsInBatch() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/one.txt", size: 1, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/archive/two.txt", size: 1, linkTarget: nil)
+        ]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "conflict-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "conflict-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var requestedPaths: [String] = []
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        let coordinator = CrossDeviceTransferCoordinator()
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/one.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/two.txt", size: 1)
+            ],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictDecisionProvider: { path in
+                requestedPaths.append(path)
+                return CrossDeviceConflictDecision(resolution: .skip, applyToAll: true)
+            },
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didSkip = await eventually { statuses.last == .skipped }
+        XCTAssertTrue(didSkip)
+        XCTAssertEqual(requestedPaths.count, 1)
+        XCTAssertTrue(bridge.copiedPaths.isEmpty)
+    }
+
+    func testCrossDeviceMoveConflictSkipPreservesEverySourceInBatch() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/existing.txt", size: 1, linkTarget: nil)
+        ]
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .file, path: "/incoming/existing.txt", size: 1, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/incoming/fresh.txt", size: 1, linkTarget: nil)
+        ]
+        let sourcePaths: Set<String> = ["/incoming/existing.txt", "/incoming/fresh.txt"]
+        bridge.trackedPaths = sourcePaths
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "move-skip-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "move-skip-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+        let coordinator = CrossDeviceTransferCoordinator()
+
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/existing.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/fresh.txt", size: 1)
+            ],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .skip,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFinish = await eventually { statuses.last == .skipped }
+        XCTAssertTrue(didFinish)
+        XCTAssertEqual(bridge.trackedPaths, sourcePaths)
+        XCTAssertTrue(bridge.renamedPaths.isEmpty)
+        XCTAssertTrue(bridge.deletedPaths.isEmpty)
+    }
+
+    func testCrossDeviceMovePreflightFailurePreservesEverySourceInBatch() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = []
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .file, path: "/incoming/first.txt", size: 1, linkTarget: nil)
+        ]
+        let sourcePaths: Set<String> = ["/incoming/first.txt", "/incoming/missing.txt"]
+        bridge.trackedPaths = sourcePaths
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "move-preflight-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "move-preflight-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+        let coordinator = CrossDeviceTransferCoordinator()
+
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/missing.txt", size: 1)
+            ],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFail = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return true
+        }
+        XCTAssertTrue(didFail)
+        XCTAssertEqual(bridge.trackedPaths, sourcePaths)
+        XCTAssertTrue(bridge.copiedPaths.isEmpty)
+        XCTAssertTrue(bridge.renamedPaths.isEmpty)
+        XCTAssertTrue(bridge.deletedPaths.isEmpty)
+    }
+
+    func testCrossDeviceSameHostMoveTransferFailurePreservesEverySourceInBatch() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = []
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .file, path: "/incoming/first.txt", size: 1, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/incoming/second.txt", size: 1, linkTarget: nil)
+        ]
+        let sourcePaths: Set<String> = ["/incoming/first.txt", "/incoming/second.txt"]
+        bridge.trackedPaths = sourcePaths
+        bridge.mutationFailurePaths = ["/incoming/second.txt"]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-failure-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-failure-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+        let coordinator = CrossDeviceTransferCoordinator()
+
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/second.txt", size: 1)
+            ],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFail = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return true
+        }
+        XCTAssertTrue(didFail)
+        XCTAssertEqual(bridge.trackedPaths, sourcePaths)
+        XCTAssertTrue(bridge.deletedPaths.isEmpty)
+    }
+
+    func testCrossDeviceSameHostMoveDeleteFailureRestoresSourcesAndLeavesNoPendingStage() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = []
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .directory, path: "/incoming/first", size: 0, linkTarget: nil),
+            RemoteFileEntry(kind: .directory, path: "/incoming/second", size: 0, linkTarget: nil)
+        ]
+        bridge.directoryChildren = [
+            "/incoming/first": ["first.txt"],
+            "/incoming/second": ["second.txt"]
+        ]
+        bridge.trackedPaths = ["/incoming/first", "/incoming/second"]
+        bridge.deleteFailuresByCallIndex = [2]
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let endpoint = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-move-delete-failure",
+            title: "服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator()
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first", size: 0, kind: .directory),
+                RemoteFileSelection(path: "/incoming/second", size: 0, kind: .directory)
+            ],
+            from: endpoint,
+            to: endpoint,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFail = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return bridge.deletedPaths.count >= 2
+        }
+        XCTAssertTrue(didFail)
+        XCTAssertEqual(bridge.directoryChildren["/incoming/first"], ["first.txt"])
+        XCTAssertEqual(bridge.directoryChildren["/incoming/second"], ["second.txt"])
+        XCTAssertFalse(bridge.directoryChildren.keys.contains { $0.contains(".stacio-move-") })
+        XCTAssertFalse(bridge.trackedPaths.contains { $0.contains(".stacio-move-") })
+    }
+
+    func testCrossDeviceSameHostCopyStopsBeforeNextItemWhenCancelledInsideLoop() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = []
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .file, path: "/incoming/first.txt", size: 1, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/incoming/second.txt", size: 1, linkTarget: nil)
+        ]
+        let releaseFirstCopy = DispatchSemaphore(value: 0)
+        bridge.onCopyLiveRemotePath = { _, callIndex in
+            guard callIndex == 1 else { return }
+            releaseFirstCopy.wait()
+        }
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let endpoint = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-copy-cancel",
+            title: "服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator()
+        var statuses: [CrossDeviceTransferStatus] = []
+        let operationID = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/second.txt", size: 1)
+            ],
+            from: endpoint,
+            to: endpoint,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+        let didStartFirstCopy = await eventually { bridge.copiedPaths.count == 1 }
+        XCTAssertTrue(didStartFirstCopy)
+
+        XCTAssertTrue(coordinator.cancel(operationID: operationID))
+        releaseFirstCopy.signal()
+
+        let didCancel = await eventually { statuses.last == .cancelled }
+        XCTAssertTrue(didCancel)
+        XCTAssertEqual(bridge.copiedPaths.count, 1)
+    }
+
+    func testCrossDeviceMoveCommitRollsBackStagedItemWhenCancelledInsideLoop() async {
+        let bridge = CrossDeviceRecordingRemoteBridge()
+        bridge.entriesByPath["/archive"] = []
+        bridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .directory, path: "/incoming/first", size: 0, linkTarget: nil),
+            RemoteFileEntry(kind: .directory, path: "/incoming/second", size: 0, linkTarget: nil)
+        ]
+        bridge.directoryChildren = [
+            "/incoming/first": ["first.txt"],
+            "/incoming/second": ["second.txt"]
+        ]
+        bridge.trackedPaths = ["/incoming/first", "/incoming/second"]
+        let releaseFirstMoveStage = DispatchSemaphore(value: 0)
+        bridge.onRenameLiveRemotePath = { pair, callIndex in
+            guard callIndex == 1, pair.to.contains(".stacio-move-") else { return }
+            releaseFirstMoveStage.wait()
+        }
+        let scheduler = CrossDeviceRecordingTransferScheduler()
+        let endpoint = CrossDeviceRemoteEndpoint(
+            runtimeID: "same-host-move-cancel",
+            title: "服务器",
+            context: Self.crossDeviceContext(host: "files.example.com"),
+            bridge: bridge,
+            transferScheduler: scheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator()
+        var statuses: [CrossDeviceTransferStatus] = []
+        let operationID = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first", size: 0, kind: .directory),
+                RemoteFileSelection(path: "/incoming/second", size: 0, kind: .directory)
+            ],
+            from: endpoint,
+            to: endpoint,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+        let didStageFirstMove = await eventually {
+            bridge.renamedPaths.contains { $0.to.contains(".stacio-move-") }
+        }
+        XCTAssertTrue(didStageFirstMove)
+
+        XCTAssertTrue(coordinator.cancel(operationID: operationID))
+        releaseFirstMoveStage.signal()
+
+        let didCancel = await eventually { statuses.last == .cancelled }
+        XCTAssertTrue(didCancel)
+        XCTAssertEqual(bridge.trackedPaths, ["/incoming/first", "/incoming/second"])
+        XCTAssertFalse(bridge.trackedPaths.contains { $0.contains(".stacio-move-") })
+        XCTAssertTrue(bridge.deletedPaths.isEmpty)
+    }
+
+    func testCrossDeviceRelayMoveUploadFailurePreservesEverySourceAndCleansRelay() async {
+        let relayRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelayMoveFailure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayRoot) }
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        sourceBridge.entriesByPath["/incoming"] = [
+            RemoteFileEntry(kind: .file, path: "/incoming/first.txt", size: 1, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/incoming/second.txt", size: 1, linkTarget: nil)
+        ]
+        let sourcePaths: Set<String> = ["/incoming/first.txt", "/incoming/second.txt"]
+        sourceBridge.trackedPaths = sourcePaths
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = []
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        sourceScheduler.materializesDownloads = true
+        let destinationScheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: { relayRoot })
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-move-failure-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-move-failure-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: destinationScheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [
+                RemoteFileSelection(path: "/incoming/first.txt", size: 1),
+                RemoteFileSelection(path: "/incoming/second.txt", size: 1)
+            ],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .move,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didScheduleFirstDownload = await eventually { sourceScheduler.jobs.count == 1 }
+        XCTAssertTrue(didScheduleFirstDownload)
+        sourceScheduler.completeLast(status: "completed")
+        let didScheduleFirstUpload = await eventually { destinationScheduler.jobs.count == 1 }
+        XCTAssertTrue(didScheduleFirstUpload)
+        destinationScheduler.completeLast(status: "completed")
+        let didScheduleSecondDownload = await eventually { sourceScheduler.jobs.count == 2 }
+        XCTAssertTrue(didScheduleSecondDownload)
+        sourceScheduler.completeLast(status: "completed")
+        let didScheduleSecondUpload = await eventually { destinationScheduler.jobs.count == 2 }
+        XCTAssertTrue(didScheduleSecondUpload)
+        destinationScheduler.completeLast(status: "failed")
+
+        let didFailAndClean = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return FileManager.default.fileExists(atPath: relayRoot.path) == false
+        }
+        XCTAssertTrue(didFailAndClean)
+        XCTAssertEqual(sourceBridge.trackedPaths, sourcePaths)
+        XCTAssertTrue(sourceBridge.renamedPaths.isEmpty)
+        XCTAssertTrue(sourceBridge.deletedPaths.isEmpty)
+    }
+
+    func testCrossDeviceTransferRelaysAcrossHostsWith0700DirectoryAndCleansAfterUpload() async throws {
+        let relayRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelayTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayRoot) }
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        sourceScheduler.completesImmediately = true
+        sourceScheduler.materializesDownloads = true
+        let destinationScheduler = CrossDeviceRecordingTransferScheduler()
+        let coordinator = CrossDeviceTransferCoordinator(
+            relayDirectoryProvider: { relayRoot }
+        )
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: destinationScheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didScheduleUpload = await eventually { destinationScheduler.jobs.count == 1 }
+        XCTAssertTrue(didScheduleUpload)
+        XCTAssertEqual(sourceScheduler.jobs.map(\.direction), [.download])
+        XCTAssertEqual(destinationScheduler.jobs.map(\.direction), [.upload])
+        let temporaryUploadPath = try XCTUnwrap(destinationScheduler.jobs.first?.destinationPath)
+        XCTAssertNotEqual(temporaryUploadPath, "/archive/report.txt")
+        XCTAssertEqual((temporaryUploadPath as NSString).deletingLastPathComponent, "/archive")
+        XCTAssertTrue((temporaryUploadPath as NSString).lastPathComponent.contains(".stacio-transfer-"))
+        let attributes = try FileManager.default.attributesOfItem(atPath: relayRoot.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+        XCTAssertTrue(statuses.contains(.downloading))
+        XCTAssertTrue(statuses.contains(.uploading))
+
+        destinationScheduler.completeLast(status: "completed")
+
+        let didCommitReplacement = await eventually {
+            let renames = destinationBridge.renamedPaths
+            guard renames.count == 2 else { return false }
+            return renames[0].from == "/archive/report.txt"
+                && renames[0].to.contains(".stacio-backup-")
+                && renames[1] == .init(
+                    from: temporaryUploadPath,
+                    to: "/archive/report.txt"
+                )
+        }
+        XCTAssertTrue(didCommitReplacement)
+        let backupPath = try XCTUnwrap(destinationBridge.renamedPaths.first?.to)
+        XCTAssertTrue(destinationBridge.deletedPaths.contains(backupPath))
+        XCTAssertFalse(destinationBridge.deletedPaths.contains("/archive/report.txt"))
+        let didCleanRelay = await eventually {
+            FileManager.default.fileExists(atPath: relayRoot.path) == false
+        }
+        XCTAssertTrue(didCleanRelay)
+        XCTAssertEqual(statuses.last, .completed)
+    }
+
+    func testCrossDeviceDefaultRelayUsesDedicatedParentAndUUIDChild() async throws {
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        let destinationScheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "default-relay-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "default-relay-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: destinationScheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator()
+        let operationID = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { _ in }
+        )
+        let didSchedule = await eventually { sourceScheduler.jobs.count == 1 }
+        XCTAssertTrue(didSchedule)
+        let job = try XCTUnwrap(sourceScheduler.jobs.first)
+        let relayDirectory = URL(fileURLWithPath: job.destinationPath).deletingLastPathComponent()
+
+        XCTAssertEqual(relayDirectory.deletingLastPathComponent().lastPathComponent, "StacioCrossDeviceTransfers")
+        XCTAssertNotNil(UUID(uuidString: relayDirectory.lastPathComponent))
+        XCTAssertEqual(
+            relayDirectory.deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL,
+            FileManager.default.temporaryDirectory.standardizedFileURL
+        )
+
+        XCTAssertTrue(coordinator.cancel(operationID: operationID))
+    }
+
+    func testCrossDeviceRelayRetryRecreatesStageAndCompletesOriginalOperation() async throws {
+        let relayParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelayRetry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayParent) }
+        var relayAttempt = 0
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        destinationBridge.directoryChildren = ["/archive/report.txt": ["old"]]
+        let transferBridge = CrossDeviceRelayRetryTransferBridge(destinationBridge: destinationBridge)
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(
+            bridge: transferBridge,
+            queueViewController: queueView,
+            maxConcurrentTransfers: 1
+        )
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: {
+            relayAttempt += 1
+            return relayParent.appendingPathComponent("attempt-\(relayAttempt)", isDirectory: true)
+        })
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-retry-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: queue
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-retry-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: queue
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFailAndCleanFirstRelay = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return FileManager.default.fileExists(
+                atPath: relayParent.appendingPathComponent("attempt-1").path
+            ) == false
+        }
+        XCTAssertTrue(didFailAndCleanFirstRelay)
+        let failedUploadJobID = try XCTUnwrap(
+            transferBridge.jobs.first(where: { $0.direction == .upload })?.id
+        )
+
+        XCTAssertTrue(queue.retryFailedTransfer(jobID: failedUploadJobID))
+
+        let didComplete = await eventually(timeout: 3) { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(transferBridge.jobs.filter { $0.direction == .download }.count, 2)
+        XCTAssertEqual(transferBridge.jobs.filter { $0.direction == .upload }.count, 2)
+        let downloadDestinations = transferBridge.jobs
+            .filter { $0.direction == .download }
+            .map(\.destinationPath)
+        XCTAssertEqual(Set(downloadDestinations.map { ($0 as NSString).deletingLastPathComponent }).count, 2)
+        XCTAssertEqual(destinationBridge.directoryChildren["/archive/report.txt"], ["new"])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: relayParent.appendingPathComponent("attempt-1").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: relayParent.appendingPathComponent("attempt-2").path
+        ))
+        XCTAssertTrue((try? FileManager.default.contentsOfDirectory(atPath: relayParent.path))?.isEmpty ?? true)
+    }
+
+    func testCrossDeviceRelayRetryCleansRemoteTemporaryPathAfterInitialCleanupFailure() async throws {
+        let relayParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRemoteCleanupRetry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayParent) }
+        var relayAttempt = 0
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        destinationBridge.directoryChildren = ["/archive/report.txt": ["old"]]
+        destinationBridge.deleteFailuresRemaining = 1
+        let transferBridge = CrossDeviceRelayRetryTransferBridge(destinationBridge: destinationBridge)
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(
+            bridge: transferBridge,
+            queueViewController: queueView,
+            maxConcurrentTransfers: 1
+        )
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: {
+            relayAttempt += 1
+            return relayParent.appendingPathComponent("attempt-\(relayAttempt)", isDirectory: true)
+        })
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "remote-cleanup-retry-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: queue
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "remote-cleanup-retry-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: queue
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFailCleanup = await eventually {
+            guard case .failed(let message) = statuses.last else { return false }
+            return message.contains("远端临时文件清理失败")
+                && destinationBridge.deletedPaths.count == 1
+        }
+        XCTAssertTrue(didFailCleanup)
+        let failedUploadJobID = try XCTUnwrap(
+            transferBridge.jobs.first(where: { $0.direction == .upload })?.id
+        )
+        let temporaryPath = try XCTUnwrap(
+            transferBridge.jobs.first(where: { $0.direction == .upload })?.destinationPath
+        )
+
+        XCTAssertTrue(queue.retryFailedTransfer(jobID: failedUploadJobID))
+
+        let didComplete = await eventually(timeout: 3) { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(destinationBridge.deletedPaths.filter { $0 == temporaryPath }.count, 2)
+        XCTAssertEqual(transferBridge.relayDirectoryPermissionsByDownload, [0o700, 0o700])
+        XCTAssertEqual(destinationBridge.directoryChildren["/archive/report.txt"], ["new"])
+        XCTAssertTrue((try? FileManager.default.contentsOfDirectory(atPath: relayParent.path))?.isEmpty ?? true)
+    }
+
+    func testCrossDeviceRelayRetryRemovesLocalRelayAfterInitialCleanupFailure() async throws {
+        let relayParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioLocalCleanupRetry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayParent) }
+        let firstRelay = relayParent.appendingPathComponent("attempt-1", isDirectory: true)
+        let fileManager = CrossDeviceFailOnceRelayRemovalFileManager(failingRemovalURL: firstRelay)
+        var relayAttempt = 0
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        destinationBridge.directoryChildren = ["/archive/report.txt": ["old"]]
+        let transferBridge = CrossDeviceRelayRetryTransferBridge(destinationBridge: destinationBridge)
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(
+            bridge: transferBridge,
+            queueViewController: queueView,
+            maxConcurrentTransfers: 1
+        )
+        let coordinator = CrossDeviceTransferCoordinator(
+            fileManager: fileManager,
+            relayDirectoryProvider: {
+                relayAttempt += 1
+                return relayParent.appendingPathComponent("attempt-\(relayAttempt)", isDirectory: true)
+            }
+        )
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "local-cleanup-retry-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: queue
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "local-cleanup-retry-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: queue
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFailCleanup = await eventually {
+            guard case .failed(let message) = statuses.last else { return false }
+            return message.contains("本机临时中继清理失败")
+                && FileManager.default.fileExists(atPath: firstRelay.path)
+        }
+        XCTAssertTrue(didFailCleanup)
+        let failedUploadJobID = try XCTUnwrap(
+            transferBridge.jobs.first(where: { $0.direction == .upload })?.id
+        )
+
+        XCTAssertTrue(queue.retryFailedTransfer(jobID: failedUploadJobID))
+
+        let didComplete = await eventually(timeout: 3) { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(transferBridge.relayDirectoryPermissionsByDownload, [0o700, 0o700])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstRelay.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: relayParent.appendingPathComponent("attempt-2").path
+        ))
+        XCTAssertEqual(destinationBridge.directoryChildren["/archive/report.txt"], ["new"])
+        XCTAssertTrue((try? FileManager.default.contentsOfDirectory(atPath: relayParent.path))?.isEmpty ?? true)
+    }
+
+    func testSFTPAdapterCrossDeviceRelayRetryRecreatesProtectedRelay() async throws {
+        let relayParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioSFTPRelayRetry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayParent) }
+        var relayAttempt = 0
+        let sourceBridge = CrossDeviceRecordingRemoteBridge()
+        let destinationBridge = CrossDeviceRecordingRemoteBridge()
+        destinationBridge.entriesByPath["/archive"] = [
+            RemoteFileEntry(kind: .file, path: "/archive/report.txt", size: 10, linkTarget: nil)
+        ]
+        destinationBridge.directoryChildren = ["/archive/report.txt": ["old"]]
+        let transferBridge = CrossDeviceRelayRetryTransferBridge(destinationBridge: destinationBridge)
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(
+            sftpBridge: transferBridge,
+            queueViewController: queueView,
+            maxConcurrentTransfers: 1
+        )
+        let scheduler = SFTPTransferSchedulerAdapter(scheduler: queue)
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: {
+            relayAttempt += 1
+            return relayParent.appendingPathComponent("attempt-\(relayAttempt)", isDirectory: true)
+        })
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "sftp-relay-retry-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: sourceBridge,
+            transferScheduler: scheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "sftp-relay-retry-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: destinationBridge,
+            transferScheduler: scheduler
+        )
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        _ = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .replace,
+            statusHandler: { statuses.append($0) }
+        )
+
+        let didFailAndCleanFirstRelay = await eventually {
+            guard case .failed = statuses.last else { return false }
+            return FileManager.default.fileExists(
+                atPath: relayParent.appendingPathComponent("attempt-1").path
+            ) == false
+        }
+        XCTAssertTrue(didFailAndCleanFirstRelay)
+        let failedUploadJobID = try XCTUnwrap(
+            transferBridge.jobs.first(where: { $0.direction == .upload })?.id
+        )
+
+        XCTAssertTrue(queue.retryFailedTransfer(jobID: failedUploadJobID))
+
+        let didComplete = await eventually(timeout: 3) { statuses.last == .completed }
+        XCTAssertTrue(didComplete)
+        XCTAssertEqual(transferBridge.jobs.filter { $0.direction == .download }.count, 2)
+        XCTAssertEqual(transferBridge.jobs.filter { $0.direction == .upload }.count, 2)
+        XCTAssertEqual(destinationBridge.directoryChildren["/archive/report.txt"], ["new"])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: relayParent.appendingPathComponent("attempt-1").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: relayParent.appendingPathComponent("attempt-2").path
+        ))
+        XCTAssertTrue((try? FileManager.default.contentsOfDirectory(atPath: relayParent.path))?.isEmpty ?? true)
+    }
+
+    func testCrossDeviceTransferCancellationCancelsQueueJobAndRemovesRelayDirectory() async {
+        let relayRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelayCancel-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayRoot) }
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        sourceScheduler.completesCancellationImmediately = false
+        let destinationScheduler = CrossDeviceRecordingTransferScheduler()
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-cancel-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-cancel-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: destinationScheduler
+        )
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: { relayRoot })
+        var statuses: [CrossDeviceTransferStatus] = []
+
+        let operationID = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .keepBoth,
+            statusHandler: { statuses.append($0) }
+        )
+        let didScheduleDownload = await eventually { sourceScheduler.jobs.count == 1 }
+        XCTAssertTrue(didScheduleDownload)
+
+        XCTAssertTrue(coordinator.cancel(operationID: operationID))
+
+        XCTAssertEqual(sourceScheduler.cancelledJobIDs, sourceScheduler.jobs.map(\.id))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: relayRoot.path))
+        XCTAssertNotEqual(statuses.last, .cancelled)
+        sourceScheduler.completeLast(status: "canceled")
+        let didCleanRelay = await eventually {
+            FileManager.default.fileExists(atPath: relayRoot.path) == false
+        }
+        XCTAssertTrue(didCleanRelay)
+        XCTAssertEqual(statuses.last, .cancelled)
+    }
+
+    func testCrossDeviceCancellationRejectionLeavesRelayAndReportsRetryableFailure() async {
+        let relayRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioRelayCancelRejected-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: relayRoot) }
+        let sourceScheduler = CrossDeviceRecordingTransferScheduler()
+        sourceScheduler.acceptsCancellation = false
+        let source = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-reject-source",
+            title: "源服务器",
+            context: Self.crossDeviceContext(host: "source.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: sourceScheduler
+        )
+        let destination = CrossDeviceRemoteEndpoint(
+            runtimeID: "relay-reject-destination",
+            title: "目标服务器",
+            context: Self.crossDeviceContext(host: "destination.example.com"),
+            bridge: CrossDeviceRecordingRemoteBridge(),
+            transferScheduler: CrossDeviceRecordingTransferScheduler()
+        )
+        let coordinator = CrossDeviceTransferCoordinator(relayDirectoryProvider: { relayRoot })
+        var statuses: [CrossDeviceTransferStatus] = []
+        let operationID = coordinator.transfer(
+            [RemoteFileSelection(path: "/incoming/report.txt", size: 10)],
+            from: source,
+            to: destination,
+            destinationDirectory: "/archive",
+            operation: .copy,
+            conflictResolution: .keepBoth,
+            statusHandler: { statuses.append($0) }
+        )
+        let didSchedule = await eventually { sourceScheduler.jobs.count == 1 }
+        XCTAssertTrue(didSchedule)
+
+        XCTAssertFalse(coordinator.cancel(operationID: operationID))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: relayRoot.path))
+        guard case .cancellationFailed(let message) = statuses.last else {
+            return XCTFail("expected an explicit retryable cancellation failure")
+        }
+        XCTAssertTrue(message.contains("重试"))
+    }
+
+    private func coordinatorForSamePathTest() -> CrossDeviceTransferCoordinator {
+        CrossDeviceTransferCoordinator()
+    }
+
+    private static func crossDeviceContext(host: String) -> TunnelLiveSessionContext {
+        TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: host,
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:\(host)"
+        )
+    }
+}
+
+private final class CrossDeviceRecordingRemoteBridge: RemoteFilesBridging {
+    struct PathPair: Equatable {
+        let from: String
+        let to: String
+    }
+
+    private let lock = NSLock()
+    var entriesByPath: [String: [RemoteFileEntry]] = [:]
+    private var copies: [PathPair] = []
+    private var renames: [PathPair] = []
+    private var deletes: [String] = []
+    private var permissionChanges: [(String, String)] = []
+    private var trackedPathsStorage = Set<String>()
+    private var mutationFailurePathsStorage = Set<String>()
+    private var directoryChildrenStorage: [String: Set<String>] = [:]
+    private var renameFailuresByDestinationStorage: [String: Int] = [:]
+    private var deleteFailuresRemainingStorage = 0
+    private var deleteFailuresByCallIndexStorage = Set<Int>()
+    private var onCopyLiveRemotePathStorage: ((PathPair, Int) -> Void)?
+    private var onRenameLiveRemotePathStorage: ((PathPair, Int) -> Void)?
+
+    var copiedPaths: [PathPair] { locked { copies } }
+    var renamedPaths: [PathPair] { locked { renames } }
+    var deletedPaths: [String] { locked { deletes } }
+    var trackedPaths: Set<String> {
+        get { locked { trackedPathsStorage } }
+        set { locked { trackedPathsStorage = newValue } }
+    }
+    var mutationFailurePaths: Set<String> {
+        get { locked { mutationFailurePathsStorage } }
+        set { locked { mutationFailurePathsStorage = newValue } }
+    }
+    var directoryChildren: [String: Set<String>] {
+        get { locked { directoryChildrenStorage } }
+        set { locked { directoryChildrenStorage = newValue } }
+    }
+    var renameFailuresByDestination: [String: Int] {
+        get { locked { renameFailuresByDestinationStorage } }
+        set { locked { renameFailuresByDestinationStorage = newValue } }
+    }
+    var deleteFailuresRemaining: Int {
+        get { locked { deleteFailuresRemainingStorage } }
+        set { locked { deleteFailuresRemainingStorage = newValue } }
+    }
+    var deleteFailuresByCallIndex: Set<Int> {
+        get { locked { deleteFailuresByCallIndexStorage } }
+        set { locked { deleteFailuresByCallIndexStorage = newValue } }
+    }
+    var onCopyLiveRemotePath: ((PathPair, Int) -> Void)? {
+        get { locked { onCopyLiveRemotePathStorage } }
+        set { locked { onCopyLiveRemotePathStorage = newValue } }
+    }
+    var onRenameLiveRemotePath: ((PathPair, Int) -> Void)? {
+        get { locked { onRenameLiveRemotePathStorage } }
+        set { locked { onRenameLiveRemotePathStorage = newValue } }
+    }
+
+    func materializeRemotePath(_ path: String, children: Set<String>) {
+        locked { directoryChildrenStorage[path] = children }
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] { [] }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        locked { entriesByPath[remotePath] ?? [] }
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        let pair = PathPair(from: fromPath, to: toPath)
+        let callback = try locked { () -> (((PathPair, Int) -> Void)?, Int) in
+            if mutationFailurePathsStorage.contains(fromPath) {
+                throw CrossDeviceRecordingBridgeError.forcedMutationFailure
+            }
+            if let remainingFailures = renameFailuresByDestinationStorage[toPath],
+               remainingFailures > 0
+            {
+                renameFailuresByDestinationStorage[toPath] = remainingFailures - 1
+                throw CrossDeviceRecordingBridgeError.forcedMutationFailure
+            }
+            renames.append(pair)
+            if let children = directoryChildrenStorage.removeValue(forKey: fromPath) {
+                directoryChildrenStorage[toPath] = children
+            }
+            if trackedPathsStorage.remove(fromPath) != nil {
+                trackedPathsStorage.insert(toPath)
+            }
+            return (onRenameLiveRemotePathStorage, renames.count)
+        }
+        callback.0?(pair, callback.1)
+    }
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {
+        try locked {
+            let callIndex = deletes.count + 1
+            deletes.append(remotePath)
+            if deleteFailuresByCallIndexStorage.contains(callIndex) {
+                throw CrossDeviceRecordingBridgeError.forcedMutationFailure
+            }
+            if deleteFailuresRemainingStorage > 0 {
+                deleteFailuresRemainingStorage -= 1
+                throw CrossDeviceRecordingBridgeError.forcedMutationFailure
+            }
+            trackedPathsStorage.remove(remotePath)
+            directoryChildrenStorage[remotePath] = nil
+        }
+    }
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {
+        locked { permissionChanges.append((remotePath, mode)) }
+    }
+
+    func copyLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {
+        let pair = PathPair(from: fromPath, to: toPath)
+        let callback = try locked { () -> (((PathPair, Int) -> Void)?, Int) in
+            if mutationFailurePathsStorage.contains(fromPath) {
+                throw CrossDeviceRecordingBridgeError.forcedMutationFailure
+            }
+            copies.append(pair)
+            let sourceChildren = directoryChildrenStorage[fromPath] ?? []
+            if directoryChildrenStorage[toPath] != nil {
+                directoryChildrenStorage[toPath, default: []].formUnion(sourceChildren)
+            } else {
+                directoryChildrenStorage[toPath] = sourceChildren
+            }
+            return (onCopyLiveRemotePathStorage, copies.count)
+        }
+        callback.0?(pair, callback.1)
+    }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}
+
+private final class CrossDeviceRelayRetryTransferBridge: SCPTransferBridging, SFTPTransferBridging {
+    private let lock = NSLock()
+    private let destinationBridge: CrossDeviceRecordingRemoteBridge
+    private var jobsStorage: [ScpTransferJob] = []
+    private var uploadAttempts = 0
+    private var relayDirectoryPermissionsByDownloadStorage: [Int] = []
+
+    init(destinationBridge: CrossDeviceRecordingRemoteBridge) {
+        self.destinationBridge = destinationBridge
+    }
+
+    var jobs: [ScpTransferJob] {
+        lock.lock()
+        defer { lock.unlock() }
+        return jobsStorage
+    }
+
+    var relayDirectoryPermissionsByDownload: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return relayDirectoryPermissionsByDownloadStorage
+    }
+
+    func runLiveSCPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        try runTransfer(job: job)
+    }
+
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        try runTransfer(job: job)
+    }
+
+    private func runTransfer(job: ScpTransferJob) throws -> [ScpTransferProgress] {
+        lock.lock()
+        jobsStorage.append(job)
+        if job.direction == .upload { uploadAttempts += 1 }
+        let currentUploadAttempt = uploadAttempts
+        lock.unlock()
+
+        if job.direction == .download {
+            let destination = URL(fileURLWithPath: job.destinationPath)
+            let relayDirectory = destination.deletingLastPathComponent()
+            let attributes = try FileManager.default.attributesOfItem(atPath: relayDirectory.path)
+            let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1
+            lock.lock()
+            relayDirectoryPermissionsByDownloadStorage.append(permissions)
+            lock.unlock()
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(repeating: 0x52, count: Int(clamping: job.bytesTotal)).write(to: destination)
+            return [ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: job.bytesTotal,
+                bytesTotal: job.bytesTotal,
+                status: "completed"
+            )]
+        }
+
+        guard FileManager.default.fileExists(atPath: job.sourcePath) else {
+            return [ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: 0,
+                bytesTotal: job.bytesTotal,
+                status: "failed"
+            )]
+        }
+        guard currentUploadAttempt > 1 else {
+            return [ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: 0,
+                bytesTotal: job.bytesTotal,
+                status: "failed"
+            )]
+        }
+        destinationBridge.materializeRemotePath(job.destinationPath, children: ["new"])
+        return [ScpTransferProgress(
+            jobId: job.id,
+            bytesDone: job.bytesTotal,
+            bytesTotal: job.bytesTotal,
+            status: "completed"
+        )]
+    }
+}
+
+private enum CrossDeviceRecordingBridgeError: Error {
+    case forcedMutationFailure
+}
+
+private final class CrossDeviceFailOnceRelayRemovalFileManager: FileManager, @unchecked Sendable {
+    private let failingRemovalURL: URL
+    private let lock = NSLock()
+    private var hasFailed = false
+
+    init(failingRemovalURL: URL) {
+        self.failingRemovalURL = failingRemovalURL.standardizedFileURL
+        super.init()
+    }
+
+    override func removeItem(at URL: URL) throws {
+        let shouldFail = locked { () -> Bool in
+            guard hasFailed == false,
+                  URL.standardizedFileURL == failingRemovalURL
+            else { return false }
+            hasFailed = true
+            return true
+        }
+        if shouldFail {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try super.removeItem(at: URL)
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
+@MainActor
+private final class CrossDeviceRecordingTransferScheduler: SCPTransferScheduling {
+    private(set) var jobs: [ScpTransferJob] = []
+    private(set) var cancelledJobIDs: [String] = []
+    var completesImmediately = false
+    var materializesDownloads = false
+    var acceptsCancellation = true
+    var completesCancellationImmediately = true
+    private var completions: [String: (ScpTransferProgress) -> Void] = [:]
+
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        jobs.append(job)
+        completions[job.id] = completion
+        if materializesDownloads, job.direction == .download {
+            let url = URL(fileURLWithPath: job.destinationPath)
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data(repeating: 0x5A, count: Int(clamping: job.bytesTotal))
+            )
+        }
+        if completesImmediately {
+            complete(jobID: job.id, status: "completed")
+        }
+    }
+
+    func cancelTransfer(jobID: String) -> Bool {
+        cancelledJobIDs.append(jobID)
+        guard acceptsCancellation else { return false }
+        if completesCancellationImmediately {
+            complete(jobID: jobID, status: "canceled")
+        }
+        return true
+    }
+
+    func completeLast(status: String) {
+        guard let jobID = jobs.last?.id else { return }
+        complete(jobID: jobID, status: status)
+    }
+
+    private func complete(jobID: String, status: String) {
+        guard let job = jobs.first(where: { $0.id == jobID }),
+              let completion = completions.removeValue(forKey: jobID)
+        else { return }
+        completion(ScpTransferProgress(
+            jobId: jobID,
+            bytesDone: status == "completed" ? job.bytesTotal : 0,
+            bytesTotal: job.bytesTotal,
+            status: status
+        ))
+    }
 }
 
 private func eventually(
@@ -3683,6 +5710,98 @@ private final class RecordingFTPTransferBridge: FTPTransferBridging, CustomDebug
     ) throws -> [ScpTransferProgress] {
         events.append("run:\(job.id)")
         return progress
+    }
+}
+
+private final class RecordingSFTPTransferBridge: SFTPTransferBridging, CustomDebugStringConvertible {
+    private let lock = NSLock()
+    private let progress: [ScpTransferProgress]
+    private var recordedEvents: [String] = []
+
+    init(progress: [ScpTransferProgress]) {
+        self.progress = progress
+    }
+
+    var events: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedEvents
+    }
+
+    var debugDescription: String {
+        events.joined(separator: " ")
+    }
+
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        lock.lock()
+        recordedEvents.append("run:\(job.id)")
+        lock.unlock()
+        return progress
+    }
+}
+
+private final class BlockingSFTPTransferBridge: SFTPTransferBridging {
+    private let lock = NSLock()
+    private let completionsByJobID: [String: [ScpTransferProgress]]
+    private var gatesByJobID: [String: DispatchSemaphore] = [:]
+    private var started: [String] = []
+    private var finished: [String] = []
+    private var cancelled: [String] = []
+
+    init(completionsByJobID: [String: [ScpTransferProgress]]) {
+        self.completionsByJobID = completionsByJobID
+        for jobID in completionsByJobID.keys {
+            gatesByJobID[jobID] = DispatchSemaphore(value: 0)
+        }
+    }
+
+    var startedJobIDs: [String] {
+        locked { started }
+    }
+
+    var finishedJobIDs: [String] {
+        locked { finished }
+    }
+
+    var cancelledJobIDs: [String] {
+        locked { cancelled }
+    }
+
+    func release(jobID: String) {
+        locked { gatesByJobID[jobID] }?.signal()
+    }
+
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        let gate = locked { () -> DispatchSemaphore in
+            started.append(job.id)
+            let gate = gatesByJobID[job.id] ?? DispatchSemaphore(value: 0)
+            gatesByJobID[job.id] = gate
+            return gate
+        }
+        gate.wait()
+        locked { finished.append(job.id) }
+        return completionsByJobID[job.id] ?? []
+    }
+
+    func cancelLiveSFTPTransfer(jobID: String) -> Bool {
+        locked { cancelled.append(jobID) }
+        return true
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 
@@ -3824,8 +5943,14 @@ private final class BlockingSCPTransferBridge: SCPTransferBridging {
     private var progressBatchJobs: [String] = []
     private var recordedResumeOptions: [ScpResumeOptions] = []
 
-    init(completionsByJobID: [String: [ScpTransferProgress]]) {
+    private let acceptsCancellation: Bool
+
+    init(
+        completionsByJobID: [String: [ScpTransferProgress]],
+        acceptsCancellation: Bool = true
+    ) {
         self.completionsByJobID = completionsByJobID
+        self.acceptsCancellation = acceptsCancellation
         for jobID in completionsByJobID.keys {
             gatesByJobID[jobID] = DispatchSemaphore(value: 0)
         }
@@ -3897,7 +6022,7 @@ private final class BlockingSCPTransferBridge: SCPTransferBridging {
         locked {
             cancelled.append(jobID)
         }
-        return true
+        return acceptsCancellation
     }
 
     func takeLiveSCPTransferProgressBatch(jobID: String) -> [ScpTransferProgress] {

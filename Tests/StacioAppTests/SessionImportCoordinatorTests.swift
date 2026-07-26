@@ -2,6 +2,7 @@ import AppKit
 import XCTest
 @testable import StacioApp
 import StacioCoreBindings
+import ZIPFoundation
 
 final class SessionImportCoordinatorTests: XCTestCase {
     func testSourcePickerListsRequestedClientsWithoutNyaTerm() {
@@ -30,6 +31,10 @@ final class SessionImportCoordinatorTests: XCTestCase {
                 "electerm.svg",
                 "bastion-host.png"
             ]
+        )
+        XCTAssertEqual(
+            AppKitSessionImportSourcePicker.supportedSources.first { $0.type == .secureCRT }?.hint,
+            ".xml / .ini / .zip"
         )
     }
 
@@ -138,6 +143,25 @@ final class SessionImportCoordinatorTests: XCTestCase {
         XCTAssertTrue(presenter.shownErrors.isEmpty)
     }
 
+    func testBastionImportDoesNotAlsoRequireSessionBulkIOLicense() throws {
+        let picker = RecordingSourceAwareSessionImportFilePicker(file: nil)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: picker,
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            licensedFeatureAuthorizer: LicenseFeatureAuthorizer(
+                accessProvider: RecordingLicenseFeatureAccessProvider(enabled: false)
+            )
+        )
+
+        let result = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertNil(result)
+        XCTAssertEqual(picker.requestedSourceTypes, [.bastionHost])
+    }
+
     func testBastionImportAutomaticallyParsesXshellFileBehindDedicatedSource() throws {
         let contents = """
         [CONNECTION]
@@ -166,6 +190,281 @@ final class SessionImportCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(authorizer.authorizationCount, 1)
         XCTAssertEqual(presenter.previewedSessionNames, ["asset"])
+    }
+
+    func testRecognizedBastionImportDoesNotPromptForVendorFallback() throws {
+        let contents = """
+        [CONNECTION]
+        Host=bastion.example.com
+        Port=2222
+        [CONNECTION:AUTHENTICATION]
+        UserName=opaque-account@default@SSH@ops@10.0.0.8@22
+        """
+        let vendorSelector = RecordingBastionHostVendorSelector(selectedVendor: .sangfor)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "asset.xsh",
+                    sourceType: .bastionHost,
+                    contents: contents,
+                    sourceURL: URL(fileURLWithPath: "/tmp/asset.xsh")
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostVendorSelector: vendorSelector
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertTrue(vendorSelector.requestedSourceNames.isEmpty)
+    }
+
+    func testBastionImportRecognitionFailurePromptsAndRetriesWithSelectedVendor() throws {
+        let fallbackPayload = ExternalSessionImportPayload(
+            sessions: [
+                ExternalImportedSession(
+                    name: "Asset",
+                    folderPath: nil,
+                    protocolName: "ssh",
+                    host: "bastion.example.com",
+                    port: 22,
+                    username: "account",
+                    privateKeyPath: nil,
+                    credential: nil
+                )
+            ],
+            warnings: []
+        )
+        let resolver = RecordingBastionHostSessionImportResolver(fallbackPayload: fallbackPayload)
+        let vendorSelector = RecordingBastionHostVendorSelector(selectedVendor: .sangfor)
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "vendor-export.dat",
+                    sourceType: .bastionHost,
+                    contents: "unrecognized",
+                    sourceURL: URL(fileURLWithPath: "/tmp/vendor-export.dat")
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: resolver,
+            bastionHostVendorSelector: vendorSelector
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertEqual(resolver.vendorHints, [nil, .sangfor])
+        XCTAssertEqual(vendorSelector.requestedSourceNames, ["vendor-export.dat"])
+        XCTAssertEqual(presenter.previewedSessionNames, ["Asset"])
+    }
+
+    func testBastionImportVendorFallbackCancellationStopsWithoutError() throws {
+        let resolver = RecordingBastionHostSessionImportResolver(fallbackPayload: nil)
+        let vendorSelector = RecordingBastionHostVendorSelector(selectedVendor: nil)
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "unknown.dat",
+                    sourceType: .bastionHost,
+                    contents: "unrecognized"
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: resolver,
+            bastionHostVendorSelector: vendorSelector
+        )
+
+        let result = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertNil(result)
+        XCTAssertEqual(resolver.vendorHints, [nil])
+        XCTAssertEqual(vendorSelector.requestedSourceNames, ["unknown.dat"])
+        XCTAssertTrue(presenter.previewedSessionNames.isEmpty)
+    }
+
+    func testBastionImportVendorFallbackFailureReturnsClearSelectedVendorError() {
+        let resolver = RecordingBastionHostSessionImportResolver(fallbackPayload: nil)
+        let vendorSelector = RecordingBastionHostVendorSelector(selectedVendor: .sangfor)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "unknown.dat",
+                    sourceType: .bastionHost,
+                    contents: "unrecognized"
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: false),
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: resolver,
+            bastionHostVendorSelector: vendorSelector
+        )
+
+        XCTAssertThrowsError(
+            try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+        ) { error in
+            XCTAssertEqual(
+                error as? BastionHostVendorFallbackError,
+                .recognitionFailed(.sangfor)
+            )
+            XCTAssertTrue(error.localizedDescription.contains("深信服"))
+        }
+        XCTAssertEqual(resolver.vendorHints, [nil, .sangfor])
+    }
+
+    func testSelectedBastionVendorAddsMetadataToGenericClientFormat() throws {
+        let payload = try DefaultBastionHostSessionImportResolver().resolve(
+            file: SessionImportFile(
+                sourceName: "asset.xsh",
+                sourceType: .bastionHost,
+                contents: """
+                [CONNECTION]
+                Host=bastion.example.com
+                Port=2222
+                UserName=account
+                """,
+                sourceURL: URL(fileURLWithPath: "/tmp/asset.xsh")
+            ),
+            vendorHint: .sangfor
+        )
+
+        let config = try XCTUnwrap(payload.sessions.first?.configJSON)
+        XCTAssertTrue(config.contains("\"bastionVendor\":\"sangfor\""))
+        XCTAssertTrue(config.contains("\"bastionFormat\":\"vendor_selected_external_session\""))
+    }
+
+    func testBastionVendorFallbackPopupListsStableVendorChoices() {
+        let popup = AppKitBastionHostVendorSelector.vendorPopupForTesting()
+
+        XCTAssertEqual(popup.identifier?.rawValue, "Stacio.Import.bastionVendor")
+        XCTAssertEqual(popup.numberOfItems, AppKitBastionHostVendorSelector.selectableVendors.count)
+        XCTAssertEqual(Set(AppKitBastionHostVendorSelector.selectableVendors), Set(BastionHostVendor.allCases))
+        XCTAssertEqual(
+            popup.itemArray.compactMap { $0.representedObject as? String },
+            AppKitBastionHostVendorSelector.selectableVendors.map(\.rawValue)
+        )
+        XCTAssertEqual(popup.itemTitles.first, "天融信")
+    }
+
+    func testSecureCRTImportAutomaticallyParsesTopsecZIP() throws {
+        let contents = """
+        S:"Protocol Name"=SSH2
+        S:"Hostname"=bastion.example.com
+        S:"Username"=opaque-account@default@SSH@ops@10.0.0.8@22
+        D:"[SSH2] Port"=000008AE
+        S:"Password"=
+        """
+        let archiveURL = try makeSessionImportArchive(entries: [
+            "asset.ini": Data(contents.utf8)
+        ])
+        defer { try? FileManager.default.removeItem(at: archiveURL) }
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let authorizer = RecordingBastionHostFeatureAuthorizer()
+        let picker = RecordingSourceAwareSessionImportFilePicker(
+            file: SessionImportFile(
+                sourceName: "sessions.zip",
+                sourceType: .secureCRT,
+                contents: "",
+                sourceURL: archiveURL
+            )
+        )
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: picker,
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        _ = try coordinator.runImport(sourceType: .secureCRT, parentWindow: nil)
+
+        XCTAssertEqual(picker.requestedSourceTypes, [.secureCRT])
+        XCTAssertEqual(authorizer.authorizationCount, 1)
+        XCTAssertEqual(presenter.previewedSessionNames, ["asset"])
+        XCTAssertTrue(try XCTUnwrap(presenter.previewedConfigJSON.first).contains("topsec_securecrt_zip"))
+    }
+
+    func testXshellImportFallsBackToOrdinaryZIPWhenItIsNotATopsecExport() throws {
+        let contents = """
+        [CONNECTION]
+        Host=server.example.com
+        Port=2222
+        Protocol=SSH
+        [CONNECTION:AUTHENTICATION]
+        UserName=deploy
+        """
+        let archiveURL = try makeSessionImportArchive(entries: [
+            "Servers/production.xsh": Data(contents.utf8)
+        ])
+        defer { try? FileManager.default.removeItem(at: archiveURL) }
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let authorizer = RecordingBastionHostFeatureAuthorizer()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "sessions.zip",
+                    sourceType: .xShell,
+                    contents: "",
+                    sourceURL: archiveURL
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        _ = try coordinator.runImport(sourceType: .xShell, parentWindow: nil)
+
+        XCTAssertEqual(presenter.previewedSessionNames, ["production"])
+        XCTAssertEqual(authorizer.authorizationCount, 0)
+    }
+
+    func testSecureCRTImportFallsBackToOrdinaryZIPWhenItIsNotATopsecExport() throws {
+        let contents = """
+        D:"Is Session"=00000001
+        S:"Protocol Name"=SSH2
+        S:"Hostname"=server.example.com
+        S:"Username"=deploy
+        D:"[SSH2] Port"=000008AE
+        """
+        let archiveURL = try makeSessionImportArchive(entries: [
+            "Servers/production.ini": Data(contents.utf8)
+        ])
+        defer { try? FileManager.default.removeItem(at: archiveURL) }
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let authorizer = RecordingBastionHostFeatureAuthorizer()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSourceAwareSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "sessions.zip",
+                    sourceType: .secureCRT,
+                    contents: "",
+                    sourceURL: archiveURL
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(),
+            bastionHostAuthorizer: authorizer
+        )
+
+        _ = try coordinator.runImport(sourceType: .secureCRT, parentWindow: nil)
+
+        XCTAssertEqual(presenter.previewedSessionNames, ["Servers__production"])
+        XCTAssertEqual(authorizer.authorizationCount, 0)
     }
 
     func testBastionManifestConfigIsForwardedIntoImportPreview() throws {
@@ -305,6 +604,62 @@ final class SessionImportCoordinatorTests: XCTestCase {
         XCTAssertEqual(credentialApplier.appliedSessions.map(\.name), ["Web 01"])
         XCTAssertEqual(credentialApplier.appliedPayload?.sessions[0].credential, .password("plain-secret"))
         XCTAssertEqual(core.events, ["listAll", "apply:mobaxterm:MobaXterm Sessions.mxtsessions"])
+    }
+
+    func testCoordinatorDoesNotApplyCredentialFromFilteredFTPSessionWithSameName() throws {
+        let payload = ExternalSessionImportPayload(
+            sessions: [
+                ExternalImportedSession(
+                    name: "Shared",
+                    folderPath: nil,
+                    protocolName: "ssh",
+                    host: "shared.example.com",
+                    port: 22,
+                    username: "deploy",
+                    privateKeyPath: nil,
+                    credential: .password("ssh-secret")
+                ),
+                ExternalImportedSession(
+                    name: "Shared",
+                    folderPath: nil,
+                    protocolName: "ftp",
+                    host: "shared.example.com",
+                    port: 21,
+                    username: "deploy",
+                    privateKeyPath: nil,
+                    credential: .password("ftp-secret")
+                )
+            ],
+            warnings: []
+        )
+        let core = RecordingSessionImportCore(
+            applyResult: makeApplyResult(importedNames: ["Shared"], importedCount: 1, skippedCount: 0)
+        )
+        let credentialApplier = RecordingExternalSessionCredentialApplier()
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "sessions.stacio-bastion",
+                    sourceType: .bastionHost,
+                    contents: "fixture"
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: core,
+            credentialApplier: credentialApplier,
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: RecordingBastionHostSessionImportResolver(
+                fallbackPayload: nil,
+                automaticallyResolvedPayload: payload
+            )
+        )
+
+        _ = try coordinator.runImport(parentWindow: nil)
+
+        let appliedPayload = try XCTUnwrap(credentialApplier.appliedPayload)
+        XCTAssertEqual(appliedPayload.sessions.map(\.protocolName), ["ssh"])
+        XCTAssertEqual(appliedPayload.sessions.map(\.credential), [.password("ssh-secret")])
     }
 
     func testCoordinatorPreviewsConfirmsAppliesAndRefreshesImportedSessions() throws {
@@ -509,7 +864,7 @@ final class SessionImportCoordinatorTests: XCTestCase {
         ])
     }
 
-    func testCoordinatorAppliesLegacyIniPreviewWhenNonSSHSupportedSessionsAreImportable() throws {
+    func testCoordinatorExcludesRemovedFTPWhileKeepingSupportedLegacySessionsImportable() throws {
         let core = RecordingSessionImportCore(
             legacyIniPreview: preview(
                 sessions: [
@@ -517,7 +872,7 @@ final class SessionImportCoordinatorTests: XCTestCase {
                     previewSession(name: "VNC 控制台", protocol: "vnc", host: "bmc.example.com", port: 5900)
                 ]
             ),
-            applyResult: makeApplyResult(importedNames: ["FTP 站点", "VNC 控制台"], importedCount: 2, skippedCount: 0)
+            applyResult: makeApplyResult(importedNames: ["VNC 控制台"], importedCount: 1, skippedCount: 0)
         )
         let presenter = RecordingSessionImportPresenter(confirmImport: true)
         let coordinator = SessionImportCoordinator(
@@ -532,13 +887,51 @@ final class SessionImportCoordinatorTests: XCTestCase {
 
         let result = try coordinator.runImport(parentWindow: nil)
 
-        XCTAssertEqual(result?.report.importedCount, 2)
-        XCTAssertEqual(presenter.previewedSessionNames, ["FTP 站点", "VNC 控制台"])
+        XCTAssertEqual(result?.report.importedCount, 1)
+        XCTAssertEqual(presenter.previewedSessionNames, ["VNC 控制台"])
+        XCTAssertEqual(core.appliedPreview?.sessions.map(\.protocol), ["vnc"])
+        XCTAssertTrue(core.appliedPreview?.warnings.contains(where: {
+            $0.contains("FTP") && $0.contains("SFTP")
+        }) == true)
         XCTAssertEqual(core.events, [
             "listAll",
             "previewLegacyIni:Legacy INI.ini",
             "apply:legacy_ini:Legacy INI.ini"
         ])
+    }
+
+    func testCoordinatorRejectsImportContainingOnlyRemovedFTP() {
+        let core = RecordingSessionImportCore(
+            legacyIniPreview: preview(
+                sessions: [
+                    previewSession(
+                        name: "FTP 站点",
+                        protocol: "ftp",
+                        host: "ftp.example.com",
+                        port: 21
+                    )
+                ]
+            )
+        )
+        let presenter = RecordingSessionImportPresenter(confirmImport: true)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "Legacy INI.ini",
+                    sourceType: .legacyINI,
+                    contents: "[Sessions]"
+                )
+            ),
+            presenter: presenter,
+            core: core
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(parentWindow: nil)) { error in
+            XCTAssertEqual(error as? SessionImportRemovedProtocolError, .onlyRemovedFTP)
+        }
+        XCTAssertTrue(presenter.previewedSessionNames.isEmpty)
+        XCTAssertNil(core.appliedPreview)
     }
 
     func testCoordinatorAppliesStacioJSONPreviewForExportedGroups() throws {
@@ -685,6 +1078,35 @@ final class SessionImportCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(message.contains("CSV 文件"))
         XCTAssertFalse(message.contains(" - csv。"))
+    }
+
+    func testImportErrorsUseChineseMessagesWithoutExposingBindingTypeNames() {
+        let invalidSession = AppKitSessionImportPreviewPresenter.errorMessageForTesting(
+            SessionError.InvalidQuickConnect
+        )
+        let invalidFormat = AppKitSessionImportPreviewPresenter.errorMessageForTesting(
+            ExternalSessionImportParserError.invalidFormat
+        )
+        let credentialFailure = AppKitSessionImportPreviewPresenter.errorMessageForTesting(
+            KeychainCredentialError.accessDenied(-25_293)
+        )
+        let unexpectedFailure = AppKitSessionImportPreviewPresenter.errorMessageForTesting(
+            NSError(
+                domain: "InternalImportSubsystem",
+                code: 41,
+                userInfo: [NSLocalizedDescriptionKey: "sensitive implementation detail"]
+            )
+        )
+
+        XCTAssertEqual(invalidSession, L10n.Import.invalidSessionData)
+        XCTAssertEqual(invalidFormat, "无法识别配置文件内容，请确认文件为来源系统导出的原始配置。")
+        XCTAssertEqual(credentialFailure, L10n.Import.credentialStorageFailure)
+        XCTAssertEqual(unexpectedFailure, L10n.Import.genericFailure)
+        XCTAssertFalse(invalidSession.contains("StacioCoreBindings"))
+        XCTAssertFalse(invalidFormat.contains("ExternalSessionImportParserError"))
+        XCTAssertFalse(credentialFailure.contains("KeychainCredentialError"))
+        XCTAssertFalse(unexpectedFailure.contains("InternalImportSubsystem"))
+        XCTAssertFalse(unexpectedFailure.contains("sensitive implementation detail"))
     }
 
     func testImportPreviewTextShowsNonSSHProtocolsAndTargets() {
@@ -846,6 +1268,7 @@ private struct RecordingLicenseFeatureAccessProvider: LicenseFeatureAccessProvid
 private final class RecordingSessionImportCore: SessionImportCoreBridging {
     var events: [String] = []
     private(set) var stacioJSONInputs: [String] = []
+    private(set) var appliedPreview: ImportPreview?
     private let existingSessions: [SessionRecord]
     private let csvPreview: ImportPreview
     private let legacyIniPreview: ImportPreview
@@ -906,6 +1329,7 @@ private final class RecordingSessionImportCore: SessionImportCoreBridging {
         preview: ImportPreview
     ) throws -> ImportApplyResult {
         events.append("apply:\(sourceType.rawValue):\(sourceName)")
+        appliedPreview = preview
         return applyResult
     }
 }
@@ -935,6 +1359,48 @@ private final class RecordingBastionHostFeatureAuthorizer: BastionHostFeatureAut
     func authorizeBastionHostAccess() throws {
         authorizationCount += 1
         if let error { throw error }
+    }
+}
+
+private final class RecordingBastionHostSessionImportResolver: BastionHostSessionImportResolving {
+    private let fallbackPayload: ExternalSessionImportPayload?
+    private let automaticallyResolvedPayload: ExternalSessionImportPayload?
+    private(set) var vendorHints: [BastionHostVendor?] = []
+
+    init(
+        fallbackPayload: ExternalSessionImportPayload?,
+        automaticallyResolvedPayload: ExternalSessionImportPayload? = nil
+    ) {
+        self.fallbackPayload = fallbackPayload
+        self.automaticallyResolvedPayload = automaticallyResolvedPayload
+    }
+
+    func resolve(
+        file: SessionImportFile,
+        vendorHint: BastionHostVendor?
+    ) throws -> ExternalSessionImportPayload {
+        vendorHints.append(vendorHint)
+        if vendorHint == nil, let automaticallyResolvedPayload {
+            return automaticallyResolvedPayload
+        }
+        guard vendorHint != nil, let fallbackPayload else {
+            throw ExternalSessionImportParserError.invalidFormat
+        }
+        return fallbackPayload
+    }
+}
+
+private final class RecordingBastionHostVendorSelector: BastionHostVendorSelecting {
+    private let selectedVendor: BastionHostVendor?
+    private(set) var requestedSourceNames: [String] = []
+
+    init(selectedVendor: BastionHostVendor?) {
+        self.selectedVendor = selectedVendor
+    }
+
+    func selectVendor(sourceName: String, parentWindow: NSWindow?) -> BastionHostVendor? {
+        requestedSourceNames.append(sourceName)
+        return selectedVendor
     }
 }
 
@@ -968,6 +1434,25 @@ private final class RecordingSecureSessionTransferPrivateKeyInstaller: SecureSes
         installedPrivateKeys.append(privateKey)
         installedSessionIDs.append(importedSession.id)
     }
+}
+
+private func makeSessionImportArchive(entries: [String: Data]) throws -> URL {
+    let archive = try Archive(accessMode: .create)
+    for (path, data) in entries.sorted(by: { $0.key < $1.key }) {
+        try archive.addEntry(
+            with: path,
+            type: .file,
+            uncompressedSize: Int64(data.count),
+            provider: { position, size in
+                data.subdata(in: Int(position)..<(Int(position) + size))
+            }
+        )
+    }
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("zip")
+    try XCTUnwrap(archive.data).write(to: url)
+    return url
 }
 
 private func preview(

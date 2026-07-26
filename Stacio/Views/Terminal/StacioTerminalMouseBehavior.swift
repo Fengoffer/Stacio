@@ -54,6 +54,7 @@ public enum StacioTerminalMouseBehavior {
 
 public final class TerminalFocusContainerView: NSView {
     public weak var terminalFocusView: TerminalView?
+    public var onTerminalFocusRequested: (() -> Void)?
     public var onEffectiveAppearanceChanged: (() -> Void)?
     private var effectiveAppearanceObservation: NSKeyValueObservation?
     private var systemAppearanceObserver: NSObjectProtocol?
@@ -130,6 +131,9 @@ public final class TerminalFocusContainerView: NSView {
            hitView != nil,
            hitView === terminalFocusView || hitView?.isDescendant(of: terminalFocusView) == true {
             StacioTerminalMouseBehavior.focusForKeyboardInput(terminalFocusView)
+            if terminalFocusView.window?.firstResponder === terminalFocusView {
+                onTerminalFocusRequested?()
+            }
         }
         return hitView
     }

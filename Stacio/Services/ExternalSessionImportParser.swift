@@ -44,10 +44,21 @@ public struct ExternalSessionImportPayload: Equatable, Sendable {
     public let warnings: [String]
 }
 
-public enum ExternalSessionImportParserError: Error, Equatable {
+public enum ExternalSessionImportParserError: Error, Equatable, LocalizedError {
     case unsupportedSource
     case invalidFormat
     case noSessions
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSource:
+            return "暂不支持该配置文件类型。"
+        case .invalidFormat:
+            return "无法识别配置文件内容，请确认文件为来源系统导出的原始配置。"
+        case .noSessions:
+            return "配置文件中没有可导入的会话。"
+        }
+    }
 }
 
 public enum ExternalSessionImportParser {
@@ -65,7 +76,7 @@ public enum ExternalSessionImportParser {
         case .windTerm:
             payload = try parseWindTerm(text)
         case .secureCRT:
-            payload = try parseSecureCRT(text)
+            payload = try parseSecureCRT(text, sourceName: sourceName)
         case .electerm:
             payload = try parseElecterm(text)
         case .termius:
@@ -111,7 +122,7 @@ public enum ExternalSessionImportParser {
             let fileComponents = fileURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
             let relativePath = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
             let sourceName = relativePath.replacingOccurrences(of: "/", with: "__")
-            let text = try String(contentsOf: fileURL, encoding: .utf8)
+            let text = try SessionImportTextDecoder.decode(Data(contentsOf: fileURL))
             sessions.append(contentsOf: parseXshell(text, sourceName: sourceName).sessions)
         }
         return ExternalSessionImportPayload(sessions: sessions, warnings: [])
@@ -157,7 +168,11 @@ public enum ExternalSessionImportParser {
     private static func parseXshell(_ text: String, sourceName: String) -> ExternalSessionImportPayload {
         let sections = iniSections(text)
         let connection = sections["CONNECTION"] ?? sections["Connection"] ?? [:]
-        let authentication = sections["AUTHENTICATION"] ?? sections["Authentication"] ?? [:]
+        let authentication = sections["CONNECTION:AUTHENTICATION"]
+            ?? sections["Connection:Authentication"]
+            ?? sections["AUTHENTICATION"]
+            ?? sections["Authentication"]
+            ?? [:]
         guard let host = optionalTrimmed(connection["Host"] ?? connection["HostName"]) else {
             return ExternalSessionImportPayload(sessions: [], warnings: [])
         }
@@ -182,7 +197,12 @@ public enum ExternalSessionImportParser {
                     protocolName: "ssh",
                     host: host,
                     port: UInt16(connection["Port"] ?? "") ?? 22,
-                    username: optionalTrimmed(connection["UserName"] ?? connection["Username"]),
+                    username: optionalTrimmed(
+                        authentication["UserName"]
+                            ?? authentication["Username"]
+                            ?? connection["UserName"]
+                            ?? connection["Username"]
+                    ),
                     privateKeyPath: keyPath,
                     credential: credential
                 )
@@ -217,12 +237,89 @@ public enum ExternalSessionImportParser {
         return ExternalSessionImportPayload(sessions: sessions, warnings: [])
     }
 
-    private static func parseSecureCRT(_ text: String) throws -> ExternalSessionImportPayload {
-        let delegate = SecureCRTImportXMLDelegate()
-        let parser = XMLParser(data: Data(text.utf8))
-        parser.delegate = delegate
-        guard parser.parse() else { throw ExternalSessionImportParserError.invalidFormat }
-        return ExternalSessionImportPayload(sessions: delegate.sessions, warnings: delegate.warnings)
+    private struct SecureCRTINIField {
+        let type: Character
+        let value: String
+    }
+
+    private static func parseSecureCRT(
+        _ text: String,
+        sourceName: String
+    ) throws -> ExternalSessionImportPayload {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
+            let delegate = SecureCRTImportXMLDelegate()
+            let parser = XMLParser(data: Data(text.utf8))
+            parser.delegate = delegate
+            guard parser.parse() else { throw ExternalSessionImportParserError.invalidFormat }
+            return ExternalSessionImportPayload(sessions: delegate.sessions, warnings: delegate.warnings)
+        }
+
+        let fields = secureCRTINIFields(text)
+        guard fields["Protocol Name"]?.value.caseInsensitiveCompare("SSH2") == .orderedSame,
+              let host = optionalTrimmed(fields["Hostname"]?.value)
+        else { throw ExternalSessionImportParserError.invalidFormat }
+
+        let sourceStem = URL(fileURLWithPath: sourceName)
+            .deletingPathExtension()
+            .lastPathComponent
+        let sessionName = optionalTrimmed(sourceStem) ?? host
+        let password = ["Password V2", "Password"]
+            .compactMap { optionalTrimmed(fields[$0]?.value) }
+            .first
+        let warnings = password == nil
+            ? []
+            : ["\(sessionName) 的 SecureCRT 加密密码无法直接迁移"]
+        let portField = fields["[SSH2] Port"]
+            ?? fields["[SSH2] 端口"]
+            ?? fields["Port"]
+        let privateKeyPath = ["Identity Filename V2", "Identity Filename"]
+            .compactMap { optionalTrimmed(fields[$0]?.value) }
+            .first
+        let session = ExternalImportedSession(
+            name: sessionName,
+            folderPath: nil,
+            protocolName: "ssh",
+            host: host,
+            port: secureCRTPort(portField) ?? 22,
+            username: optionalTrimmed(fields["Username"]?.value),
+            privateKeyPath: privateKeyPath,
+            credential: nil
+        )
+        return ExternalSessionImportPayload(sessions: [session], warnings: warnings)
+    }
+
+    private static func secureCRTINIFields(_ text: String) -> [String: SecureCRTINIField] {
+        var fields: [String: SecureCRTINIField] = [:]
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let type = line.first, type == "S" || type == "D" else { continue }
+            let colonIndex = line.index(after: line.startIndex)
+            guard colonIndex < line.endIndex, line[colonIndex] == ":" else { continue }
+            let openingQuoteIndex = line.index(after: colonIndex)
+            guard openingQuoteIndex < line.endIndex, line[openingQuoteIndex] == "\"" else { continue }
+            let keyStartIndex = line.index(after: openingQuoteIndex)
+            guard let closingQuoteIndex = line[keyStartIndex...].firstIndex(of: "\"") else { continue }
+            let equalsIndex = line.index(after: closingQuoteIndex)
+            guard equalsIndex < line.endIndex, line[equalsIndex] == "=" else { continue }
+            let valueStartIndex = line.index(after: equalsIndex)
+            let key = String(line[keyStartIndex..<closingQuoteIndex])
+            guard key.isEmpty == false else { continue }
+            fields[key] = SecureCRTINIField(type: type, value: String(line[valueStartIndex...]))
+        }
+        return fields
+    }
+
+    private static func secureCRTPort(_ field: SecureCRTINIField?) -> UInt16? {
+        guard let field else { return nil }
+        let value = field.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed: UInt64?
+        if field.type == "D" {
+            parsed = UInt64(value, radix: 16)
+        } else {
+            parsed = UInt64(value)
+        }
+        guard let parsed, parsed > 0 else { return nil }
+        return UInt16(exactly: parsed)
     }
 
     private static func parseElecterm(_ text: String) throws -> ExternalSessionImportPayload {

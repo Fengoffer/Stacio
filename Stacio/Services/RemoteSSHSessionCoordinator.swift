@@ -495,6 +495,7 @@ public final class RemoteSSHSessionCoordinator {
                 liveSessionContext: nil
             )
         }
+        pane?.setConnectionEndpoint("\(config.username)@\(Self.endpointDescription(for: config))")
         pane?.displayConnectionStarting()
         let pendingStatus = LiveShellStatus(
             runtimeId: pane?.runtimeID ?? "pending_\(UUID().uuidString.lowercased())",

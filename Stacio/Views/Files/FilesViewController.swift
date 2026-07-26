@@ -575,12 +575,19 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         tableView.intercellSpacing = NSSize(width: 0, height: 1)
         tableView.dataSource = self
         tableView.delegate = self
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: true)
         tableView.setAccessibilityIdentifier("Stacio.Files.remoteTable")
         tableView.setAccessibilityLabel(L10n.Files.remoteFiles)
         tableView.target = self
         tableView.doubleAction = #selector(openSelectedEntry(_:))
         let localFileDropHandler: ([String]) -> Void = { [weak self] localPaths in
             self?.handleDroppedLocalFilePaths(localPaths)
+        }
+        tableView.localFileDropTargetHandler = { [weak self] localPaths, row in
+            self?.handleDroppedLocalFilePaths(localPaths, proposedRow: row)
+        }
+        tableView.localFileDropTargetValidator = { [weak self] row in
+            self?.isRemoteDirectoryRow(row) == true
         }
         tableView.rowContextMenuProvider = { [weak self] row in
             self?.contextMenu(forRow: row)
@@ -876,8 +883,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         updateActionStates()
     }
 
-    public func performDropLocalFilesForTesting(_ localPaths: [String]) {
-        handleDroppedLocalFilePaths(localPaths)
+    public func performDropLocalFilesForTesting(_ localPaths: [String], onRemoteRow row: Int? = nil) {
+        handleDroppedLocalFilePaths(localPaths, proposedRow: row)
     }
 
     public func performCreateDirectoryForTesting() {
@@ -1882,6 +1889,18 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         return cell
     }
 
+    public func tableView(
+        _ tableView: NSTableView,
+        pasteboardWriterForRow row: Int
+    ) -> NSPasteboardWriting? {
+        guard !isRemoteSearchActive,
+              rows.indices.contains(row)
+        else {
+            return nil
+        }
+        return RemoteFileDragPayload.pasteboardItem(for: rows[row].selection)
+    }
+
     public func tableViewSelectionDidChange(_ notification: Notification) {
         updateActionStates()
     }
@@ -2356,9 +2375,23 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         restoreCollapsedEmbeddedCapability()
     }
 
-    private func handleDroppedLocalFilePaths(_ localPaths: [String]) {
+    private func handleDroppedLocalFilePaths(_ localPaths: [String], proposedRow: Int? = nil) {
         guard !localPaths.isEmpty else { return }
-        onUploadDroppedFiles?(normalizedCurrentPath(), localPaths)
+        let remoteDirectory = proposedRow.flatMap(remoteDirectoryForUploadDrop(onRow:))
+            ?? normalizedCurrentPath()
+        onUploadDroppedFiles?(remoteDirectory, localPaths)
+    }
+
+    private func isRemoteDirectoryRow(_ row: Int) -> Bool {
+        remoteDirectoryForUploadDrop(onRow: row) != nil
+    }
+
+    private func remoteDirectoryForUploadDrop(onRow row: Int) -> String? {
+        guard rows.indices.contains(row), rows[row].selection.isDirectory else {
+            return nil
+        }
+        let path = rows[row].selection.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
     }
 
     private func performRemoteSearchFromField() {
@@ -3678,6 +3711,12 @@ private struct FilesTransferMetric {
 public final class RemoteFilesTableView: NSTableView {
     public var rowContextMenuProvider: ((Int) -> NSMenu?)?
     public var middleClickRowHandler: ((Int) -> Void)?
+    var localFileDropTargetHandler: (([String], Int) -> Void)? {
+        didSet {
+            LocalFileDropHandler.register(self)
+        }
+    }
+    var localFileDropTargetValidator: ((Int) -> Bool)?
     var localFileDropHandler: (([String]) -> Void)? {
         didSet {
             LocalFileDropHandler.register(self)
@@ -3685,17 +3724,50 @@ public final class RemoteFilesTableView: NSTableView {
     }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        LocalFileDropHandler.operation(for: sender.draggingPasteboard)
+        let operation = LocalFileDropHandler.operation(for: sender.draggingPasteboard)
+        updateDropRow(for: sender)
+        return operation
     }
 
     public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        LocalFileDropHandler.operation(for: sender.draggingPasteboard)
+        let operation = LocalFileDropHandler.operation(for: sender.draggingPasteboard)
+        updateDropRow(for: sender)
+        return operation
+    }
+
+    public override func draggingExited(_ sender: NSDraggingInfo?) {
+        clearDropRow()
+        super.draggingExited(sender)
     }
 
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        LocalFileDropHandler.performDrop(from: sender) { [weak self] paths in
+        let targetRow = row(at: convert(sender.draggingLocation, from: nil))
+        defer { clearDropRow() }
+        if let localFileDropTargetHandler {
+            return LocalFileDropHandler.performDrop(from: sender) { paths in
+                localFileDropTargetHandler(paths, targetRow)
+            }
+        }
+        return LocalFileDropHandler.performDrop(from: sender) { [weak self] paths in
             self?.localFileDropHandler?(paths)
         }
+    }
+
+    private func updateDropRow(for sender: NSDraggingInfo) {
+        guard LocalFileDropHandler.operation(for: sender.draggingPasteboard) != [] else {
+            clearDropRow()
+            return
+        }
+        let targetRow = row(at: convert(sender.draggingLocation, from: nil))
+        guard targetRow >= 0, localFileDropTargetValidator?(targetRow) == true else {
+            clearDropRow()
+            return
+        }
+        setDropRow(targetRow, dropOperation: .on)
+    }
+
+    private func clearDropRow() {
+        setDropRow(-1, dropOperation: .on)
     }
 
     public override func menu(for event: NSEvent) -> NSMenu? {

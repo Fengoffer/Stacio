@@ -85,6 +85,26 @@ final class ExternalSessionImportParserTests: XCTestCase {
         XCTAssertEqual(payload.sessions[0].credential, .privateKeyPassphrase("key-passphrase"))
     }
 
+    func testXshellReadsTopsecUsernameFromConnectionAuthenticationSection() throws {
+        let payload = try ExternalSessionImportParser.parseText(
+            """
+            [CONNECTION]
+            Host=bastion.example.com
+            Port=2222
+            Protocol=SSH
+            [CONNECTION:AUTHENTICATION]
+            UserName=opaque-account@default@SSH@ops@10.0.0.8@22
+            """,
+            sourceType: .xShell,
+            sourceName: "10.0.0.8_6.xsh"
+        )
+
+        XCTAssertEqual(
+            payload.sessions[0].username,
+            "opaque-account@default@SSH@ops@10.0.0.8@22"
+        )
+    }
+
     func testXshellDirectoryImportsAllFilesUsingRelativeFolders() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let group = root.appendingPathComponent("Production/Web", isDirectory: true)
@@ -101,6 +121,32 @@ final class ExternalSessionImportParserTests: XCTestCase {
 
         XCTAssertEqual(payload.sessions.map(\.name), ["Web"])
         XCTAssertEqual(payload.sessions.map(\.folderPath), ["Production/Web"])
+    }
+
+    func testXshellDirectoryDecodesUTF16LESessionFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let text = """
+        [CONNECTION]
+        Host=bastion.example.com
+        Port=2222
+        [CONNECTION:AUTHENTICATION]
+        UserName=opaque-account@default@SSH@ops@10.0.0.8@22
+        """
+        var encoded = Data([0xFF, 0xFE])
+        encoded.append(try XCTUnwrap(text.data(using: .utf16LittleEndian)))
+        try encoded.write(to: root.appendingPathComponent("Asset_7.xsh"))
+
+        let payload = try ExternalSessionImportParser.parseDirectory(
+            root,
+            sourceType: .xShell,
+            sourceName: "Xshell Sessions"
+        )
+
+        XCTAssertEqual(payload.sessions.count, 1)
+        XCTAssertEqual(payload.sessions[0].host, "bastion.example.com")
+        XCTAssertEqual(payload.sessions[0].username, "opaque-account@default@SSH@ops@10.0.0.8@22")
     }
 
     func testWindTermImportsMultipleSessionsAndGroups() throws {
@@ -138,6 +184,49 @@ final class ExternalSessionImportParserTests: XCTestCase {
         XCTAssertEqual(payload.sessions[0].folderPath, "Production")
         XCTAssertEqual(payload.sessions[0].name, "API")
         XCTAssertEqual(payload.sessions[0].credential, .password("plain-secret"))
+    }
+
+    func testSecureCRTImportsTypedINISessionAndDecodesDwordPort() throws {
+        let payload = try ExternalSessionImportParser.parseText(
+            """
+            D:"Is Session"=00000001
+            S:"Protocol Name"=SSH2
+            S:"Hostname"=bastion.example.com
+            S:"Username"=opaque-account@default@SSH@ops@10.0.0.8@22
+            D:"[SSH2] Port"=000008AE
+            S:"Password"=
+            B:"Window Placement"=00000000
+             2c 00 00 00 02 00 00 00
+            """,
+            sourceType: .secureCRT,
+            sourceName: "asset.ini"
+        )
+
+        let session = try XCTUnwrap(payload.sessions.first)
+        XCTAssertEqual(payload.sessions.count, 1)
+        XCTAssertEqual(session.name, "asset")
+        XCTAssertEqual(session.host, "bastion.example.com")
+        XCTAssertEqual(session.port, 2222)
+        XCTAssertEqual(session.username, "opaque-account@default@SSH@ops@10.0.0.8@22")
+        XCTAssertNil(session.credential)
+        XCTAssertTrue(payload.warnings.isEmpty)
+    }
+
+    func testSecureCRTTypedINIDoesNotImportEncryptedPassword() throws {
+        let payload = try ExternalSessionImportParser.parseText(
+            """
+            S:"Protocol Name"=SSH2
+            S:"Hostname"=server.example.com
+            S:"Username"=deploy
+            D:"[SSH2] Port"=00000016
+            S:"Password V2"=02:encrypted-value
+            """,
+            sourceType: .secureCRT,
+            sourceName: "server.ini"
+        )
+
+        XCTAssertNil(payload.sessions[0].credential)
+        XCTAssertEqual(payload.warnings, ["server 的 SecureCRT 加密密码无法直接迁移"])
     }
 
     func testElectermImportsBookmarkGroupsAndCredentials() throws {

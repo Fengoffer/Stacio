@@ -137,10 +137,8 @@ impl TerminalRuntimeRegistry {
             runtime.id.clone(),
             VecDeque::with_capacity(self.max_buffer_bytes),
         );
-        self.input_buffers.insert(
-            runtime.id.clone(),
-            VecDeque::new(),
-        );
+        self.input_buffers
+            .insert(runtime.id.clone(), VecDeque::new());
         self.dropped_counts.insert(runtime.id.clone(), 0);
         self.input_dropped_counts.insert(runtime.id.clone(), 0);
         self.runtimes.insert(runtime.id.clone(), runtime.clone());

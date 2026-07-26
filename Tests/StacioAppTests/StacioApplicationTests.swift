@@ -112,7 +112,7 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.0"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.1"))
     }
 
     func testApplicationLaunchDoesNotRevalidatePersistedLicenseOrStartNetworkMonitoring() async {
@@ -396,6 +396,46 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertEqual(workbench.deviceDashboardMenuToggleCount, 1)
     }
 
+    func testWorkspaceCapabilityMenuValidationUsesWorkbenchPolicy() {
+        let workbench = FakeWorkbenchWindowController()
+        workbench.deniedWorkspaceCapabilities = Set(WorkspaceCapability.allCases)
+        let delegate = AppDelegate(
+            factory: { workbench },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            sparkleUpdateChecker: RecordingSparkleUpdateChecker(),
+            licenseStateProvider: {
+                LicenseState(
+                    plan: "professional",
+                    expiresAt: .distantFuture,
+                    status: .active
+                )
+            }
+        )
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        let actions = [
+            #selector(AppDelegate.showFilesFromMenu(_:)),
+            #selector(AppDelegate.showBrowserFromMenu(_:)),
+            #selector(AppDelegate.showTunnelsFromMenu(_:)),
+            #selector(AppDelegate.toggleDeviceDashboardFromMenu(_:)),
+            #selector(AppDelegate.showDiagnosticsFromMenu(_:)),
+            #selector(AppDelegate.showAIAssistantFromMenu(_:))
+        ]
+
+        for action in actions {
+            let item = NSMenuItem(title: NSStringFromSelector(action), action: action, keyEquivalent: "")
+
+            XCTAssertFalse(delegate.validateMenuItem(item), NSStringFromSelector(action))
+            XCTAssertEqual(item.toolTip, L10n.Workbench.sshSessionRequiredTooltip)
+
+            workbench.deniedWorkspaceCapabilities = []
+            XCTAssertTrue(delegate.validateMenuItem(item), NSStringFromSelector(action))
+            XCTAssertNil(item.toolTip, NSStringFromSelector(action))
+            workbench.deniedWorkspaceCapabilities = Set(WorkspaceCapability.allCases)
+        }
+    }
+
     func testUpdateMenuActionUsesSparkleManualChecker() {
         let workbench = FakeWorkbenchWindowController()
         let checker = RecordingSparkleUpdateChecker()
@@ -604,7 +644,7 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.0")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.1")
         XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
         XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")
@@ -691,6 +731,7 @@ private final class FakeWorkbenchWindowController: WorkbenchWindowShowing {
     var openBastionHostRequests: [BastionHostDeepLinkRequest] = []
     var deviceDashboardMenuToggleCount = 0
     var shouldPrepareForTermination = true
+    var deniedWorkspaceCapabilities: Set<WorkspaceCapability> = []
     private(set) var showWindowCount = 0
     private(set) var prepareForTerminationCount = 0
 
@@ -712,6 +753,10 @@ private final class FakeWorkbenchWindowController: WorkbenchWindowShowing {
 
     func toggleDeviceDashboardFromMenu(_ sender: Any?) {
         deviceDashboardMenuToggleCount += 1
+    }
+
+    func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool {
+        deniedWorkspaceCapabilities.contains(capability) == false
     }
 
     func prepareForApplicationTermination() -> Bool {

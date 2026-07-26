@@ -88,10 +88,132 @@ public struct RemoteTextEditorDisplayOptions: Codable, Equatable {
     }
 }
 
+enum FileWorkspaceTableSortColumn: String, Sendable {
+    case name
+    case size
+    case time
+}
+
+struct FileWorkspaceTableSortOrder: Equatable, Sendable {
+    static let initial = FileWorkspaceTableSortOrder(column: .name, ascending: true)
+
+    let column: FileWorkspaceTableSortColumn
+    let ascending: Bool
+
+    init(column: FileWorkspaceTableSortColumn, ascending: Bool) {
+        self.column = column
+        self.ascending = ascending
+    }
+
+    init?(descriptor: NSSortDescriptor) {
+        guard let key = descriptor.key,
+              let column = FileWorkspaceTableSortColumn(rawValue: key)
+        else { return nil }
+        self.init(column: column, ascending: descriptor.ascending)
+    }
+
+    var descriptor: NSSortDescriptor {
+        NSSortDescriptor(key: column.rawValue, ascending: ascending)
+    }
+
+    func toggled(for identifier: String) -> FileWorkspaceTableSortOrder? {
+        guard let nextColumn = FileWorkspaceTableSortColumn(rawValue: identifier) else { return nil }
+        return FileWorkspaceTableSortOrder(
+            column: nextColumn,
+            ascending: nextColumn == column ? !ascending : true
+        )
+    }
+
+    func placesBefore(_ comparison: ComparisonResult) -> Bool {
+        ascending ? comparison == .orderedAscending : comparison == .orderedDescending
+    }
+}
+
+final class RemoteFileModifiedTimeParser {
+    private let calendar: Calendar
+    private let iso8601Formatters: [ISO8601DateFormatter]
+    private let absoluteDateFormatters: [DateFormatter]
+    private let yearlessDateFormatters: [DateFormatter]
+
+    init(timeZone: TimeZone = .current) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        self.calendar = calendar
+
+        iso8601Formatters = [
+            Self.makeISO8601Formatter(options: [.withInternetDateTime, .withFractionalSeconds]),
+            Self.makeISO8601Formatter(options: [.withInternetDateTime])
+        ]
+        absoluteDateFormatters = [
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+            "yyyy/MM/dd HH:mm:ss",
+            "yyyy/MM/dd HH:mm",
+            "yyyyMMddHHmmss",
+            "MMM d yyyy"
+        ].map { Self.makeDateFormatter(format: $0, timeZone: timeZone) }
+        yearlessDateFormatters = [
+            "MM-dd HH:mm",
+            "MMM d HH:mm"
+        ].map { Self.makeDateFormatter(format: $0, timeZone: timeZone) }
+    }
+
+    func date(from value: String, relativeTo referenceDate: Date = Date()) -> Date? {
+        for formatter in iso8601Formatters {
+            if let date = formatter.date(from: value) {
+                return date
+            }
+        }
+        for formatter in absoluteDateFormatters {
+            if let date = formatter.date(from: value) {
+                return date
+            }
+        }
+        for formatter in yearlessDateFormatters {
+            guard let partialDate = formatter.date(from: value) else { continue }
+            var components = formatter.calendar.dateComponents(
+                [.month, .day, .hour, .minute],
+                from: partialDate
+            )
+            components.year = calendar.component(.year, from: referenceDate)
+            components.timeZone = calendar.timeZone
+            guard var inferredDate = calendar.date(from: components) else { continue }
+            if inferredDate.timeIntervalSince(referenceDate) > 183 * 24 * 60 * 60 {
+                components.year = (components.year ?? 0) - 1
+                guard let adjustedDate = calendar.date(from: components) else { continue }
+                inferredDate = adjustedDate
+            }
+            return inferredDate
+        }
+        return nil
+    }
+
+    private static func makeISO8601Formatter(
+        options: ISO8601DateFormatter.Options
+    ) -> ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = options
+        return formatter
+    }
+
+    private static func makeDateFormatter(format: String, timeZone: TimeZone) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        formatter.isLenient = false
+        return formatter
+    }
+}
+
 enum StacioFileDisplay {
     static let iconDimension: CGFloat = 28
     static let iconSize = NSSize(width: iconDimension, height: iconDimension)
     static let tableRowHeight: CGFloat = 34
+    static var tableTextFont: NSFont {
+        .systemFont(ofSize: NSFont.smallSystemFontSize)
+    }
 
     static func sortedRemoteRows(_ rows: [RemoteFileRow]) -> [RemoteFileRow] {
         rows.sorted(by: compareFileRows)

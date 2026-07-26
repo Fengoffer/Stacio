@@ -1,5 +1,4 @@
 import AppKit
-import CoreFoundation
 import Foundation
 import StacioCoreBindings
 import UniformTypeIdentifiers
@@ -62,15 +61,15 @@ public struct SessionImportSourceDescriptor: Sendable {
 public enum AppKitSessionImportSourcePicker {
     public static let supportedSources: [SessionImportSourceDescriptor] = [
         .init(type: .stacioJSON, name: "Stacio", hint: ".json / .stacio-session", symbolName: "terminal", iconResourceName: nil),
-        .init(type: .xShell, name: "Xshell", hint: ".xsh / .xts", symbolName: "chevron.left.forwardslash.chevron.right", iconResourceName: "xshell.svg"),
+        .init(type: .xShell, name: "Xshell", hint: ".xsh / .xts / .zip", symbolName: "chevron.left.forwardslash.chevron.right", iconResourceName: "xshell.svg"),
         .init(type: .mobaXterm, name: "MobaXterm", hint: ".mxtsessions", symbolName: "rectangle.connected.to.line.below", iconResourceName: "mobaxterm.svg"),
         .init(type: .windTerm, name: "WindTerm", hint: ".sessions", symbolName: "wind", iconResourceName: "windterm.svg"),
-        .init(type: .secureCRT, name: "SecureCRT", hint: ".xml", symbolName: "lock.shield", iconResourceName: "securecrt.svg"),
+        .init(type: .secureCRT, name: "SecureCRT", hint: ".xml / .ini / .zip", symbolName: "lock.shield", iconResourceName: "securecrt.svg"),
         .init(type: .finalShell, name: "FinalShell", hint: "conn 目录", symbolName: "folder", iconResourceName: "finalshell.svg"),
         .init(type: .termius, name: "Termius", hint: ".json", symbolName: "cloud", iconResourceName: "termius.svg"),
         .init(type: .electerm, name: "Electerm", hint: ".json", symbolName: "bolt.horizontal", iconResourceName: "electerm.svg"),
         .init(type: .genericJSON, name: "JSON", hint: ".json", symbolName: "curlybraces", iconResourceName: nil),
-        .init(type: .bastionHost, name: "堡垒机", hint: "厂商导出的连接文件", symbolName: "server.rack", iconResourceName: "bastion-host.png")
+        .init(type: .bastionHost, name: "堡垒机", hint: ".xlsx / .zip / 厂商连接文件", symbolName: "server.rack", iconResourceName: "bastion-host.png")
     ]
 }
 
@@ -161,6 +160,32 @@ public protocol SessionImportPreviewPresenting {
     ) -> Bool
     func showImportResult(_ result: ImportApplyResult, parentWindow: NSWindow?)
     func showImportError(_ error: Error, parentWindow: NSWindow?)
+}
+
+public protocol BastionHostVendorSelecting {
+    func selectVendor(sourceName: String, parentWindow: NSWindow?) -> BastionHostVendor?
+}
+
+public enum BastionHostVendorFallbackError: LocalizedError, Equatable {
+    case recognitionFailed(BastionHostVendor)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .recognitionFailed(vendor):
+            return L10n.Import.bastionVendorRetryFailed(vendor.displayName)
+        }
+    }
+}
+
+public enum SessionImportRemovedProtocolError: LocalizedError, Equatable {
+    case onlyRemovedFTP
+
+    public var errorDescription: String? {
+        switch self {
+        case .onlyRemovedFTP:
+            return "导入文件只包含已移除的 FTP 会话，请在来源工具中改为导出 SFTP 或 SCP 会话。"
+        }
+    }
 }
 
 public protocol SessionImportCoreBridging {
@@ -337,6 +362,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
     private let secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting
     private let importedPrivateKeyInstaller: SecureSessionTransferPrivateKeyInstalling
     private let bastionHostAuthorizer: BastionHostFeatureAuthorizing
+    private let bastionHostImportResolver: BastionHostSessionImportResolving
+    private let bastionHostVendorSelector: BastionHostVendorSelecting
     private let licensedFeatureAuthorizer: LicensedFeatureAuthorizing
     private let onImported: () -> Void
 
@@ -349,6 +376,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         secureSessionTransferPassphrasePrompter: SecureSessionTransferPassphrasePrompting = AppKitSecureSessionTransferPassphrasePrompter(),
         importedPrivateKeyInstaller: SecureSessionTransferPrivateKeyInstalling = StacioImportedPrivateKeyInstaller(),
         bastionHostAuthorizer: BastionHostFeatureAuthorizing = LicenseBastionHostFeatureAuthorizer(),
+        bastionHostImportResolver: BastionHostSessionImportResolving = DefaultBastionHostSessionImportResolver(),
+        bastionHostVendorSelector: BastionHostVendorSelecting = AppKitBastionHostVendorSelector(),
         licensedFeatureAuthorizer: LicensedFeatureAuthorizing = LicenseFeatureAuthorizer(
             accessProvider: UnrestrictedLicenseFeatureAccessProvider()
         ),
@@ -362,6 +391,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         self.secureSessionTransferPassphrasePrompter = secureSessionTransferPassphrasePrompter
         self.importedPrivateKeyInstaller = importedPrivateKeyInstaller
         self.bastionHostAuthorizer = bastionHostAuthorizer
+        self.bastionHostImportResolver = bastionHostImportResolver
+        self.bastionHostVendorSelector = bastionHostVendorSelector
         self.licensedFeatureAuthorizer = licensedFeatureAuthorizer
         self.onImported = onImported
     }
@@ -381,9 +412,10 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         sourceType requestedSourceType: SessionImportSourceType?,
         parentWindow: NSWindow?
     ) throws -> ImportApplyResult? {
-        try licensedFeatureAuthorizer.authorize(.sessionBulkIO)
         if requestedSourceType == .bastionHost {
             try bastionHostAuthorizer.authorizeBastionHostAccess()
+        } else {
+            try licensedFeatureAuthorizer.authorize(.sessionBulkIO)
         }
         let file: SessionImportFile?
         if let requestedSourceType {
@@ -404,19 +436,45 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         let existingSessionNames = try core
             .listAllSessionRecords(databasePath: databasePath)
             .map(\.name)
-        let (sourceType, preview, externalPayload) = try makePreview(
-            for: importFile,
-            existingSessionNames: existingSessionNames
-        )
+        let preparedPreview: (SessionImportSourceType, ImportPreview, ExternalSessionImportPayload?)
+        do {
+            preparedPreview = try makePreview(
+                for: importFile,
+                existingSessionNames: existingSessionNames,
+                bastionVendorHint: nil
+            )
+        } catch {
+            guard importFile.sourceType == .bastionHost,
+                  error is ExternalSessionImportParserError
+            else { throw error }
+            guard let vendor = bastionHostVendorSelector.selectVendor(
+                sourceName: importFile.sourceName,
+                parentWindow: parentWindow
+            ) else {
+                return nil
+            }
+            do {
+                preparedPreview = try makePreview(
+                    for: importFile,
+                    existingSessionNames: existingSessionNames,
+                    bastionVendorHint: vendor
+                )
+            } catch {
+                throw BastionHostVendorFallbackError.recognitionFailed(vendor)
+            }
+        }
+        let (sourceType, originalPreview, externalPayload) = preparedPreview
         if sourceType != .bastionHost,
            let externalPayload,
            BastionHostSessionDetector.containsBastionHostSession(externalPayload) {
             try bastionHostAuthorizer.authorizeBastionHostAccess()
         }
         if let secureTransfer = preparedImport.secureTransfer,
-           secureTransferMatchesPreview(secureTransfer, preview: preview) == false {
+           secureTransferMatchesPreview(secureTransfer, preview: originalPreview) == false {
             throw SecureSessionTransferError.invalidPayload
         }
+        let preview = try previewExcludingRemovedProtocols(originalPreview)
+        let credentialPayload = externalPayload.map(payloadExcludingRemovedProtocols)
         guard presenter.confirmImport(
             preview: preview,
             sourceName: importFile.sourceName,
@@ -437,9 +495,9 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
                 secureTransfer,
                 to: result.importedSessions
             )
-        } else if let externalPayload, result.importedSessions.isEmpty == false {
+        } else if let credentialPayload, result.importedSessions.isEmpty == false {
             try credentialApplier.applyCredentials(
-                from: externalPayload,
+                from: credentialPayload,
                 to: result.importedSessions,
                 databasePath: databasePath
             )
@@ -449,6 +507,38 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         }
         presenter.showImportResult(result, parentWindow: parentWindow)
         return result
+    }
+
+    private func previewExcludingRemovedProtocols(_ preview: ImportPreview) throws -> ImportPreview {
+        let supportedSessions = preview.sessions.filter {
+            isRemovedFTPProtocol($0.protocol) == false
+        }
+        let removedCount = preview.sessions.count - supportedSessions.count
+        guard removedCount > 0 else { return preview }
+        guard supportedSessions.isEmpty == false else {
+            throw SessionImportRemovedProtocolError.onlyRemovedFTP
+        }
+        var warnings = preview.warnings
+        warnings.append("已跳过 \(removedCount) 个 FTP 会话；FTP 已移除，请改用 SFTP 或 SCP。")
+        return ImportPreview(
+            sessions: supportedSessions,
+            warnings: warnings,
+            conflictCount: UInt32(supportedSessions.filter(\.conflict).count),
+            ignoredSecretFieldCount: preview.ignoredSecretFieldCount
+        )
+    }
+
+    private func payloadExcludingRemovedProtocols(
+        _ payload: ExternalSessionImportPayload
+    ) -> ExternalSessionImportPayload {
+        ExternalSessionImportPayload(
+            sessions: payload.sessions.filter { isRemovedFTPProtocol($0.protocolName) == false },
+            warnings: payload.warnings
+        )
+    }
+
+    private func isRemovedFTPProtocol(_ protocolName: String) -> Bool {
+        protocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "ftp"
     }
 
     private func prepareImportFile(
@@ -521,11 +611,15 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
 
     private func makePreview(
         for file: SessionImportFile,
-        existingSessionNames: [String]
+        existingSessionNames: [String],
+        bastionVendorHint: BastionHostVendor?
     ) throws -> (SessionImportSourceType, ImportPreview, ExternalSessionImportPayload?) {
         switch file.sourceType {
         case .bastionHost:
-            let payload = try bastionHostPayload(for: file)
+            let payload = try bastionHostImportResolver.resolve(
+                file: file,
+                vendorHint: bastionVendorHint
+            )
             return (
                 .bastionHost,
                 externalPreview(payload, existingSessionNames: existingSessionNames),
@@ -561,16 +655,32 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
                 ),
                 nil
             )
-        case .mobaXterm, .windTerm, .secureCRT, .termius, .electerm:
+        case .mobaXterm, .windTerm, .termius, .electerm:
             let payload = try ExternalSessionImportParser.parseText(
                 file.contents,
                 sourceType: file.sourceType,
                 sourceName: file.sourceName
             )
             return (file.sourceType, externalPreview(payload, existingSessionNames: existingSessionNames), payload)
+        case .secureCRT:
+            let payload: ExternalSessionImportPayload
+            if let sourceURL = file.sourceURL,
+               sourceURL.pathExtension.caseInsensitiveCompare("zip") == .orderedSame {
+                payload = try parseClientArchive(at: sourceURL)
+            } else {
+                payload = try ExternalSessionImportParser.parseText(
+                    file.contents,
+                    sourceType: .secureCRT,
+                    sourceName: file.sourceName
+                )
+            }
+            return (.secureCRT, externalPreview(payload, existingSessionNames: existingSessionNames), payload)
         case .xShell:
             let payload: ExternalSessionImportPayload
-            if let sourceURL = file.sourceURL, sourceURL.hasDirectoryPath {
+            if let sourceURL = file.sourceURL,
+               sourceURL.pathExtension.caseInsensitiveCompare("zip") == .orderedSame {
+                payload = try parseClientArchive(at: sourceURL)
+            } else if let sourceURL = file.sourceURL, sourceURL.hasDirectoryPath {
                 payload = try ExternalSessionImportParser.parseDirectory(
                     sourceURL,
                     sourceType: .xShell,
@@ -640,44 +750,12 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         }
     }
 
-    private func bastionHostPayload(for file: SessionImportFile) throws -> ExternalSessionImportPayload {
-        if let sourceURL = file.sourceURL, sourceURL.hasDirectoryPath {
-            return try ExternalSessionImportParser.parseDirectory(
-                sourceURL,
-                sourceType: .xShell,
-                sourceName: file.sourceName
-            )
+    private func parseClientArchive(at sourceURL: URL) throws -> ExternalSessionImportPayload {
+        do {
+            return try TopsecSessionImportParser.parseFile(at: sourceURL)
+        } catch {
+            return try TopsecSessionImportParser.parseGenericClientArchive(at: sourceURL)
         }
-
-        if let payload = try? BastionHostImportAdapter.parseManifest(file.contents) {
-            return payload
-        }
-
-        let preferredTypes: [SessionImportSourceType]
-        switch file.sourceURL?.pathExtension.lowercased() ?? "" {
-        case "xsh", "xts", "ini", "txt":
-            preferredTypes = [.xShell, .secureCRT]
-        case "xml":
-            preferredTypes = [.secureCRT, .xShell]
-        case "json":
-            preferredTypes = [.windTerm, .electerm, .termius]
-        default:
-            preferredTypes = [.xShell, .secureCRT, .windTerm, .electerm, .termius]
-        }
-        for sourceType in preferredTypes {
-            if let payload = try? ExternalSessionImportParser.parseText(
-                file.contents,
-                sourceType: sourceType,
-                sourceName: file.sourceName
-            ) {
-                return BastionHostImportAdapter.addingDetectedVendorMetadata(
-                    to: payload,
-                    sourceName: file.sourceName,
-                    contents: file.contents
-                )
-            }
-        }
-        throw ExternalSessionImportParserError.invalidFormat
     }
 
     private func externalPreview(
@@ -741,7 +819,9 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
             return nil
         }
 
-        let contents = url.hasDirectoryPath ? "" : try Self.readTextFile(url)
+        let contents = url.hasDirectoryPath || Self.isBinaryContainer(url)
+            ? ""
+            : try Self.readTextFile(url)
         return SessionImportFile(
             sourceName: url.lastPathComponent,
             sourceType: sourceType,
@@ -754,7 +834,7 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
         let extensions: [String]
         switch sourceType {
         case .bastionHost:
-            return [UTType.folder] + ["stacio-bastion", "xsh", "xts", "xml", "ini", "txt", "json"].compactMap {
+            return [UTType.folder] + ["xlsx", "zip", "stacio-bastion", "xsh", "xts", "xml", "ini", "txt", "json"].compactMap {
                 UTType(filenameExtension: $0)
             }
         case .stacioJSON, .genericJSON:
@@ -762,13 +842,13 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
         case .termius, .electerm:
             extensions = ["json"]
         case .xShell:
-            return [UTType.folder] + ["xsh", "xts"].compactMap { UTType(filenameExtension: $0) }
+            return [UTType.folder] + ["xsh", "xts", "zip"].compactMap { UTType(filenameExtension: $0) }
         case .mobaXterm:
             extensions = ["mxtsessions"]
         case .windTerm:
             extensions = ["sessions"]
         case .secureCRT:
-            extensions = ["xml"]
+            extensions = ["xml", "ini", "zip"]
         case .finalShell:
             return [.folder]
         case .csv:
@@ -785,39 +865,11 @@ public struct AppKitSessionImportFilePicker: SessionImportFilePicking {
         try decodeTextData(Data(contentsOf: url))
     }
 
+    private static func isBinaryContainer(_ url: URL) -> Bool {
+        ["xlsx", "zip"].contains(url.pathExtension.lowercased())
+    }
+
     static func decodeTextData(_ data: Data) throws -> String {
-        guard data.isEmpty == false else { return "" }
-
-        if data.starts(with: [0xFF, 0xFE, 0x00, 0x00]),
-           let text = String(data: data, encoding: .utf32LittleEndian) {
-            return text
-        }
-        if data.starts(with: [0x00, 0x00, 0xFE, 0xFF]),
-           let text = String(data: data, encoding: .utf32BigEndian) {
-            return text
-        }
-        if data.starts(with: [0xFF, 0xFE]),
-           let text = String(data: data, encoding: .utf16LittleEndian) {
-            return text
-        }
-        if data.starts(with: [0xFE, 0xFF]),
-           let text = String(data: data, encoding: .utf16BigEndian) {
-            return text
-        }
-        if let text = String(data: data, encoding: .utf8) {
-            return text
-        }
-
-        let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
-            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)
-        ))
-        if let text = String(data: data, encoding: gb18030) {
-            return text
-        }
-        if let text = String(data: data, encoding: .windowsCP1252)
-            ?? String(data: data, encoding: .isoLatin1) {
-            return text
-        }
-        throw CocoaError(.fileReadInapplicableStringEncoding)
+        try SessionImportTextDecoder.decode(data)
     }
 }

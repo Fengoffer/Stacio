@@ -115,7 +115,9 @@ mod broadcast_audit_tests {
         assert!(!event.redacted_input.contains("sk-live-123456"));
         assert!(!event.redacted_input.contains("sk-live-abcdef"));
         assert!(event.redacted_input.contains("Bearer [redacted]"));
-        assert!(event.redacted_input.contains("Authorization:Bearer [redacted]"));
+        assert!(event
+            .redacted_input
+            .contains("Authorization:Bearer [redacted]"));
     }
 
     #[test]

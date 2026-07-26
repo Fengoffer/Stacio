@@ -61,4 +61,55 @@ final class BrowserURLNormalizerTests: XCTestCase {
         XCTAssertNil(BrowserURLNormalizer.normalizedURL("https://example.com\t.evil/status"))
         XCTAssertNil(BrowserURLNormalizer.normalizedURL("example.com\t.evil/status"))
     }
+
+    func testLoopbackTransportURLForcesProxyWithoutChangingDisplayedAddress() throws {
+        let displayURL = try XCTUnwrap(URL(string: "http://127.0.0.1:8080/status?full=1"))
+
+        let transportURL = BrowserURLNormalizer.transportURL(for: displayURL)
+
+        XCTAssertEqual(
+            transportURL.absoluteString,
+            "http://stacio-ipv4-127-0-0-1-x.invalid:8080/status?full=1"
+        )
+        XCTAssertEqual(BrowserURLNormalizer.displayURL(for: transportURL), displayURL)
+    }
+
+    func testLocalhostTransportURLUsesRemoteResolvableRootLabel() throws {
+        let displayURL = try XCTUnwrap(URL(string: "http://localhost/admin"))
+
+        XCTAssertEqual(
+            BrowserURLNormalizer.transportURL(for: displayURL).absoluteString,
+            "http://stacio-host-localhost-x.invalid/admin"
+        )
+    }
+
+    func testNonLoopbackTransportURLIsUnchanged() throws {
+        let publicURL = try XCTUnwrap(URL(string: "https://example.com/"))
+
+        XCTAssertEqual(BrowserURLNormalizer.transportURL(for: publicURL), publicURL)
+    }
+
+    func testPrivateIPv4TransportURLForcesRemoteProxyResolution() throws {
+        let displayURL = try XCTUnwrap(URL(string: "http://192.168.1.20:8080/status"))
+
+        let transportURL = BrowserURLNormalizer.transportURL(for: displayURL)
+
+        XCTAssertEqual(
+            transportURL.absoluteString,
+            "http://stacio-ipv4-192-168-1-20-x.invalid:8080/status"
+        )
+        XCTAssertEqual(BrowserURLNormalizer.displayURL(for: transportURL), displayURL)
+    }
+
+    func testIPv6TransportURLUsesReversibleProxyHostname() throws {
+        let displayURL = try XCTUnwrap(URL(string: "http://[::1]:8080/status"))
+
+        let transportURL = BrowserURLNormalizer.transportURL(for: displayURL)
+
+        XCTAssertEqual(
+            transportURL.absoluteString,
+            "http://stacio-ipv6---1-x.invalid:8080/status"
+        )
+        XCTAssertEqual(BrowserURLNormalizer.displayURL(for: transportURL), displayURL)
+    }
 }
