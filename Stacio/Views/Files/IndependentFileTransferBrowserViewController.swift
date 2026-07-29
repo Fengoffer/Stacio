@@ -16,6 +16,29 @@ struct FileTransferRemotePaneConfiguration {
     let remoteProtocolName: String
     let initialRemotePath: String
     let remoteFilePathTerminalSender: (String) -> Void
+    let onRuntimeClosed: (() -> Void)?
+
+    init(
+        sourceRuntimeID: String,
+        context: TunnelLiveSessionContext,
+        title: String,
+        bridge: RemoteFilesBridging,
+        transferScheduler: SCPTransferScheduling?,
+        remoteProtocolName: String,
+        initialRemotePath: String,
+        remoteFilePathTerminalSender: @escaping (String) -> Void,
+        onRuntimeClosed: (() -> Void)? = nil
+    ) {
+        self.sourceRuntimeID = sourceRuntimeID
+        self.context = context
+        self.title = title
+        self.bridge = bridge
+        self.transferScheduler = transferScheduler
+        self.remoteProtocolName = remoteProtocolName
+        self.initialRemotePath = initialRemotePath
+        self.remoteFilePathTerminalSender = remoteFilePathTerminalSender
+        self.onRuntimeClosed = onRuntimeClosed
+    }
 }
 
 struct FileTransferRemoteDeviceOption: Equatable {
@@ -687,7 +710,6 @@ private enum FileWorkspaceAtomicTransferError: Error {
 public final class IndependentFileTransferBrowserViewController: NSViewController, NSSplitViewDelegate {
     private enum Layout {
         static let minimumPaneWidth: CGFloat = 360
-        static let defaultLocalWidthFraction: CGFloat = 0.5
         static let toolbarHeight: CGFloat = 36
         static let gridSpacing: CGFloat = 1
         static let storedModeKey = "Stacio.FileTransferBrowser.layoutMode"
@@ -702,6 +724,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     private let bridge: RemoteFilesBridging
     private let sshContext: TunnelLiveSessionContext?
     private let transferScheduler: SCPTransferScheduling?
+    private let remoteProtocolName: String
     private let initialRemotePath: String
     private let initialLoadPresentation: RemoteFilesInitialLoadPresentation
     private let connectionStateView: SessionConnectionStateView
@@ -714,26 +737,32 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         self?.remoteFilesViewController.setStatus(message)
     }
     private let remoteContainer = NSView()
-    private let splitView = NSSplitView()
+    private let splitView = FileTransferWorkspaceSplitView()
     private let gridContainer = NSView()
     private let layoutControl = NSSegmentedControl()
+    private let transferQueueButton = NSButton()
     private let addLocalDirectoryButton = NSButton()
     private let addRemoteDeviceButton = NSButton()
+    private var transferQueuePopover: NSPopover?
+    private var transferQueuePopoverViewController: TransferQueuePopoverViewController?
+    private var removeTransferQueueObservation: (() -> Void)?
+    private var previousActiveTransferCount = 0
+    private var pendingTransferQueueAutoPresentation = false
     private var layoutMode: FileTransferWorkspaceLayoutMode
     private var additionalLocalPanes: [LocalFilePaneViewController] = []
     private var additionalRemotePanes: [IndependentFileTransferRemotePaneViewController] = []
     private var attachedRemoteSourceRuntimeIDs: Set<String>
     private var primaryRemoteSourceRuntimeIDs: Set<String>
+    private var primaryRemoteSessionID: String?
     private var pendingRemoteDeviceSessionIDs: [Int: String] = [:]
     private var propertiesWindowControllers: [FileWorkspacePropertiesWindowController] = []
     var remoteDeviceOptionsProvider: (() -> [FileTransferRemoteDeviceOption])?
     var onRequestConnectRemoteDevice: ((String) -> Void)?
-    var onRequestCreateRemoteDevice: (() -> Void)?
+    var onRequestCreateRemoteDevice: ((String) -> Void)?
     private var loadGeneration = 0
     private var initialLoadErrorStorage: Error?
-    private var needsInitialSplitPosition = true
     private var paneWidthConstraints: [NSLayoutConstraint] = []
-    private var localPaneCurrentWidthConstraint: NSLayoutConstraint?
+    private var equalPaneWidthConstraints: [NSLayoutConstraint] = []
     private var gridColumnCount = 0
     private var gridRowCount = 0
     private var didCloseRuntime = false
@@ -763,6 +792,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         self.sshContext = context
         self.bridge = bridge
         self.transferScheduler = transferScheduler
+        self.remoteProtocolName = remoteProtocolName
         self.initialRemotePath = Self.normalizedPath(initialRemotePath)
         self.initialLoadPresentation = initialLoadPresentation
         self.layoutDefaults = layoutDefaults
@@ -772,7 +802,10 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         self.documentCoordinator = FileTransferDocumentCoordinator()
         self.workspaceClipboard = workspaceClipboard ?? .shared
         self.crossDeviceTransferCoordinator = crossDeviceTransferCoordinator
-            ?? CrossDeviceTransferCoordinator()
+            ?? CrossDeviceTransferCoordinator(
+                remoteTransferBridge: CoreBridgeRemoteToRemoteTransferBridge(),
+                completionNotificationPresenter: Self.defaultCompletionNotificationPresenter()
+            )
         self.conflictResolver = conflictResolver
         self.localFilesViewController = localFilesViewController
         self.remoteFilesViewController = IndependentRemoteFilesViewController(
@@ -810,9 +843,11 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
 
         configureAddLocalDirectoryButton()
         configureAddRemoteDeviceButton()
+        configureTransferQueueButton()
         configureLayoutControl()
         layoutBar.addSubview(addLocalDirectoryButton)
         layoutBar.addSubview(addRemoteDeviceButton)
+        layoutBar.addSubview(transferQueueButton)
         layoutBar.addSubview(layoutControl)
 
         splitView.isVertical = true
@@ -821,6 +856,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         splitView.setAccessibilityIdentifier("Stacio.FileTransferBrowser.split")
         splitView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         splitView.delegate = self
+        splitView.onUserDividerDragBegan = { [weak self] in
+            self?.allowManualColumnWidths()
+        }
 
         gridContainer.translatesAutoresizingMaskIntoConstraints = false
         gridContainer.setAccessibilityIdentifier("Stacio.FileTransferBrowser.grid")
@@ -878,6 +916,10 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             layoutControl.centerYAnchor.constraint(equalTo: layoutBar.centerYAnchor),
             layoutControl.widthAnchor.constraint(equalToConstant: 72),
             layoutControl.heightAnchor.constraint(equalToConstant: 28),
+            transferQueueButton.trailingAnchor.constraint(equalTo: layoutControl.leadingAnchor, constant: -8),
+            transferQueueButton.centerYAnchor.constraint(equalTo: layoutBar.centerYAnchor),
+            transferQueueButton.widthAnchor.constraint(equalToConstant: 28),
+            transferQueueButton.heightAnchor.constraint(equalToConstant: 28),
             addRemoteDeviceButton.leadingAnchor.constraint(equalTo: layoutBar.leadingAnchor, constant: 10),
             addRemoteDeviceButton.centerYAnchor.constraint(equalTo: layoutBar.centerYAnchor),
             addRemoteDeviceButton.widthAnchor.constraint(equalToConstant: 132),
@@ -886,7 +928,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             addLocalDirectoryButton.centerYAnchor.constraint(equalTo: layoutBar.centerYAnchor),
             addLocalDirectoryButton.widthAnchor.constraint(equalToConstant: 132),
             addLocalDirectoryButton.heightAnchor.constraint(equalToConstant: 28),
-            addLocalDirectoryButton.trailingAnchor.constraint(lessThanOrEqualTo: layoutControl.leadingAnchor, constant: -12),
+            addLocalDirectoryButton.trailingAnchor.constraint(lessThanOrEqualTo: transferQueueButton.leadingAnchor, constant: -12),
             splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             splitView.topAnchor.constraint(equalTo: layoutBar.bottomAnchor),
@@ -897,8 +939,8 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             gridContainer.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ])
         view = root
+        configureTransferQueuePopoverIfAvailable()
         rebuildWorkspaceLayout()
-        applyInitialSplitPosition()
         connectionStateView.setRetryAction(
             title: L10n.Files.retry,
             action: initialLoadPresentation == .connectionState ? { [weak self] in
@@ -911,7 +953,11 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     public override func viewDidLayout() {
         super.viewDidLayout()
         layoutGridPanes()
-        applyInitialSplitPosition()
+    }
+
+    public override func viewDidAppear() {
+        super.viewDidAppear()
+        presentTransferQueueIfPending()
     }
 
     public func splitView(
@@ -929,7 +975,6 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             - Layout.minimumPaneWidth
         guard maximum >= Layout.minimumPaneWidth else { return proposedPosition }
         let localWidth = min(max(proposedPosition, Layout.minimumPaneWidth), maximum)
-        localPaneCurrentWidthConstraint?.constant = localWidth
         return localWidth
     }
 
@@ -970,8 +1015,20 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         layoutControl
     }
 
+    public var transferQueueButtonForTesting: NSButton {
+        transferQueueButton
+    }
+
+    public var hasTransferQueuePopoverForTesting: Bool {
+        transferQueuePopover != nil
+    }
+
     public var workspacePaneCountForTesting: Int {
         workspacePaneViews.count
+    }
+
+    public var workspaceSessionGroupDefinitionForTesting: WorkspaceSessionGroupDefinition? {
+        workspaceSessionGroupDefinition
     }
 
     public var remoteFilesViewControllersForTesting: [IndependentRemoteFilesViewController] {
@@ -1017,6 +1074,17 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         _ = addLocalDirectoryPane(directoryURL)
     }
 
+    func restoreWorkspace(
+        additionalLocalDirectoryPaths: [String],
+        layout: FileTransferWorkspaceLayoutMode
+    ) {
+        for path in additionalLocalDirectoryPaths {
+            let expandedPath = (path as NSString).expandingTildeInPath
+            _ = addLocalDirectoryPane(URL(fileURLWithPath: expandedPath, isDirectory: true))
+        }
+        setLayoutMode(layout, persistPreference: false)
+    }
+
     public var addRemoteDeviceMenuTitlesForTesting: [String] {
         makeRemoteDeviceMenu().items.filter { $0.isSeparatorItem == false }.map(\.title)
     }
@@ -1026,11 +1094,12 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     }
 
     public func requestRemoteDeviceCreationForTesting() {
-        onRequestCreateRemoteDevice?()
+        onRequestCreateRemoteDevice?(normalizedRemoteProtocolName.uppercased())
     }
 
     func markPrimaryRemoteDevice(sessionID: String) {
         let sourceRuntimeID = Self.savedSessionSourceID(sessionID)
+        primaryRemoteSessionID = sessionID
         primaryRemoteSourceRuntimeIDs.insert(sourceRuntimeID)
         attachedRemoteSourceRuntimeIDs.insert(sourceRuntimeID)
     }
@@ -1046,6 +1115,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         initialRemotePath: String = "~",
         initialLoadPresentation: RemoteFilesInitialLoadPresentation = .connectionState,
         sourceRuntimeID: String? = nil,
+        onRuntimeClosed: (() -> Void)? = nil,
         remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in }
     ) -> IndependentFileTransferRemotePaneViewController {
         let pane = IndependentFileTransferRemotePaneViewController(
@@ -1058,6 +1128,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             initialRemotePath: initialRemotePath,
             initialLoadPresentation: initialLoadPresentation,
             sourceRuntimeID: sourceRuntimeID,
+            onRuntimeClosed: onRuntimeClosed,
             localDirectoryProvider: { [weak self] in
                 self?.localFilesViewController.directoryURL
             },
@@ -1121,6 +1192,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     public func closeRuntime() {
         guard didCloseRuntime == false else { return }
         didCloseRuntime = true
+        removeTransferQueueObservation?()
+        removeTransferQueueObservation = nil
+        transferQueuePopover?.close()
         loadGeneration &+= 1
         remoteStageCleanupRegistry.beginClosing()
         documentCoordinator.closeDocumentWindows()
@@ -1142,10 +1216,57 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             + additionalRemotePanes.map(\.view)
     }
 
+    var workspaceSessionGroupDefinition: WorkspaceSessionGroupDefinition? {
+        let kind: WorkspaceSessionGroupKind
+        switch remoteProtocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "scp":
+            kind = .scp
+        case "sftp":
+            kind = .sftp
+        default:
+            return nil
+        }
+        let localPanes = [localFilesViewController] + additionalLocalPanes
+        let localDefinitions = localPanes.map {
+            WorkspaceSessionGroupPane.localDirectory(path: $0.directoryURL.standardizedFileURL.path)
+        }
+        let primaryRemote = WorkspaceSessionGroupPane.remoteSession(
+            sessionID: primaryRemoteSessionID ?? "",
+            path: currentRemotePath
+        )
+        let additionalRemoteDefinitions = additionalRemotePanes.map { pane in
+            WorkspaceSessionGroupPane.remoteSession(
+                sessionID: Self.savedSessionID(from: pane.sourceRuntimeID) ?? "",
+                path: pane.currentRemotePath
+            )
+        }
+        return WorkspaceSessionGroupDefinition(
+            kind: kind,
+            layout: layoutMode == .grid ? .grid : .columns,
+            panes: localDefinitions + [primaryRemote] + additionalRemoteDefinitions
+        )
+    }
+
     private var availableRemoteDeviceOptions: [FileTransferRemoteDeviceOption] {
         (remoteDeviceOptionsProvider?() ?? []).filter { option in
-            attachedRemoteSourceRuntimeIDs.contains(Self.savedSessionSourceID(option.sessionID)) == false
+            option.protocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == normalizedRemoteProtocolName
+                && attachedRemoteSourceRuntimeIDs.contains(Self.savedSessionSourceID(option.sessionID)) == false
         }
+    }
+
+    private var normalizedRemoteProtocolName: String {
+        remoteProtocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func defaultCompletionNotificationPresenter()
+        -> TransferCompletionNotificationPresenting
+    {
+        let processName = ProcessInfo.processInfo.processName.lowercased()
+        if processName == "xctest" || processName.hasSuffix("xctest") {
+            return NoopTransferCompletionNotificationPresenter()
+        }
+        return TransferCompletionNotificationPresenter.shared
     }
 
     private func configureAddRemoteDeviceButton() {
@@ -1156,6 +1277,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         ) ?? NSImage()
         addRemoteDeviceButton.title = "连接远端设备"
         addRemoteDeviceButton.imagePosition = .imageLeading
+        addRemoteDeviceButton.imageHugsTitle = true
         addRemoteDeviceButton.target = self
         addRemoteDeviceButton.action = #selector(addRemoteDeviceButtonPressed(_:))
         addRemoteDeviceButton.bezelStyle = .texturedRounded
@@ -1176,6 +1298,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         ) ?? NSImage()
         addLocalDirectoryButton.title = "添加本地目录"
         addLocalDirectoryButton.imagePosition = .imageLeading
+        addLocalDirectoryButton.imageHugsTitle = true
         addLocalDirectoryButton.target = self
         addLocalDirectoryButton.action = #selector(addLocalDirectoryButtonPressed(_:))
         addLocalDirectoryButton.bezelStyle = .texturedRounded
@@ -1186,6 +1309,144 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         addLocalDirectoryButton.setAccessibilityIdentifier("Stacio.FileTransferBrowser.addLocalDirectory")
         addLocalDirectoryButton.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.styleToolbarButton(addLocalDirectoryButton)
+    }
+
+    private func configureTransferQueueButton() {
+        let tooltip = "传输队列"
+        transferQueueButton.title = ""
+        transferQueueButton.image = NSImage(
+            systemSymbolName: "arrow.up.arrow.down.circle",
+            accessibilityDescription: tooltip
+        ) ?? NSImage(
+            systemSymbolName: "tray.full",
+            accessibilityDescription: tooltip
+        )
+        transferQueueButton.imagePosition = .imageOnly
+        transferQueueButton.target = self
+        transferQueueButton.action = #selector(transferQueueButtonPressed(_:))
+        transferQueueButton.bezelStyle = .texturedRounded
+        transferQueueButton.controlSize = .small
+        transferQueueButton.toolTip = tooltip
+        transferQueueButton.setAccessibilityLabel(tooltip)
+        transferQueueButton.setAccessibilityIdentifier("Stacio.FileTransferBrowser.transferQueue")
+        transferQueueButton.translatesAutoresizingMaskIntoConstraints = false
+        transferQueueButton.isEnabled = false
+        StacioDesignSystem.styleToolbarButton(transferQueueButton)
+    }
+
+    private func configureTransferQueuePopoverIfAvailable() {
+        guard transferQueuePopover == nil,
+              let coordinator = (transferScheduler as? TransferQueueCoordinatorProviding)?
+                .transferQueueCoordinator
+        else { return }
+
+        let contentViewController = TransferQueuePopoverViewController()
+        contentViewController.onTransferAction = { [weak coordinator] action, jobID in
+            switch action {
+            case .retry:
+                _ = coordinator?.retryFailedTransfer(jobID: jobID)
+            case .pause:
+                _ = coordinator?.pauseTransfer(jobID: jobID)
+            case .resume:
+                _ = coordinator?.resumeTransfer(jobID: jobID)
+            case .restart:
+                _ = coordinator?.restartTransfer(jobID: jobID)
+            case .stop:
+                _ = coordinator?.stopTransfer(jobID: jobID)
+            }
+        }
+        contentViewController.onCancelTransfer = { [weak coordinator] jobID in
+            _ = coordinator?.cancelTransfer(jobID: jobID)
+        }
+        contentViewController.onClearFinished = { [weak coordinator] in
+            _ = coordinator?.clearFinishedTransfers()
+        }
+        contentViewController.onCollapseRequested = { [weak self] in
+            self?.transferQueuePopover?.close()
+        }
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 520, height: 460)
+        popover.contentViewController = contentViewController
+        transferQueuePopover = popover
+        transferQueuePopoverViewController = contentViewController
+        transferQueueButton.isEnabled = true
+
+        let observation = coordinator.observeQueue(runtimeIDs: { [weak self] in
+            guard let self else { return [] }
+            return Set(
+                [self.runtimeID]
+                    + self.additionalRemotePanes.map(\.runtimeID)
+                    + self.allLocalPanes.map(\.runtimeID)
+            )
+        }) { [weak self, weak contentViewController] snapshot in
+            contentViewController?.apply(snapshot: snapshot)
+            self?.updateTransferQueueButton(snapshot: snapshot)
+        }
+        removeTransferQueueObservation = { [weak coordinator] in
+            coordinator?.removeQueueObservation(observation)
+        }
+    }
+
+    private func updateTransferQueueButton(snapshot: TransferQueueSnapshot) {
+        let activeCount = snapshot.rows.filter { row in
+            !["completed", "failed", "canceled", "cancelled", "stopped"].contains(
+                row.rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
+        }.count
+        if previousActiveTransferCount == 0, activeCount > 0 {
+            pendingTransferQueueAutoPresentation = true
+        } else if activeCount == 0 {
+            pendingTransferQueueAutoPresentation = false
+        }
+        previousActiveTransferCount = activeCount
+        let symbolName = activeCount > 0
+            ? "arrow.up.arrow.down.circle.fill"
+            : "arrow.up.arrow.down.circle"
+        transferQueueButton.image = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: "传输队列"
+        )
+        transferQueueButton.contentTintColor = activeCount > 0 ? .controlAccentColor : nil
+        transferQueueButton.toolTip = activeCount > 0
+            ? "传输队列（正在传输 \(activeCount) 项）"
+            : "传输队列"
+        transferQueueButton.setAccessibilityLabel(transferQueueButton.toolTip ?? "传输队列")
+        if pendingTransferQueueAutoPresentation {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentTransferQueueIfPending()
+            }
+        }
+    }
+
+    private func presentTransferQueueIfPending() {
+        guard pendingTransferQueueAutoPresentation,
+              didCloseRuntime == false,
+              transferQueueButton.window != nil,
+              let transferQueuePopover
+        else { return }
+        pendingTransferQueueAutoPresentation = false
+        guard transferQueuePopover.isShown == false else { return }
+        transferQueuePopover.show(
+            relativeTo: transferQueueButton.bounds,
+            of: transferQueueButton,
+            preferredEdge: .maxY
+        )
+    }
+
+    @objc private func transferQueueButtonPressed(_ sender: NSButton) {
+        guard let transferQueuePopover else { return }
+        if transferQueuePopover.isShown {
+            transferQueuePopover.close()
+        } else {
+            transferQueuePopover.show(
+                relativeTo: sender.bounds,
+                of: sender,
+                preferredEdge: .maxY
+            )
+        }
     }
 
     @objc private func addLocalDirectoryButtonPressed(_ sender: NSButton) {
@@ -1215,7 +1476,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         pendingRemoteDeviceSessionIDs = [:]
         if options.isEmpty {
             let emptyItem = NSMenuItem(
-                title: "没有可连接的已保存 SCP/SFTP 设备",
+                title: "没有可连接的已保存 \(normalizedRemoteProtocolName.uppercased()) 设备",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -1240,7 +1501,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
 
         menu.addItem(.separator())
         let createItem = NSMenuItem(
-            title: "新建 SCP/SFTP 会话...",
+            title: "新建 \(normalizedRemoteProtocolName.uppercased()) 连接...",
             action: #selector(createRemoteDeviceMenuItemPressed(_:)),
             keyEquivalent: ""
         )
@@ -1259,7 +1520,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
 
     @objc private func createRemoteDeviceMenuItemPressed(_ sender: NSMenuItem) {
         pendingRemoteDeviceSessionIDs = [:]
-        onRequestCreateRemoteDevice?()
+        onRequestCreateRemoteDevice?(normalizedRemoteProtocolName.uppercased())
     }
 
     @discardableResult
@@ -1327,6 +1588,18 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     }
 
     @discardableResult
+    func removeAttachedRemoteDevices(savedSessionIDs: Set<String>) -> Int {
+        let matchingPanes = additionalRemotePanes.filter { pane in
+            guard let sessionID = Self.savedSessionID(from: pane.sourceRuntimeID) else {
+                return false
+            }
+            return savedSessionIDs.contains(sessionID)
+        }
+        matchingPanes.forEach(removeAdditionalRemotePane)
+        return matchingPanes.count
+    }
+
+    @discardableResult
     func attachRemoteDevice(
         _ configuration: FileTransferRemotePaneConfiguration
     ) -> IndependentFileTransferRemotePaneViewController {
@@ -1341,6 +1614,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             initialRemotePath: configuration.initialRemotePath,
             initialLoadPresentation: .connectionState,
             sourceRuntimeID: configuration.sourceRuntimeID,
+            onRuntimeClosed: configuration.onRuntimeClosed,
             remoteFilePathTerminalSender: configuration.remoteFilePathTerminalSender
         )
     }
@@ -1382,11 +1656,16 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         setLayoutMode(sender.selectedSegment == 1 ? .grid : .columns)
     }
 
-    private func setLayoutMode(_ mode: FileTransferWorkspaceLayoutMode) {
+    private func setLayoutMode(
+        _ mode: FileTransferWorkspaceLayoutMode,
+        persistPreference: Bool = true
+    ) {
         layoutControl.selectedSegment = mode == .columns ? 0 : 1
         guard layoutMode != mode else { return }
         layoutMode = mode
-        layoutDefaults.set(mode.rawValue, forKey: Layout.storedModeKey)
+        if persistPreference {
+            layoutDefaults.set(mode.rawValue, forKey: Layout.storedModeKey)
+        }
         guard isViewLoaded else { return }
         rebuildWorkspaceLayout()
     }
@@ -1394,8 +1673,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     private func rebuildWorkspaceLayout() {
         guard isViewLoaded else { return }
         NSLayoutConstraint.deactivate(paneWidthConstraints)
+        NSLayoutConstraint.deactivate(equalPaneWidthConstraints)
         paneWidthConstraints = []
-        localPaneCurrentWidthConstraint = nil
+        equalPaneWidthConstraints = []
 
         for pane in splitView.arrangedSubviews {
             splitView.removeArrangedSubview(pane)
@@ -1411,10 +1691,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
                 pane.translatesAutoresizingMaskIntoConstraints = false
                 pane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 splitView.addArrangedSubview(pane)
-                splitView.setHoldingPriority(index == 0 ? .defaultHigh : .defaultLow, forSubviewAt: index)
+                splitView.setHoldingPriority(.defaultLow, forSubviewAt: index)
             }
             installPaneWidthConstraints()
-            needsInitialSplitPosition = true
             gridColumnCount = 0
             gridRowCount = 0
 
@@ -1426,7 +1705,6 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
                 pane.autoresizingMask = []
                 gridContainer.addSubview(pane)
             }
-            needsInitialSplitPosition = false
             layoutGridPanes()
         }
         view.needsLayout = true
@@ -1529,6 +1807,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         return CrossDeviceRemoteEndpoint(
             runtimeID: runtimeID,
             title: title ?? sshContext.config.host,
+            protocolName: remoteProtocolName,
             context: sshContext,
             bridge: bridge,
             transferScheduler: transferScheduler
@@ -1573,6 +1852,8 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
     private func configureLocalWorkspaceActions(_ pane: LocalFilePaneViewController) {
         pane.workspaceClipboard = workspaceClipboard
         pane.conflictResolver = conflictResolver
+        pane.localFileTransferScheduler = (transferScheduler as? TransferQueueCoordinatorProviding)?
+            .transferQueueCoordinator
         pane.transferTargetsProvider = { [weak self, weak pane] in
             guard let self, let pane else { return [] }
             return self.workspaceTransferTargets(excluding: pane.runtimeID)
@@ -2517,63 +2798,30 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         }
     }
 
-    private func applyInitialSplitPosition() {
-        guard needsInitialSplitPosition,
-              layoutMode == .columns,
-              splitView.arrangedSubviews.count >= 2,
-              splitView.bounds.width > 0
-        else { return }
-        let paneCount = splitView.arrangedSubviews.count
-        let dividerTotal = splitView.dividerThickness * CGFloat(paneCount - 1)
-        let available = splitView.bounds.width - dividerTotal
-        guard available > 0 else { return }
-        if paneCount > 2 {
-            let paneWidth = available / CGFloat(paneCount)
-            needsInitialSplitPosition = false
-            for dividerIndex in 0..<(paneCount - 1) {
-                let position = paneWidth * CGFloat(dividerIndex + 1)
-                    + splitView.dividerThickness * CGFloat(dividerIndex)
-                splitView.setPosition(position, ofDividerAt: dividerIndex)
-            }
-            return
-        }
-        guard available >= Layout.minimumPaneWidth * 2 else { return }
-        let maximumLocalWidth = available - Layout.minimumPaneWidth
-        let localWidth = min(
-            max(available * Layout.defaultLocalWidthFraction, Layout.minimumPaneWidth),
-            maximumLocalWidth
-        )
-        needsInitialSplitPosition = false
-        localPaneCurrentWidthConstraint?.constant = localWidth
-        splitView.setPosition(localWidth, ofDividerAt: 0)
-    }
-
     private func installPaneWidthConstraints() {
         NSLayoutConstraint.deactivate(paneWidthConstraints)
-        guard splitView.arrangedSubviews.count == 2 else {
-            paneWidthConstraints = workspacePaneViews.map { pane in
-                let constraint = pane.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
-                constraint.priority = .defaultHigh
-                return constraint
-            }
-            NSLayoutConstraint.activate(paneWidthConstraints)
-            return
+        NSLayoutConstraint.deactivate(equalPaneWidthConstraints)
+        let panes = splitView.arrangedSubviews
+        guard let firstPane = panes.first else { return }
+        let minimumWidth = panes.count == 2 ? Layout.minimumPaneWidth : 260
+        paneWidthConstraints = panes.map { pane in
+            let constraint = pane.widthAnchor.constraint(greaterThanOrEqualToConstant: minimumWidth)
+            constraint.priority = .defaultHigh
+            return constraint
         }
-        let localMinimum = localFilesViewController.view.widthAnchor.constraint(
-            greaterThanOrEqualToConstant: Layout.minimumPaneWidth
-        )
-        let remoteMinimum = remoteContainer.widthAnchor.constraint(
-            greaterThanOrEqualToConstant: Layout.minimumPaneWidth
-        )
-        let localCurrent = localFilesViewController.view.widthAnchor.constraint(
-            equalToConstant: Layout.minimumPaneWidth
-        )
-        localMinimum.priority = .defaultHigh
-        remoteMinimum.priority = .defaultHigh
-        localCurrent.priority = NSLayoutConstraint.Priority(751)
-        localPaneCurrentWidthConstraint = localCurrent
-        paneWidthConstraints = [localMinimum, remoteMinimum, localCurrent]
+        equalPaneWidthConstraints = panes.dropFirst().map { pane in
+            let constraint = pane.widthAnchor.constraint(equalTo: firstPane.widthAnchor)
+            constraint.priority = NSLayoutConstraint.Priority(751)
+            return constraint
+        }
         NSLayoutConstraint.activate(paneWidthConstraints)
+        NSLayoutConstraint.activate(equalPaneWidthConstraints)
+    }
+
+    private func allowManualColumnWidths() {
+        guard layoutMode == .columns, equalPaneWidthConstraints.isEmpty == false else { return }
+        NSLayoutConstraint.deactivate(equalPaneWidthConstraints)
+        equalPaneWidthConstraints = []
     }
 
     private static func normalizedPath(_ path: String) -> String {
@@ -2583,6 +2831,15 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
 
     private static func savedSessionSourceID(_ sessionID: String) -> String {
         "saved:\(sessionID)"
+    }
+
+    private static func savedSessionID(from sourceRuntimeID: String?) -> String? {
+        guard let sourceRuntimeID,
+              sourceRuntimeID.hasPrefix("saved:")
+        else { return nil }
+        let sessionID = String(sourceRuntimeID.dropFirst("saved:".count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sessionID.isEmpty ? nil : sessionID
     }
 
     private static func restoredLayoutMode(from defaults: UserDefaults) -> FileTransferWorkspaceLayoutMode {
@@ -2633,12 +2890,14 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
     private let context: TunnelLiveSessionContext
     private let bridge: RemoteFilesBridging
     private let transferScheduler: SCPTransferScheduling?
+    private let remoteProtocolName: String
     private let initialRemotePath: String
     private let initialLoadPresentation: RemoteFilesInitialLoadPresentation
     private let connectionStateView: SessionConnectionStateView
     private let localDirectoryProvider: () -> URL?
     private let localDirectoryRefresh: () -> Void
     private let conflictResolver: RemoteFileConflictResolving
+    private let onRuntimeClosed: (() -> Void)?
     private lazy var remoteStageCleanupRegistry = FileWorkspaceRemoteStageCleanupRegistry { [weak self] message in
         self?.remoteFilesViewController.setStatus(message)
     }
@@ -2656,6 +2915,7 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
         initialRemotePath: String,
         initialLoadPresentation: RemoteFilesInitialLoadPresentation,
         sourceRuntimeID: String? = nil,
+        onRuntimeClosed: (() -> Void)? = nil,
         localDirectoryProvider: @escaping () -> URL?,
         localDirectoryRefresh: @escaping () -> Void,
         conflictResolver: RemoteFileConflictResolving,
@@ -2666,11 +2926,13 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
         self.context = context
         self.bridge = bridge
         self.transferScheduler = transferScheduler
+        self.remoteProtocolName = remoteProtocolName
         self.initialRemotePath = Self.normalizedPath(initialRemotePath)
         self.initialLoadPresentation = initialLoadPresentation
         self.localDirectoryProvider = localDirectoryProvider
         self.localDirectoryRefresh = localDirectoryRefresh
         self.conflictResolver = conflictResolver
+        self.onRuntimeClosed = onRuntimeClosed
         self.remoteFilesViewController = IndependentRemoteFilesViewController(
             title: title,
             protocolName: remoteProtocolName,
@@ -2740,6 +3002,7 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
         loadGeneration &+= 1
         remoteStageCleanupRegistry.beginClosing()
         _ = transferScheduler?.disconnectTransfers(runtimeID: runtimeID)
+        onRuntimeClosed?()
     }
 
     var crossDeviceEndpoint: CrossDeviceRemoteEndpoint? {
@@ -2747,6 +3010,7 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
         return CrossDeviceRemoteEndpoint(
             runtimeID: runtimeID,
             title: title ?? context.config.host,
+            protocolName: remoteProtocolName,
             context: context,
             bridge: bridge,
             transferScheduler: transferScheduler
@@ -4019,6 +4283,15 @@ public final class IndependentRemoteFilesViewController: NSViewController, NSTab
     private static func normalizedPath(_ path: String) -> String {
         let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "~" : value
+    }
+}
+
+private final class FileTransferWorkspaceSplitView: NSSplitView {
+    var onUserDividerDragBegan: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onUserDividerDragBegan?()
+        super.mouseDown(with: event)
     }
 }
 

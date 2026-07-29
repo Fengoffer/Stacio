@@ -5,6 +5,125 @@ import StacioCoreBindings
 import ZIPFoundation
 
 final class SessionImportCoordinatorTests: XCTestCase {
+    func testCoordinatorRecordsBoundedRedactedTraceForBastionImport() throws {
+        let traceStore = FeedbackDiagnosticTraceStore(
+            maxEvents: 16,
+            ttl: 86_400,
+            clock: Date.init,
+            routeHashKey: Data(repeating: 0x42, count: 32)
+        )
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let payload = ExternalSessionImportPayload(
+            sessions: [externalBastionSession(
+                name: "Database",
+                targetHost: "10.20.30.40",
+                targetUsername: "dbadmin",
+                credential: .password("never-record-this")
+            )],
+            warnings: []
+        )
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "topsec-export.xsh",
+                    sourceType: .bastionHost,
+                    contents: "topsec raw export"
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: RecordingSessionImportCore(
+                applyResult: makeApplyResult(importedNames: ["Database"], importedCount: 1, skippedCount: 0)
+            ),
+            credentialApplier: RecordingExternalSessionCredentialApplier(),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: RecordingBastionHostSessionImportResolver(
+                fallbackPayload: nil,
+                automaticallyResolvedPayload: payload
+            ),
+            diagnosticTraceRecorder: traceStore,
+            diagnosticLogRecorder: diagnosticLog
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        let trace = traceStore.snapshot()
+        XCTAssertEqual(trace.events.map(\.stage), [.selection, .recognition, .preview, .apply, .credentials])
+        XCTAssertEqual(trace.events.map(\.result), [.selected, .ready, .ready, .succeeded, .succeeded])
+        let routeHashes = trace.events.flatMap(\.routeHashes)
+        XCTAssertFalse(routeHashes.isEmpty)
+        XCTAssertTrue(routeHashes.allSatisfy {
+            $0.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil
+        })
+        let json = try XCTUnwrap(trace.encodedJSONString())
+        XCTAssertFalse(json.contains("bastion.example.com"))
+        XCTAssertFalse(json.contains("10.20.30.40"))
+        XCTAssertFalse(json.contains("dbadmin"))
+        XCTAssertFalse(json.contains("opaque@default"))
+        XCTAssertFalse(json.contains("never-record-this"))
+        XCTAssertFalse(json.contains("topsec raw export"))
+        XCTAssertFalse(json.contains("topsec-export.xsh"))
+        let diagnosticEvents = diagnosticLog.snapshot().events
+        XCTAssertEqual(diagnosticEvents.map(\.eventCode), Array(repeating: .sessionImportStage, count: 5))
+        XCTAssertEqual(
+            diagnosticEvents.map(\.stage),
+            [.selection, .recognition, .preview, .apply, .credentials]
+        )
+        let diagnosticJSON = try XCTUnwrap(diagnosticLog.snapshot().encodedJSONString())
+        for forbidden in [
+            "bastion.example.com", "10.20.30.40", "dbadmin", "opaque@default",
+            "never-record-this", "topsec raw export", "topsec-export.xsh"
+        ] {
+            XCTAssertFalse(diagnosticJSON.contains(forbidden), forbidden)
+        }
+    }
+
+    func testCoordinatorRecordsApplySuccessBeforeCredentialFailure() throws {
+        let traceStore = FeedbackDiagnosticTraceStore(
+            maxEvents: 16,
+            ttl: 86_400,
+            clock: Date.init,
+            routeHashKey: Data(repeating: 0x42, count: 32)
+        )
+        let payload = ExternalSessionImportPayload(
+            sessions: [externalBastionSession(
+                name: "Database",
+                targetHost: "10.20.30.40",
+                credential: .password("never-record-this")
+            )],
+            warnings: []
+        )
+        let credentialError = NSError(domain: "credential", code: 1)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "topsec-export.xsh",
+                    sourceType: .bastionHost,
+                    contents: "topsec raw export"
+                )
+            ),
+            presenter: RecordingSessionImportPresenter(confirmImport: true),
+            core: RecordingSessionImportCore(
+                applyResult: makeApplyResult(importedNames: ["Database"], importedCount: 1, skippedCount: 0)
+            ),
+            credentialApplier: RecordingExternalSessionCredentialApplier(error: credentialError),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: RecordingBastionHostSessionImportResolver(
+                fallbackPayload: nil,
+                automaticallyResolvedPayload: payload
+            ),
+            diagnosticTraceRecorder: traceStore
+        )
+
+        XCTAssertThrowsError(try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil))
+
+        let events = traceStore.snapshot().events
+        XCTAssertEqual(events.suffix(2).map(\.stage), [.apply, .credentials])
+        XCTAssertEqual(events.suffix(2).map(\.result), [.succeeded, .failed])
+        XCTAssertEqual(events.last?.errorCode, "credentials_failed")
+    }
+
     func testSourcePickerListsRequestedClientsWithoutNyaTerm() {
         XCTAssertEqual(AppKitSessionImportSourcePicker.supportedSources.map(\.type), [
             .stacioJSON,
@@ -506,6 +625,12 @@ final class SessionImportCoordinatorTests: XCTestCase {
         """
         let presenter = RecordingSessionImportPresenter(confirmImport: true)
         let authorizer = RecordingBastionHostFeatureAuthorizer(error: .licenseRequired)
+        let traceStore = FeedbackDiagnosticTraceStore(
+            maxEvents: 16,
+            ttl: 86_400,
+            clock: Date.init,
+            routeHashKey: Data(repeating: 0x42, count: 32)
+        )
         let coordinator = SessionImportCoordinator(
             databasePath: "/tmp/Stacio.sqlite",
             filePicker: RecordingSessionImportFilePicker(
@@ -513,7 +638,8 @@ final class SessionImportCoordinatorTests: XCTestCase {
             ),
             presenter: presenter,
             core: RecordingSessionImportCore(),
-            bastionHostAuthorizer: authorizer
+            bastionHostAuthorizer: authorizer,
+            diagnosticTraceRecorder: traceStore
         )
 
         XCTAssertThrowsError(try coordinator.runImport(parentWindow: nil)) { error in
@@ -521,6 +647,9 @@ final class SessionImportCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(authorizer.authorizationCount, 1)
         XCTAssertTrue(presenter.previewedSessionNames.isEmpty)
+        XCTAssertEqual(traceStore.snapshot().events.last?.stage, .recognition)
+        XCTAssertEqual(traceStore.snapshot().events.last?.result, .failed)
+        XCTAssertEqual(traceStore.snapshot().events.last?.errorCode, "authorization_failed")
     }
 
     func testCoordinatorDoesNotRequireBastionLicenseForOrdinaryXshellSession() throws {
@@ -660,6 +789,91 @@ final class SessionImportCoordinatorTests: XCTestCase {
         let appliedPayload = try XCTUnwrap(credentialApplier.appliedPayload)
         XCTAssertEqual(appliedPayload.sessions.map(\.protocolName), ["ssh"])
         XCTAssertEqual(appliedPayload.sessions.map(\.credential), [.password("ssh-secret")])
+    }
+
+    func testBastionPreviewUsesRouteIdentityAndRenamesSameNameDifferentTarget() throws {
+        let existing = SessionRecord(
+            id: "existing_target_a",
+            folderId: nil,
+            name: "Database",
+            protocol: "ssh",
+            host: "bastion.example.com",
+            port: 2222,
+            username: "opaque@default@SSH@dbadmin@10.0.0.8@22",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+        let existingConfig = """
+        {"bastionVendor":"topsec","bastionTargetHost":"10.0.0.8","bastionTargetPort":22,"bastionTargetUsername":"dbadmin"}
+        """
+        let payload = ExternalSessionImportPayload(
+            sessions: [
+                externalBastionSession(name: "Database", targetHost: "10.0.0.8"),
+                externalBastionSession(name: "Database", targetHost: "10.0.0.9")
+            ],
+            warnings: []
+        )
+        let presenter = RecordingSessionImportPresenter(confirmImport: false)
+        let coordinator = SessionImportCoordinator(
+            databasePath: "/tmp/Stacio.sqlite",
+            filePicker: RecordingSessionImportFilePicker(
+                file: SessionImportFile(
+                    sourceName: "sessions.zip",
+                    sourceType: .bastionHost,
+                    contents: "fixture"
+                )
+            ),
+            presenter: presenter,
+            core: RecordingSessionImportCore(
+                existingSessions: [existing],
+                configJSONBySessionID: [existing.id: existingConfig]
+            ),
+            bastionHostAuthorizer: RecordingBastionHostFeatureAuthorizer(),
+            bastionHostImportResolver: RecordingBastionHostSessionImportResolver(
+                fallbackPayload: nil,
+                automaticallyResolvedPayload: payload
+            )
+        )
+
+        _ = try coordinator.runImport(sourceType: .bastionHost, parentWindow: nil)
+
+        XCTAssertEqual(presenter.previewedSessions.map(\.conflict), [true, false])
+        XCTAssertEqual(presenter.previewedSessions.map(\.name), ["Database", "Database · 10.0.0.9"])
+        XCTAssertTrue(presenter.previewedSessions.allSatisfy { $0.host == "bastion.example.com" })
+        XCTAssertTrue(presenter.previewedSessions.allSatisfy {
+            $0.username?.contains("opaque@default@SSH") == true
+        })
+    }
+
+    func testBastionCredentialMatcherUsesRouteWhenImportedDisplayNameChanged() {
+        let source = externalBastionSession(
+            name: "Database",
+            targetHost: "10.0.0.9",
+            credential: .password("secret")
+        )
+        let imported = SessionRecord(
+            id: "imported_target_b",
+            folderId: nil,
+            name: "Database · 10.0.0.9",
+            protocol: "ssh",
+            host: source.host,
+            port: UInt32(source.port),
+            username: source.username,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        let matchedID = KeychainExternalSessionCredentialApplier.matchedSessionIDForTesting(
+            source: source,
+            importedSessions: [imported],
+            configJSONBySessionID: [imported.id: source.configJSON ?? ""]
+        )
+
+        XCTAssertEqual(matchedID, imported.id)
     }
 
     func testCoordinatorPreviewsConfirmsAppliesAndRefreshesImportedSessions() throws {
@@ -901,6 +1115,12 @@ final class SessionImportCoordinatorTests: XCTestCase {
     }
 
     func testCoordinatorRejectsImportContainingOnlyRemovedFTP() {
+        let traceStore = FeedbackDiagnosticTraceStore(
+            maxEvents: 16,
+            ttl: 86_400,
+            clock: Date.init,
+            routeHashKey: Data(repeating: 0x42, count: 32)
+        )
         let core = RecordingSessionImportCore(
             legacyIniPreview: preview(
                 sessions: [
@@ -924,7 +1144,8 @@ final class SessionImportCoordinatorTests: XCTestCase {
                 )
             ),
             presenter: presenter,
-            core: core
+            core: core,
+            diagnosticTraceRecorder: traceStore
         )
 
         XCTAssertThrowsError(try coordinator.runImport(parentWindow: nil)) { error in
@@ -932,6 +1153,9 @@ final class SessionImportCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(presenter.previewedSessionNames.isEmpty)
         XCTAssertNil(core.appliedPreview)
+        XCTAssertEqual(traceStore.snapshot().events.last?.stage, .preview)
+        XCTAssertEqual(traceStore.snapshot().events.last?.result, .failed)
+        XCTAssertEqual(traceStore.snapshot().events.last?.errorCode, "preview_failed")
     }
 
     func testCoordinatorAppliesStacioJSONPreviewForExportedGroups() throws {
@@ -1162,38 +1386,97 @@ final class SessionImportCoordinatorTests: XCTestCase {
         XCTAssertFalse(text.contains("id_rsa"))
     }
 
-    func testImportPreviewAccessoryRendersNativeTableWithChineseColumnsAndRedactedWarnings() throws {
+    func testImportPreviewSheetRendersReadableNativeTableWithBastionTargetAndRedactedWarnings() throws {
+        let longName = "天融信堡垒机导出的生产数据库服务器会话名称非常长需要截断显示"
+        let configJSON = """
+        {"bastionVendor":"topsec","bastionTargetHost":"10.20.30.40","bastionTargetPort":2222,"bastionTargetUsername":"dbadmin"}
+        """
         let preview = preview(
             sessions: [
-                previewSession(name: "API", host: "api.example.com", conflict: true),
+                previewSession(
+                    name: longName,
+                    protocol: "ssh",
+                    host: "192.0.2.10",
+                    port: 22,
+                    conflict: true,
+                    username: "SSH@dbadmin@10.20.30.40@internal-account-id",
+                    configJSON: configJSON
+                ),
                 previewSession(name: "Worker", protocol: "ftp", host: "worker.example.com", port: 21)
             ],
             warnings: [
+                "第一行普通警告",
                 "已忽略 password=hunter2、secret=token123、private key=/Users/me/.ssh/id_rsa"
             ],
             conflictCount: 1
         )
 
-        let accessory = AppKitSessionImportPreviewPresenter.previewAccessoryForTesting(preview)
-        let scrollView = try XCTUnwrap(accessory.firstSubview(ofType: NSScrollView.self))
-        let tableView = try XCTUnwrap(accessory.firstSubview(ofType: NSTableView.self))
+        let controller = AppKitSessionImportPreviewPresenter.previewWindowControllerForTesting(
+            preview,
+            message: "长文件名 sessions-20260724-production-export.stacio-bastion\n请核对目标与警告后导入"
+        )
+        let window: NSWindow = try XCTUnwrap(controller.window)
+        let contentView: NSView = try XCTUnwrap(window.contentView)
+        window.appearance = NSAppearance(named: .darkAqua)
+        contentView.layoutSubtreeIfNeeded()
+        let scrollView: NSScrollView = try XCTUnwrap(contentView.firstSubview(ofType: NSScrollView.self))
+        let tableView: NSTableView = try XCTUnwrap(contentView.firstSubview(ofType: NSTableView.self))
+        tableView.reloadData()
+        tableView.layoutSubtreeIfNeeded()
 
         XCTAssertEqual(tableView.tableColumns.map { $0.title }, ["名称", "文件夹", "协议", "目标", "状态", "警告"])
         XCTAssertEqual(tableView.numberOfRows, 2)
+        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.width, 760)
+        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.height, 460)
         XCTAssertFalse(tableView.usesAlternatingRowBackgroundColors)
-        XCTAssertEqual(tableView.backgroundColor, .clear)
+        XCTAssertEqual(tableView.backgroundColor, NSColor.clear)
         XCTAssertEqual(scrollView.hasHorizontalScroller, false)
-        XCTAssertEqual(scrollView.borderType, .noBorder)
-        XCTAssertEqual(tableView.tableColumns.reduce(CGFloat(0)) { $0 + $1.width }, 520, accuracy: 1)
+        XCTAssertEqual(scrollView.borderType, NSBorderType.bezelBorder)
+        XCTAssertLessThanOrEqual(
+            tableView.tableColumns.reduce(CGFloat(0)) { $0 + $1.width },
+            scrollView.contentSize.width + 1
+        )
+        XCTAssertEqual(
+            contentView.effectiveAppearance.bestMatch(from: [NSAppearance.Name.darkAqua, .aqua]),
+            NSAppearance.Name.darkAqua
+        )
+        XCTAssertEqual(tableView.stringValue(row: 0, column: "name"), longName)
+        XCTAssertEqual(tableView.toolTip(row: 0, column: "name"), longName)
         XCTAssertEqual(tableView.stringValue(row: 0, column: "status"), "冲突")
         XCTAssertEqual(tableView.stringValue(row: 1, column: "protocol"), "FTP")
         XCTAssertEqual(tableView.stringValue(row: 1, column: "target"), "deploy@worker.example.com:21")
+        let bastionTarget = tableView.stringValue(row: 0, column: "target")
+        XCTAssertEqual(bastionTarget, "dbadmin@10.20.30.40:2222\n经由 192.0.2.10:22")
+        XCTAssertFalse(bastionTarget.contains("internal-account-id"))
 
         let warningText = tableView.stringValue(row: 0, column: "warnings")
+        XCTAssertTrue(warningText.contains("第一行普通警告"))
         XCTAssertTrue(warningText.contains("已隐藏敏感字段"))
         XCTAssertFalse(warningText.contains("hunter2"))
         XCTAssertFalse(warningText.contains("token123"))
         XCTAssertFalse(warningText.contains("id_rsa"))
+
+        let importButton = try XCTUnwrap(
+            contentView.firstSubview(accessibilityIdentifier: "Stacio.ImportPreview.import") as? NSButton
+        )
+        let cancelButton = try XCTUnwrap(
+            contentView.firstSubview(accessibilityIdentifier: "Stacio.ImportPreview.cancel") as? NSButton
+        )
+        XCTAssertTrue(contentView.bounds.contains(importButton.frame))
+        XCTAssertTrue(contentView.bounds.contains(cancelButton.frame))
+        XCTAssertGreaterThan(importButton.frame.minY, 0)
+    }
+
+    func testImportPreviewSheetClampsToSmallVisibleScreenWithoutHidingFooter() {
+        let availableSize = NSSize(width: 760, height: 480)
+
+        let contentSize = AppKitSessionImportPreviewPresenter.previewContentSizeForTesting(
+            availableSize: availableSize
+        )
+
+        XCTAssertLessThanOrEqual(contentSize.width, availableSize.width)
+        XCTAssertLessThanOrEqual(contentSize.height, availableSize.height)
+        XCTAssertGreaterThanOrEqual(contentSize.height, 360)
     }
 }
 
@@ -1229,6 +1512,7 @@ private final class RecordingSourceAwareSessionImportFilePicker: SessionImportFi
 private final class RecordingSessionImportPresenter: SessionImportPreviewPresenting {
     private let confirmImport: Bool
     private(set) var previewedSessionNames: [String] = []
+    private(set) var previewedSessions: [ImportSessionPreview] = []
     private(set) var previewedConfigJSON: [String] = []
     private(set) var shownResults: [ImportApplyResult] = []
     private(set) var shownErrors: [Error] = []
@@ -1243,6 +1527,7 @@ private final class RecordingSessionImportPresenter: SessionImportPreviewPresent
         sourceType: SessionImportSourceType,
         parentWindow: NSWindow?
     ) -> Bool {
+        previewedSessions = preview.sessions
         previewedSessionNames = preview.sessions.map(\.name)
         previewedConfigJSON = preview.sessions.compactMap(\.configJson)
         return confirmImport
@@ -1274,24 +1559,31 @@ private final class RecordingSessionImportCore: SessionImportCoreBridging {
     private let legacyIniPreview: ImportPreview
     private let jsonPreview: ImportPreview
     private let applyResult: ImportApplyResult
+    private let configJSONBySessionID: [String: String]
 
     init(
         existingSessions: [SessionRecord] = [],
         csvPreview: ImportPreview = preview(sessions: []),
         legacyIniPreview: ImportPreview = preview(sessions: []),
         jsonPreview: ImportPreview = preview(sessions: []),
-        applyResult: ImportApplyResult = makeApplyResult(importedNames: [], importedCount: 0, skippedCount: 0)
+        applyResult: ImportApplyResult = makeApplyResult(importedNames: [], importedCount: 0, skippedCount: 0),
+        configJSONBySessionID: [String: String] = [:]
     ) {
         self.existingSessions = existingSessions
         self.csvPreview = csvPreview
         self.legacyIniPreview = legacyIniPreview
         self.jsonPreview = jsonPreview
         self.applyResult = applyResult
+        self.configJSONBySessionID = configJSONBySessionID
     }
 
     func listAllSessionRecords(databasePath: String) throws -> [SessionRecord] {
         events.append("listAll")
         return existingSessions
+    }
+
+    func sessionConfigJSON(databasePath: String, id: String) throws -> String? {
+        configJSONBySessionID[id]
     }
 
     func previewCSVImport(
@@ -1337,12 +1629,18 @@ private final class RecordingSessionImportCore: SessionImportCoreBridging {
 private final class RecordingExternalSessionCredentialApplier: ExternalSessionCredentialApplying {
     private(set) var appliedPayload: ExternalSessionImportPayload?
     private(set) var appliedSessions: [SessionRecord] = []
+    private let error: Error?
+
+    init(error: Error? = nil) {
+        self.error = error
+    }
 
     func applyCredentials(
         from payload: ExternalSessionImportPayload,
         to importedSessions: [SessionRecord],
         databasePath: String
     ) throws {
+        if let error { throw error }
         appliedPayload = payload
         appliedSessions = importedSessions
     }
@@ -1480,16 +1778,37 @@ private extension NSView {
         }
         return nil
     }
+
+    func firstSubview(accessibilityIdentifier: String) -> NSView? {
+        if self.accessibilityIdentifier() == accessibilityIdentifier {
+            return self
+        }
+        for subview in subviews {
+            if let match = subview.firstSubview(accessibilityIdentifier: accessibilityIdentifier) {
+                return match
+            }
+        }
+        return nil
+    }
 }
 
 private extension NSTableView {
     func stringValue(row: Int, column identifier: String) -> String {
         guard let columnIndex = tableColumns.firstIndex(where: { $0.identifier.rawValue == identifier }),
-              let view = view(atColumn: columnIndex, row: row, makeIfNecessary: false) as? NSTableCellView
+              let view = view(atColumn: columnIndex, row: row, makeIfNecessary: true) as? NSTableCellView
         else {
             return ""
         }
         return view.textField?.stringValue ?? ""
+    }
+
+    func toolTip(row: Int, column identifier: String) -> String? {
+        guard let columnIndex = tableColumns.firstIndex(where: { $0.identifier.rawValue == identifier }),
+              let view = view(atColumn: columnIndex, row: row, makeIfNecessary: true) as? NSTableCellView
+        else {
+            return nil
+        }
+        return view.textField?.toolTip
     }
 }
 
@@ -1506,7 +1825,9 @@ private func previewSession(
     protocol: String,
     host: String,
     port: UInt16,
-    conflict: Bool = false
+    conflict: Bool = false,
+    username: String? = "deploy",
+    configJSON: String? = nil
 ) -> ImportSessionPreview {
     ImportSessionPreview(
         name: name,
@@ -1514,10 +1835,32 @@ private func previewSession(
         protocol: `protocol`,
         host: host,
         port: port,
-        username: "deploy",
+        username: username,
         privateKeyPath: nil,
-        configJson: nil,
+        configJson: configJSON,
         conflict: conflict
+    )
+}
+
+private func externalBastionSession(
+    name: String,
+    targetHost: String,
+    targetUsername: String = "dbadmin",
+    credential: ExternalImportedCredential? = nil
+) -> ExternalImportedSession {
+    let configJSON = """
+    {"bastionVendor":"topsec","bastionTargetHost":"\(targetHost)","bastionTargetPort":22,"bastionTargetUsername":"\(targetUsername)"}
+    """
+    return ExternalImportedSession(
+        name: name,
+        folderPath: nil,
+        protocolName: "ssh",
+        host: "bastion.example.com",
+        port: 2222,
+        username: "opaque@default@SSH@\(targetUsername)@\(targetHost)@22",
+        privateKeyPath: nil,
+        credential: credential,
+        configJSON: configJSON
     )
 }
 

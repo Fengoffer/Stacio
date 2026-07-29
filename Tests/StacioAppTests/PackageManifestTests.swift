@@ -1,6 +1,17 @@
 import XCTest
 
 final class PackageManifestTests: XCTestCase {
+    func testManifestLinksCoreBluetoothForStacioApp() throws {
+        let manifestURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Package.swift")
+        let manifest = try String(contentsOf: manifestURL, encoding: .utf8)
+
+        XCTAssertTrue(manifest.contains(".linkedFramework(\"CoreBluetooth\")"))
+    }
+
     func testManifestDoesNotExposeRemovedRDPAdapterProduct() throws {
         let manifestURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

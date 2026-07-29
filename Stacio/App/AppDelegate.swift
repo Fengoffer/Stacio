@@ -30,7 +30,7 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.14.1"
+    private static let fallbackDisplayVersion = "Stacio-0.14.2"
     public static var displayVersion: String { displayVersion(in: .main) }
     public static let websiteURL = "https://www.stacio.cn/"
     public static let documentationURL = "https://www.stacio.cn/wiki/"
@@ -506,7 +506,7 @@ public final class AppKitInstalledUpdateReleaseNotesPresenter: InstalledUpdateRe
     private func makeReleaseNotesScrollView(_ releaseNotes: String) -> NSScrollView {
         let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         let textContainerInset = NSSize(width: 10, height: 10)
-        let attributedReleaseNotes = AIAssistantMarkdownRenderer.attributedString(
+        let attributedReleaseNotes = UpdateReleaseNotesRenderer.attributedString(
             from: releaseNotes,
             baseFont: font,
             textColor: StacioDesignSystem.theme.primaryTextColor
@@ -574,6 +574,23 @@ public final class AppKitInstalledUpdateReleaseNotesPresenter: InstalledUpdateRe
     }
 }
 
+enum UpdateReleaseNotesRenderer {
+    static func attributedString(
+        from releaseNotes: String,
+        baseFont: NSFont = .systemFont(ofSize: NSFont.systemFontSize),
+        textColor: NSColor = StacioDesignSystem.theme.primaryTextColor
+    ) -> NSAttributedString {
+        let normalizedMarkdown = releaseNotes
+            .stacioNormalizedReleaseNotesForDisplay()
+            .stacioReleaseNotesWithNormalizedListMarkers()
+        return AIAssistantMarkdownRenderer.attributedString(
+            from: normalizedMarkdown,
+            baseFont: baseFont,
+            textColor: textColor
+        )
+    }
+}
+
 extension String {
     func stacioNormalizedReleaseNotesForDisplay() -> String {
         let decodedLineBreaks = replacingOccurrences(of: "\\r\\n", with: "\n")
@@ -616,6 +633,18 @@ extension String {
             .map { item in
                 let existingMarkers = ["• ", "- ", "* ", "– ", "— "]
                 return existingMarkers.contains(where: { item.hasPrefix($0) }) ? item : "• \(item)"
+            }
+            .joined(separator: "\n")
+    }
+
+    fileprivate func stacioReleaseNotesWithNormalizedListMarkers() -> String {
+        components(separatedBy: .newlines)
+            .map { line in
+                line.replacingOccurrences(
+                    of: "^(\\s*)[-*+]\\s+",
+                    with: "$1• ",
+                    options: .regularExpression
+                )
             }
             .joined(separator: "\n")
     }
@@ -1474,6 +1503,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private let licenseRevalidator: LicenseRevalidating?
     private let licenseNetworkMonitor: LicenseNetworkMonitoring?
     private let appLog: StacioLogWriting?
+    private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
     private let licenseAccess: any LicenseFeatureAccessProviding
     private let licenseStateProvider: () -> LicenseState
     private let shouldShowFreePlanNotice: Bool
@@ -1512,12 +1542,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             let configuration = ProductOpsConfigurationStore().load()
             return FeedbackWindowController(
                 configuration: configuration,
-                context: FeedbackDiagnosticContext.current(
-                    configuration: configuration,
-                    licenseStatusProvider: {
-                        licenseSnapshot.currentState()?.status ?? .inactive
-                    }
-                )
+                contextProvider: {
+                    FeedbackDiagnosticContext.current(
+                        configuration: configuration,
+                        licenseStatusProvider: {
+                            licenseSnapshot.currentState()?.status ?? .inactive
+                        }
+                    )
+                }
             )
         }
         runningTunnelTerminationConfirmation = AppKitRunningTunnelTerminationConfirmation()
@@ -1539,6 +1571,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
         licenseNetworkMonitor = NWPathLicenseNetworkMonitor()
         appLog = StacioLogStore.shared
+        diagnosticLogRecorder = FeedbackDiagnosticLogStore.shared
         licenseAccess = featureAccess
         licenseStateProvider = { licenseSnapshot.currentState() ?? LicenseState() }
         shouldShowFreePlanNotice = true
@@ -1557,11 +1590,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
     }
 
-    convenience init(factory: @escaping () -> WorkbenchWindowShowing, appLog: StacioLogWriting?) {
+    convenience init(
+        factory: @escaping () -> WorkbenchWindowShowing,
+        appLog: StacioLogWriting?,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
+    ) {
         self.init(
             factory: factory,
             runningTunnelTerminationConfirmation: AppKitRunningTunnelTerminationConfirmation(),
-            appLog: appLog
+            appLog: appLog,
+            diagnosticLogRecorder: diagnosticLogRecorder
         )
     }
 
@@ -1576,6 +1614,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         licenseStateProvider: @escaping () -> LicenseState = { LicenseState() },
         feedbackWindowControllerFactory: (() -> FeedbackWindowController)? = nil,
         appLog: StacioLogWriting? = nil,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared,
         shouldShowFreePlanNotice: Bool = false,
         hasValidLicense: @escaping @MainActor () -> Bool = { true },
         freePlanNoticeWindowControllerFactory: @escaping @MainActor () -> FreePlanNoticeWindowController = {
@@ -1588,10 +1627,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             let configuration = ProductOpsConfigurationStore().load()
             return FeedbackWindowController(
                 configuration: configuration,
-                context: FeedbackDiagnosticContext.current(
-                    configuration: configuration,
-                    licenseStatusProvider: { licenseStateProvider().status }
-                )
+                contextProvider: {
+                    FeedbackDiagnosticContext.current(
+                        configuration: configuration,
+                        licenseStatusProvider: { licenseStateProvider().status }
+                    )
+                }
             )
         }
         self.runningTunnelTerminationConfirmation = runningTunnelTerminationConfirmation
@@ -1603,6 +1644,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         self.licenseNetworkMonitor = licenseNetworkMonitor
         self.licenseStateProvider = licenseStateProvider
         self.appLog = appLog
+        self.diagnosticLogRecorder = diagnosticLogRecorder
         self.shouldShowFreePlanNotice = shouldShowFreePlanNotice
         self.hasValidLicense = hasValidLicense
         self.freePlanNoticeWindowControllerFactory = freePlanNoticeWindowControllerFactory
@@ -1652,6 +1694,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         factory: @escaping () -> WorkbenchWindowShowing,
         runningTunnelTerminationConfirmation: RunningTunnelTerminationConfirming,
         appLog: StacioLogWriting? = nil,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared,
         shouldShowFreePlanNotice: Bool = false,
         hasValidLicense: @escaping @MainActor () -> Bool = { true },
         freePlanNoticeWindowControllerFactory: @escaping @MainActor () -> FreePlanNoticeWindowController = {
@@ -1663,6 +1706,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             runningTunnelTerminationConfirmation: runningTunnelTerminationConfirmation,
             sparkleUpdateChecker: SparkleUpdateController(),
             appLog: appLog,
+            diagnosticLogRecorder: diagnosticLogRecorder,
             shouldShowFreePlanNotice: shouldShowFreePlanNotice,
             hasValidLicense: hasValidLicense,
             freePlanNoticeWindowControllerFactory: freePlanNoticeWindowControllerFactory
@@ -1672,6 +1716,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public func applicationDidFinishLaunching(_ notification: Notification) {
         migrateLegacyApplicationSupportIfNeeded()
         logApplicationStarted()
+        diagnosticLogRecorder.record(
+            level: .info,
+            subsystem: .application,
+            eventCode: .applicationStarted,
+            stage: .startup,
+            result: .succeeded,
+            errorCategory: nil,
+            resourceIdentities: []
+        )
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),

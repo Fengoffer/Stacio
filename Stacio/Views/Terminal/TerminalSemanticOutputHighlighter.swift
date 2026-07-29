@@ -1,5 +1,10 @@
 import Foundation
 
+public enum TerminalSemanticHighlightProfile: Equatable, Sendable {
+    case generalPurpose
+    case networkDeviceConsole
+}
+
 public enum TerminalSemanticOutputHighlighter {
     private struct Rule {
         let group: String
@@ -70,12 +75,14 @@ public enum TerminalSemanticOutputHighlighter {
     private static let portDeskMarkupStartPayload = "777;StacioHighlight=start"
     private static let portDeskMarkupEndPayload = "777;StacioHighlight=end"
 
-    private static let compiledPromptRules: [CompiledRule] = ruleGroups
+    private static let compiledRules: [CompiledRule] = ruleGroups
         .flatMap { $0 }
-        .filter { $0.group == "prompt" }
         .map { CompiledRule(rule: $0, regex: $0.regex) }
 
-    private static let compiledRules: [CompiledRule] = ruleGroups
+    private static let compiledPromptRules: [CompiledRule] = compiledRules
+        .filter { $0.rule.group == "prompt" }
+
+    private static let compiledNetworkDeviceRules: [CompiledRule] = networkDeviceRuleGroups
         .flatMap { $0 }
         .map { CompiledRule(rule: $0, regex: $0.regex) }
 
@@ -143,11 +150,105 @@ public enum TerminalSemanticOutputHighlighter {
         ]
     ]
 
+    private static let networkDeviceRuleGroups: [[Rule]] = [
+        [
+            Rule(
+                group: "network-device-error-line",
+                pattern: #"(?m)^(?:\s*%\s*)?(?:Invalid input|Incomplete command|Ambiguous command|Error|Failed|Failure|Critical|Alarm)[^\r\n]*"#,
+                role: .error,
+                bold: true
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-status",
+                pattern: #"\b(?:administratively\s+down|err-disabled|notconnect|disabled|inactive|down|failed|failure|critical|alarm|denied|timeout|unreachable)\b"#,
+                role: .error,
+                bold: true
+            ),
+            Rule(
+                group: "network-device-status",
+                pattern: #"\b(?:CRC errors?|input errors?|output errors?|input drops?|output drops?|discards?|collisions?|packet loss)\b"#,
+                role: .error,
+                bold: true
+            ),
+            Rule(
+                group: "network-device-status",
+                pattern: #"\b(?:warning|degraded|flapping|mismatch|half-duplex|blocking|listening|learning)\b"#,
+                role: .warning,
+                bold: true
+            ),
+            Rule(
+                group: "network-device-status",
+                pattern: #"(?<![\w-])(?:up|connected|active|enabled|established|forwarding|full|success|succeeded|passed)(?![\w-])"#,
+                role: .success,
+                bold: true
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-interface",
+                pattern: #"(?<![A-Za-z0-9_.-])(?:HundredGigE|FortyGigabitEthernet|TwentyFiveGigE|TenGigabitEthernet|XGigabitEthernet|GigabitEthernet|FastEthernet|Port-channel|Vlan-interface|ManagementEthernet|Ethernet|Loopback|Eth-Trunk|Vlanif|Tunnel|Serial|MgmtEth|XGE|GE|Gi|Fa|Te|Eth|Po)\s*\d+(?:[/.:]\d+)*(?:\.\d+)?(?![A-Za-z0-9_])"#,
+                role: .resource,
+                bold: true
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-address",
+                pattern: #"(?<![A-Fa-f0-9])(?:[A-Fa-f0-9]{4}\.){2}[A-Fa-f0-9]{4}(?![A-Fa-f0-9])"#,
+                role: .address
+            ),
+            Rule(
+                group: "network-device-address",
+                pattern: #"(?<![A-Fa-f0-9])(?:[A-Fa-f0-9]{2}[:-]){5}[A-Fa-f0-9]{2}(?![A-Fa-f0-9])"#,
+                role: .address
+            ),
+            Rule(
+                group: "network-device-address",
+                pattern: #"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,3})?(?![\d.])"#,
+                role: .address
+            ),
+            Rule(
+                group: "network-device-address",
+                pattern: #"(?<![A-Fa-f0-9:])(?:[A-Fa-f0-9]{1,4}:){3,}[A-Fa-f0-9]{0,4}(?:/\d{1,3})?(?![A-Fa-f0-9:])"#,
+                role: .address
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-protocol",
+                pattern: #"\b(?:BGP|OSPFv?3?|IS-IS|ISIS|RIPng|RIP|STP|RSTP|MSTP|LACP|LLDP|VRRP|HSRP|ARP|NDP|DHCP|DNS|NTP|SNMP|SSH|Telnet|VLAN|VXLAN|VRF|ACL|QoS)\b"#,
+                role: .info,
+                bold: true
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-config",
+                pattern: #"(?m)^\s*(interface|router|vlan|vrf|ip\s+route|ipv6\s+route|access-list|acl|description|hostname|system-view|undo|no\s+shutdown|shutdown|switchport|port\s+link-type)\b"#,
+                role: .command,
+                captureGroup: 1,
+                bold: true
+            )
+        ],
+        [
+            Rule(
+                group: "network-device-header",
+                pattern: #"(?m)^\s*(Interface|Port|IP-Address|Protocol|Status|State|Neighbor|Destination|Gateway|Metric|Prefix|Route|MAC Address|VLAN ID|Uptime)\b"#,
+                role: .info,
+                captureGroup: 1,
+                bold: true
+            )
+        ]
+    ]
+
     public static func highlight(
         _ text: String,
         level: TerminalHighlightLevelPreference,
         richHighlightingEnabled: Bool = true,
-        theme: TerminalColorTheme = .portDeskDark
+        theme: TerminalColorTheme = .portDeskDark,
+        profile: TerminalSemanticHighlightProfile = .generalPurpose
     ) -> String {
         guard level != .off,
               text.isEmpty == false,
@@ -156,20 +257,33 @@ public enum TerminalSemanticOutputHighlighter {
             return text
         }
         let palette = TerminalHighlightPalette(theme: theme)
-        let rules = level == .commandLineEnhanced && richHighlightingEnabled ? compiledRules : compiledPromptRules
+        let rules: [CompiledRule]
+        switch profile {
+        case .generalPurpose:
+            rules = level == .commandLineEnhanced && richHighlightingEnabled ? compiledRules : compiledPromptRules
+        case .networkDeviceConsole:
+            guard level == .commandLineEnhanced, richHighlightingEnabled else {
+                return text
+            }
+            rules = compiledNetworkDeviceRules
+        }
         var result = ""
         result.reserveCapacity(text.count)
         text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: [.byLines, .substringNotRequired]) { _, lineRange, enclosingRange, _ in
             let line = String(text[lineRange])
-            if line.utf16.count > maximumHighlightedLineLength {
+            let trailing = text[lineRange.upperBound..<enclosingRange.upperBound]
+            let isCompletedNetworkDeviceLine = profile != .networkDeviceConsole || trailing.isEmpty == false
+            if line.utf16.count > maximumHighlightedLineLength || isCompletedNetworkDeviceLine == false {
                 result.append(line)
             } else {
                 result.append(highlightLine(line, palette: palette, rules: rules))
             }
-            let trailing = text[lineRange.upperBound..<enclosingRange.upperBound]
             result.append(contentsOf: trailing)
         }
         if result.isEmpty, text.isEmpty == false {
+            if profile == .networkDeviceConsole {
+                return text
+            }
             return text.utf16.count > maximumHighlightedLineLength ? text : highlightLine(text, palette: palette, rules: rules)
         }
         return result
@@ -179,7 +293,8 @@ public enum TerminalSemanticOutputHighlighter {
         _ bytes: [UInt8],
         level: TerminalHighlightLevelPreference,
         richHighlightingEnabled: Bool = true,
-        theme: TerminalColorTheme = .portDeskDark
+        theme: TerminalColorTheme = .portDeskDark,
+        profile: TerminalSemanticHighlightProfile = .generalPurpose
     ) -> [UInt8] {
         guard level != .off,
               let text = String(bytes: bytes, encoding: .utf8)
@@ -190,9 +305,15 @@ public enum TerminalSemanticOutputHighlighter {
             text,
             level: level,
             richHighlightingEnabled: richHighlightingEnabled,
-            theme: theme
+            theme: theme,
+            profile: profile
         )
         return highlighted == text ? bytes : Array(highlighted.utf8)
+    }
+
+    static func prepare() {
+        _ = compiledRules.count
+        _ = compiledNetworkDeviceRules.count
     }
 
     public static func strippingStacioDisplayMarkup(from text: String) -> String {
@@ -578,5 +699,260 @@ public enum TerminalSemanticOutputHighlighter {
             index += 1
         }
         return text.length
+    }
+}
+
+struct TerminalSemanticHighlightConfiguration {
+    let level: TerminalHighlightLevelPreference
+    let richHighlightingEnabled: Bool
+    let theme: TerminalColorTheme
+    let profile: TerminalSemanticHighlightProfile
+
+    init(
+        level: TerminalHighlightLevelPreference,
+        richHighlightingEnabled: Bool,
+        theme: TerminalColorTheme,
+        profile: TerminalSemanticHighlightProfile = .generalPurpose
+    ) {
+        self.level = level
+        self.richHighlightingEnabled = richHighlightingEnabled
+        self.theme = theme
+        self.profile = profile
+    }
+
+    func apply(to bytes: [UInt8]) -> [UInt8] {
+        TerminalSemanticOutputHighlighter.highlight(
+            bytes,
+            level: level,
+            richHighlightingEnabled: richHighlightingEnabled,
+            theme: theme,
+            profile: profile
+        )
+    }
+}
+
+final class TerminalSemanticOutputProcessor {
+    typealias Delivery = ([UInt8]) -> Void
+
+    private struct Request {
+        let bytes: [UInt8]
+        var configuration: TerminalSemanticHighlightConfiguration?
+        let generation: UInt64
+        let delivery: Delivery
+    }
+
+    private static let asynchronousByteThreshold = 512
+    private static let maximumHighlightedOutstandingByteCount = 512 * 1_024
+
+    private let workerQueue: DispatchQueue
+    private let stateLock = NSLock()
+    private var pendingRequests: [Request] = []
+    private var pendingRequestIndex = 0
+    private var workerIsRunning = false
+    private var synchronousRequestIsRunning = false
+    private var generation: UInt64 = 0
+    private var outstandingByteCount = 0
+    private var bypassHighlightingUntilDrained = false
+    private var pendingMainDeliveryBatchCount = 0
+
+    init(label: String) {
+        workerQueue = DispatchQueue(label: label, qos: .userInitiated)
+        TerminalSemanticOutputHighlighter.prepare()
+    }
+
+    func process(
+        bytes: [UInt8],
+        configuration: TerminalSemanticHighlightConfiguration?,
+        delivery: @escaping Delivery
+    ) {
+        guard bytes.isEmpty == false else {
+            deliverOnMain(bytes, delivery: delivery)
+            return
+        }
+
+        if Thread.isMainThread,
+           bytes.count < Self.asynchronousByteThreshold,
+           let reservedGeneration = reserveSynchronousRequest(byteCount: bytes.count) {
+            let displayBytes = configuration?.apply(to: bytes) ?? bytes
+            if isCurrentGeneration(reservedGeneration) {
+                delivery(displayBytes)
+            }
+            finishSynchronousRequest(byteCount: bytes.count, generation: reservedGeneration)
+            return
+        }
+
+        enqueue(bytes: bytes, configuration: configuration, delivery: delivery)
+    }
+
+    func cancel() {
+        stateLock.lock()
+        generation &+= 1
+        pendingRequests.removeAll(keepingCapacity: false)
+        pendingRequestIndex = 0
+        outstandingByteCount = 0
+        bypassHighlightingUntilDrained = false
+        stateLock.unlock()
+    }
+
+    private func reserveSynchronousRequest(byteCount: Int) -> UInt64? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard workerIsRunning == false,
+              synchronousRequestIsRunning == false,
+              pendingMainDeliveryBatchCount == 0,
+              pendingRequestIndex >= pendingRequests.count
+        else {
+            return nil
+        }
+        synchronousRequestIsRunning = true
+        outstandingByteCount += byteCount
+        return generation
+    }
+
+    private func finishSynchronousRequest(byteCount: Int, generation requestGeneration: UInt64) {
+        var shouldStartWorker = false
+        stateLock.lock()
+        synchronousRequestIsRunning = false
+        if requestGeneration == generation {
+            outstandingByteCount = max(0, outstandingByteCount - byteCount)
+        }
+        if pendingRequestIndex < pendingRequests.count, workerIsRunning == false {
+            workerIsRunning = true
+            shouldStartWorker = true
+        } else if outstandingByteCount == 0 {
+            bypassHighlightingUntilDrained = false
+        }
+        stateLock.unlock()
+        if shouldStartWorker {
+            scheduleWorker()
+        }
+    }
+
+    private func enqueue(
+        bytes: [UInt8],
+        configuration: TerminalSemanticHighlightConfiguration?,
+        delivery: @escaping Delivery
+    ) {
+        var shouldStartWorker = false
+        stateLock.lock()
+        let nextOutstandingByteCount = outstandingByteCount + bytes.count
+        if nextOutstandingByteCount > Self.maximumHighlightedOutstandingByteCount {
+            bypassHighlightingUntilDrained = true
+            if pendingRequestIndex < pendingRequests.count {
+                for index in pendingRequestIndex..<pendingRequests.count {
+                    pendingRequests[index].configuration = nil
+                }
+            }
+        }
+        pendingRequests.append(Request(
+            bytes: bytes,
+            configuration: bypassHighlightingUntilDrained ? nil : configuration,
+            generation: generation,
+            delivery: delivery
+        ))
+        outstandingByteCount = nextOutstandingByteCount
+        if workerIsRunning == false, synchronousRequestIsRunning == false {
+            workerIsRunning = true
+            shouldStartWorker = true
+        }
+        stateLock.unlock()
+        if shouldStartWorker {
+            scheduleWorker()
+        }
+    }
+
+    private func scheduleWorker() {
+        workerQueue.async { [weak self] in
+            self?.drainPendingRequests()
+        }
+    }
+
+    private func drainPendingRequests() {
+        var deliveries: [(generation: UInt64, bytes: [UInt8], delivery: Delivery)] = []
+        var didReserveMainDeliveryBatch = false
+
+        while let request = takeNextRequest() {
+            guard isCurrentGeneration(request.generation) else {
+                finish(request)
+                continue
+            }
+            if didReserveMainDeliveryBatch == false {
+                reserveMainDeliveryBatch()
+                didReserveMainDeliveryBatch = true
+            }
+            let displayBytes = request.configuration?.apply(to: request.bytes) ?? request.bytes
+            deliveries.append((request.generation, displayBytes, request.delivery))
+            finish(request)
+        }
+
+        guard deliveries.isEmpty == false else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            defer { self.finishMainDeliveryBatch() }
+            for item in deliveries {
+                guard self.isCurrentGeneration(item.generation) else { continue }
+                item.delivery(item.bytes)
+            }
+        }
+    }
+
+    private func reserveMainDeliveryBatch() {
+        stateLock.lock()
+        pendingMainDeliveryBatchCount += 1
+        stateLock.unlock()
+    }
+
+    private func finishMainDeliveryBatch() {
+        stateLock.lock()
+        pendingMainDeliveryBatchCount = max(0, pendingMainDeliveryBatchCount - 1)
+        stateLock.unlock()
+    }
+
+    private func takeNextRequest() -> Request? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard pendingRequestIndex < pendingRequests.count else {
+            pendingRequests.removeAll(keepingCapacity: true)
+            pendingRequestIndex = 0
+            workerIsRunning = false
+            if outstandingByteCount == 0 {
+                bypassHighlightingUntilDrained = false
+            }
+            return nil
+        }
+        let request = pendingRequests[pendingRequestIndex]
+        pendingRequestIndex += 1
+        if pendingRequestIndex >= 64,
+           pendingRequestIndex * 2 >= pendingRequests.count {
+            pendingRequests.removeFirst(pendingRequestIndex)
+            pendingRequestIndex = 0
+        }
+        return request
+    }
+
+    private func finish(_ request: Request) {
+        stateLock.lock()
+        if request.generation == generation {
+            outstandingByteCount = max(0, outstandingByteCount - request.bytes.count)
+        }
+        stateLock.unlock()
+    }
+
+    private func isCurrentGeneration(_ requestGeneration: UInt64) -> Bool {
+        stateLock.lock()
+        let isCurrent = requestGeneration == generation
+        stateLock.unlock()
+        return isCurrent
+    }
+
+    private func deliverOnMain(_ bytes: [UInt8], delivery: @escaping Delivery) {
+        if Thread.isMainThread {
+            delivery(bytes)
+        } else {
+            DispatchQueue.main.async {
+                delivery(bytes)
+            }
+        }
     }
 }

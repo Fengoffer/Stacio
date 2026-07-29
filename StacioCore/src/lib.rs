@@ -20,6 +20,14 @@ pub use domain::agent::AIConversationHistoryItemDraft;
 pub use domain::macro_recording::{MacroRecording, MacroStep};
 use domain::{
     agent::{AgentActionAuditEvent, AgentTaskProposalDraft, AgentTaskSessionDraft},
+    console::{
+        match_console_profile as match_console_profile_target,
+        parse_console_config as parse_console_config_target,
+        resolve_console_transport_policy as resolve_console_transport_policy_target,
+        serialize_console_config as serialize_console_config_target, ConsoleConfigError,
+        ConsolePlatform, ConsoleProfileMatch, ConsoleServiceMetadata, ConsoleSessionConfig,
+        ConsoleTransportDecision,
+    },
     credential::{CredentialDraft, CredentialRecord},
     device_metrics::DeviceMetricsSnapshot,
     diagnostics::{DiagnosticBundle, DiagnosticEntry},
@@ -27,7 +35,8 @@ use domain::{
     ftp::{validate_ftp_config as validate_ftp_config_target, FtpAuthSecret, FtpConnectionConfig},
     multiexec::{MultiExecError, MultiExecTarget},
     scp::{
-        resolve_conflict_path as resolve_scp_conflict_path_target, ScpConflictPolicy,
+        resolve_conflict_path as resolve_scp_conflict_path_target, RemoteToRemoteTransferReport,
+        RemoteToRemoteTransferRequest, RemoteTransferProtocol, ScpConflictPolicy, ScpDirection,
         ScpResumeOptions, ScpTransferError, ScpTransferJob, ScpTransferProgress,
     },
     serial::{validate_serial_config as validate_serial_config_target, SerialConnectionConfig},
@@ -68,6 +77,10 @@ use infrastructure::{
     },
     import_repository::ImportReportRepository,
     known_host_repository::KnownHostRepository,
+    remote_transfer::{
+        transfer_remote_file_ranges, Libssh2RemoteTransferBackend, LocalFileTransferBackend,
+        RemoteFileTransferBackend, RemoteFileTransferReport, RemoteFileTransferRequest,
+    },
     scp::libssh2_engine::Libssh2ScpEngine,
     serial::SerialShellChannel,
     session_repository::SessionRepository,
@@ -88,7 +101,7 @@ use infrastructure::{
 };
 use services::scp_service::{
     cancel_live_scp_transfer as cancel_live_scp_transfer_target, is_live_scp_transfer_cancelled,
-    run_scp_transfer,
+    record_live_scp_transfer_progress, run_scp_transfer,
     take_live_scp_transfer_progress_batch as take_live_scp_transfer_progress_batch_target,
     with_live_scp_transfer_cancellation_scope, MockScpEngine, MockScpOutcome,
 };
@@ -165,6 +178,35 @@ pub fn health() -> CoreHealth {
         version: env!("CARGO_PKG_VERSION").to_string(),
         architecture: "swift-appkit-rust-core".to_string(),
     }
+}
+
+#[uniffi::export]
+pub fn parse_console_session_config(
+    json: String,
+) -> Result<ConsoleSessionConfig, ConsoleConfigError> {
+    parse_console_config_target(json)
+}
+
+#[uniffi::export]
+pub fn serialize_console_session_config(
+    config: ConsoleSessionConfig,
+) -> Result<String, ConsoleConfigError> {
+    serialize_console_config_target(config)
+}
+
+#[uniffi::export]
+pub fn match_ble_console_profile(
+    services: Vec<ConsoleServiceMetadata>,
+) -> Option<ConsoleProfileMatch> {
+    match_console_profile_target(services)
+}
+
+#[uniffi::export]
+pub fn console_transport_policy(
+    platform: ConsolePlatform,
+    windows_port: Option<String>,
+) -> ConsoleTransportDecision {
+    resolve_console_transport_policy_target(platform, windows_port)
 }
 
 fn terminal_registry() -> &'static Mutex<TerminalRuntimeRegistry> {
@@ -565,6 +607,16 @@ pub fn open_local_shell_runtime(shell_path: String, cols: u32, rows: u32) -> Ter
 }
 
 #[uniffi::export]
+pub fn open_external_terminal_runtime(
+    kind: String,
+    endpoint: String,
+    cols: u32,
+    rows: u32,
+) -> Result<TerminalRuntime, TerminalRuntimeError> {
+    recover_global_lock(terminal_registry()).open_external(kind, endpoint, cols, rows)
+}
+
+#[uniffi::export]
 pub fn open_remote_ssh_runtime(
     host: String,
     port: u16,
@@ -911,11 +963,24 @@ pub fn apply_session_import(
     let source_type = normalize_import_source_type(&source_type)?;
     let source_name = normalized_import_source_name(source_name);
     let repository = session_repository_for_path(database_path.clone())?;
-    let mut existing_names = repository
-        .list_all_sessions()?
-        .into_iter()
+    let existing_sessions = repository.list_all_sessions()?;
+    let mut existing_names = existing_sessions
+        .iter()
         .map(|session| normalized_import_name(&session.name))
         .collect::<HashSet<_>>();
+    let mut existing_bastion_routes = HashSet::new();
+    for session in &existing_sessions {
+        let config_json = repository.get_session_config_json(&session.id)?;
+        if let Some(route) = bastion_route_identity(
+            &session.protocol,
+            &session.host,
+            session.port,
+            session.username.as_deref(),
+            config_json.as_deref(),
+        ) {
+            existing_bastion_routes.insert(route.canonical);
+        }
+    }
     let existing_folders = repository.list_folders()?;
     let mut folder_ids_by_path = folder_ids_by_path(&existing_folders);
     let mut imported_sessions = Vec::new();
@@ -927,14 +992,30 @@ pub fn apply_session_import(
         .map(|warning| redact_import_issue(&warning))
         .collect::<Vec<_>>();
 
-    for session in preview.sessions {
-        if session.conflict || existing_names.contains(&normalized_import_name(&session.name)) {
+    for mut session in preview.sessions {
+        let route = bastion_route_identity(
+            &session.protocol,
+            &session.host,
+            u32::from(session.port),
+            session.username.as_deref(),
+            session.config_json.as_deref(),
+        );
+        let conflicts_with_current_database = route
+            .as_ref()
+            .map(|route| existing_bastion_routes.contains(&route.canonical))
+            .unwrap_or_else(|| existing_names.contains(&normalized_import_name(&session.name)));
+        if conflicts_with_current_database {
             skipped_count += 1;
             issues.push(redact_import_issue(&format!(
-                "{} skipped because a session with the same name exists",
+                "{} skipped because the same session route already exists",
                 session.name
             )));
             continue;
+        }
+
+        if let Some(route) = route.as_ref() {
+            session.name =
+                unique_bastion_import_name(&session.name, &route.target_label, &existing_names);
         }
 
         match import_preview_session(
@@ -943,7 +1024,12 @@ pub fn apply_session_import(
             &session,
             &mut existing_names,
         ) {
-            Ok(record) => imported_sessions.push(record),
+            Ok(record) => {
+                if let Some(route) = route {
+                    existing_bastion_routes.insert(route.canonical);
+                }
+                imported_sessions.push(record);
+            }
             Err(error) => {
                 failed_count += 1;
                 issues.push(redact_import_issue(&format!(
@@ -1329,6 +1415,16 @@ pub fn run_live_scp_transfer_with_resume(
 ) -> Result<Vec<ScpTransferProgress>, SshRuntimeError> {
     with_live_scp_transfer_cancellation_scope(&job.id.clone(), || {
         validate_ssh_config_target(config.clone())?;
+        if let Some(report) = run_parallel_local_remote_transfer(
+            &config,
+            secret.clone(),
+            expected_fingerprint_sha256.clone(),
+            &job,
+            &resume_options,
+            RemoteTransferProtocol::Scp,
+        )? {
+            return Ok(parallel_transfer_progress(&job, &report));
+        }
         let transport = Libssh2Transport::new();
         let session = transport.connect_with_secret_and_expected_transfer_session(
             &config,
@@ -1385,10 +1481,38 @@ pub fn run_live_sftp_transfer(
     expected_fingerprint_sha256: String,
     job: ScpTransferJob,
 ) -> Result<Vec<ScpTransferProgress>, SshRuntimeError> {
+    run_live_sftp_transfer_with_resume(
+        config,
+        secret,
+        expected_fingerprint_sha256,
+        job,
+        ScpResumeOptions::fresh(),
+    )
+}
+
+#[uniffi::export]
+pub fn run_live_sftp_transfer_with_resume(
+    config: SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    job: ScpTransferJob,
+    resume_options: ScpResumeOptions,
+) -> Result<Vec<ScpTransferProgress>, SshRuntimeError> {
     with_live_scp_transfer_cancellation_scope(&job.id.clone(), || {
+        validate_ssh_config_target(config.clone())?;
+        if let Some(report) = run_parallel_local_remote_transfer(
+            &config,
+            secret.clone(),
+            expected_fingerprint_sha256.clone(),
+            &job,
+            &resume_options,
+            RemoteTransferProtocol::Sftp,
+        )? {
+            return Ok(parallel_transfer_progress(&job, &report));
+        }
         let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
         let bytes_done = Libssh2SftpEngine::new()
-            .transfer(&session, &job)
+            .transfer_with_resume(&session, &job, &resume_options)
             .map_err(files_error_to_ssh_runtime)?;
         let bytes_total = if job.bytes_total == 0 {
             bytes_done
@@ -1398,9 +1522,18 @@ pub fn run_live_sftp_transfer(
         Ok(vec![
             ScpTransferProgress {
                 job_id: job.id.clone(),
-                bytes_done: 0,
+                bytes_done: if resume_options.requested_offset > 0 && !resume_options.force_restart
+                {
+                    resume_options.requested_offset.min(bytes_total)
+                } else {
+                    0
+                },
                 bytes_total,
-                status: "running".to_string(),
+                status: if resume_options.requested_offset > 0 && !resume_options.force_restart {
+                    "resuming".to_string()
+                } else {
+                    "running".to_string()
+                },
             },
             ScpTransferProgress {
                 job_id: job.id,
@@ -1409,6 +1542,250 @@ pub fn run_live_sftp_transfer(
                 status: "completed".to_string(),
             },
         ])
+    })
+}
+
+const PARALLEL_FILE_TRANSFER_CHUNK_SIZE_BYTES: u64 = 1024 * 1024;
+const PARALLEL_FILE_TRANSFER_WORKER_COUNT: u8 = 4;
+
+fn local_upload_is_parallel_candidate(job: &ScpTransferJob) -> bool {
+    job.direction == ScpDirection::Upload
+        && std::fs::metadata(&job.source_path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+}
+
+fn run_parallel_local_remote_transfer(
+    config: &SshConnectionConfig,
+    secret: SshAuthSecret,
+    expected_fingerprint_sha256: String,
+    job: &ScpTransferJob,
+    resume_options: &ScpResumeOptions,
+    protocol: RemoteTransferProtocol,
+) -> Result<Option<RemoteFileTransferReport>, SshRuntimeError> {
+    if is_live_scp_transfer_cancelled(&job.id) {
+        return Err(SshRuntimeError::Transport {
+            message: "FILES_TRANSFER_CANCELED".to_string(),
+        });
+    }
+    let source_size = match job.direction {
+        ScpDirection::Upload => {
+            if !local_upload_is_parallel_candidate(job) {
+                return Ok(None);
+            }
+            std::fs::metadata(&job.source_path)
+                .map_err(|_| SshRuntimeError::Transport {
+                    message: "FILES_LOCAL_FILE_MISSING".to_string(),
+                })?
+                .len()
+        }
+        ScpDirection::Download => {
+            let mut probe = Libssh2RemoteTransferBackend::new(
+                config.clone(),
+                secret.clone(),
+                expected_fingerprint_sha256.clone(),
+                protocol.clone(),
+            );
+            let Some(identity) = probe
+                .file_identity(&job.source_path)
+                .map_err(|message| SshRuntimeError::Transport { message })?
+            else {
+                return Ok(None);
+            };
+            identity.size
+        }
+    };
+    let transfer_request = RemoteFileTransferRequest {
+        job_id: job.id.clone(),
+        source_path: job.source_path.clone(),
+        destination_path: job.destination_path.clone(),
+        expected_size: if job.bytes_total == 0 {
+            source_size
+        } else {
+            job.bytes_total
+        },
+        requested_offset: resume_options.requested_offset,
+        force_restart: resume_options.force_restart,
+    };
+    let job_id = job.id.clone();
+    let progress_job_id = job.id.clone();
+    let transfer = match job.direction {
+        ScpDirection::Upload => {
+            let destination_config = config.clone();
+            let destination_secret = secret;
+            let destination_fingerprint = expected_fingerprint_sha256;
+            transfer_remote_file_ranges(
+                || Ok(LocalFileTransferBackend::new()),
+                move || {
+                    Ok(Libssh2RemoteTransferBackend::new(
+                        destination_config.clone(),
+                        destination_secret.clone(),
+                        destination_fingerprint.clone(),
+                        protocol.clone(),
+                    ))
+                },
+                &transfer_request,
+                PARALLEL_FILE_TRANSFER_CHUNK_SIZE_BYTES,
+                PARALLEL_FILE_TRANSFER_WORKER_COUNT,
+                move || is_live_scp_transfer_cancelled(&job_id),
+                move |bytes_done| {
+                    record_live_scp_transfer_progress(ScpTransferProgress {
+                        job_id: progress_job_id.clone(),
+                        bytes_done,
+                        bytes_total: source_size,
+                        status: "running".to_string(),
+                    });
+                },
+            )
+        }
+        ScpDirection::Download => {
+            let source_config = config.clone();
+            let source_secret = secret;
+            let source_fingerprint = expected_fingerprint_sha256;
+            transfer_remote_file_ranges(
+                move || {
+                    Ok(Libssh2RemoteTransferBackend::new(
+                        source_config.clone(),
+                        source_secret.clone(),
+                        source_fingerprint.clone(),
+                        protocol.clone(),
+                    ))
+                },
+                || Ok(LocalFileTransferBackend::new()),
+                &transfer_request,
+                PARALLEL_FILE_TRANSFER_CHUNK_SIZE_BYTES,
+                PARALLEL_FILE_TRANSFER_WORKER_COUNT,
+                move || is_live_scp_transfer_cancelled(&job_id),
+                move |bytes_done| {
+                    record_live_scp_transfer_progress(ScpTransferProgress {
+                        job_id: progress_job_id.clone(),
+                        bytes_done,
+                        bytes_total: source_size,
+                        status: "running".to_string(),
+                    });
+                },
+            )
+        }
+    };
+    transfer
+        .map(Some)
+        .map_err(|error| SshRuntimeError::Transport {
+            message: error.code,
+        })
+}
+
+fn parallel_transfer_progress(
+    job: &ScpTransferJob,
+    report: &RemoteFileTransferReport,
+) -> Vec<ScpTransferProgress> {
+    vec![
+        ScpTransferProgress {
+            job_id: job.id.clone(),
+            bytes_done: report.resumed_from,
+            bytes_total: report.bytes_total,
+            status: if report.resumed_from > 0 {
+                "resuming".to_string()
+            } else {
+                "running".to_string()
+            },
+        },
+        ScpTransferProgress {
+            job_id: job.id.clone(),
+            bytes_done: report.bytes_done,
+            bytes_total: report.bytes_total,
+            status: "completed".to_string(),
+        },
+    ]
+}
+
+/// Streams one remote file directly between two independently authenticated
+/// SSH/SFTP endpoints. Each range worker opens its own libssh2 session, keeps
+/// only a bounded in-memory pipeline, and persists a redacted checkpoint on
+/// the destination so an interrupted transfer can continue without a local
+/// relay file.
+#[uniffi::export]
+pub fn run_live_remote_to_remote_transfer(
+    source_config: SshConnectionConfig,
+    source_secret: SshAuthSecret,
+    source_expected_fingerprint_sha256: String,
+    destination_config: SshConnectionConfig,
+    destination_secret: SshAuthSecret,
+    destination_expected_fingerprint_sha256: String,
+    request: RemoteToRemoteTransferRequest,
+) -> Result<RemoteToRemoteTransferReport, SshRuntimeError> {
+    let job = request.job.clone();
+    with_live_scp_transfer_cancellation_scope(&job.id.clone(), || {
+        validate_ssh_config_target(source_config.clone())?;
+        validate_ssh_config_target(destination_config.clone())?;
+        let source_protocol = request.source_protocol.clone();
+        let destination_protocol = request.destination_protocol.clone();
+        let source_factory = move || {
+            Ok(Libssh2RemoteTransferBackend::new(
+                source_config.clone(),
+                source_secret.clone(),
+                source_expected_fingerprint_sha256.clone(),
+                source_protocol.clone(),
+            ))
+        };
+        let destination_factory = move || {
+            Ok(Libssh2RemoteTransferBackend::new(
+                destination_config.clone(),
+                destination_secret.clone(),
+                destination_expected_fingerprint_sha256.clone(),
+                destination_protocol.clone(),
+            ))
+        };
+        let transfer_request = RemoteFileTransferRequest {
+            job_id: job.id.clone(),
+            source_path: job.source_path.clone(),
+            destination_path: job.destination_path.clone(),
+            expected_size: job.bytes_total,
+            requested_offset: request.requested_offset,
+            force_restart: request.force_restart,
+        };
+        let bytes_total = job.bytes_total;
+        let job_id = job.id.clone();
+        let result = transfer_remote_file_ranges(
+            source_factory,
+            destination_factory,
+            &transfer_request,
+            request.chunk_size_bytes,
+            request.worker_count,
+            {
+                let job_id = job_id.clone();
+                move || is_live_scp_transfer_cancelled(&job_id)
+            },
+            {
+                let job_id = job_id.clone();
+                move |bytes_done| {
+                    record_live_scp_transfer_progress(ScpTransferProgress {
+                        job_id: job_id.clone(),
+                        bytes_done,
+                        bytes_total,
+                        status: "running".to_string(),
+                    });
+                }
+            },
+        );
+        result
+            .map(|report| {
+                record_live_scp_transfer_progress(ScpTransferProgress {
+                    job_id: job.id.clone(),
+                    bytes_done: report.bytes_done,
+                    bytes_total: report.bytes_total,
+                    status: "completed".to_string(),
+                });
+                RemoteToRemoteTransferReport {
+                    job_id: job.id,
+                    bytes_done: report.bytes_done,
+                    bytes_total: report.bytes_total,
+                    resumed_from: report.resumed_from,
+                    sha256_hex: report.sha256_hex,
+                }
+            })
+            .map_err(|error| SshRuntimeError::Transport {
+                message: error.code,
+            })
     })
 }
 
@@ -2378,6 +2755,161 @@ fn normalized_import_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BastionRouteIdentity {
+    canonical: String,
+    target_label: String,
+}
+
+fn bastion_route_identity(
+    protocol: &str,
+    gateway_host: &str,
+    gateway_port: u32,
+    gateway_username: Option<&str>,
+    config_json: Option<&str>,
+) -> Option<BastionRouteIdentity> {
+    let metadata = config_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| value.as_object().cloned());
+    let composite = gateway_username.and_then(topsec_composite_route);
+    let vendor = metadata
+        .as_ref()
+        .and_then(|object| object.get("bastionVendor"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalized_route_component)
+        .or_else(|| composite.as_ref().map(|_| "topsec".to_string()));
+    let has_bastion_marker = vendor.is_some()
+        || metadata.as_ref().is_some_and(|object| {
+            object.contains_key("bastionFormat") || object.contains_key("bastionTargetHost")
+        });
+    if !has_bastion_marker && composite.is_none() {
+        return None;
+    }
+
+    let target_host = metadata
+        .as_ref()
+        .and_then(|object| object.get("bastionTargetHost"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalized_route_value)
+        .or_else(|| composite.as_ref().map(|route| route.target_host.clone()))?;
+    let target_label = target_host.clone();
+    let target_port = metadata
+        .as_ref()
+        .and_then(|object| object.get("bastionTargetPort"))
+        .and_then(route_port)
+        .or_else(|| composite.as_ref().map(|route| route.target_port))
+        .unwrap_or_else(|| default_import_port(protocol));
+    let target_username = metadata
+        .as_ref()
+        .and_then(|object| object.get("bastionTargetUsername"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalized_route_component)
+        .or_else(|| {
+            composite
+                .as_ref()
+                .map(|route| route.target_username.clone())
+        })
+        .unwrap_or_default();
+    let components = [
+        vendor.unwrap_or_else(|| "custom".to_string()),
+        normalized_route_value(gateway_host)?,
+        gateway_port.to_string(),
+        target_host,
+        target_port.to_string(),
+        normalized_route_component(protocol)?,
+        target_username,
+    ];
+    let canonical = serde_json::to_string(&components).ok()?;
+    Some(BastionRouteIdentity {
+        canonical,
+        target_label,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopsecCompositeRoute {
+    target_host: String,
+    target_port: u32,
+    target_username: String,
+}
+
+fn topsec_composite_route(username: &str) -> Option<TopsecCompositeRoute> {
+    let components = username
+        .trim()
+        .split('@')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if components.len() < 6 {
+        return None;
+    }
+    let protocol = components.get(components.len() - 4)?.to_ascii_lowercase();
+    if !matches!(protocol.as_str(), "ssh" | "sftp") {
+        return None;
+    }
+    let target_username = normalized_route_component(components.get(components.len() - 3)?)?;
+    let target_host = normalized_route_value(components.get(components.len() - 2)?)?;
+    let target_port = components.last()?.parse::<u32>().ok()?;
+    if !(1..=65_535).contains(&target_port) {
+        return None;
+    }
+    Some(TopsecCompositeRoute {
+        target_host,
+        target_port,
+        target_username,
+    })
+}
+
+fn route_port(value: &serde_json::Value) -> Option<u32> {
+    let port = value
+        .as_u64()
+        .and_then(|port| u32::try_from(port).ok())
+        .or_else(|| value.as_str()?.trim().parse::<u32>().ok())?;
+    (1..=65_535).contains(&port).then_some(port)
+}
+
+fn normalized_route_component(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 1_024 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value)
+}
+
+fn normalized_route_value(value: &str) -> Option<String> {
+    normalized_route_component(value)
+}
+
+fn default_import_port(protocol: &str) -> u32 {
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "telnet" => 23,
+        "vnc" => 5_900,
+        _ => 22,
+    }
+}
+
+fn unique_bastion_import_name(
+    requested_name: &str,
+    target_label: &str,
+    existing_names: &HashSet<String>,
+) -> String {
+    let requested_name = requested_name.trim();
+    if !existing_names.contains(&normalized_import_name(requested_name)) {
+        return requested_name.to_string();
+    }
+    let target_label = target_label.chars().take(96).collect::<String>();
+    let base = format!("{requested_name} · {target_label}");
+    if !existing_names.contains(&normalized_import_name(&base)) {
+        return base;
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{base} ({suffix})");
+        if !existing_names.contains(&normalized_import_name(&candidate)) {
+            return candidate;
+        }
+    }
+    unreachable!("an unused bastion import name must be available")
+}
+
 fn folder_ids_by_path(folders: &[SessionFolder]) -> HashMap<String, String> {
     folder_paths_by_id(folders)
         .into_iter()
@@ -3064,8 +3596,9 @@ mod tests {
 #[cfg(test)]
 mod terminal_api_tests {
     use super::{
-        close_terminal_runtime, open_local_shell_runtime, record_terminal_output,
-        record_terminal_resize, take_terminal_output_batch, terminal_registry,
+        close_terminal_runtime, open_external_terminal_runtime, open_local_shell_runtime,
+        record_terminal_output, record_terminal_resize, take_terminal_output_batch,
+        terminal_registry,
     };
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -3082,6 +3615,26 @@ mod terminal_api_tests {
         assert_eq!(batch.bytes, vec![65, 66, 67]);
 
         let closed = close_terminal_runtime(runtime.id).expect("close");
+        assert_eq!(closed.status, "closed");
+    }
+
+    #[test]
+    fn exported_terminal_api_opens_external_ble_runtime() {
+        let runtime = open_external_terminal_runtime(
+            "ble_console".to_string(),
+            "NBEE_BLE_1103".to_string(),
+            80,
+            24,
+        )
+        .expect("open external runtime");
+
+        assert_eq!(runtime.kind, "ble_console");
+        assert_eq!(runtime.remote_host.as_deref(), Some("NBEE_BLE_1103"));
+        record_terminal_output(runtime.id.clone(), b"ready".to_vec()).expect("record BLE RX");
+        let batch = take_terminal_output_batch(runtime.id.clone()).expect("take BLE RX");
+        assert_eq!(batch.bytes, b"ready");
+
+        let closed = close_terminal_runtime(runtime.id).expect("close external runtime");
         assert_eq!(closed.status, "closed");
     }
 
@@ -3106,15 +3659,78 @@ mod terminal_api_tests {
 }
 
 #[cfg(test)]
+mod console_api_tests {
+    use super::{
+        console_transport_policy, match_ble_console_profile, parse_console_session_config,
+        serialize_console_session_config,
+    };
+    use crate::domain::console::{
+        ConsoleCharacteristicMetadata, ConsolePlatform, ConsoleServiceMetadata,
+        ConsoleTransportDecision,
+    };
+
+    #[test]
+    fn exported_console_api_uses_the_shared_validated_contract() {
+        let json = r#"{
+            "kind":"console",
+            "schemaVersion":1,
+            "transportPolicy":"prefer_ble",
+            "ble":{
+                "deviceName":"NBEE_BLE_1103",
+                "profileID":"bterm-ffe1-split-v1",
+                "serviceUUID":"FFE1",
+                "txCharacteristicUUID":"FFE3",
+                "rxCharacteristicUUID":"FFE2",
+                "writeType":"without_response",
+                "platformBindings":{
+                    "macOSPeripheralUUID":"opaque-device-id",
+                    "windowsDeviceID":null
+                }
+            },
+            "sppFallback":null
+        }"#;
+
+        let config = parse_console_session_config(json.to_string()).expect("parse exported config");
+        let serialized =
+            serialize_console_session_config(config).expect("serialize exported config");
+        let matched = match_ble_console_profile(vec![ConsoleServiceMetadata {
+            uuid: "FFE1".to_string(),
+            characteristics: vec![
+                ConsoleCharacteristicMetadata {
+                    uuid: "FFE3".to_string(),
+                    supports_write: true,
+                    supports_write_without_response: true,
+                    supports_notify: false,
+                    supports_indicate: false,
+                },
+                ConsoleCharacteristicMetadata {
+                    uuid: "FFE2".to_string(),
+                    supports_write: false,
+                    supports_write_without_response: false,
+                    supports_notify: true,
+                    supports_indicate: false,
+                },
+            ],
+        }])
+        .expect("match exported profile");
+        let policy = console_transport_policy(ConsolePlatform::Macos, Some("COM7".to_string()));
+
+        assert!(serialized.contains("bterm-ffe1-split-v1"));
+        assert_eq!(matched.profile_id, "bterm-ffe1-split-v1");
+        assert_eq!(policy, ConsoleTransportDecision::BleOnly);
+    }
+}
+
+#[cfg(test)]
 mod live_shell_api_tests {
     use super::{
         append_scp_transfer_progress, cancel_live_ftp_transfer, cancel_live_scp_transfer,
         chmod_live_remote_path, clear_finished_scp_transfer_jobs, close_live_ssh_shell,
         close_terminal_runtime, create_live_remote_directory, delete_live_remote_path,
         list_live_remote_directory, list_scp_transfer_events, list_scp_transfer_jobs,
-        open_remote_ssh_runtime, poll_live_ssh_shell, record_scp_transfer_job,
-        rename_live_remote_path, run_live_ftp_transfer, run_live_scp_transfer,
-        start_live_serial_shell_runtime, start_live_telnet_shell_runtime,
+        local_upload_is_parallel_candidate, open_remote_ssh_runtime, poll_live_ssh_shell,
+        record_scp_transfer_job, rename_live_remote_path, run_live_ftp_transfer,
+        run_live_scp_transfer, start_live_serial_shell_runtime, start_live_telnet_shell_runtime,
         take_live_scp_transfer_progress_batch, take_terminal_output_batch, write_terminal_input,
     };
     use crate::domain::ftp::{FtpAuthSecret, FtpConnectionConfig};
@@ -3281,6 +3897,24 @@ mod live_shell_api_tests {
                 .expect_err("invalid config");
 
         assert_eq!(error, SshRuntimeError::InvalidConfig);
+    }
+
+    #[test]
+    fn parallel_transfer_candidate_accepts_single_files_but_not_directories() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = directory.path().join("archive.bin");
+        std::fs::write(&file, b"payload").expect("source file");
+        let mut job = ScpTransferJob {
+            id: "parallel-candidate".to_string(),
+            direction: ScpDirection::Upload,
+            source_path: file.to_string_lossy().into_owned(),
+            destination_path: "/srv/archive.bin".to_string(),
+            bytes_total: 7,
+        };
+
+        assert!(local_upload_is_parallel_candidate(&job));
+        job.source_path = directory.path().to_string_lossy().into_owned();
+        assert!(!local_upload_is_parallel_candidate(&job));
     }
 
     #[test]
@@ -4506,6 +5140,128 @@ mod session_api_tests {
         assert_eq!(config["bastionAccountId"], "account-8");
         assert!(config.get("password").is_none());
         assert!(!config_json.contains("must-not-persist"));
+    }
+
+    #[test]
+    fn session_import_distinguishes_bastion_routes_and_revalidates_after_delete() {
+        let temp = tempfile::NamedTempFile::new().expect("temp database");
+        let database_path = temp.path().to_string_lossy().to_string();
+        let make_session = |target_host: &str, target_username: &str, conflict: bool| {
+            ImportSessionPreview {
+                name: "Database".to_string(),
+                folder: None,
+                protocol: "ssh".to_string(),
+                host: "bastion.example.com".to_string(),
+                port: 2222,
+                username: Some(format!(
+                    "opaque-account@default@SSH@{target_username}@{target_host}@22"
+                )),
+                private_key_path: None,
+                config_json: Some(format!(
+                    r#"{{"bastionVendor":"topsec","bastionTargetHost":"{target_host}","bastionTargetPort":22,"bastionTargetUsername":"{target_username}"}}"#
+                )),
+                conflict,
+            }
+        };
+
+        let first_result = super::apply_session_import(
+            database_path.clone(),
+            "bastion_host".to_string(),
+            "sessions.zip".to_string(),
+            ImportPreview {
+                sessions: vec![
+                    make_session("10.0.0.8", "dbadmin", false),
+                    make_session("10.0.0.9", "dbadmin", false),
+                ],
+                warnings: vec![],
+                conflict_count: 0,
+                ignored_secret_field_count: 0,
+            },
+        )
+        .expect("import distinct bastion routes");
+
+        assert_eq!(first_result.report.imported_count, 2);
+        assert_eq!(first_result.report.skipped_count, 0);
+        assert_eq!(first_result.imported_sessions[0].name, "Database");
+        assert_eq!(
+            first_result.imported_sessions[1].name,
+            "Database · 10.0.0.9"
+        );
+
+        let mut duplicate = make_session("10.0.0.9", "dbadmin", false);
+        duplicate.name = "Renamed duplicate".to_string();
+        let duplicate_result = super::apply_session_import(
+            database_path.clone(),
+            "bastion_host".to_string(),
+            "duplicate.zip".to_string(),
+            ImportPreview {
+                sessions: vec![duplicate],
+                warnings: vec![],
+                conflict_count: 0,
+                ignored_secret_field_count: 0,
+            },
+        )
+        .expect("skip duplicate bastion route");
+        assert_eq!(duplicate_result.report.imported_count, 0);
+        assert_eq!(duplicate_result.report.skipped_count, 1);
+
+        super::delete_session_record(
+            database_path.clone(),
+            first_result.imported_sessions[0].id.clone(),
+        )
+        .expect("delete first imported route");
+        let reimport_result = super::apply_session_import(
+            database_path.clone(),
+            "bastion_host".to_string(),
+            "sessions.zip".to_string(),
+            ImportPreview {
+                sessions: vec![make_session("10.0.0.8", "dbadmin", true)],
+                warnings: vec![],
+                conflict_count: 1,
+                ignored_secret_field_count: 0,
+            },
+        )
+        .expect("reimport deleted route without restart");
+
+        assert_eq!(reimport_result.report.imported_count, 1);
+        assert_eq!(reimport_result.report.skipped_count, 0);
+        assert_eq!(
+            super::list_all_session_records(database_path)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn session_import_does_not_trust_stale_preview_conflict_flag() {
+        let temp = tempfile::NamedTempFile::new().expect("temp database");
+        let database_path = temp.path().to_string_lossy().to_string();
+        let result = super::apply_session_import(
+            database_path,
+            "csv".to_string(),
+            "sessions.csv".to_string(),
+            ImportPreview {
+                sessions: vec![ImportSessionPreview {
+                    name: "Worker".to_string(),
+                    folder: None,
+                    protocol: "ssh".to_string(),
+                    host: "worker.example.com".to_string(),
+                    port: 22,
+                    username: Some("deploy".to_string()),
+                    private_key_path: None,
+                    config_json: None,
+                    conflict: true,
+                }],
+                warnings: vec![],
+                conflict_count: 1,
+                ignored_secret_field_count: 0,
+            },
+        )
+        .expect("apply with current database state");
+
+        assert_eq!(result.report.imported_count, 1);
+        assert_eq!(result.report.skipped_count, 0);
     }
 
     #[test]

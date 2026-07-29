@@ -1412,7 +1412,11 @@ public enum TerminalAppearanceApplier {
         }
     }
 
-    public static func apply(settings: AppSettings, to terminalView: TerminalView) {
+    public static func apply(
+        settings: AppSettings,
+        to terminalView: TerminalView,
+        colorThemeOverride: TerminalColorTheme? = nil
+    ) {
         terminalView.font = font(for: settings)
         terminalView.optionAsMetaKey = settings.terminalAltAsMetaEnabled
         terminalView.changeScrollback(settings.terminalScrollbackLines)
@@ -1424,24 +1428,28 @@ public enum TerminalAppearanceApplier {
         terminalView.terminal.options.cursorStyle = cursorStyle(for: settings)
         terminalView.cursorStyleChanged(source: terminalView.terminal, newStyle: terminalView.terminal.options.cursorStyle)
 
-        switch settings.terminalTheme {
-        case .system:
-            terminalView.nativeForegroundColor = StacioDesignSystem.resolvedColor(.textColor, for: terminalView)
-            terminalView.nativeBackgroundColor = StacioDesignSystem.resolvedColor(.textBackgroundColor, for: terminalView)
-            terminalView.caretColor = terminalView.nativeForegroundColor
-            terminalView.selectedTextBackgroundColor = StacioDesignSystem.resolvedColor(
-                .selectedTextBackgroundColor,
-                for: terminalView
-            )
-        case .light:
-            apply(theme: .solarizedLight, to: terminalView)
-        case .dark:
-            apply(theme: TerminalColorTheme.resolvedBuiltInTheme(id: settings.terminalBuiltInThemeID), to: terminalView)
-        case .custom:
-            if let theme = settings.customTerminalTheme {
-                apply(theme: theme, to: terminalView)
-            } else {
-                terminalView.configureNativeColors()
+        if let colorThemeOverride {
+            apply(theme: colorThemeOverride, to: terminalView)
+        } else {
+            switch settings.terminalTheme {
+            case .system:
+                terminalView.nativeForegroundColor = StacioDesignSystem.resolvedColor(.textColor, for: terminalView)
+                terminalView.nativeBackgroundColor = StacioDesignSystem.resolvedColor(.textBackgroundColor, for: terminalView)
+                terminalView.caretColor = terminalView.nativeForegroundColor
+                terminalView.selectedTextBackgroundColor = StacioDesignSystem.resolvedColor(
+                    .selectedTextBackgroundColor,
+                    for: terminalView
+                )
+            case .light:
+                apply(theme: .solarizedLight, to: terminalView)
+            case .dark:
+                apply(theme: TerminalColorTheme.resolvedBuiltInTheme(id: settings.terminalBuiltInThemeID), to: terminalView)
+            case .custom:
+                if let theme = settings.customTerminalTheme {
+                    apply(theme: theme, to: terminalView)
+                } else {
+                    terminalView.configureNativeColors()
+                }
             }
         }
         terminalView.wantsLayer = true

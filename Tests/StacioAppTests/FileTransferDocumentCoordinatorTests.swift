@@ -1,6 +1,7 @@
 import AppKit
 import CoreFoundation
 import PDFKit
+@preconcurrency import QuickLookUI
 import StacioCoreBindings
 import XCTest
 @testable import StacioApp
@@ -611,6 +612,171 @@ final class FileTransferDocumentCoordinatorTests: XCTestCase {
         coordinator.closePreview()
     }
 
+    func testQuickLookCoordinatorOwnsAndReleasesPreviewPanelControl() throws {
+        let coordinator = FileWorkspaceQuickLookCoordinator()
+        let panel = try XCTUnwrap(QLPreviewPanel.shared())
+
+        XCTAssertTrue(coordinator.acceptsPreviewPanelControl(panel))
+        coordinator.beginPreviewPanelControl(panel)
+        XCTAssertTrue(panel.dataSource === coordinator)
+        XCTAssertTrue(panel.delegate === coordinator)
+
+        coordinator.endPreviewPanelControl(panel)
+        XCTAssertNil(panel.dataSource)
+        XCTAssertNil(panel.delegate)
+    }
+
+    func testQuickLookPresentReclaimsSharedPanelFromAStaleController() throws {
+        let stale = FileWorkspaceQuickLookCoordinator()
+        let current = FileWorkspaceQuickLookCoordinator()
+        let panel = try XCTUnwrap(QLPreviewPanel.shared())
+        let previewURL = temporaryDirectory.appendingPathComponent("local-preview.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: previewURL)
+        stale.beginPreviewPanelControl(panel)
+
+        current.present(urls: [previewURL])
+
+        XCTAssertTrue(panel.dataSource === current)
+        XCTAssertTrue(panel.delegate === current)
+        XCTAssertEqual(current.previewURLsForTesting, [previewURL.standardizedFileURL])
+        current.closePreview()
+    }
+
+    func testRemoteQuickLookShowsLoadingImmediatelyAndSchedulesSilentCacheTransfer() throws {
+        let scheduler = QuickLookRecordingTransferScheduler()
+        scheduler.materializesCompletedDownloads = true
+        let source = FileTransferRemoteDocumentSource(
+            runtimeID: "quicklook-loading",
+            context: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "files.example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:files"
+            ),
+            bridge: DirectoryQuickLookRemoteFilesBridge(listings: [:], dataByPath: [:]),
+            transferScheduler: scheduler,
+            setStatus: { _ in }
+        )
+        let coordinator = FileTransferDocumentCoordinator()
+
+        coordinator.quickLookRemoteSelections(
+            [RemoteFileSelection(path: "/srv/preview.png", size: 4)],
+            source: source
+        )
+
+        XCTAssertTrue(coordinator.quickLookCoordinatorForTesting.isLoadingForTesting)
+        XCTAssertEqual(scheduler.notificationPolicies, [.silent])
+        scheduler.complete(jobAt: 0, status: "completed")
+        XCTAssertTrue(waitUntil {
+            coordinator.quickLookCoordinatorForTesting.previewURLsForTesting.count == 1
+        })
+        XCTAssertFalse(coordinator.quickLookCoordinatorForTesting.isLoadingForTesting)
+        coordinator.closeDocumentWindowsForTesting()
+    }
+
+    func testRemoteQuickLookLoadingPanelUsesNativePopoverMaterialInDarkMode() throws {
+        let coordinator = FileWorkspaceQuickLookCoordinator()
+        coordinator.showLoading(message: "正在准备一项名称较长的远端文件快速预览...")
+        defer { coordinator.dismissLoading() }
+
+        let panel = try XCTUnwrap(coordinator.loadingPanelForTesting)
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        let materialView = try XCTUnwrap(panel.contentView as? NSVisualEffectView)
+        XCTAssertEqual(materialView.material, .popover)
+        XCTAssertEqual(panel.contentLayoutRect.size, NSSize(width: 292, height: 84))
+        XCTAssertFalse(materialView.quickLookDescendants.contains(where: \.hasAmbiguousLayout))
+
+        let progressIndicator = try XCTUnwrap(
+            materialView.quickLookDescendants.compactMap { $0 as? NSProgressIndicator }.first
+        )
+        XCTAssertEqual(progressIndicator.style, .spinning)
+        XCTAssertTrue(progressIndicator.isIndeterminate)
+        let label = try XCTUnwrap(
+            materialView.quickLookDescendants
+                .compactMap { $0 as? NSTextField }
+                .first(where: { $0.stringValue.contains("远端文件快速预览") })
+        )
+        XCTAssertEqual(label.textColor, .labelColor)
+        XCTAssertEqual(label.lineBreakMode, .byTruncatingTail)
+    }
+
+    func testRemoteQuickLookDismissesLoadingWhenCacheTransferFails() {
+        let scheduler = QuickLookRecordingTransferScheduler()
+        var statuses: [String] = []
+        let source = FileTransferRemoteDocumentSource(
+            runtimeID: "quicklook-failure",
+            context: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "files.example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:files"
+            ),
+            bridge: DirectoryQuickLookRemoteFilesBridge(listings: [:], dataByPath: [:]),
+            transferScheduler: scheduler,
+            setStatus: { statuses.append($0) }
+        )
+        let coordinator = FileTransferDocumentCoordinator()
+
+        coordinator.quickLookRemoteSelections(
+            [RemoteFileSelection(path: "/srv/missing.png", size: 4)],
+            source: source
+        )
+        XCTAssertTrue(coordinator.quickLookCoordinatorForTesting.isLoadingForTesting)
+
+        scheduler.complete(jobAt: 0, status: "failed")
+
+        XCTAssertTrue(waitUntil {
+            coordinator.quickLookCoordinatorForTesting.isLoadingForTesting == false
+        })
+        XCTAssertTrue(coordinator.quickLookCoordinatorForTesting.previewURLsForTesting.isEmpty)
+        XCTAssertEqual(statuses.last, FileTransferDocumentError.previewPreparationFailed("missing.png").localizedDescription)
+        coordinator.closeDocumentWindowsForTesting()
+    }
+
+    func testClosingRemoteQuickLookDismissesLoadingAndCancelsCacheTransfer() {
+        let scheduler = QuickLookRecordingTransferScheduler()
+        let source = FileTransferRemoteDocumentSource(
+            runtimeID: "quicklook-cancel",
+            context: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "files.example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:files"
+            ),
+            bridge: DirectoryQuickLookRemoteFilesBridge(listings: [:], dataByPath: [:]),
+            transferScheduler: scheduler,
+            setStatus: { _ in }
+        )
+        let coordinator = FileTransferDocumentCoordinator()
+
+        coordinator.quickLookRemoteSelections(
+            [RemoteFileSelection(path: "/srv/cancel.png", size: 4)],
+            source: source
+        )
+        XCTAssertTrue(coordinator.quickLookCoordinatorForTesting.isLoadingForTesting)
+
+        coordinator.closeDocumentWindowsForTesting()
+
+        XCTAssertFalse(coordinator.quickLookCoordinatorForTesting.isLoadingForTesting)
+        XCTAssertTrue(scheduler.pendingJobIDs.isEmpty)
+    }
+
     func testQuickLookKeepsPreparedRemoteCopyUntilReplacementOrClose() throws {
         let firstRoot = temporaryDirectory.appendingPathComponent("first-remote", isDirectory: true)
         let secondRoot = temporaryDirectory.appendingPathComponent("second-remote", isDirectory: true)
@@ -745,6 +911,12 @@ private final class LocalTextIOThreadRecorder: @unchecked Sendable {
     }
 }
 
+private extension NSView {
+    var quickLookDescendants: [NSView] {
+        subviews + subviews.flatMap(\.quickLookDescendants)
+    }
+}
+
 private final class BlockingDocumentPreparationRemoteFilesBridge: RemoteFilesBridging, @unchecked Sendable {
     private let lock = NSLock()
     private let firstReadStarted = DispatchSemaphore(value: 0)
@@ -860,6 +1032,77 @@ private final class BlockingDocumentPreparationRemoteFilesBridge: RemoteFilesBri
             _ = releaseGate.wait(timeout: .now() + 1)
         }
         return Data(repeating: 0x20, count: Int(length ?? 0))
+    }
+}
+
+@MainActor
+private final class QuickLookRecordingTransferScheduler: SCPTransferScheduling {
+    private(set) var jobs: [ScpTransferJob] = []
+    private(set) var notificationPolicies: [TransferCompletionNotificationPolicy] = []
+    var materializesCompletedDownloads = false
+    private var completions: [String: (ScpTransferProgress) -> Void] = [:]
+
+    var pendingJobIDs: Set<String> {
+        Set(completions.keys)
+    }
+
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduleLiveTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: .userVisible,
+            completion: completion
+        )
+    }
+
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        jobs.append(job)
+        notificationPolicies.append(notificationPolicy)
+        completions[job.id] = completion
+    }
+
+    func disconnectTransfers(runtimeID: String) -> [String] { [] }
+    func cancelTransfer(jobID: String) -> Bool { completions.removeValue(forKey: jobID) != nil }
+    func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
+
+    func complete(jobAt index: Int, status: String) {
+        guard jobs.indices.contains(index) else { return }
+        let job = jobs[index]
+        if status == "completed", materializesCompletedDownloads {
+            let destination = URL(fileURLWithPath: job.destinationPath)
+            try? FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(
+                atPath: destination.path,
+                contents: Data(repeating: 0x41, count: Int(clamping: job.bytesTotal))
+            )
+        }
+        completions.removeValue(forKey: job.id)?(ScpTransferProgress(
+            jobId: job.id,
+            bytesDone: status == "completed" ? job.bytesTotal : 0,
+            bytesTotal: job.bytesTotal,
+            status: status
+        ))
     }
 }
 

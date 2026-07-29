@@ -990,6 +990,11 @@ public extension TransferRetryOrchestrationScheduling {
 }
 
 @MainActor
+public protocol TransferQueueCoordinatorProviding: AnyObject {
+    var transferQueueCoordinator: TransferQueueCoordinator? { get }
+}
+
+@MainActor
 public protocol SCPTransferScheduling: TransferRetryOrchestrationScheduling {
     func scheduleLiveTransfer(
         runtimeID: String,
@@ -997,6 +1002,15 @@ public protocol SCPTransferScheduling: TransferRetryOrchestrationScheduling {
         secret: SshAuthSecret,
         expectedFingerprintSHA256: String,
         job: ScpTransferJob,
+        completion: ((ScpTransferProgress) -> Void)?
+    )
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
         completion: ((ScpTransferProgress) -> Void)?
     )
     func scheduleLiveTransfer(
@@ -1012,6 +1026,25 @@ public protocol SCPTransferScheduling: TransferRetryOrchestrationScheduling {
 }
 
 public extension SCPTransferScheduling {
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduleLiveTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: completion
+        )
+    }
+
     func scheduleLiveTransfer(
         runtimeID: String,
         config: SshConnectionConfig,
@@ -1082,6 +1115,9 @@ public extension SCPTransferScheduling {
 }
 
 extension TransferQueueCoordinator: SCPTransferScheduling {}
+extension TransferQueueCoordinator: TransferQueueCoordinatorProviding {
+    public var transferQueueCoordinator: TransferQueueCoordinator? { self }
+}
 
 @MainActor
 public protocol SFTPTransferScheduling: TransferRetryOrchestrationScheduling {
@@ -1093,12 +1129,40 @@ public protocol SFTPTransferScheduling: TransferRetryOrchestrationScheduling {
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)?
     )
+    func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    )
     func disconnectTransfers(runtimeID: String) -> [String]
     func cancelTransfer(jobID: String) -> Bool
     func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64)
 }
 
 public extension SFTPTransferScheduling {
+    func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            completion: completion
+        )
+    }
+
     func scheduleLiveSFTPTransfer(
         runtimeID: String,
         config: SshConnectionConfig,
@@ -1130,11 +1194,15 @@ public extension SFTPTransferScheduling {
 extension TransferQueueCoordinator: SFTPTransferScheduling {}
 
 @MainActor
-public final class SFTPTransferSchedulerAdapter: SCPTransferScheduling {
+public final class SFTPTransferSchedulerAdapter: SCPTransferScheduling, TransferQueueCoordinatorProviding {
     private weak var scheduler: SFTPTransferScheduling?
 
     public init(scheduler: SFTPTransferScheduling) {
         self.scheduler = scheduler
+    }
+
+    public var transferQueueCoordinator: TransferQueueCoordinator? {
+        (scheduler as? TransferQueueCoordinatorProviding)?.transferQueueCoordinator
     }
 
     public func scheduleLiveTransfer(
@@ -1151,6 +1219,26 @@ public final class SFTPTransferSchedulerAdapter: SCPTransferScheduling {
             secret: secret,
             expectedFingerprintSHA256: expectedFingerprintSHA256,
             job: job,
+            completion: completion
+        )
+    }
+
+    public func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
+        scheduler?.scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: notificationPolicy,
             completion: completion
         )
     }
@@ -2434,6 +2522,7 @@ public final class FilesCoordinator {
     private let conflictResolver: RemoteFileConflictResolving
     private let remoteEditCache: RemoteEditCache
     private let remoteEditOpener: RemoteEditOpening
+    private let documentCoordinator: FileTransferDocumentCoordinator
     private let remoteEditSessionIDProvider: () -> String
     private let settingsStore: AppSettingsStore
     private let localUploadSizeProvider: LocalUploadSizeProviding
@@ -2479,6 +2568,7 @@ public final class FilesCoordinator {
         self.conflictResolver = conflictResolver
         self.remoteEditCache = remoteEditCache ?? Self.makeDefaultRemoteEditCache()
         self.remoteEditOpener = remoteEditOpener ?? EmbeddedRemoteEditOpener(filesViewController: filesViewController)
+        self.documentCoordinator = FileTransferDocumentCoordinator()
         self.remoteEditSessionIDProvider = remoteEditSessionIDProvider
         self.settingsStore = settingsStore
         self.localUploadSizeProvider = localUploadSizeProvider
@@ -2554,6 +2644,10 @@ public final class FilesCoordinator {
             self?.remoteSearchGeneration += 1
         }
         updateRemoteSearchAvailability()
+    }
+
+    func closeDocumentWindows() {
+        documentCoordinator.closeDocumentWindows()
     }
 
     @discardableResult
@@ -4210,6 +4304,33 @@ public final class FilesCoordinator {
         mode: RemoteFileOpenMode,
         context: TunnelLiveSessionContext
     ) {
+        let fileName = (selection.path as NSString).lastPathComponent
+        let contentKind = StacioFileDisplay.contentKind(forFileName: fileName)
+        if contentKind.isPreviewableMedia {
+            documentCoordinator.openRemoteSelection(
+                selection,
+                source: FileTransferRemoteDocumentSource(
+                    runtimeID: liveSessionRuntimeID(for: context),
+                    context: context,
+                    bridge: bridge,
+                    transferScheduler: transferScheduler,
+                    setStatus: { [weak self] message in
+                        self?.filesViewController?.setRemoteEditSyncStatus(
+                            message: message,
+                            progressValue: nil
+                        )
+                    }
+                )
+            )
+            logFileOpenEvent(
+                name: "file.open.online.media-window",
+                selection: selection,
+                mode: mode,
+                extra: "kind=\(contentKind)"
+            )
+            return
+        }
+
         guard remoteEditOpener.prepareToOpenRemote(selection: selection, mode: mode) else {
             logFileOpenEvent(
                 name: "file.open.cancelled",
@@ -4221,8 +4342,6 @@ public final class FilesCoordinator {
             return
         }
 
-        let fileName = (selection.path as NSString).lastPathComponent
-        let contentKind = StacioFileDisplay.contentKind(forFileName: fileName)
         if contentKind == .text,
            selection.size > Self.maximumInlineRemoteTextEditorBytes
         {
@@ -4237,26 +4356,6 @@ public final class FilesCoordinator {
             remoteEditOpener.remoteOpenDidFail(selection: selection, mode: mode, message: message)
             return
         }
-        if contentKind.isPreviewableMedia {
-            let previewURL = makeOnlineMediaPreviewURL(selection: selection, context: context)
-            let descriptor = RemoteTextEditorDocumentDescriptor(
-                remotePath: selection.path,
-                fileName: fileName,
-                content: "",
-                contentKind: contentKind,
-                previewSource: previewURL.absoluteString,
-                byteCount: selection.size
-            )
-            remoteEditOpener.openRemoteDocument(descriptor, mode: mode, saveHandler: nil)
-            logFileOpenEvent(
-                name: "file.open.online.preview",
-                selection: selection,
-                mode: mode,
-                extra: "source=\(previewURL.scheme ?? "unknown")"
-            )
-            return
-        }
-
         let bridgeBox = UncheckedSendableBox(bridge)
         let openerBox = UncheckedSendableBox(remoteEditOpener)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -4583,46 +4682,6 @@ public final class FilesCoordinator {
         }
     }
 
-    private func makeOnlineMediaPreviewURL(
-        selection: RemoteFileSelection,
-        context: TunnelLiveSessionContext
-    ) -> URL {
-        let fileName = (selection.path as NSString).lastPathComponent
-        let mimeType = Self.mimeType(forFileName: fileName)
-        let readSession = RemoteFileReadSession.deferred(
-            open: { [bridge] in
-                try bridge.openLiveRemoteFileReadSession(
-                    config: context.config,
-                    secret: context.secret,
-                    expectedFingerprintSHA256: context.expectedFingerprintSHA256
-                )
-            },
-            fallback: { [bridge] remotePath, offset, length in
-                try bridge.readLiveRemoteFile(
-                    config: context.config,
-                    secret: context.secret,
-                    expectedFingerprintSHA256: context.expectedFingerprintSHA256,
-                    remotePath: remotePath,
-                    offset: offset,
-                    length: length
-                )
-            }
-        )
-        return RemoteFileOnlineMediaRegistry.shared.register(
-            fileName: fileName,
-            mimeType: mimeType,
-            byteCount: selection.size,
-            onInvalidate: { readSession.close() },
-            reader: { offset, length in
-                try readSession.read(
-                    remotePath: selection.path,
-                    offset: offset,
-                    length: length
-                )
-            }
-        )
-    }
-
     private func writeRemoteEditText(
         _ text: String,
         selection: RemoteFileSelection,
@@ -4694,49 +4753,6 @@ public final class FilesCoordinator {
             || diagnostic.contains("permission denied")
             || diagnostic.contains("权限不足")
             || diagnostic.contains("权限被拒绝")
-    }
-
-    private static func mimeType(forFileName fileName: String) -> String {
-        switch (fileName as NSString).pathExtension.lowercased() {
-        case "jpg", "jpeg":
-            return "image/jpeg"
-        case "png":
-            return "image/png"
-        case "gif":
-            return "image/gif"
-        case "bmp":
-            return "image/bmp"
-        case "webp":
-            return "image/webp"
-        case "svg":
-            return "image/svg+xml"
-        case "ico":
-            return "image/x-icon"
-        case "mp3":
-            return "audio/mpeg"
-        case "wav":
-            return "audio/wav"
-        case "ogg":
-            return "audio/ogg"
-        case "aac":
-            return "audio/aac"
-        case "flac":
-            return "audio/flac"
-        case "m4a":
-            return "audio/mp4"
-        case "mp4":
-            return "video/mp4"
-        case "webm":
-            return "video/webm"
-        case "avi":
-            return "video/x-msvideo"
-        case "mov":
-            return "video/quicktime"
-        case "mkv":
-            return "video/x-matroska"
-        default:
-            return "application/octet-stream"
-        }
     }
 
     private func cleanCachedRemoteEditItem(

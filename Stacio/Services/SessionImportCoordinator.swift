@@ -190,6 +190,7 @@ public enum SessionImportRemovedProtocolError: LocalizedError, Equatable {
 
 public protocol SessionImportCoreBridging {
     func listAllSessionRecords(databasePath: String) throws -> [SessionRecord]
+    func sessionConfigJSON(databasePath: String, id: String) throws -> String?
     func previewCSVImport(
         _ input: String,
         sourceName: String,
@@ -211,6 +212,12 @@ public protocol SessionImportCoreBridging {
         sourceName: String,
         preview: ImportPreview
     ) throws -> ImportApplyResult
+}
+
+public extension SessionImportCoreBridging {
+    func sessionConfigJSON(databasePath: String, id: String) throws -> String? {
+        nil
+    }
 }
 
 public protocol SessionImportCoordinating {
@@ -254,13 +261,22 @@ public final class KeychainExternalSessionCredentialApplier: ExternalSessionCred
         to importedSessions: [SessionRecord],
         databasePath: String
     ) throws {
-        let importedByName = Dictionary(
-            uniqueKeysWithValues: importedSessions.map { ($0.name.lowercased(), $0) }
-        )
+        let configJSONBySessionID: [String: String] = try importedSessions.reduce(into: [:]) { result, session in
+            if let configJSON = try CoreBridge.getSessionConfigJSON(
+                databasePath: databasePath,
+                id: session.id
+            ) {
+                result[session.id] = configJSON
+            }
+        }
         let saver = credentialSaverFactory(databasePath)
         for source in payload.sessions {
             guard let credential = source.credential,
-                  let imported = importedByName[source.name.lowercased()]
+                  let imported = Self.matchingImportedSession(
+                    source: source,
+                    importedSessions: importedSessions,
+                    configJSONBySessionID: configJSONBySessionID
+                  )
             else { continue }
             let kind: String
             let label: String
@@ -295,6 +311,48 @@ public final class KeychainExternalSessionCredentialApplier: ExternalSessionCred
             )
         }
     }
+
+    private static func matchingImportedSession(
+        source: ExternalImportedSession,
+        importedSessions: [SessionRecord],
+        configJSONBySessionID: [String: String]
+    ) -> SessionRecord? {
+        let sourceSummary = BastionSessionDisplaySummaryCodec.summary(
+            protocolName: source.protocolName,
+            gatewayHost: source.host,
+            gatewayPort: UInt32(source.port),
+            gatewayUsername: source.username,
+            configJSON: source.configJSON
+        )
+        if let sourceRoute = sourceSummary.routeIdentity(protocolName: source.protocolName),
+           let match = importedSessions.first(where: { imported in
+               BastionSessionDisplaySummaryCodec.summary(
+                   protocolName: imported.protocol,
+                   gatewayHost: imported.host,
+                   gatewayPort: imported.port,
+                   gatewayUsername: imported.username,
+                   configJSON: configJSONBySessionID[imported.id]
+               ).routeIdentity(protocolName: imported.protocol) == sourceRoute
+           }) {
+            return match
+        }
+        let normalizedName = source.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return importedSessions.first {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
+        }
+    }
+
+    static func matchedSessionIDForTesting(
+        source: ExternalImportedSession,
+        importedSessions: [SessionRecord],
+        configJSONBySessionID: [String: String]
+    ) -> String? {
+        matchingImportedSession(
+            source: source,
+            importedSessions: importedSessions,
+            configJSONBySessionID: configJSONBySessionID
+        )?.id
+    }
 }
 
 @MainActor
@@ -307,6 +365,10 @@ public final class CoreBridgeSessionImportCoreBridge: SessionImportCoreBridging 
 
     public func listAllSessionRecords(databasePath: String) throws -> [SessionRecord] {
         try CoreBridge.listAllSessionRecords(databasePath: databasePath)
+    }
+
+    public func sessionConfigJSON(databasePath: String, id: String) throws -> String? {
+        try CoreBridge.getSessionConfigJSON(databasePath: databasePath, id: id)
     }
 
     public func previewCSVImport(
@@ -354,6 +416,11 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         let secureTransfer: SecureSessionTransferPayload?
     }
 
+    private struct ExistingSession {
+        let record: SessionRecord
+        let configJSON: String?
+    }
+
     private let databasePath: String
     private let filePicker: SessionImportFilePicking
     private let presenter: SessionImportPreviewPresenting
@@ -366,6 +433,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
     private let bastionHostVendorSelector: BastionHostVendorSelecting
     private let licensedFeatureAuthorizer: LicensedFeatureAuthorizing
     private let onImported: () -> Void
+    private let diagnosticTraceRecorder: FeedbackDiagnosticTraceRecording
+    private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
 
     public init(
         databasePath: String,
@@ -381,7 +450,9 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         licensedFeatureAuthorizer: LicensedFeatureAuthorizing = LicenseFeatureAuthorizer(
             accessProvider: UnrestrictedLicenseFeatureAccessProvider()
         ),
-        onImported: @escaping () -> Void = {}
+        onImported: @escaping () -> Void = {},
+        diagnosticTraceRecorder: FeedbackDiagnosticTraceRecording = FeedbackDiagnosticTraceStore.shared,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
     ) {
         self.databasePath = databasePath
         self.filePicker = filePicker
@@ -395,6 +466,8 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         self.bastionHostVendorSelector = bastionHostVendorSelector
         self.licensedFeatureAuthorizer = licensedFeatureAuthorizer
         self.onImported = onImported
+        self.diagnosticTraceRecorder = diagnosticTraceRecorder
+        self.diagnosticLogRecorder = diagnosticLogRecorder
     }
 
     public func runImport(parentWindow: NSWindow?) throws -> ImportApplyResult? {
@@ -412,30 +485,98 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         sourceType requestedSourceType: SessionImportSourceType?,
         parentWindow: NSWindow?
     ) throws -> ImportApplyResult? {
-        if requestedSourceType == .bastionHost {
-            try bastionHostAuthorizer.authorizeBastionHostAccess()
-        } else {
-            try licensedFeatureAuthorizer.authorize(.sessionBulkIO)
+        do {
+            if requestedSourceType == .bastionHost {
+                try bastionHostAuthorizer.authorizeBastionHostAccess()
+            } else {
+                try licensedFeatureAuthorizer.authorize(.sessionBulkIO)
+            }
+        } catch {
+            recordTrace(
+                stage: .selection,
+                sourceType: requestedSourceType ?? .unknown,
+                result: .failed,
+                errorCode: "selection_failed"
+            )
+            throw error
         }
         let file: SessionImportFile?
-        if let requestedSourceType {
-            file = try filePicker.pickImportFile(
-                sourceType: requestedSourceType,
-                parentWindow: parentWindow
+        do {
+            if let requestedSourceType {
+                file = try filePicker.pickImportFile(
+                    sourceType: requestedSourceType,
+                    parentWindow: parentWindow
+                )
+            } else {
+                file = try filePicker.pickImportFile(parentWindow: parentWindow)
+            }
+        } catch {
+            recordTrace(
+                stage: .selection,
+                sourceType: requestedSourceType ?? .unknown,
+                result: .failed,
+                errorCode: "selection_failed"
             )
-        } else {
-            file = try filePicker.pickImportFile(parentWindow: parentWindow)
+            throw error
         }
-        guard let file,
-              let preparedImport = try prepareImportFile(file, parentWindow: parentWindow)
-        else {
+        guard let file else {
+            recordTrace(
+                stage: .selection,
+                sourceType: requestedSourceType ?? .unknown,
+                result: .cancelled,
+                errorCode: "selection_cancelled"
+            )
+            return nil
+        }
+        let preparedImport: PreparedImport?
+        do {
+            preparedImport = try prepareImportFile(file, parentWindow: parentWindow)
+        } catch {
+            recordTrace(
+                stage: .selection,
+                sourceType: file.sourceType,
+                result: .failed,
+                errorCode: "selection_failed"
+            )
+            throw error
+        }
+        guard let preparedImport else {
+            recordTrace(
+                stage: .selection,
+                sourceType: file.sourceType,
+                result: .cancelled,
+                errorCode: "selection_cancelled"
+            )
             return nil
         }
         let importFile = preparedImport.file
+        recordTrace(
+            stage: .selection,
+            sourceType: importFile.sourceType,
+            result: .selected,
+            errorCode: nil
+        )
 
-        let existingSessionNames = try core
-            .listAllSessionRecords(databasePath: databasePath)
-            .map(\.name)
+        let existingRecords: [SessionRecord]
+        let existingSessions: [ExistingSession]
+        do {
+            existingRecords = try core.listAllSessionRecords(databasePath: databasePath)
+            existingSessions = try existingRecords.map { record in
+                ExistingSession(
+                    record: record,
+                    configJSON: try core.sessionConfigJSON(databasePath: databasePath, id: record.id)
+                )
+            }
+        } catch {
+            recordTrace(
+                stage: .recognition,
+                sourceType: importFile.sourceType,
+                result: .failed,
+                errorCode: "parse_failed"
+            )
+            throw error
+        }
+        let existingSessionNames = existingRecords.map(\.name)
         let preparedPreview: (SessionImportSourceType, ImportPreview, ExternalSessionImportPayload?)
         do {
             preparedPreview = try makePreview(
@@ -446,11 +587,25 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
         } catch {
             guard importFile.sourceType == .bastionHost,
                   error is ExternalSessionImportParserError
-            else { throw error }
+            else {
+                recordTrace(
+                    stage: .recognition,
+                    sourceType: importFile.sourceType,
+                    result: .failed,
+                    errorCode: "parse_failed"
+                )
+                throw error
+            }
             guard let vendor = bastionHostVendorSelector.selectVendor(
                 sourceName: importFile.sourceName,
                 parentWindow: parentWindow
             ) else {
+                recordTrace(
+                    stage: .recognition,
+                    sourceType: importFile.sourceType,
+                    result: .cancelled,
+                    errorCode: "vendor_not_selected"
+                )
                 return nil
             }
             do {
@@ -460,47 +615,163 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
                     bastionVendorHint: vendor
                 )
             } catch {
+                recordTrace(
+                    stage: .recognition,
+                    sourceType: importFile.sourceType,
+                    result: .failed,
+                    errorCode: "parse_failed"
+                )
                 throw BastionHostVendorFallbackError.recognitionFailed(vendor)
             }
         }
-        let (sourceType, originalPreview, externalPayload) = preparedPreview
+        let (sourceType, unverifiedPreview, externalPayload) = preparedPreview
+        let originalPreview = reconciledPreview(
+            unverifiedPreview,
+            existingSessions: existingSessions
+        )
         if sourceType != .bastionHost,
            let externalPayload,
            BastionHostSessionDetector.containsBastionHostSession(externalPayload) {
-            try bastionHostAuthorizer.authorizeBastionHostAccess()
+            do {
+                try bastionHostAuthorizer.authorizeBastionHostAccess()
+            } catch {
+                recordTrace(
+                    stage: .recognition,
+                    sourceType: sourceType,
+                    preview: originalPreview,
+                    externalPayload: externalPayload,
+                    result: .failed,
+                    errorCode: "authorization_failed"
+                )
+                throw error
+            }
         }
         if let secureTransfer = preparedImport.secureTransfer,
            secureTransferMatchesPreview(secureTransfer, preview: originalPreview) == false {
+            recordTrace(
+                stage: .recognition,
+                sourceType: sourceType,
+                preview: originalPreview,
+                externalPayload: externalPayload,
+                result: .failed,
+                errorCode: "parse_failed"
+            )
             throw SecureSessionTransferError.invalidPayload
         }
-        let preview = try previewExcludingRemovedProtocols(originalPreview)
+        recordTrace(
+            stage: .recognition,
+            sourceType: sourceType,
+            preview: originalPreview,
+            externalPayload: externalPayload,
+            result: .ready,
+            errorCode: nil
+        )
+        let preview: ImportPreview
+        do {
+            preview = try previewExcludingRemovedProtocols(originalPreview)
+        } catch {
+            recordTrace(
+                stage: .preview,
+                sourceType: sourceType,
+                preview: originalPreview,
+                externalPayload: externalPayload,
+                result: .failed,
+                errorCode: "preview_failed"
+            )
+            throw error
+        }
         let credentialPayload = externalPayload.map(payloadExcludingRemovedProtocols)
+        recordTrace(
+            stage: .preview,
+            sourceType: sourceType,
+            preview: preview,
+            externalPayload: externalPayload,
+            result: .ready,
+            errorCode: nil
+        )
         guard presenter.confirmImport(
             preview: preview,
             sourceName: importFile.sourceName,
             sourceType: sourceType,
             parentWindow: parentWindow
         ) else {
+            recordTrace(
+                stage: .preview,
+                sourceType: sourceType,
+                preview: preview,
+                externalPayload: externalPayload,
+                result: .cancelled,
+                errorCode: "preview_cancelled"
+            )
             return nil
         }
-        let result = try core.applySessionImport(
-            databasePath: databasePath,
+        let result: ImportApplyResult
+        do {
+            result = try core.applySessionImport(
+                databasePath: databasePath,
+                sourceType: sourceType,
+                sourceName: importFile.sourceName,
+                preview: preview
+            )
+        } catch {
+            recordTrace(
+                stage: .apply,
+                sourceType: sourceType,
+                preview: preview,
+                externalPayload: externalPayload,
+                result: .failed,
+                errorCode: "apply_failed"
+            )
+            throw error
+        }
+        recordTrace(
+            stage: .apply,
             sourceType: sourceType,
-            sourceName: importFile.sourceName,
-            preview: preview
+            preview: preview,
+            externalPayload: externalPayload,
+            result: .succeeded,
+            errorCode: nil
         )
-        if let secureTransfer = preparedImport.secureTransfer,
-           result.importedSessions.isEmpty == false {
-            try applySecureTransfer(
-                secureTransfer,
-                to: result.importedSessions
+        do {
+            if let secureTransfer = preparedImport.secureTransfer,
+               result.importedSessions.isEmpty == false {
+                try applySecureTransfer(
+                    secureTransfer,
+                    to: result.importedSessions
+                )
+                recordTrace(
+                    stage: .credentials,
+                    sourceType: sourceType,
+                    preview: preview,
+                    externalPayload: externalPayload,
+                    result: .succeeded,
+                    errorCode: nil
+                )
+            } else if let credentialPayload, result.importedSessions.isEmpty == false {
+                try credentialApplier.applyCredentials(
+                    from: credentialPayload,
+                    to: result.importedSessions,
+                    databasePath: databasePath
+                )
+                recordTrace(
+                    stage: .credentials,
+                    sourceType: sourceType,
+                    preview: preview,
+                    externalPayload: externalPayload,
+                    result: .succeeded,
+                    errorCode: nil
+                )
+            }
+        } catch {
+            recordTrace(
+                stage: .credentials,
+                sourceType: sourceType,
+                preview: preview,
+                externalPayload: externalPayload,
+                result: .failed,
+                errorCode: "credentials_failed"
             )
-        } else if let credentialPayload, result.importedSessions.isEmpty == false {
-            try credentialApplier.applyCredentials(
-                from: credentialPayload,
-                to: result.importedSessions,
-                databasePath: databasePath
-            )
+            throw error
         }
         if result.report.importedCount > 0 {
             onImported()
@@ -782,6 +1053,174 @@ public final class SessionImportCoordinator: SessionImportCoordinating {
             conflictCount: UInt32(sessions.filter(\.conflict).count),
             ignoredSecretFieldCount: 0
         )
+    }
+
+    private func reconciledPreview(
+        _ preview: ImportPreview,
+        existingSessions: [ExistingSession]
+    ) -> ImportPreview {
+        var reservedNames = Set(existingSessions.map {
+            normalizedImportName($0.record.name)
+        })
+        var reservedRoutes = Set(existingSessions.compactMap { existing in
+            BastionSessionDisplaySummaryCodec.summary(
+                protocolName: existing.record.protocol,
+                gatewayHost: existing.record.host,
+                gatewayPort: existing.record.port,
+                gatewayUsername: existing.record.username,
+                configJSON: existing.configJSON
+            ).routeIdentity(protocolName: existing.record.protocol)
+        })
+        let sessions = preview.sessions.map { session -> ImportSessionPreview in
+            let summary = BastionSessionDisplaySummaryCodec.summary(
+                protocolName: session.protocol,
+                gatewayHost: session.host,
+                gatewayPort: UInt32(session.port),
+                gatewayUsername: session.username,
+                configJSON: session.configJson
+            )
+            let route = summary.routeIdentity(protocolName: session.protocol)
+            let normalizedName = normalizedImportName(session.name)
+            let conflict = route.map(reservedRoutes.contains)
+                ?? reservedNames.contains(normalizedName)
+            var displayName = session.name
+            if conflict == false,
+               route != nil,
+               reservedNames.contains(normalizedName) {
+                displayName = uniqueBastionImportName(
+                    requestedName: session.name,
+                    targetLabel: summary.targetHost ?? summary.primaryTarget,
+                    reservedNames: reservedNames
+                )
+            }
+            if conflict == false {
+                reservedNames.insert(normalizedImportName(displayName))
+                if let route {
+                    reservedRoutes.insert(route)
+                }
+            }
+            return ImportSessionPreview(
+                name: displayName,
+                folder: session.folder,
+                protocol: session.protocol,
+                host: session.host,
+                port: session.port,
+                username: session.username,
+                privateKeyPath: session.privateKeyPath,
+                configJson: session.configJson,
+                conflict: conflict
+            )
+        }
+        return ImportPreview(
+            sessions: sessions,
+            warnings: preview.warnings,
+            conflictCount: UInt32(sessions.filter(\.conflict).count),
+            ignoredSecretFieldCount: preview.ignoredSecretFieldCount
+        )
+    }
+
+    private func uniqueBastionImportName(
+        requestedName: String,
+        targetLabel: String,
+        reservedNames: Set<String>
+    ) -> String {
+        let requestedName = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetLabel = String(targetLabel.prefix(96))
+        let base = "\(requestedName) · \(targetLabel)"
+        if reservedNames.contains(normalizedImportName(base)) == false {
+            return base
+        }
+        var suffix = 2
+        while reservedNames.contains(normalizedImportName("\(base) (\(suffix))")) {
+            suffix += 1
+        }
+        return "\(base) (\(suffix))"
+    }
+
+    private func normalizedImportName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func recordTrace(
+        stage: FeedbackDiagnosticTraceStage,
+        sourceType: SessionImportSourceType,
+        preview: ImportPreview? = nil,
+        externalPayload: ExternalSessionImportPayload? = nil,
+        result: FeedbackDiagnosticTraceResult,
+        errorCode: String?
+    ) {
+        let sessions = preview?.sessions ?? []
+        let routeData = sessions.map { session in
+            (
+                summary: BastionSessionDisplaySummaryCodec.summary(
+                    protocolName: session.protocol,
+                    gatewayHost: session.host,
+                    gatewayPort: UInt32(session.port),
+                    gatewayUsername: session.username,
+                    configJSON: session.configJson
+                ),
+                protocolName: session.protocol
+            )
+        }
+        let routeIdentities = routeData.compactMap {
+            $0.summary.routeIdentity(protocolName: $0.protocolName)
+        }
+        diagnosticTraceRecorder.record(
+            stage: stage,
+            sourceType: sourceType,
+            vendor: routeData.compactMap { $0.summary.vendor?.rawValue }.first,
+            sessionCount: sessions.isEmpty ? (externalPayload?.sessions.count ?? 0) : sessions.count,
+            conflictCount: sessions.filter(\.conflict).count,
+            result: result,
+            errorCode: errorCode,
+            routeIdentities: routeIdentities,
+            hasTargetMetadata: routeData.contains(where: { $0.summary.hasTargetMetadata })
+        )
+        diagnosticLogRecorder.record(
+            level: result == .failed ? .error : .info,
+            subsystem: .importFlow,
+            eventCode: .sessionImportStage,
+            stage: diagnosticLogStage(for: stage),
+            result: diagnosticLogResult(for: result),
+            errorCategory: diagnosticLogErrorCategory(for: stage, result: result),
+            resourceIdentities: routeIdentities
+        )
+    }
+
+    private func diagnosticLogStage(
+        for stage: FeedbackDiagnosticTraceStage
+    ) -> FeedbackDiagnosticLogStage {
+        switch stage {
+        case .selection: return .selection
+        case .recognition: return .recognition
+        case .preview: return .preview
+        case .apply: return .apply
+        case .credentials: return .credentials
+        }
+    }
+
+    private func diagnosticLogResult(
+        for result: FeedbackDiagnosticTraceResult
+    ) -> FeedbackDiagnosticLogResult {
+        switch result {
+        case .selected, .ready: return .ready
+        case .cancelled: return .cancelled
+        case .succeeded: return .succeeded
+        case .failed: return .failed
+        }
+    }
+
+    private func diagnosticLogErrorCategory(
+        for stage: FeedbackDiagnosticTraceStage,
+        result: FeedbackDiagnosticTraceResult
+    ) -> FeedbackDiagnosticLogErrorCategory? {
+        guard result == .failed else { return nil }
+        switch stage {
+        case .selection: return .configuration
+        case .recognition, .preview: return .parsing
+        case .apply: return .persistence
+        case .credentials: return .credentials
+        }
     }
 }
 

@@ -870,23 +870,40 @@ public struct FeedbackDiagnosticContext: Codable, Equatable {
         licenseService: LicenseService = LicenseService(),
         licenseStatusProvider: (() -> LicenseStatus)? = nil,
         bundle: Bundle = .main,
-        processInfo: ProcessInfo = .processInfo
+        processInfo: ProcessInfo = .processInfo,
+        diagnosticTraceProvider: () -> FeedbackDiagnosticTrace = {
+            FeedbackDiagnosticTraceStore.shared.snapshot()
+        },
+        diagnosticLogProvider: () throws -> FeedbackDiagnosticLogSnapshot = {
+            FeedbackDiagnosticLogStore.shared.snapshot()
+        }
     ) -> FeedbackDiagnosticContext {
         let appVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? StacioAppMetadata.displayVersion
         let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
             ?? "dev"
+        var diagnostics = [
+            "productID": configuration.productID,
+            "configuredUpdateChannel": configuration.effectiveUpdateChannel.rawValue,
+            "betaUpdatesEnabled": configuration.betaUpdatesEnabled ? "true" : "false"
+        ]
+        let trace = diagnosticTraceProvider()
+        if trace.events.isEmpty == false,
+           let encodedTrace = trace.encodedJSONString() {
+            diagnostics[FeedbackDiagnosticTraceStore.diagnosticsKey] = encodedTrace
+        }
+        if let diagnosticLog = try? diagnosticLogProvider(),
+           diagnosticLog.events.isEmpty == false,
+           let encodedLog = diagnosticLog.encodedJSONString() {
+            diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey] = encodedLog
+        }
         return FeedbackDiagnosticContext(
             appVersion: appVersion,
             build: build,
             osVersion: processInfo.operatingSystemVersionString,
             deviceID: deviceIDStore.deviceID(),
             licenseStatus: licenseStatusProvider?() ?? licenseService.loadState().status,
-            diagnostics: [
-                "productID": configuration.productID,
-                "configuredUpdateChannel": configuration.effectiveUpdateChannel.rawValue,
-                "betaUpdatesEnabled": configuration.betaUpdatesEnabled ? "true" : "false"
-            ]
+            diagnostics: diagnostics
         )
     }
 
@@ -895,6 +912,14 @@ public struct FeedbackDiagnosticContext: Codable, Equatable {
     }
 
     public var visibleSummary: String {
+        summaryLines(includeTraceEvents: true).joined(separator: "\n")
+    }
+
+    public var compactVisibleSummary: String {
+        summaryLines(includeTraceEvents: false).joined(separator: "\n")
+    }
+
+    private func summaryLines(includeTraceEvents: Bool) -> [String] {
         var lines = [
             "App 版本：\(appVersion)",
             "Build：\(build)",
@@ -902,18 +927,51 @@ public struct FeedbackDiagnosticContext: Codable, Equatable {
             "匿名设备标识：\(deviceID)",
             "License 状态：\(licenseStatus.rawValue)"
         ]
-        if sanitizedDiagnostics.isEmpty == false {
-            let diagnosticsLine = sanitizedDiagnostics
+        var diagnostics = sanitizedDiagnostics
+        let trace = diagnostics
+            .removeValue(forKey: FeedbackDiagnosticTraceStore.diagnosticsKey)
+            .flatMap { FeedbackDiagnosticTrace.validatedTrace(from: $0) }
+        let diagnosticLog = diagnostics
+            .removeValue(forKey: FeedbackDiagnosticLogStore.diagnosticsKey)
+            .flatMap { FeedbackDiagnosticLogSnapshot.validatedSnapshot(from: $0) }
+        if diagnostics.isEmpty == false {
+            let diagnosticsLine = diagnostics
                 .sorted { $0.key < $1.key }
                 .map { "\($0.key)=\($0.value)" }
                 .joined(separator: "；")
             lines.append("诊断上下文：\(diagnosticsLine)")
         }
+        if let trace {
+            lines.append("安全导入诊断轨迹：\(trace.events.count) 条")
+            if includeTraceEvents {
+                let formatter = ISO8601DateFormatter()
+                lines.append(contentsOf: trace.events.enumerated().map { index, event in
+                    let vendor = event.vendor ?? "未识别"
+                    let errorCode = event.errorCode ?? "无"
+                    let routes = event.routeHashes.isEmpty ? "无" : event.routeHashes.joined(separator: ",")
+                    return "\(index + 1). 时间=\(formatter.string(from: event.timestamp))；阶段=\(event.stage.rawValue)；来源=\(event.sourceType.rawValue)；厂商=\(vendor)；会话=\(event.sessionCount)；冲突=\(event.conflictCount)；结果=\(event.result.rawValue)；错误码=\(errorCode)；路由哈希=\(routes)；目标元数据=\(event.hasTargetMetadata ? "有" : "无")"
+                })
+            }
+        }
+        if let diagnosticLog {
+            let environment = diagnosticLog.environment
+            lines.append(
+                "近期安全诊断日志：\(diagnosticLog.events.count) 条；App \(environment.appVersion) (\(environment.build))；\(environment.osVersion)；\(environment.architecture)"
+            )
+            if includeTraceEvents {
+                let formatter = ISO8601DateFormatter()
+                lines.append(contentsOf: diagnosticLog.events.enumerated().map { index, event in
+                    let errorCategory = event.errorCategory?.rawValue ?? "无"
+                    let resources = event.resourceHashes.isEmpty ? "无" : event.resourceHashes.joined(separator: ",")
+                    return "\(index + 1). 时间=\(formatter.string(from: event.timestamp))；级别=\(event.level.rawValue)；模块=\(event.subsystem.rawValue)；事件码=\(event.eventCode.rawValue)；阶段=\(event.stage.rawValue)；结果=\(event.result.rawValue)；错误类别=\(errorCategory)；资源哈希=\(resources)"
+                })
+            }
+        }
         lines.append(Self.privacySummary)
-        return lines.joined(separator: "\n")
+        return lines
     }
 
-    public static let privacySummary = "不会包含密码、Token、完整 License Key、终端内容、远程文件内容、SSH 配置或用户文件。"
+    public static let privacySummary = "不会包含密码、Token、完整 License Key、IP、主机名、账号、路径、命令、终端内容、文件内容、SSH 配置、导入源文件内容或用户文件。"
 }
 
 public enum ProductOpsDiagnosticSanitizer {
@@ -921,12 +979,24 @@ public enum ProductOpsDiagnosticSanitizer {
         "productID",
         "configuredUpdateChannel",
         "betaUpdatesEnabled",
-        "activeWindowCount"
+        "activeWindowCount",
+        FeedbackDiagnosticTraceStore.diagnosticsKey,
+        FeedbackDiagnosticLogStore.diagnosticsKey
     ]
 
     public static func sanitized(_ diagnostics: [String: String]) -> [String: String] {
         diagnostics.reduce(into: [:]) { partial, pair in
             guard allowedKeys.contains(pair.key) else { return }
+            if pair.key == FeedbackDiagnosticTraceStore.diagnosticsKey {
+                guard let trace = FeedbackDiagnosticTrace.validatedJSONString(pair.value) else { return }
+                partial[pair.key] = trace
+                return
+            }
+            if pair.key == FeedbackDiagnosticLogStore.diagnosticsKey {
+                guard let log = FeedbackDiagnosticLogSnapshot.validatedJSONString(pair.value) else { return }
+                partial[pair.key] = log
+                return
+            }
             let value = redactSensitiveValue(pair.value)
             guard value.isEmpty == false,
                   isAllowedValue(value, forKey: pair.key)

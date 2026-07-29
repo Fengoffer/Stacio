@@ -1057,6 +1057,7 @@ final class FileTransferDocumentCoordinator {
         source: FileTransferRemoteDocumentSource
     ) {
         guard selections.isEmpty == false else { return }
+        quickLookCoordinator.showLoading()
         let lifecycleToken = lifecycle.makeToken()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("StacioQuickLook", isDirectory: true)
@@ -1064,6 +1065,7 @@ final class FileTransferDocumentCoordinator {
         do {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         } catch {
+            quickLookCoordinator.dismissLoading()
             source.setStatus(RuntimeDiagnosticFormatter.userMessage(for: error))
             return
         }
@@ -1093,6 +1095,7 @@ final class FileTransferDocumentCoordinator {
             guard let self, lifecycleToken.isActive else { return }
             if urls.isEmpty {
                 guard self.pendingPreparations.finish(id: preparationID, outcome: .failure) else { return }
+                self.quickLookCoordinator.dismissLoading()
                 source.setStatus(FileTransferDocumentError.previewPreparationFailed(Self.fileName(for: selections[0])).localizedDescription)
                 return
             }
@@ -1132,6 +1135,7 @@ final class FileTransferDocumentCoordinator {
                         destinationPath: destination.path,
                         bytesTotal: selection.size
                     ),
+                    notificationPolicy: .silent,
                     completion: { [weak self] progress in
                         guard Self.isTerminalTransferStatus(progress.status) else { return }
                         DispatchQueue.main.async { [weak self] in

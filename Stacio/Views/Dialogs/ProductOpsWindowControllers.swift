@@ -10,9 +10,10 @@ public enum FeedbackSubmissionState: Equatable {
 @MainActor
 public final class FeedbackWindowController: NSWindowController {
     private let configuration: ProductOpsConfiguration
-    private let context: FeedbackDiagnosticContext
+    private let contextProvider: () -> FeedbackDiagnosticContext
     private let submitter: FeedbackSubmitting
     private let idempotencyStore: FeedbackIdempotencyKeyStoring
+    private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
 
     private let titleField = NSTextField()
     private let typePopup = NSPopUpButton()
@@ -33,22 +34,41 @@ public final class FeedbackWindowController: NSWindowController {
     private let copyErrorButton = NSButton(title: L10n.ProductOps.copyError, target: nil, action: nil)
     private let submitButton = NSButton(title: L10n.ProductOps.submitFeedback, target: nil, action: nil)
     private var lastErrorDescription = ""
+    private var frozenDiagnosticContext: FeedbackDiagnosticContext?
     public private(set) var submissionState: FeedbackSubmissionState = .draft
 
     public var shouldReuseAfterClose: Bool {
         submissionState != .succeeded
     }
 
-    public init(
+    public convenience init(
         configuration: ProductOpsConfiguration,
         context: FeedbackDiagnosticContext,
         submitter: FeedbackSubmitting? = nil,
-        idempotencyStore: FeedbackIdempotencyKeyStoring = FeedbackIdempotencyKeyStore()
+        idempotencyStore: FeedbackIdempotencyKeyStoring = FeedbackIdempotencyKeyStore(),
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
+    ) {
+        self.init(
+            configuration: configuration,
+            contextProvider: { context },
+            submitter: submitter,
+            idempotencyStore: idempotencyStore,
+            diagnosticLogRecorder: diagnosticLogRecorder
+        )
+    }
+
+    public init(
+        configuration: ProductOpsConfiguration,
+        contextProvider: @escaping () -> FeedbackDiagnosticContext,
+        submitter: FeedbackSubmitting? = nil,
+        idempotencyStore: FeedbackIdempotencyKeyStoring = FeedbackIdempotencyKeyStore(),
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
     ) {
         self.configuration = configuration
-        self.context = context
+        self.contextProvider = contextProvider
         self.submitter = submitter ?? FeedbackSubmissionService(configuration: configuration)
         self.idempotencyStore = idempotencyStore
+        self.diagnosticLogRecorder = diagnosticLogRecorder
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -59,6 +79,11 @@ public final class FeedbackWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.center()
         super.init(window: window)
+        recordFeedbackEvent(
+            level: .info,
+            eventCode: .feedbackWindowOpened,
+            result: .succeeded
+        )
         window.contentView = makeContentView()
     }
 
@@ -90,7 +115,13 @@ public final class FeedbackWindowController: NSWindowController {
         guard requiresConfirmation == false || confirmSubmission() else {
             return
         }
-        let idempotencyKey = idempotencyStore.key(for: report, context: context)
+        let submissionContext = contextForSubmission(report: report)
+        let idempotencyKey = idempotencyStore.key(for: report, context: submissionContext)
+        recordFeedbackEvent(
+            level: .info,
+            eventCode: .feedbackSubmissionStarted,
+            result: .started
+        )
         statusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         statusLabel.stringValue = L10n.ProductOps.feedbackSubmitting
         submitButton.isEnabled = false
@@ -102,14 +133,25 @@ public final class FeedbackWindowController: NSWindowController {
             do {
                 _ = try await submitter.submit(
                     report: report,
-                    context: context,
+                    context: submissionContext,
                     idempotencyKey: idempotencyKey
                 )
-                idempotencyStore.clearKey(for: report, context: context, matching: idempotencyKey)
+                idempotencyStore.clearKey(for: report, context: submissionContext, matching: idempotencyKey)
                 submissionState = .succeeded
                 statusLabel.textColor = StacioDesignSystem.theme.successColor
                 statusLabel.stringValue = L10n.ProductOps.feedbackSubmitted
+                recordFeedbackEvent(
+                    level: .info,
+                    eventCode: .feedbackSubmissionSucceeded,
+                    result: .succeeded
+                )
             } catch {
+                recordFeedbackEvent(
+                    level: .error,
+                    eventCode: .feedbackSubmissionFailed,
+                    result: .failed,
+                    errorCategory: feedbackErrorCategory(for: error)
+                )
                 renderSubmissionFailure(error.localizedDescription)
             }
             if submissionState != .succeeded {
@@ -124,12 +166,52 @@ public final class FeedbackWindowController: NSWindowController {
     }
 
     @objc private func previewDiagnosticsPressed(_ sender: Any?) {
+        guard includeDiagnosticsCheckbox.state == .on else {
+            return
+        }
+        let context = freezeDiagnosticContext()
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = L10n.ProductOps.feedbackDiagnosticsPreviewTitle
         alert.informativeText = context.visibleSummary
         alert.addButton(withTitle: L10n.Common.ok)
         alert.runModal()
+    }
+
+    func setIncludeDiagnosticsForTesting(_ enabled: Bool) {
+        includeDiagnosticsCheckbox.state = enabled ? .on : .off
+        includeDiagnosticsChanged(nil)
+    }
+
+    func diagnosticsPreviewTextForTesting() -> String {
+        freezeDiagnosticContext().visibleSummary
+    }
+
+    @objc private func includeDiagnosticsChanged(_ sender: Any?) {
+        if includeDiagnosticsCheckbox.state == .on {
+            diagnosticsLabel.stringValue = freezeDiagnosticContext().compactVisibleSummary
+            previewDiagnosticsButton.isEnabled = true
+        } else {
+            frozenDiagnosticContext = nil
+            var context = contextProvider()
+            context.diagnostics.removeValue(forKey: FeedbackDiagnosticTraceStore.diagnosticsKey)
+            context.diagnostics.removeValue(forKey: FeedbackDiagnosticLogStore.diagnosticsKey)
+            diagnosticsLabel.stringValue = context.compactVisibleSummary
+            previewDiagnosticsButton.isEnabled = false
+        }
+    }
+
+    private func freezeDiagnosticContext() -> FeedbackDiagnosticContext {
+        if let frozenDiagnosticContext {
+            return frozenDiagnosticContext
+        }
+        let context = contextProvider()
+        frozenDiagnosticContext = context
+        return context
+    }
+
+    private func contextForSubmission(report: FeedbackReport) -> FeedbackDiagnosticContext {
+        report.includeDiagnostics ? freezeDiagnosticContext() : contextProvider()
     }
 
     func renderSubmissionFailureForTesting(_ message: String) {
@@ -143,6 +225,41 @@ public final class FeedbackWindowController: NSWindowController {
         statusLabel.stringValue = L10n.ProductOps.feedbackFailedPrefix + message
         copyErrorButton.isHidden = false
         submitButton.isEnabled = true
+    }
+
+    private func recordFeedbackEvent(
+        level: FeedbackDiagnosticLogLevel,
+        eventCode: FeedbackDiagnosticLogEventCode,
+        result: FeedbackDiagnosticLogResult,
+        errorCategory: FeedbackDiagnosticLogErrorCategory? = nil
+    ) {
+        diagnosticLogRecorder.record(
+            level: level,
+            subsystem: .feedback,
+            eventCode: eventCode,
+            stage: eventCode == .feedbackWindowOpened ? .open : .submit,
+            result: result,
+            errorCategory: errorCategory,
+            resourceIdentities: []
+        )
+    }
+
+    private func feedbackErrorCategory(for error: Error) -> FeedbackDiagnosticLogErrorCategory {
+        switch ProductOpsError.classify(error) {
+        case .offline:
+            return .network
+        case .timeout:
+            return .timeout
+        case .missingAPIBaseURL, .missingFeedbackProductAPIKey, .invalidURL, .invalidFeedbackReport:
+            return .configuration
+        case .rateLimited, .server:
+            return .unavailable
+        case .client, .invalidResponseStatus, .backend:
+            return .transport
+        case .invalidOfflineLicenseToken, .licenseIdentityMismatch, .invalidSignedLicenseToken,
+             .licenseClaimsMismatch, .licenseStorageUnavailable:
+            return .authorization
+        }
     }
 
     private func currentReport() -> FeedbackReport {
@@ -214,13 +331,17 @@ public final class FeedbackWindowController: NSWindowController {
         StacioDesignSystem.styleTextField(contactField)
         stack.addArrangedSubview(formRow(label: L10n.ProductOps.feedbackContact, control: contactField))
 
-        diagnosticsLabel.stringValue = context.visibleSummary
+        includeDiagnosticsCheckbox.state = .on
+        diagnosticsLabel.stringValue = freezeDiagnosticContext().compactVisibleSummary
         diagnosticsLabel.setAccessibilityIdentifier("Stacio.Feedback.diagnostics")
         diagnosticsLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         diagnosticsLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         diagnosticsLabel.maximumNumberOfLines = 0
         includeDiagnosticsCheckbox.setAccessibilityIdentifier("Stacio.Feedback.includeDiagnostics")
         includeDiagnosticsCheckbox.font = .systemFont(ofSize: NSFont.systemFontSize)
+        includeDiagnosticsCheckbox.target = self
+        includeDiagnosticsCheckbox.action = #selector(includeDiagnosticsChanged(_:))
+        previewDiagnosticsButton.isEnabled = true
         previewDiagnosticsButton.target = self
         previewDiagnosticsButton.action = #selector(previewDiagnosticsPressed(_:))
         previewDiagnosticsButton.setAccessibilityIdentifier("Stacio.Feedback.previewDiagnostics")
@@ -463,7 +584,7 @@ public final class UpdatePromptWindowController: NSWindowController {
         case .updateAvailable(let update):
             statusLabel.textColor = StacioDesignSystem.theme.warningColor
             statusLabel.stringValue = L10n.ProductOps.updateAvailable(version: update.version, build: update.build)
-            releaseNotesView.string = update.releaseNotes
+            renderReleaseNotes(update.releaseNotes)
             pendingDownloadURL = update.artifactURL
             downloadButton.isHidden = update.artifactURL == nil
         case .appcastUnavailable(let message):
@@ -500,9 +621,7 @@ public final class UpdatePromptWindowController: NSWindowController {
             statusLabel.textColor = StacioDesignSystem.theme.warningColor
             statusLabel.stringValue = L10n.ProductOps.updateAvailable(version: update.version, build: update.build)
             detailsLabel.stringValue = Self.updateDetailsText(update)
-            releaseNotesView.string = update.releaseNotes.isEmpty
-                ? L10n.ProductOps.updateReleaseNotesUnavailable
-                : update.releaseNotes.stacioPlainReleaseNotesForDisplay()
+            renderReleaseNotes(update.releaseNotes)
             pendingSparkleUpdate = update
             downloadButton.title = L10n.ProductOps.updateDownload
             setSparkleActionButtonsHidden(false)
@@ -531,6 +650,20 @@ public final class UpdatePromptWindowController: NSWindowController {
             parts.append(ByteCountFormatter.string(fromByteCount: clampedSize, countStyle: .file))
         }
         return parts.joined(separator: "  ·  ")
+    }
+
+    private func renderReleaseNotes(_ releaseNotes: String) {
+        let displayText = releaseNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? L10n.ProductOps.updateReleaseNotesUnavailable
+            : releaseNotes
+        releaseNotesView.textStorage?.setAttributedString(
+            UpdateReleaseNotesRenderer.attributedString(
+                from: displayText,
+                baseFont: .systemFont(ofSize: NSFont.systemFontSize),
+                textColor: StacioDesignSystem.theme.primaryTextColor
+            )
+        )
+        releaseNotesView.scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
     private func renderFailure(_ message: String) {

@@ -119,6 +119,38 @@ public struct TerminalColorTheme: Codable, Equatable {
         ]
     )
 
+    public static let oneHalfDark = TerminalColorTheme(
+        id: "one-half-dark",
+        name: "One Half Dark",
+        sourceFormat: .portDesk,
+        foregroundHex: "#DCDFE4",
+        backgroundHex: "#282C34",
+        cursorHex: "#DCDFE4",
+        selectionBackgroundHex: "#3E4451",
+        ansiColorHexes: [
+            "#282C34", "#E06C75", "#98C379", "#E5C07B",
+            "#61AFEF", "#C678DD", "#56B6C2", "#DCDFE4",
+            "#5C6370", "#E06C75", "#98C379", "#E5C07B",
+            "#61AFEF", "#C678DD", "#56B6C2", "#DCDFE4"
+        ]
+    )
+
+    public static let oneHalfLight = TerminalColorTheme(
+        id: "one-half-light",
+        name: "One Half Light",
+        sourceFormat: .portDesk,
+        foregroundHex: "#383A42",
+        backgroundHex: "#FAFAFA",
+        cursorHex: "#383A42",
+        selectionBackgroundHex: "#E5E5E6",
+        ansiColorHexes: [
+            "#383A42", "#E45649", "#50A14F", "#C18401",
+            "#0184BC", "#A626A4", "#0997B3", "#FAFAFA",
+            "#696C77", "#E45649", "#50A14F", "#C18401",
+            "#0184BC", "#A626A4", "#0997B3", "#FAFAFA"
+        ]
+    )
+
     public static let solarizedLight = TerminalColorTheme(
         id: "solarized-light",
         name: "Solarized Light",

@@ -72,6 +72,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     private let settingsStore: AppSettingsStore
     private let processLauncher: LocalTerminalProcessLaunching
     private let linkOpener: TerminalLinkOpening
+    private let initialDirectory: String?
     private let agentTraceController = TerminalTraceController()
     private let commandInputObserver = TerminalCommandInputObserver()
     private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
@@ -117,6 +118,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         settingsStore: AppSettingsStore = .shared,
         processLauncher: LocalTerminalProcessLaunching = SwiftTermLocalTerminalProcessLauncher(),
         linkOpener: TerminalLinkOpening? = nil,
+        initialDirectory: String? = nil,
         autoStartProcess: Bool = true
     ) {
         self.runtimeID = runtimeID
@@ -126,6 +128,9 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         self.settingsStore = settingsStore
         self.processLauncher = processLauncher
         self.linkOpener = linkOpener ?? WorkspaceTerminalLinkOpener.shared
+        let normalizedInitialDirectory = TerminalCurrentDirectoryNormalizer.normalize(initialDirectory)
+        self.initialDirectory = normalizedInitialDirectory
+        self.currentLocalDirectory = normalizedInitialDirectory
         self.autoStartProcess = autoStartProcess
         self.terminalView = StacioLocalTerminalView(frame: .zero)
         super.init(nibName: nil, bundle: nil)
@@ -285,7 +290,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
                     )
                 }(),
                 execName: launch.execName,
-                currentDirectory: nil
+                currentDirectory: initialDirectory
             )
         }
     }
@@ -397,6 +402,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     public func closeTerminal() {
+        terminalView.cancelPendingSemanticOutput()
         processLauncher.terminate(terminalView)
         notifyClosed()
     }
@@ -572,6 +578,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     deinit {
+        terminalView.cancelPendingSemanticOutput()
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }

@@ -87,8 +87,8 @@ enum SerialConnectionSupport {
         var seen = Set<String>()
         for path in devicePaths where seen.insert(path).inserted {
             if isNBEESPPDevice(path) {
-                if path.hasPrefix("/dev/cu."),
-                   availablePaths.contains(ttyCounterpart(for: path)) {
+                if path.hasPrefix("/dev/tty."),
+                   availablePaths.contains(cuCounterpart(for: path)) {
                     continue
                 }
                 guard path.hasPrefix("/dev/cu.") || path.hasPrefix("/dev/tty.") else {
@@ -140,11 +140,19 @@ enum SerialConnectionSupport {
         }
         return "/dev/tty." + devicePath.dropFirst("/dev/cu.".count)
     }
+
+    private static func cuCounterpart(for devicePath: String) -> String {
+        guard devicePath.hasPrefix("/dev/tty.") else {
+            return devicePath
+        }
+        return "/dev/cu." + devicePath.dropFirst("/dev/tty.".count)
+    }
 }
 
 enum SessionSidebarSessionFormMode: Equatable {
     case network
     case serial
+    case console
     case ftp
     case browser
     case file
@@ -156,7 +164,7 @@ enum SessionSidebarSessionFormMode: Equatable {
 
     var hidesPort: Bool {
         switch self {
-        case .browser, .file, .shell:
+        case .console, .browser, .file, .shell:
             return true
         case .network, .serial, .ftp:
             return false
@@ -165,7 +173,7 @@ enum SessionSidebarSessionFormMode: Equatable {
 
     var hidesUserAndAuth: Bool {
         switch self {
-        case .serial, .browser, .file, .shell:
+        case .serial, .console, .browser, .file, .shell:
             return true
         case .network, .ftp:
             return false
@@ -186,6 +194,8 @@ enum SessionSidebarSessionFormMode: Equatable {
             return L10n.SessionSettings.host
         case .serial:
             return L10n.SessionSettings.devicePath
+        case .console:
+            return "蓝牙设备"
         case .browser:
             return L10n.SessionSettings.url
         case .file:
@@ -205,6 +215,8 @@ enum SessionSidebarSessionFormMode: Equatable {
             return "192.168.1.10"
         case .serial:
             return "/dev/cu.usbserial-001"
+        case .console:
+            return "尚未选择蓝牙设备"
         case .browser:
             return "https://example.com"
         case .file:
@@ -218,6 +230,8 @@ enum SessionSidebarSessionFormMode: Equatable {
         switch self {
         case .serial:
             return "9600"
+        case .console:
+            return "0"
         case .ftp:
             return "21"
         default:
@@ -229,6 +243,8 @@ enum SessionSidebarSessionFormMode: Equatable {
         switch self {
         case .browser:
             return "443"
+        case .console:
+            return "0"
         case .file, .shell:
             return "1"
         case .network, .serial, .ftp:
@@ -237,11 +253,11 @@ enum SessionSidebarSessionFormMode: Equatable {
     }
 
     var allowsZeroPort: Bool {
-        self == .serial
+        self == .serial || self == .console
     }
 
     var treatsEmptyPortAsZero: Bool {
-        self == .serial
+        self == .serial || self == .console
     }
 }
 
@@ -551,6 +567,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private let nameField = NSTextField(string: "")
     private let networkHostField = NSTextField(string: "")
     private let serialDevicePathField = NSComboBox()
+    private let consoleScanButton = NSButton(title: "扫描设备", target: nil, action: nil)
     private let portField = NSComboBox()
     private let usernameField = NSTextField(string: "")
     private let authPopup = NSPopUpButton()
@@ -576,6 +593,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private let validationRow: NSGridRow
     private let credentialSecretLabel: NSTextField
     private let validationLabel: NSTextField
+    private let networkHostTrailingToContainerConstraint: NSLayoutConstraint
+    private let networkHostTrailingToScanButtonConstraint: NSLayoutConstraint
     private weak var saveButton: NSButton?
     private var mode: SessionSidebarSessionFormMode = .network
     private var shouldShowValidationFeedback = false
@@ -585,6 +604,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     private let networkHostPlaceholder: String
     private var serialDevicePathSuggestions: [String] = []
     private var serialPortSuggestions: [String] = []
+
+    var onRequestConsoleScan: (() -> Void)?
 
     init(
         existingSession: SessionRecord?,
@@ -602,6 +623,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             nameField: nameField,
             networkHostField: networkHostField,
             serialDevicePathField: serialDevicePathField,
+            consoleScanButton: consoleScanButton,
             portField: portField,
             usernameField: usernameField,
             authPopup: authPopup,
@@ -629,6 +651,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         validationRow = components.validationRow
         credentialSecretLabel = components.credentialSecretLabel
         validationLabel = components.validationLabel
+        networkHostTrailingToContainerConstraint = components.networkHostTrailingToContainerConstraint
+        networkHostTrailingToScanButtonConstraint = components.networkHostTrailingToScanButtonConstraint
         super.init()
 
         nameField.stringValue = existingSession?.name ?? ""
@@ -687,6 +711,19 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         StacioDesignSystem.stylePopupButton(authPopup)
         authPopup.target = self
         authPopup.action = #selector(authPopupChanged(_:))
+        consoleScanButton.bezelStyle = .rounded
+        consoleScanButton.controlSize = .regular
+        consoleScanButton.image = StacioSymbolImage.image(
+            named: "bluetooth",
+            accessibilityDescription: "扫描蓝牙设备",
+            size: NSSize(width: 16, height: 16)
+        )
+        consoleScanButton.imagePosition = .imageLeading
+        consoleScanButton.target = self
+        consoleScanButton.action = #selector(requestConsoleScan(_:))
+        consoleScanButton.toolTip = "扫描附近的蓝牙 Console 设备"
+        consoleScanButton.setAccessibilityIdentifier("Stacio.SessionEditor.consoleScan")
+        consoleScanButton.setAccessibilityLabel("扫描蓝牙设备")
         tagColorWell.target = self
         tagColorWell.action = #selector(tagColorChanged(_:))
         tagColorWell.setAccessibilityLabel(L10n.SessionSettings.tagColor)
@@ -720,6 +757,10 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     @objc private func authPopupChanged(_ sender: NSPopUpButton) {
         shouldShowValidationFeedback = true
         refreshFormState()
+    }
+
+    @objc private func requestConsoleScan(_ sender: NSButton) {
+        onRequestConsoleScan?()
     }
 
     @objc private func tagColorChanged(_ sender: NSColorWell) {
@@ -780,6 +821,12 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         portLabel.stringValue = mode.portLabel
         networkHostField.isHidden = mode == .serial
         serialDevicePathField.isHidden = mode != .serial
+        let showsConsoleScan = mode == .console
+        consoleScanButton.isHidden = !showsConsoleScan
+        networkHostTrailingToContainerConstraint.isActive = !showsConsoleScan
+        networkHostTrailingToScanButtonConstraint.isActive = showsConsoleScan
+        networkHostField.isEditable = mode != .console
+        networkHostField.isSelectable = true
         networkHostField.placeholderString = networkHostPlaceholder(for: mode)
         portField.placeholderString = mode.portPlaceholder
         hostRow.isHidden = mode.hidesHost
@@ -891,16 +938,22 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     }
 
     private func configureKeyViewLoop() {
-        let controls: [NSView] = [
+        var controls: [NSView] = [
             nameField,
-            activeHostField,
+            activeHostField
+        ]
+        if mode == .console {
+            controls.append(consoleScanButton)
+        }
+        controls.append(contentsOf: [
             portField,
             usernameField,
             authPopup,
             privateKeyField,
             credentialSecretField,
             tagsField
-        ] + tagColorButtons + [tagColorWell]
+        ])
+        controls += tagColorButtons + [tagColorWell]
 
         for (index, control) in controls.enumerated() {
             control.nextKeyView = controls[(index + 1) % controls.count]
@@ -911,6 +964,7 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         nameField: NSTextField,
         networkHostField: NSTextField,
         serialDevicePathField: NSComboBox,
+        consoleScanButton: NSButton,
         portField: NSTextField,
         usernameField: NSTextField,
         authPopup: NSPopUpButton,
@@ -925,18 +979,32 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         hostInput.translatesAutoresizingMaskIntoConstraints = false
         networkHostField.translatesAutoresizingMaskIntoConstraints = false
         serialDevicePathField.translatesAutoresizingMaskIntoConstraints = false
+        consoleScanButton.translatesAutoresizingMaskIntoConstraints = false
         serialDevicePathField.isHidden = true
+        consoleScanButton.isHidden = true
         hostInput.addSubview(networkHostField)
         hostInput.addSubview(serialDevicePathField)
+        hostInput.addSubview(consoleScanButton)
+        let networkHostTrailingToContainerConstraint = networkHostField.trailingAnchor.constraint(
+            equalTo: hostInput.trailingAnchor
+        )
+        let networkHostTrailingToScanButtonConstraint = networkHostField.trailingAnchor.constraint(
+            equalTo: consoleScanButton.leadingAnchor,
+            constant: -8
+        )
+        networkHostTrailingToContainerConstraint.isActive = true
         NSLayoutConstraint.activate([
             networkHostField.leadingAnchor.constraint(equalTo: hostInput.leadingAnchor),
-            networkHostField.trailingAnchor.constraint(equalTo: hostInput.trailingAnchor),
             networkHostField.centerYAnchor.constraint(equalTo: hostInput.centerYAnchor),
             networkHostField.heightAnchor.constraint(equalToConstant: 36),
             serialDevicePathField.leadingAnchor.constraint(equalTo: hostInput.leadingAnchor),
             serialDevicePathField.trailingAnchor.constraint(equalTo: hostInput.trailingAnchor),
             serialDevicePathField.centerYAnchor.constraint(equalTo: hostInput.centerYAnchor),
-            serialDevicePathField.heightAnchor.constraint(equalToConstant: 36)
+            serialDevicePathField.heightAnchor.constraint(equalToConstant: 36),
+            consoleScanButton.trailingAnchor.constraint(equalTo: hostInput.trailingAnchor),
+            consoleScanButton.centerYAnchor.constraint(equalTo: hostInput.centerYAnchor),
+            consoleScanButton.widthAnchor.constraint(equalToConstant: 96),
+            consoleScanButton.heightAnchor.constraint(equalToConstant: 30)
         ])
         let nameRow = row(label: L10n.SessionSettings.name, field: nameField)
         let hostRow = row(label: L10n.SessionSettings.host, field: hostInput)
@@ -1089,7 +1157,9 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
             tagColorRow: tagColorGridRow,
             validationRow: validationGridRow,
             credentialSecretLabel: credentialSecretRow.label,
-            validationLabel: validationLabel
+            validationLabel: validationLabel,
+            networkHostTrailingToContainerConstraint: networkHostTrailingToContainerConstraint,
+            networkHostTrailingToScanButtonConstraint: networkHostTrailingToScanButtonConstraint
         )
     }
 
@@ -1151,6 +1221,18 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
     func restoreValues(_ values: SessionSidebarSessionFormValues) {
         shouldShowValidationFeedback = false
         applyValues(values, resetsMissingTagColor: true)
+        refreshFormState()
+    }
+
+    func applyConsoleDevice(named deviceName: String) {
+        let normalizedDeviceName = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedDeviceName.isEmpty == false else { return }
+        networkHostField.stringValue = normalizedDeviceName
+        let currentName = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if currentName.isEmpty || currentName == lastAutofilledName {
+            nameField.stringValue = normalizedDeviceName
+            lastAutofilledName = normalizedDeviceName
+        }
         refreshFormState()
     }
 
@@ -1224,6 +1306,9 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     func applyMode(_ mode: SessionSidebarSessionFormMode) {
         self.mode = mode
+        if mode == .console {
+            portField.stringValue = "0"
+        }
         configureKeyViewLoop()
         refreshFormState()
     }
@@ -1274,6 +1359,10 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
 
     var hostValueForTesting: String {
         activeHostField.stringValue
+    }
+
+    var consoleScanButtonIsVisibleForTesting: Bool {
+        consoleScanButton.isHidden == false
     }
 
     var hostSuggestionsForTesting: [String] {
@@ -1628,6 +1717,8 @@ final class SessionSidebarSessionForm: NSObject, NSTextFieldDelegate {
         let validationRow: NSGridRow
         let credentialSecretLabel: NSTextField
         let validationLabel: NSTextField
+        let networkHostTrailingToContainerConstraint: NSLayoutConstraint
+        let networkHostTrailingToScanButtonConstraint: NSLayoutConstraint
     }
 
     private struct FormRow {

@@ -271,4 +271,55 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn external_runtime_uses_existing_buffers_without_a_worker() {
+        let mut registry = TerminalRuntimeRegistry::new(8);
+        let runtime = registry
+            .open_external(
+                "ble_console".to_string(),
+                "NBEE_BLE_1103".to_string(),
+                80,
+                24,
+            )
+            .expect("open external runtime");
+
+        assert_eq!(runtime.kind, "ble_console");
+        assert_eq!(runtime.remote_host.as_deref(), Some("NBEE_BLE_1103"));
+        assert_eq!(runtime.remote_port, None);
+        assert_eq!(runtime.username, None);
+        registry
+            .record_output(runtime.id.clone(), b"ok".to_vec())
+            .expect("record RX");
+        assert_eq!(
+            registry
+                .take_output_batch(runtime.id.clone())
+                .expect("batch")
+                .bytes,
+            b"ok"
+        );
+        registry.close(runtime.id.clone()).expect("close");
+        assert!(matches!(
+            registry.write_input(runtime.id.clone(), b"x".to_vec()),
+            Err(TerminalRuntimeError::RuntimeClosed { .. })
+        ));
+    }
+
+    #[test]
+    fn external_runtime_rejects_unknown_kind_and_unsafe_endpoint() {
+        let mut registry = TerminalRuntimeRegistry::new(8);
+
+        for (kind, endpoint) in [
+            ("", "NBEE_BLE_1103"),
+            ("remote_serial", "NBEE_BLE_1103"),
+            ("ble_console", ""),
+            ("ble_console", "NBEE\nBLE"),
+        ] {
+            assert!(matches!(
+                registry.open_external(kind.to_string(), endpoint.to_string(), 80, 24),
+                Err(TerminalRuntimeError::RuntimeIo { .. })
+            ));
+        }
+        assert_eq!(registry.active_count(), 0);
+    }
 }

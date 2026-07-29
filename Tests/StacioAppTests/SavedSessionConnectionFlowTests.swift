@@ -1,9 +1,80 @@
 import StacioCoreBindings
+import SQLite3
 import XCTest
 @testable import StacioApp
 
 @MainActor
 final class SavedSessionConnectionFlowTests: XCTestCase {
+    func testConsoleSavedSessionDecodesStoredConfigAndStartsConsoleWithoutSerial() throws {
+        let tempURL = savedConsoleTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let config = savedConsoleConfig(macOSPeripheralUUID: UUID().uuidString)
+        let savedSession = try createSavedConsoleSession(databasePath: tempURL.path, config: config)
+        let consoleStarter = SavedSessionRecordingConsoleStarter()
+        let serialStarter = SavedSessionRecordingSerialStarter()
+        let openRecorder = SavedSessionRecordingOpenRecorder()
+        let workbench = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionStore: TunnelLiveSessionStore(),
+            serialSessionStarter: serialStarter,
+            consoleSessionStarter: consoleStarter,
+            savedSessionOpenRecorder: openRecorder,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try workbench.openSavedSession(savedSession)
+
+        let normalizedConfig = try CoreBridge.parseConsoleSessionConfig(
+            json: CoreBridge.serializeConsoleSessionConfig(config: config)
+        )
+        XCTAssertEqual(consoleStarter.openedConfigs, [normalizedConfig])
+        XCTAssertEqual(consoleStarter.openedTitles, ["Core Switch Console"])
+        XCTAssertEqual(status.runtimeId, "term_console_saved")
+        XCTAssertEqual(status.status, "running")
+        XCTAssertTrue(serialStarter.openedConfigs.isEmpty)
+        XCTAssertEqual(openRecorder.openedSessionIDs, [savedSession.id])
+    }
+
+    func testConsoleSavedSessionRejectsMissingCurrentMacOSBinding() throws {
+        let tempURL = savedConsoleTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let savedSession = try createSavedConsoleSession(
+            databasePath: tempURL.path,
+            config: savedConsoleConfig(macOSPeripheralUUID: nil)
+        )
+        let consoleStarter = SavedSessionRecordingConsoleStarter()
+        let serialStarter = SavedSessionRecordingSerialStarter()
+        let openRecorder = SavedSessionRecordingOpenRecorder()
+        let workbench = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            serialSessionStarter: serialStarter,
+            consoleSessionStarter: consoleStarter,
+            savedSessionOpenRecorder: openRecorder,
+            databasePathProvider: { tempURL.path }
+        )
+
+        XCTAssertThrowsError(try workbench.openSavedSession(savedSession)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("BLE_CONSOLE_CONFIG_INVALID"))
+        }
+        XCTAssertTrue(consoleStarter.openedConfigs.isEmpty)
+        XCTAssertTrue(serialStarter.openedConfigs.isEmpty)
+        XCTAssertTrue(openRecorder.openedSessionIDs.isEmpty)
+    }
+
+    func testConsoleSavedSessionRejectsUnknownSchemaVersion() throws {
+        try assertSavedConsoleConfigRejected(
+            #"{"kind":"console","schemaVersion":2,"transportPolicy":"prefer_ble","ble":{"deviceName":"NBEE_BLE_1103","profileID":"bterm-ffe1-split-v1","serviceUUID":"FFE1","txCharacteristicUUID":"FFE3","rxCharacteristicUUID":"FFE2","writeType":"without_response","platformBindings":{"macOSPeripheralUUID":"opaque-device-id","windowsDeviceID":null}},"sppFallback":null}"#
+        )
+    }
+
+    func testConsoleSavedSessionRejectsInvalidStoredConfig() throws {
+        try assertSavedConsoleConfigRejected(#"{"kind":"console","schemaVersion":1}"#)
+    }
+
+    func testConsoleSavedSessionRejectsMalformedJSON() throws {
+        try assertSavedConsoleConfigRejected("{not-json")
+    }
+
     func testPasswordSavedSessionResolvesKeychainSecretAndStartsEmbeddedLiveShell() throws {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -265,6 +336,183 @@ final class SavedSessionConnectionFlowTests: XCTestCase {
         XCTAssertEqual(contextStore.current()?.config.host, fixture.host)
         XCTAssertTrue(output.contains(marker), "Fixture shell output did not contain marker: \(output)")
         XCTAssertFalse(String(describing: contextStore).contains(fixture.secretNeedle))
+    }
+}
+
+@MainActor
+private extension SavedSessionConnectionFlowTests {
+    func assertSavedConsoleConfigRejected(
+        _ invalidConfigJSON: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let tempURL = savedConsoleTemporaryDatabaseURL()
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let savedSession = try createSavedConsoleSession(
+            databasePath: tempURL.path,
+            config: savedConsoleConfig(macOSPeripheralUUID: UUID().uuidString)
+        )
+        try overwriteSavedConsoleConfigJSON(
+            invalidConfigJSON,
+            sessionID: savedSession.id,
+            databasePath: tempURL.path
+        )
+        let consoleStarter = SavedSessionRecordingConsoleStarter()
+        let serialStarter = SavedSessionRecordingSerialStarter()
+        let openRecorder = SavedSessionRecordingOpenRecorder()
+        let workbench = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            serialSessionStarter: serialStarter,
+            consoleSessionStarter: consoleStarter,
+            savedSessionOpenRecorder: openRecorder,
+            databasePathProvider: { tempURL.path }
+        )
+
+        XCTAssertThrowsError(try workbench.openSavedSession(savedSession), file: file, line: line) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("BLE_CONSOLE_CONFIG_INVALID"),
+                "Unexpected error: \(error)",
+                file: file,
+                line: line
+            )
+        }
+        XCTAssertTrue(consoleStarter.openedConfigs.isEmpty, file: file, line: line)
+        XCTAssertTrue(serialStarter.openedConfigs.isEmpty, file: file, line: line)
+        XCTAssertTrue(openRecorder.openedSessionIDs.isEmpty, file: file, line: line)
+    }
+}
+
+private func savedConsoleTemporaryDatabaseURL() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("sqlite")
+}
+
+private func createSavedConsoleSession(
+    databasePath: String,
+    config: ConsoleSessionConfig
+) throws -> SessionRecord {
+    try CoreBridge.createSessionRecord(
+        databasePath: databasePath,
+        draft: SessionDraft(
+            folderId: nil,
+            name: "Core Switch Console",
+            protocol: "console",
+            host: "NBEE_BLE_1103 (BLE)",
+            port: 0,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: ["network"],
+            configJson: try CoreBridge.serializeConsoleSessionConfig(config: config)
+        )
+    )
+}
+
+private func savedConsoleConfig(macOSPeripheralUUID: String?) -> ConsoleSessionConfig {
+    ConsoleSessionConfig(
+        kind: "console",
+        schemaVersion: 1,
+        transportPolicy: "prefer_ble",
+        ble: ConsoleBleConfig(
+            deviceName: "NBEE_BLE_1103",
+            profileId: "bterm-ffe1-split-v1",
+            serviceUuid: "FFE1",
+            txCharacteristicUuid: "FFE3",
+            rxCharacteristicUuid: "FFE2",
+            writeType: "without_response",
+            platformBindings: ConsolePlatformBindings(
+                macOsPeripheralUuid: macOSPeripheralUUID,
+                windowsDeviceId: nil
+            )
+        ),
+        sppFallback: nil
+    )
+}
+
+private func overwriteSavedConsoleConfigJSON(
+    _ configJSON: String,
+    sessionID: String,
+    databasePath: String
+) throws {
+    let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    var database: OpaquePointer?
+    guard sqlite3_open(databasePath, &database) == SQLITE_OK, let database else {
+        throw NSError(domain: "SavedSessionConnectionFlowTests.SQLite", code: 1)
+    }
+    defer { sqlite3_close(database) }
+
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+        database,
+        "UPDATE sessions SET config_json = ?1 WHERE id = ?2",
+        -1,
+        &statement,
+        nil
+    ) == SQLITE_OK,
+    let statement else {
+        throw NSError(domain: "SavedSessionConnectionFlowTests.SQLite", code: 2)
+    }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_text(statement, 1, configJSON, -1, sqliteTransient)
+    sqlite3_bind_text(statement, 2, sessionID, -1, sqliteTransient)
+    guard sqlite3_step(statement) == SQLITE_DONE else {
+        throw NSError(domain: "SavedSessionConnectionFlowTests.SQLite", code: 3)
+    }
+}
+
+@MainActor
+private final class SavedSessionRecordingConsoleStarter: ConsoleSessionStarting {
+    private(set) var openedConfigs: [ConsoleSessionConfig] = []
+    private(set) var openedTitles: [String] = []
+
+    func openSessionTab(config: ConsoleSessionConfig, title: String) throws -> TerminalRuntime {
+        openedConfigs.append(config)
+        openedTitles.append(title)
+        return TerminalRuntime(
+            id: "term_console_saved",
+            kind: "ble_console",
+            shellPath: "",
+            remoteHost: nil,
+            remotePort: nil,
+            username: nil,
+            cols: 80,
+            rows: 24,
+            resizeRevision: 0,
+            status: "running",
+            outputPaused: false
+        )
+    }
+}
+
+@MainActor
+private final class SavedSessionRecordingSerialStarter: SerialSessionStarting {
+    private(set) var openedConfigs: [SerialConnectionConfig] = []
+
+    func start(config: SerialConnectionConfig, title: String) throws -> LiveShellStatus {
+        openedConfigs.append(config)
+        return LiveShellStatus(runtimeId: "term_serial_unexpected", status: "running", diagnostic: "running")
+    }
+}
+
+private final class SavedSessionRecordingOpenRecorder: SavedSessionOpenRecording {
+    private(set) var openedSessionIDs: [String] = []
+
+    func markSessionRecordOpened(databasePath: String, id: String) throws -> SessionRecord {
+        openedSessionIDs.append(id)
+        return SessionRecord(
+            id: id,
+            folderId: nil,
+            name: "",
+            protocol: "console",
+            host: "",
+            port: 0,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "now"
+        )
     }
 }
 

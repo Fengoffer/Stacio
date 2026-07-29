@@ -132,6 +132,36 @@ impl TerminalRuntimeRegistry {
         self.register_runtime(runtime)
     }
 
+    pub fn open_external(
+        &mut self,
+        kind: String,
+        endpoint: String,
+        cols: u32,
+        rows: u32,
+    ) -> Result<TerminalRuntime, TerminalRuntimeError> {
+        let kind = kind.trim();
+        let endpoint = endpoint.trim();
+        if kind != "ble_console" || endpoint.is_empty() || endpoint.chars().any(char::is_control) {
+            return Err(TerminalRuntimeError::RuntimeIo {
+                message: "invalid external runtime".to_string(),
+            });
+        }
+
+        Ok(self.register_runtime(TerminalRuntime {
+            id: format!("term_{}", Uuid::new_v4()),
+            kind: kind.to_string(),
+            shell_path: String::new(),
+            remote_host: Some(endpoint.to_string()),
+            remote_port: None,
+            username: None,
+            cols,
+            rows,
+            resize_revision: 0,
+            status: "running".to_string(),
+            output_paused: false,
+        }))
+    }
+
     fn register_runtime(&mut self, runtime: TerminalRuntime) -> TerminalRuntime {
         self.output_buffers.insert(
             runtime.id.clone(),

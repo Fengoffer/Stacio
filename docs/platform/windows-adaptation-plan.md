@@ -187,7 +187,7 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 ### 7.6 文件与拖放
 
 1. 文件选择使用 Windows Storage Picker 或与桌面权限兼容的 picker。
-2. 支持盘符、UNC、长路径、OneDrive 占位文件和只读位置。
+2. 支持盘符、UNC、长路径、OneDrive 按需下载文件和只读位置。
 3. 拖放上传必须处理虚拟文件与延迟提供的数据。
 4. 下载冲突策略与 Core 保持一致，展示使用 Windows 原生对话框。
 
@@ -198,6 +198,39 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 3. 使用 AppInstance 处理单实例和协议唤起。
 4. 通知正文不得包含密码、完整命令输出或敏感主机信息。
 
+### 7.8 BLE Console 与 SPP fallback
+
+Windows Console 必须沿用共享的 Console v1 contract，并保持 BLE first。Windows 平台不得重新定义 profile、错误码或持久化结构。
+
+共享 API 与数据边界：
+
+1. 复用 `ConsoleSessionConfig`、`ConsoleBleConfig`、`ConsolePlatformBindings`、`ConsoleSppFallbackConfig`、`ConsoleProfileMatch`、`ConsolePlatform` 和 `ConsoleTransportDecision`。
+2. 通过 Core exports `parse_console_session_config`、`serialize_console_session_config`、`match_ble_console_profile` 和 `console_transport_policy` 完成校验、profile 匹配与 transport 决策。
+3. `transportPolicy` 固定为 `prefer_ble`；FFE1/FFE3/FFE2、FFE0/FFE1 和 `custom-v1` 的解释由共享 Core 负责。
+4. macOS 即使同步到非空 `sppFallback` 也必须忽略它并返回 BLE-only；Windows 才能消费已验证的 SPP binding。
+
+WinRT adapter 映射：
+
+| Shared/macOS concept | Windows implementation |
+| --- | --- |
+| 扫描与增量设备列表 | `DeviceWatcher`；设备行以稳定 device id 去重并更新名称/RSSI。 |
+| 设备连接 | `BluetoothLEDevice`，只连接用户明确选择或会话精确保存的 device id。 |
+| Service discovery | `GattDeviceService`，把 UUID 和 characteristic metadata 映射为共享 DTO。 |
+| TX/RX characteristic | `GattCharacteristic`；订阅 ValueChanged，按属性选择 with/without response。 |
+| 发送背压 | 使用 WinRT GATT 写入完成/可写状态驱动同一有序队列，不固定假设 20 字节。 |
+| SPP endpoint | 平台 adapter 持有精确保存且重新验证的 `COMn`，不进入共享 BLE driver。 |
+
+连接状态机与 fallback 规则：
+
+1. 首选使用保存的 Windows BLE device id；不存在或失效时要求用户重新扫描绑定，禁止按名称自动选择设备。
+2. BLE 连接、服务发现或订阅失败时，先执行与共享策略一致的有限重试；只有重试耗尽后才评估 SPP。
+3. SPP 只有在当前会话保存了精确大写 `COMn` 且该端口仍对应预期设备时才可使用。`COM0`、小写、空格、后缀、同名设备、枚举第一项和随机端口都无效。
+4. 没有精确 COM binding 时必须保持 BLE-only，返回可操作的 rebind 提示；不得静默连接其他串口。
+5. BLE 与 SPP 共用终端 pane、Macro、MultiExec、AI 和 diagnostics 输入路径，但平台 transport owner 必须保证一次只有一个有效连接。
+6. Windows adapter 的诊断必须记录选择 BLE 或 exact COM 的原因，但不能记录敏感终端字节。
+
+Windows 回归至少覆盖：两套 BTerm profile、unknown mapper、device id 失效、BLE 重试后 exact-COM fallback、错误 COM 拒绝、手机占用、1/20/21/MTU/4 KiB 写入顺序、断电/超距、close-after-reconnect，以及 Serial 会话不被 Console fallback 接管。
+
 ## 8. UI 功能映射
 
 | macOS 当前概念 | Windows 实现 |
@@ -207,6 +240,7 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 | `NSOutlineView` 会话树 | TreeView |
 | `NSTabView`/工作区标签 | TabView |
 | SwiftTerm | 选定的 Windows terminal control |
+| CoreBluetooth BLE Console | WinRT `DeviceWatcher` + `BluetoothLEDevice` + GATT APIs |
 | Keychain | Credential Manager |
 | Sparkle | MSIX/App Installer 更新 |
 | `NSOpenPanel`/`NSSavePanel` | Windows file/folder picker |
@@ -246,10 +280,12 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 
 1. ConPTY local terminal。
 2. Rust live SSH shell 接入。
-3. terminal input/output、resize、close、reconnect。
-4. 标签、分屏、搜索和复制粘贴。
+3. WinRT BLE Console adapter、设备扫描和 GATT profile mapping。
+4. BLE 有限重试后的 exact-COM-only SPP fallback。
+5. terminal input/output、resize、close、reconnect。
+6. 标签、分屏、搜索和复制粘贴。
 
-完成定义：本地 PowerShell 和真实 SSH 均可连续运行 60 分钟；高输出时 UI 可交互，关闭后无残留 worker。
+完成定义：本地 PowerShell、真实 SSH 和真实 BLE Console 均完成持续运行与断连恢复；有精确 COM binding 时验证 BLE 失败后的 SPP fallback，无 binding 时证明不会随机选端口；高输出时 UI 可交互，关闭后无残留 worker。
 
 ### W3：Files、传输和隧道
 
@@ -309,6 +345,7 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 | DPI | 100%、150%、200%、300% |
 | Shell | Windows PowerShell、PowerShell 7、cmd、WSL |
 | 网络 | 直连、jump host、断网重连、高延迟 |
+| Bluetooth Console | BLE 正常、手机占用、设备掉电、超距、蓝牙关闭、exact COM 有/无效 |
 | 凭据 | 密码、私钥、passphrase、agent |
 | 文件 | 本地盘、UNC、长路径、中文和 emoji 文件名 |
 
@@ -366,6 +403,7 @@ Windows 必须在首个可交付版本加入包后 smoke：校验在线/离线�
 4. 禁止 UI 直接读写共享 SQLite 业务表。
 5. 禁止把密码、API key 或私钥 passphrase 写入配置文件。
 6. 禁止在没有安装、升级和卸载验证时宣称 Windows 版本可发布。
+7. 禁止按设备名称、枚举顺序或随机结果选择 COM 口；SPP 只能使用当前会话保存并重新验证的 exact COM binding。
 
 ## 16. 最终验收
 
@@ -378,3 +416,4 @@ Windows 版本只有同时满足以下条件才视为完成：
 5. x86_64 安装包完成签名、安装、升级、卸载和 smoke test。
 6. ARM64 若列入当前发布范围，必须独立构建并完成同等级验证。
 7. 已输出已知限制、第三方许可、SBOM、回滚与诊断说明。
+8. BLE Console 完成 WinRT GATT 硬件矩阵；SPP fallback 只在 exact COM binding 下通过，错误或缺失 binding 不会连接其他串口。

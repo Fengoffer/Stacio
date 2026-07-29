@@ -63,6 +63,65 @@ final class RemoteSSHSessionCoordinatorTests: XCTestCase {
         XCTAssertFalse(String(describing: contextStore).contains("super-secret"))
     }
 
+    func testEstablishedSSHCloseRecordsSanitizedDisconnectLifecycle() throws {
+        let context = tunnelContext()
+        let contextStore = TunnelLiveSessionStore()
+        let workspace = RecordingRemoteWorkspaceOpening()
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let coordinator = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingTunnelContextBuilder(context: context),
+            liveShellStarter: RecordingLiveShellStarter(
+                status: LiveShellStatus(runtimeId: "term_live", status: "running", diagnostic: "running")
+            ),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" },
+            diagnosticLogRecorder: diagnosticLog
+        )
+
+        _ = try coordinator.start(config: context.config, title: "deploy@example.com")
+        let pane = try XCTUnwrap(workspace.openedPanes.first)
+        XCTAssertTrue(waitUntil { pane.runtimeID == "term_live" })
+        pane.closeTerminal()
+
+        XCTAssertEqual(
+            diagnosticLog.snapshot().events.map(\.eventCode),
+            [.sessionConnectionStarted, .sessionConnected, .sessionDisconnected]
+        )
+        let json = try XCTUnwrap(diagnosticLog.snapshot().encodedJSONString())
+        XCTAssertFalse(json.contains(context.config.host))
+        XCTAssertFalse(json.contains(context.config.username))
+    }
+
+    func testClosingPendingSSHDoesNotRecordDisconnectedLifecycle() throws {
+        let context = tunnelContext()
+        let contextStore = TunnelLiveSessionStore()
+        let workspace = RecordingRemoteWorkspaceOpening()
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let shellBridge = BlockingLiveShellStarter(
+            status: LiveShellStatus(runtimeId: "term_late", status: "running", diagnostic: "running")
+        )
+        let coordinator = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingTunnelContextBuilder(context: context),
+            liveShellStarter: shellBridge,
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" },
+            diagnosticLogRecorder: diagnosticLog
+        )
+
+        _ = try coordinator.start(config: context.config, title: "deploy@example.com")
+        XCTAssertTrue(shellBridge.waitUntilStartRequested())
+        let pane = try XCTUnwrap(workspace.openedPanes.first)
+        pane.closeTerminal()
+        shellBridge.releaseStart()
+        XCTAssertTrue(waitUntil { shellBridge.closedRuntimeIDs == ["term_late"] })
+
+        XCTAssertFalse(
+            diagnosticLog.snapshot().events.map(\.eventCode).contains(.sessionDisconnected)
+        )
+    }
+
     func testStartRemoteSessionDoesNotFallbackToAgentAfterAuthenticationFailure() throws {
         let context = tunnelContext()
         let contextStore = TunnelLiveSessionStore()

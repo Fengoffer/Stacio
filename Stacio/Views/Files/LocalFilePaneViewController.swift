@@ -98,6 +98,15 @@ public enum LocalFilePaneError: Error, Equatable, LocalizedError {
     }
 }
 
+enum LocalFileDragPayload {
+    static func urls(from pasteboard: NSPasteboard) -> [URL] {
+        pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        )?.compactMap { ($0 as? URL)?.standardizedFileURL } ?? []
+    }
+}
+
 public final class LocalFilePaneTableView: NSTableView {
     var rowContextMenuProvider: ((Int) -> NSMenu?)?
     var onQuickLookRequested: (() -> Void)?
@@ -139,6 +148,7 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
     public var transferTargetsProvider: (() -> [FileWorkspaceTransferTarget])?
     public var onTransferLocalURLsToTarget: (([URL], FileWorkspaceTransferTarget) -> Void)?
     public var onPastePayload: ((FileWorkspaceClipboardPayload, URL) -> Void)?
+    public weak var localFileTransferScheduler: LocalFileTransferScheduling?
     public var onUploadLocalPaths: (([String]) -> Void)? {
         didSet {
             guard isViewLoaded else { return }
@@ -222,6 +232,10 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
         let container = LocalFilesRootView()
         container.onRemoteSelectionsDropped = { [weak self] sourceRuntimeID, selections in
             self?.handleRemoteSelectionsDropped(selections, sourceRuntimeID: sourceRuntimeID)
+        }
+        container.onLocalURLsDropped = { [weak self] urls in
+            guard let self else { return }
+            _ = self.acceptLocalFileDrop(urls, destination: self.directoryURL)
         }
         container.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.applyWorkspaceSurface(container)
@@ -311,7 +325,10 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
         tableView.target = self
         tableView.doubleAction = #selector(openSelectedEntry)
         tableView.setDraggingSourceOperationMask(.copy, forLocal: true)
-        tableView.registerForDraggedTypes([RemoteFileDragPayload.pasteboardType])
+        tableView.registerForDraggedTypes([
+            RemoteFileDragPayload.pasteboardType,
+            .fileURL
+        ])
         tableView.rowContextMenuProvider = { [weak self] row in
             self?.contextMenu(forRow: row)
         }
@@ -441,7 +458,11 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
         proposedRow row: Int,
         proposedDropOperation dropOperation: NSTableView.DropOperation
     ) -> NSDragOperation {
-        guard RemoteFileDragPayload.selections(from: info.draggingPasteboard).isEmpty == false else {
+        let hasRemoteSelections = RemoteFileDragPayload.selections(
+            from: info.draggingPasteboard
+        ).isEmpty == false
+        let hasLocalURLs = LocalFileDragPayload.urls(from: info.draggingPasteboard).isEmpty == false
+        guard hasRemoteSelections || hasLocalURLs else {
             return []
         }
         if rows.indices.contains(row), rows[row].isDirectory {
@@ -458,15 +479,20 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
         row: Int,
         dropOperation: NSTableView.DropOperation
     ) -> Bool {
-        let selections = RemoteFileDragPayload.selections(from: info.draggingPasteboard)
-        guard selections.isEmpty == false else { return false }
         let destination = destinationURL(forProposedRow: row)
-        routeRemoteSelectionsDropped(
-            selections,
-            sourceRuntimeID: RemoteFileDragPayload.sourceRuntimeID(from: info.draggingPasteboard),
+        let selections = RemoteFileDragPayload.selections(from: info.draggingPasteboard)
+        if selections.isEmpty == false {
+            routeRemoteSelectionsDropped(
+                selections,
+                sourceRuntimeID: RemoteFileDragPayload.sourceRuntimeID(from: info.draggingPasteboard),
+                destination: destination
+            )
+            return true
+        }
+        return acceptLocalFileDrop(
+            LocalFileDragPayload.urls(from: info.draggingPasteboard),
             destination: destination
         )
-        return true
     }
 
     public var statusTextForTesting: String {
@@ -625,6 +651,21 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
     public func acceptPastePayload(_ payload: FileWorkspaceClipboardPayload) {
         guard payload.localURLs.isEmpty == false else { return }
         performLocalCopyOrMove(payload, to: directoryURL)
+    }
+
+    @discardableResult
+    func acceptLocalFileDrop(_ urls: [URL], destination: URL) -> Bool {
+        let normalizedURLs = urls.map(\.standardizedFileURL)
+        guard normalizedURLs.isEmpty == false else { return false }
+        performLocalCopyOrMove(
+            FileWorkspaceClipboardPayload(
+                operation: .copy,
+                sourceDeviceID: "local-drag",
+                localURLs: normalizedURLs
+            ),
+            to: destination.standardizedFileURL
+        )
+        return true
     }
 
     private func loadDirectory(recordAction: Bool) {
@@ -1093,6 +1134,72 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
         let urls = payload.localURLs
         let operation = payload.operation
         let conflictSession = RemoteFileConflictResolutionSession(resolver: conflictResolver)
+        if let localFileTransferScheduler {
+            let plans = urls.compactMap { sourceURL -> (URL, URL)? in
+                let proposedDestination = directory.appendingPathComponent(
+                    sourceURL.lastPathComponent,
+                    isDirectory: sourceURL.hasDirectoryPath
+                )
+                guard sourceURL.standardizedFileURL != proposedDestination.standardizedFileURL else {
+                    return nil
+                }
+                let hasConflict = FileManager.default.fileExists(atPath: proposedDestination.path)
+                let policy = hasConflict
+                    ? conflictSession.resolveConflict(
+                        destinationPath: proposedDestination.path,
+                        direction: .download,
+                        parentWindow: view.window
+                    )
+                    : .overwrite
+                guard let policy, policy != .skip else { return nil }
+                let destination = hasConflict && policy != .overwrite
+                    ? Self.uniqueDestinationURL(proposedDestination)
+                    : proposedDestination
+                return (sourceURL.standardizedFileURL, destination.standardizedFileURL)
+            }
+            guard plans.isEmpty == false else {
+                updateStatus("没有可传输的本地项目")
+                return
+            }
+            updateStatus(operation == .copy ? "正在复制..." : "正在移动...")
+            let batch = LocalFileTransferBatch(
+                expectedCount: plans.count,
+                completion: { [weak self] results in
+                    guard let self else { return }
+                    let allCompleted = results.count == plans.count
+                        && results.allSatisfy { $0 == .completed }
+                    if operation == .cut, allCompleted {
+                        self.workspaceClipboard.clear()
+                    }
+                    self.refreshDirectory()
+                    if allCompleted {
+                        self.updateStatus(operation == .copy ? "复制完成" : "移动完成")
+                    } else if let message = results.compactMap({ result -> String? in
+                        if case .failed(let message) = result { return message }
+                        return nil
+                    }).first {
+                        self.updateStatus("文件操作失败：\(message)")
+                    } else {
+                        self.updateStatus("文件操作已取消")
+                    }
+                }
+            )
+            for plan in plans {
+                localFileTransferScheduler.scheduleLocalFileTransfer(
+                    runtimeID: runtimeID,
+                    sourceURL: plan.0,
+                    destinationURL: plan.1,
+                    operation: operation == .copy ? .copy : .move,
+                    notificationPolicy: .userVisible,
+                    completion: { result in
+                        DispatchQueue.main.async {
+                            batch.receive(result)
+                        }
+                    }
+                )
+            }
+            return
+        }
         updateStatus(operation == .copy ? "正在复制..." : "正在移动...")
         fileOperationQueue.async { [weak self] in
             guard let self else { return }
@@ -1525,13 +1632,46 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
     }
 }
 
-private final class LocalFilesRootView: NSView {
-    var onRemoteSelectionsDropped: ((String?, [RemoteFileSelection]) -> Void)? {
-        didSet { registerForDraggedTypes([RemoteFileDragPayload.pasteboardType]) }
+@MainActor
+private final class LocalFileTransferBatch {
+    private let expectedCount: Int
+    private let completion: ([LocalFileTransferResult]) -> Void
+    private var results: [LocalFileTransferResult] = []
+
+    init(
+        expectedCount: Int,
+        completion: @escaping ([LocalFileTransferResult]) -> Void
+    ) {
+        self.expectedCount = expectedCount
+        self.completion = completion
     }
 
+    func receive(_ result: LocalFileTransferResult) {
+        guard results.count < expectedCount else { return }
+        results.append(result)
+        if results.count == expectedCount {
+            completion(results)
+        }
+    }
+}
+
+private final class LocalFilesRootView: NSView {
+    var onRemoteSelectionsDropped: ((String?, [RemoteFileSelection]) -> Void)? {
+        didSet {
+            registerForDraggedTypes([
+                RemoteFileDragPayload.pasteboardType,
+                .fileURL
+            ])
+        }
+    }
+    var onLocalURLsDropped: (([URL]) -> Void)?
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        RemoteFileDragPayload.selections(from: sender.draggingPasteboard).isEmpty ? [] : .copy
+        let hasRemoteSelections = RemoteFileDragPayload.selections(
+            from: sender.draggingPasteboard
+        ).isEmpty == false
+        let hasLocalURLs = LocalFileDragPayload.urls(from: sender.draggingPasteboard).isEmpty == false
+        return hasRemoteSelections || hasLocalURLs ? .copy : []
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1540,11 +1680,16 @@ private final class LocalFilesRootView: NSView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let selections = RemoteFileDragPayload.selections(from: sender.draggingPasteboard)
-        guard selections.isEmpty == false else { return false }
-        onRemoteSelectionsDropped?(
-            RemoteFileDragPayload.sourceRuntimeID(from: sender.draggingPasteboard),
-            selections
-        )
+        if selections.isEmpty == false {
+            onRemoteSelectionsDropped?(
+                RemoteFileDragPayload.sourceRuntimeID(from: sender.draggingPasteboard),
+                selections
+            )
+            return true
+        }
+        let urls = LocalFileDragPayload.urls(from: sender.draggingPasteboard)
+        guard urls.isEmpty == false else { return false }
+        onLocalURLsDropped?(urls)
         return true
     }
 }

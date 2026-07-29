@@ -1312,7 +1312,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(request.mode, .textEditor)
     }
 
-    func testCoordinatorOpensBuiltInEditorAndPreviewWithoutSchedulingCacheDownloads() throws {
+    func testCoordinatorOpensTextInEditorAndRemoteMediaInIndependentWindowWithoutCacheDownloads() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1338,23 +1338,30 @@ final class FilesCoordinatorTests: XCTestCase {
 
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.performOpenRemoteEditForTesting()
+        XCTAssertTrue(waitUntil {
+            files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting == ["config.json"]
+        })
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting.count == 2 })
+        XCTAssertTrue(waitUntil {
+            NSApp.windows.contains {
+                $0.title == "screenshot.png"
+                    && $0.contentViewController is FileWorkspaceMediaViewController
+            }
+        })
+        defer {
+            NSApp.windows
+                .filter { $0.title == "screenshot.png" }
+                .forEach { $0.close() }
+        }
         XCTAssertTrue(
             scheduler.jobs.filter { $0.id.hasPrefix("remote_edit_download_") }.isEmpty,
-            "内置编辑器/预览必须在线打开，不能先下载到 StacioRemoteEditCache"
+            "内置编辑器和独立媒体窗口必须在线打开，不能先下载到 StacioRemoteEditCache"
         )
         XCTAssertEqual(bridge.readRequests.map(\.path), ["/srv/app/config.json"])
         let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
-        XCTAssertEqual(Set(editor.tabTitlesForTesting), Set(["screenshot.png", "config.json"]))
-
-        editor.switchToDocumentForTesting(fileName: "screenshot.png")
-        XCTAssertEqual(editor.activeMediaPreviewSourceForTesting?.hasPrefix("stacio-remote-media://"), true)
-        XCTAssertFalse(editor.activeMediaPreviewSourceForTesting?.hasPrefix("file://") ?? true)
-
-        editor.switchToDocumentForTesting(fileName: "config.json")
+        XCTAssertEqual(editor.tabTitlesForTesting, ["config.json"])
         XCTAssertEqual(editor.currentTextForTesting, #"{"enabled":true}"#)
         editor.replaceTextForTesting(#"{"enabled":false}"#)
         try editor.performSaveForTesting()
@@ -1438,7 +1445,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertNil(files.embeddedEditorViewControllerForTesting)
     }
 
-    func testCoordinatorOpensRemoteMediaPreviewWithOnlineSource() throws {
+    func testCoordinatorOpensRemoteImageVideoAndAudioInIndependentMediaWindows() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let opener = RecordingRemoteEditOpener()
@@ -1448,6 +1455,7 @@ final class FilesCoordinatorTests: XCTestCase {
             bridge: RecordingRemoteFilesBridge(),
             filesViewController: files,
             liveSessionContextProvider: { self.liveContext() },
+            liveSessionRuntimeIDProvider: { "runtime-media" },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
             remoteEditOpener: opener,
@@ -1455,20 +1463,38 @@ final class FilesCoordinatorTests: XCTestCase {
         )
         XCTAssertNotNil(coordinator)
         files.setRemoteEntries([
-            RemoteFileEntry(kind: .file, path: "/srv/app/screenshot.png", size: 1_024, linkTarget: nil)
+            RemoteFileEntry(kind: .file, path: "/srv/app/files-panel-photo.png", size: 1_024, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/srv/app/files-panel-demo.mp4", size: 2_048, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/srv/app/files-panel-audio.mp3", size: 3_072, linkTarget: nil)
         ])
 
-        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        files.openSelectedEntryForTesting()
+        for row in 0..<3 {
+            files.tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            files.openSelectedEntryForTesting()
+        }
 
+        let expectedNames = Set([
+            "files-panel-photo.png",
+            "files-panel-demo.mp4",
+            "files-panel-audio.mp3"
+        ])
+        XCTAssertTrue(waitUntil {
+            Set(NSApp.windows.compactMap { window -> String? in
+                guard window.contentViewController is FileWorkspaceMediaViewController else { return nil }
+                return expectedNames.contains(window.title) ? window.title : nil
+            }) == expectedNames
+        })
+        defer {
+            NSApp.windows
+                .filter { expectedNames.contains($0.title) }
+                .forEach { $0.close() }
+        }
         XCTAssertTrue(scheduler.jobs.isEmpty)
-        let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
-        XCTAssertEqual(request.document.remotePath, "/srv/app/screenshot.png")
-        XCTAssertEqual(request.document.previewSource?.hasPrefix("stacio-remote-media://"), true)
-        XCTAssertEqual(request.mode, .mediaPreview)
+        XCTAssertTrue(opener.remoteDocumentRequests.isEmpty)
+        XCTAssertNil(files.embeddedEditorViewControllerForTesting)
     }
 
-    func testCoordinatorDefaultOpenerEmbedsEditorAndMediaPreviewAsEditorTabsInFilesView() throws {
+    func testCoordinatorDefaultOpenerKeepsRemoteMediaOutOfEditorTabs() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1504,16 +1530,26 @@ final class FilesCoordinatorTests: XCTestCase {
 
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting.count == 2 })
+        XCTAssertTrue(waitUntil {
+            NSApp.windows.contains {
+                $0.title == "screenshot.png"
+                    && $0.contentViewController is FileWorkspaceMediaViewController
+            }
+        })
+        defer {
+            NSApp.windows
+                .filter { $0.title == "screenshot.png" }
+                .forEach { $0.close() }
+        }
         files.view.layoutSubtreeIfNeeded()
 
         let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
         XCTAssertNil(files.embeddedMediaPreviewViewControllerForTesting)
         XCTAssertNotNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
         XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.MediaPreview.root"))
-        XCTAssertEqual(Set(editor.tabTitlesForTesting), Set(["config.json", "screenshot.png"]))
-        XCTAssertEqual(editor.activeFileNameForTesting, "screenshot.png")
-        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "image")
+        XCTAssertEqual(editor.tabTitlesForTesting, ["config.json"])
+        XCTAssertEqual(editor.activeFileNameForTesting, "config.json")
+        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "text")
         XCTAssertTrue(scheduler.jobs.isEmpty)
         XCTAssertNil(files.view.window)
     }

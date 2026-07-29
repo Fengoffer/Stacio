@@ -58,12 +58,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
     private let settingsStore: AppSettingsStore
     private let licenseAccess: any LicenseFeatureAccessProviding
+    private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
     private let removedProtocolExportNoticeHandler: (SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void
     private var activePingRuns: [String: SessionSidebarPingRunning] = [:]
     private var activePingPresenters: [String: SessionSidebarPingProgressPresenting] = [:]
     private var allNodes: [NSObject] = []
     private var nodes: [NSObject] = []
     private var manualSessionIconIDs: [String: String] = [:]
+    private var sessionDisplaySummariesByID: [String: BastionSessionDisplaySummary] = [:]
     private var expandedFolderKeys: Set<String> = []
     private var hasInitializedExpansionState = false
     private var searchQuery = ""
@@ -102,7 +104,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
         settingsStore: AppSettingsStore = .shared,
         licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
-        removedProtocolExportNoticeHandler: ((SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void)? = nil
+        removedProtocolExportNoticeHandler: ((SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void)? = nil,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
     ) {
         self.sessionStore = sessionStore
         self.onOpenSession = onOpenSession
@@ -123,6 +126,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.clipboardDismissalStore = clipboardDismissalStore
         self.settingsStore = settingsStore
         self.licenseAccess = licenseAccess
+        self.diagnosticLogRecorder = diagnosticLogRecorder
         self.removedProtocolExportNoticeHandler = removedProtocolExportNoticeHandler
             ?? Self.presentRemovedProtocolExportNotice
         showsRecentSessions = settingsStore.snapshot().sessionSidebarShowRecentSessions
@@ -237,6 +241,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         outlineView.style = .sourceList
         outlineView.dataSource = self
         outlineView.delegate = self
+        outlineView.allowsMultipleSelection = true
         outlineView.target = self
         outlineView.doubleAction = #selector(openSelectedSession(_:))
         outlineView.backgroundColor = .clear
@@ -246,6 +251,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         if let sidebarOutlineView = outlineView as? SessionSidebarOutlineView {
             sidebarOutlineView.rowContextMenuProvider = { [weak self] row in
                 self?.contextMenu(forRow: row)
+            }
+            sidebarOutlineView.deleteSelectionHandler = { [weak self] in
+                self?.deleteSelectedSidebarItems() ?? false
             }
         }
         outlineView.setAccessibilityIdentifier("Stacio.Sidebar.sessionOutline")
@@ -590,7 +598,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     public func sessionProtocolIconSymbolNameForTesting(_ protocolName: String) -> String {
-        sessionProtocolIconDescriptor(for: protocolName).symbolName
+        Self.sessionProtocolIconDescriptor(for: protocolName).symbolName
     }
 
     public func reloadSessions() {
@@ -808,7 +816,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 identifier: "Stacio.Sidebar.sessionProtocolIcon"
             )
         } else {
-            let iconDescriptor = sessionProtocolIconDescriptor(for: session.session.protocol)
+            let iconDescriptor = Self.sessionProtocolIconDescriptor(for: session.session.protocol)
             iconView = makeRowIcon(
                 symbolName: iconDescriptor.symbolName,
                 accessibilityDescription: iconDescriptor.accessibilityDescription,
@@ -846,9 +854,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         identifier: String
     ) -> NSImageView {
         let imageView = NSImageView(
-            image: NSImage(
-                systemSymbolName: symbolName,
-                accessibilityDescription: accessibilityDescription
+            image: StacioSymbolImage.image(
+                named: symbolName,
+                accessibilityDescription: accessibilityDescription,
+                size: NSSize(width: 18, height: 18)
             ) ?? NSImage()
         )
         imageView.setAccessibilityIdentifier(identifier)
@@ -872,7 +881,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return imageView
     }
 
-    private func sessionProtocolIconDescriptor(for protocolName: String) -> (
+    static func sessionProtocolIconDescriptor(for protocolName: String) -> (
         symbolName: String,
         accessibilityDescription: String
     ) {
@@ -881,6 +890,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             return ("terminal", "SSH")
         case "serial":
             return ("cable.connector", "串口")
+        case "console":
+            return (SessionTabIconDescriptor.consoleSystemSymbolName, "蓝牙 Console")
         case "vnc":
             return ("rectangle.connected.to.line.below", "VNC")
         case "scp":
@@ -897,6 +908,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             return ("folder", "文件")
         case "shell", "local":
             return ("terminal", "Shell")
+        case "scp-group":
+            return ("rectangle.split.3x1", "SCP 分组")
+        case "sftp-group":
+            return ("square.grid.2x2", "SFTP 分组")
+        case "terminal-group":
+            return ("rectangle.split.2x1", "终端分屏分组")
+        case "multi-exec-group":
+            return ("terminal.fill", "终端多执行分组")
         case "prd":
             return ("doc.richtext", "PRD")
         default:
@@ -1013,11 +1032,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         includesManagementActions: Bool = true
     ) -> NSMenu {
         let menu = NSMenu(title: session.name)
-        [
-            (L10n.Sidebar.executeSession, SessionSidebarContextMenuAction.execute),
-            (L10n.Sidebar.connectAs, .connectAs),
-            (L10n.Sidebar.pingHost, .pingHost)
-        ].forEach { title, action in
+        var connectionActions: [(String, SessionSidebarContextMenuAction)] = [
+            (L10n.Sidebar.executeSession, .execute)
+        ]
+        if WorkspaceSessionGroupKind(sessionProtocol: session.protocol) == nil {
+            connectionActions.append((L10n.Sidebar.connectAs, .connectAs))
+            connectionActions.append((L10n.Sidebar.pingHost, .pingHost))
+        }
+        connectionActions.forEach { title, action in
             menu.addItem(makeContextMenuItem(title: title, action: action, session: session))
         }
         guard includesManagementActions else {
@@ -1057,6 +1079,15 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         _ action: SessionSidebarContextMenuAction,
         for session: SessionRecord
     ) -> Bool {
+        if WorkspaceSessionGroupKind(sessionProtocol: session.protocol) != nil {
+            switch action {
+            case .rename, .delete, .duplicate, .move:
+                return true
+            case .execute, .connectAs, .pingHost, .edit, .saveToFile, .createDesktopShortcut,
+                 .saveAsDefaultPreset, .copySettings:
+                return false
+            }
+        }
         guard isRemovedFTPSession(session) else { return true }
         switch action {
         case .edit, .duplicate, .saveToFile, .createDesktopShortcut, .saveAsDefaultPreset, .copySettings:
@@ -1462,9 +1493,26 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
 
         do {
-            _ = try sessionStore.createSession(draft)
+            let session = try sessionStore.createSession(draft)
+            diagnosticLogRecorder.record(
+                level: .info,
+                subsystem: .session,
+                eventCode: .sessionCreated,
+                stage: .create,
+                result: .succeeded,
+                errorCategory: nil,
+                resourceIdentity: session.id
+            )
             reloadSessionNodes()
         } catch {
+            diagnosticLogRecorder.record(
+                level: .error,
+                subsystem: .session,
+                eventCode: .sessionCreationFailed,
+                stage: .create,
+                result: .failed,
+                errorCategory: .persistence
+            )
             errorPresenter.present(error, context: .createSession, parentWindow: view.window)
         }
     }
@@ -1621,13 +1669,15 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
     }
 
-    private func deleteFolder(_ folderNode: SessionSidebarFolderNode) {
+    @discardableResult
+    private func deleteFolder(_ folderNode: SessionSidebarFolderNode) -> Set<String> {
         guard let sessionStore,
               let folder = folderNode.folder
         else {
-            return
+            return []
         }
 
+        var deletedSessionIDs = Set<String>()
         do {
             let snapshot = try sessionStore.loadSnapshot()
             let sessions = sessionsInFolderSubtree(folder.id, snapshot: snapshot)
@@ -1636,15 +1686,72 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 sessionCount: sessions.count,
                 parentWindow: view.window
             ) else {
-                return
+                return []
             }
             if choice == .deleteFolderAndSessions {
                 try deleteSessionRecords(sessions)
+                deletedSessionIDs = Set(sessions.map(\.id))
             }
             try sessionStore.deleteFolder(id: folder.id)
             reloadSessionNodes()
+            return deletedSessionIDs
         } catch {
+            reloadSessionNodes()
             errorPresenter.present(error, context: .deleteFolder, parentWindow: view.window)
+            return deletedSessionIDs
+        }
+    }
+
+    private func deleteSelectedSidebarItems() -> Bool {
+        var sessions: [SessionRecord] = []
+        var seenSessionIDs = Set<String>()
+        var folders: [SessionSidebarFolderNode] = []
+        var seenFolderIDs = Set<String>()
+
+        for row in outlineView.selectedRowIndexes {
+            if let sessionNode = outlineView.item(atRow: row) as? SessionSidebarSessionNode,
+               seenSessionIDs.insert(sessionNode.session.id).inserted {
+                sessions.append(sessionNode.session)
+                continue
+            }
+            if let folderNode = outlineView.item(atRow: row) as? SessionSidebarFolderNode,
+               let folderID = folderNode.id,
+               seenFolderIDs.insert(folderID).inserted {
+                folders.append(folderNode)
+            }
+        }
+
+        guard sessions.isEmpty == false || folders.isEmpty == false else {
+            return false
+        }
+
+        var sessionsDeletedWithFolders = Set<String>()
+        for folder in topLevelSelectedFolders(folders) {
+            sessionsDeletedWithFolders.formUnion(deleteFolder(folder))
+        }
+
+        let remainingSessions = sessions.filter {
+            sessionsDeletedWithFolders.contains($0.id) == false
+        }
+        if remainingSessions.isEmpty == false {
+            deleteSessions(remainingSessions)
+        }
+        return true
+    }
+
+    private func topLevelSelectedFolders(
+        _ folders: [SessionSidebarFolderNode]
+    ) -> [SessionSidebarFolderNode] {
+        let selectedFolderIDs = Set(folders.compactMap(\.id))
+        return folders.filter { selectedFolder in
+            var parentID = selectedFolder.folder?.parentId
+            while let currentParentID = parentID {
+                if selectedFolderIDs.contains(currentParentID) {
+                    return false
+                }
+                parentID = folderNode(id: currentParentID)?.folder?.parentId
+            }
+            return true
         }
     }
 
@@ -1779,14 +1886,42 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             try deleteSessionRecords(sessions)
             reloadSessionNodes()
         } catch {
+            reloadSessionNodes()
             errorPresenter.present(error, context: .deleteSession, parentWindow: view.window)
         }
     }
 
     private func deleteSessionRecords(_ sessions: [SessionRecord]) throws {
         guard let sessionStore else { return }
+        var successfullyDeletedSessionIDs = Set<String>()
+        defer {
+            SavedSessionDeletionNotification.post(sessionIDs: successfullyDeletedSessionIDs)
+        }
         for session in sessions {
-            try sessionStore.deleteSession(id: session.id)
+            do {
+                try sessionStore.deleteSession(id: session.id)
+            } catch {
+                diagnosticLogRecorder.record(
+                    level: .error,
+                    subsystem: .deletion,
+                    eventCode: .sessionDeleteFailed,
+                    stage: .delete,
+                    result: .failed,
+                    errorCategory: .persistence,
+                    resourceIdentity: session.id
+                )
+                throw error
+            }
+            successfullyDeletedSessionIDs.insert(session.id)
+            diagnosticLogRecorder.record(
+                level: .info,
+                subsystem: .deletion,
+                eventCode: .sessionDeleted,
+                stage: .delete,
+                result: .succeeded,
+                errorCategory: nil,
+                resourceIdentity: session.id
+            )
             onDeleteSessionHistory(session.id)
             do {
                 try remoteEditCacheCleaner?.clearSession(sessionID: session.id)
@@ -2077,6 +2212,21 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             let snapshot = try sessionStore.loadSnapshot()
             let folders = snapshot.folders
             let loadedSessions = snapshot.sessions
+            let configJSONs = try sessionStore.sessionConfigJSONs(ids: loadedSessions.map(\.id))
+            sessionDisplaySummariesByID = Dictionary(
+                uniqueKeysWithValues: loadedSessions.map { session in
+                    (
+                        session.id,
+                        BastionSessionDisplaySummaryCodec.summary(
+                            protocolName: session.protocol,
+                            gatewayHost: session.host,
+                            gatewayPort: session.port,
+                            gatewayUsername: session.username,
+                            configJSON: configJSONs[session.id]
+                        )
+                    )
+                }
+            )
             let sessionsByFolderID = Dictionary(grouping: loadedSessions, by: \.folderId)
             manualSessionIconIDs = snapshot.manualIconAssignments.reduce(into: [:]) { result, assignment in
                 guard SessionIconCatalog.definition(id: assignment.iconId) != nil else {
@@ -2092,13 +2242,15 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 parentID: nil,
                 folders: folders,
                 sessionsByFolderID: sessionsByFolderID,
-                orderByParentID: orderByParentID
+                orderByParentID: orderByParentID,
+                displaySummariesByID: sessionDisplaySummariesByID
             )
             let rootSessions = loadedNodes.compactMap { $0 as? SessionSidebarSessionNode }
             let rootFolders = loadedNodes.filter { $0 is SessionSidebarFolderNode }
             let virtualNodes = virtualSessionNodes(
                 from: loadedSessions,
-                ungroupedSessions: rootSessions
+                ungroupedSessions: rootSessions,
+                displaySummariesByID: sessionDisplaySummariesByID
             ).map { $0 as NSObject }
             if showsRecentSessions {
                 return virtualNodes + rootFolders
@@ -2106,6 +2258,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             return virtualNodes + rootSessions.map { $0 as NSObject } + rootFolders
         } catch {
             manualSessionIconIDs = [:]
+            sessionDisplaySummariesByID = [:]
             return []
         }
     }
@@ -2123,7 +2276,8 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         parentID: String?,
         folders: [SessionFolder],
         sessionsByFolderID: [String?: [SessionRecord]],
-        orderByParentID: [String?: [SessionSidebarOrderItem]]
+        orderByParentID: [String?: [SessionSidebarOrderItem]],
+        displaySummariesByID: [String: BastionSessionDisplaySummary]
     ) -> [NSObject] {
         let folderNodes: [SessionSidebarFolderNode] = folders
             .filter { $0.parentId == parentID }
@@ -2134,12 +2288,13 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                         parentID: folder.id,
                         folders: folders,
                         sessionsByFolderID: sessionsByFolderID,
-                        orderByParentID: orderByParentID
+                        orderByParentID: orderByParentID,
+                        displaySummariesByID: displaySummariesByID
                     )
                 )
             }
         let sessionNodes: [SessionSidebarSessionNode] = (sessionsByFolderID[parentID] ?? []).map {
-            SessionSidebarSessionNode(session: $0)
+            SessionSidebarSessionNode(session: $0, displaySummary: displaySummariesByID[$0.id])
         }
         let foldersByID: [String: NSObject] = Dictionary(uniqueKeysWithValues: folderNodes.compactMap { node in
             node.id.map { ($0, node as NSObject) }
@@ -2178,9 +2333,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     private func virtualSessionNodes(
         from sessions: [SessionRecord],
-        ungroupedSessions: [SessionSidebarSessionNode]
+        ungroupedSessions: [SessionSidebarSessionNode],
+        displaySummariesByID: [String: BastionSessionDisplaySummary]
     ) -> [SessionSidebarFolderNode] {
-        var recent = recentSessionNodes(from: sessions)
+        var recent = recentSessionNodes(from: sessions, displaySummariesByID: displaySummariesByID)
         let recentIDs = Set(recent.map { $0.session.id })
         recent.append(contentsOf: ungroupedSessions.filter { !recentIDs.contains($0.session.id) })
         let favorites = sessions.filter { session in
@@ -2204,7 +2360,11 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 SessionSidebarFolderNode(
                     title: L10n.Sidebar.favorites,
                     children: favorites.map {
-                        SessionSidebarSessionNode(session: $0, isPersistedRepresentation: false)
+                        SessionSidebarSessionNode(
+                            session: $0,
+                            displaySummary: displaySummariesByID[$0.id],
+                            isPersistedRepresentation: false
+                        )
                     }
                 )
             )
@@ -2212,7 +2372,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return nodes
     }
 
-    private func recentSessionNodes(from sessions: [SessionRecord]) -> [SessionSidebarSessionNode] {
+    private func recentSessionNodes(
+        from sessions: [SessionRecord],
+        displaySummariesByID: [String: BastionSessionDisplaySummary]
+    ) -> [SessionSidebarSessionNode] {
         sessions
             .compactMap { session -> (session: SessionRecord, date: Date)? in
                 guard let lastOpenedAt = session.lastOpenedAt,
@@ -2227,6 +2390,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             .map {
                 SessionSidebarSessionNode(
                     session: $0.session,
+                    displaySummary: displaySummariesByID[$0.session.id],
                     displayStyle: .recent(lastOpenedAt: $0.date),
                     isPersistedRepresentation: false
                 )
@@ -2713,14 +2877,17 @@ private final class SessionSidebarSessionNode: NSObject {
 
     let session: SessionRecord
     let isPersistedRepresentation: Bool
+    private let displaySummary: BastionSessionDisplaySummary?
     private let displayStyle: DisplayStyle
 
     init(
         session: SessionRecord,
+        displaySummary: BastionSessionDisplaySummary? = nil,
         displayStyle: DisplayStyle = .normal,
         isPersistedRepresentation: Bool = true
     ) {
         self.session = session
+        self.displaySummary = displaySummary
         self.displayStyle = displayStyle
         self.isPersistedRepresentation = isPersistedRepresentation
     }
@@ -2740,16 +2907,34 @@ private final class SessionSidebarSessionNode: NSObject {
         case .normal:
             return session.name
         case .recent:
-            return session.host
+            if displaySummary?.isBastionHost == true {
+                let normalizedName = session.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                return normalizedName.isEmpty ? displaySummary?.primaryTarget ?? session.host : normalizedName
+            }
+            return WorkspaceSessionGroupKind(sessionProtocol: session.protocol) == nil
+                ? session.host
+                : session.name
         }
     }
 
     var subtitle: String {
         switch displayStyle {
         case .normal:
+            if let kind = WorkspaceSessionGroupKind(sessionProtocol: session.protocol) {
+                return "\(kind.displayName) · \(session.host)"
+            }
+            if let displaySummary, displaySummary.isBastionHost {
+                return displaySummary.displayText
+            }
             let userPrefix = session.username.map { "\($0)@" } ?? ""
             return "\(userPrefix)\(session.host):\(session.port)"
         case let .recent(lastOpenedAt):
+            if let kind = WorkspaceSessionGroupKind(sessionProtocol: session.protocol) {
+                return "\(kind.displayName) • \(Self.relativeString(for: lastOpenedAt))"
+            }
+            if let displaySummary, displaySummary.isBastionHost {
+                return "\(displaySummary.primaryTarget) • \(Self.relativeString(for: lastOpenedAt))"
+            }
             let username = session.username?.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayUsername = (username?.isEmpty == false ? username : nil) ?? NSUserName()
             return "\(displayUsername) • \(Self.relativeString(for: lastOpenedAt))"
@@ -2858,6 +3043,15 @@ private final class SessionSidebarClipboardSuggestionBannerView: NSView {
 
 private final class SessionSidebarOutlineView: NSOutlineView {
     var rowContextMenuProvider: ((Int) -> NSMenu?)?
+    var deleteSelectionHandler: (() -> Bool)?
+
+    override func keyDown(with event: NSEvent) {
+        if (event.keyCode == 51 || event.keyCode == 117),
+           deleteSelectionHandler?() == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)

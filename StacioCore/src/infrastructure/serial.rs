@@ -33,14 +33,9 @@ impl SerialShellChannel {
     pub fn open_with_config(config: SerialConnectionConfig) -> Result<Self, SshRuntimeError> {
         validate_serial_config(&config)?;
         let device_path = resolved_serial_device_path(config.device_path.trim());
-        let device = serialport::new(device_path, config.baud_rate)
-            .data_bits(serial_data_bits(config.data_bits))
-            .parity(serial_parity(&config.parity))
-            .stop_bits(serial_stop_bits(config.stop_bits))
-            .flow_control(serial_flow_control(&config.flow_control))
-            .timeout(Duration::from_millis(10))
-            .open_native()
-            .map_err(|error| serial_transport_error(&error.to_string()))?;
+        let device = open_with_retry(&device_path, config.baud_rate, &config)?;
+        #[cfg(unix)]
+        set_local_carrier_mode(&device);
 
         Ok(Self {
             device,
@@ -50,22 +45,82 @@ impl SerialShellChannel {
     }
 }
 
+fn open_with_retry(
+    device_path: &str,
+    baud_rate: u32,
+    config: &SerialConnectionConfig,
+) -> Result<TTYPort, SshRuntimeError> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300 * attempt as u64));
+        }
+        let result = serialport::new(device_path, baud_rate)
+            .data_bits(serial_data_bits(config.data_bits))
+            .parity(serial_parity(&config.parity))
+            .stop_bits(serial_stop_bits(config.stop_bits))
+            .flow_control(serial_flow_control(&config.flow_control))
+            .timeout(Duration::from_millis(10))
+            .open_native();
+        match result {
+            Ok(device) => return Ok(device),
+            Err(error) => {
+                let message = error.to_string();
+                let normalized = message.to_ascii_lowercase();
+                let is_busy = matches!(error.kind(), serialport::ErrorKind::NoDevice)
+                    || normalized.contains("busy")
+                    || normalized.contains("resource");
+                if is_busy && attempt < 2 {
+                    continue;
+                }
+                return Err(serial_transport_error(&message));
+            }
+        }
+    }
+    unreachable!("serial open retry loop always returns")
+}
+
+impl Drop for SerialShellChannel {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        discard_pending_serial_input(&self.device);
+    }
+}
+
+/// Active macOS serial connections prefer callout nodes, which do not wait for carrier detect.
 fn resolved_serial_device_path(device_path: &str) -> String {
-    if let Some(tty_path) = nbee_tty_counterpart(device_path) {
-        if std::path::Path::new(&tty_path).exists() {
-            return tty_path;
+    resolved_serial_device_path_with_exists(device_path, |path| std::path::Path::new(path).exists())
+}
+
+fn resolved_serial_device_path_with_exists(
+    device_path: &str,
+    exists: impl Fn(&str) -> bool,
+) -> String {
+    if device_path.starts_with("/dev/cu.") {
+        return device_path.to_string();
+    }
+    if let Some(suffix) = device_path.strip_prefix("/dev/tty.") {
+        let callout_path = format!("/dev/cu.{suffix}");
+        if exists(&callout_path) {
+            return callout_path;
         }
     }
     device_path.to_string()
 }
 
-fn nbee_tty_counterpart(device_path: &str) -> Option<String> {
-    const CALLOUT_PREFIX: &str = "/dev/cu.";
-    let suffix = device_path.strip_prefix(CALLOUT_PREFIX)?;
-    if !suffix.to_ascii_lowercase().contains("nbee_spp_") {
-        return None;
+#[cfg(unix)]
+fn set_local_carrier_mode(device: &TTYPort) {
+    let fd = device.as_raw_fd();
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } == 0 {
+        let mut termios = unsafe { termios.assume_init() };
+        termios.c_cflag |= libc::CLOCAL;
+        let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
     }
-    Some(format!("/dev/tty.{suffix}"))
+}
+
+#[cfg(unix)]
+fn discard_pending_serial_input(device: &TTYPort) {
+    let _ = unsafe { libc::tcflush(device.as_raw_fd(), libc::TCIFLUSH) };
 }
 
 impl ShellChannel for SerialShellChannel {
@@ -112,6 +167,8 @@ impl ShellChannel for SerialShellChannel {
 
     fn close(&mut self) -> io::Result<()> {
         self.eof = true;
+        #[cfg(unix)]
+        discard_pending_serial_input(&self.device);
         Ok(())
     }
 
@@ -164,8 +221,11 @@ fn serial_transport_error(message: &str) -> SshRuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{nbee_tty_counterpart, SerialShellChannel};
+    use super::{
+        resolved_serial_device_path_with_exists, set_local_carrier_mode, SerialShellChannel,
+    };
     use crate::services::live_shell_service::ShellChannel;
+    use serialport::SerialPort;
     use std::ffi::CStr;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -211,6 +271,25 @@ mod tests {
     }
 
     #[test]
+    fn serial_channel_explicitly_restores_local_carrier_mode() {
+        let fixture = PseudoTerminalFixture::new();
+        let channel =
+            SerialShellChannel::open(&fixture.slave_path, 0).expect("open serial fixture");
+        let fd = channel.device.as_raw_fd();
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
+        termios.c_cflag &= !libc::CLOCAL;
+        assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) }, 0);
+
+        set_local_carrier_mode(&channel.device);
+
+        let mut restored = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut restored) }, 0);
+        assert_ne!(restored.c_cflag & libc::CLOCAL, 0);
+    }
+
+    #[test]
     fn serial_channel_opens_device_exclusively() {
         let fixture = PseudoTerminalFixture::new();
         let _channel =
@@ -222,13 +301,121 @@ mod tests {
     }
 
     #[test]
-    fn nbee_console_maps_callout_path_to_vendor_documented_tty_path() {
-        assert_eq!(
-            nbee_tty_counterpart("/dev/cu.NBEE_SPP_1103"),
-            Some("/dev/tty.NBEE_SPP_1103".to_string())
+    fn serial_channel_retries_when_device_is_temporarily_busy() {
+        let fixture = PseudoTerminalFixture::new();
+        let first_channel =
+            SerialShellChannel::open(&fixture.slave_path, 0).expect("open serial fixture");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(first_channel);
+        });
+
+        let started_at = Instant::now();
+        let reopened = SerialShellChannel::open(&fixture.slave_path, 0);
+        let elapsed = started_at.elapsed();
+        release.join().expect("release first serial channel");
+
+        assert!(
+            reopened.is_ok(),
+            "serial port should reopen after busy retry"
         );
-        assert_eq!(nbee_tty_counterpart("/dev/cu.Other-Bluetooth"), None);
-        assert_eq!(nbee_tty_counterpart("/dev/cu.usbserial-001"), None);
+        assert!(elapsed >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn serial_channel_reopens_after_close_and_drop() {
+        let fixture = PseudoTerminalFixture::new();
+        {
+            let mut first =
+                SerialShellChannel::open(&fixture.slave_path, 0).expect("open serial fixture");
+            first.close().expect("close first serial channel");
+        }
+
+        let mut reopened =
+            SerialShellChannel::open(&fixture.slave_path, 0).expect("reopen serial fixture");
+        fixture
+            .master_file()
+            .write_all(b"reconnected> ")
+            .expect("write reopened fixture output");
+        let output = read_until_non_empty(&mut reopened);
+        reopened
+            .write_input(b"status\r")
+            .expect("write reopened serial input");
+        let mut input = [0_u8; 7];
+        fixture
+            .master_file()
+            .read_exact(&mut input)
+            .expect("read reopened channel input");
+
+        assert_eq!(output, b"reconnected> ".to_vec());
+        assert_eq!(&input, b"status\r");
+    }
+
+    #[test]
+    fn serial_channel_close_discards_pending_input() {
+        let fixture = PseudoTerminalFixture::new();
+        let mut channel =
+            SerialShellChannel::open(&fixture.slave_path, 0).expect("open serial fixture");
+        fixture
+            .master_file()
+            .write_all(b"stale-input")
+            .expect("write pending serial input");
+        wait_until_input_is_pending(&channel);
+
+        channel.close().expect("close serial channel");
+
+        assert_eq!(
+            channel
+                .device
+                .bytes_to_read()
+                .expect("read pending byte count after close"),
+            0
+        );
+    }
+
+    #[test]
+    fn serial_channel_drop_discards_pending_input() {
+        let fixture = PseudoTerminalFixture::new();
+        let channel =
+            SerialShellChannel::open(&fixture.slave_path, 0).expect("open serial fixture");
+        let observer_fd = unsafe { libc::dup(channel.device.as_raw_fd()) };
+        assert!(observer_fd >= 0, "duplicate serial fd");
+        let observer_fd = unsafe { OwnedFd::from_raw_fd(observer_fd) };
+        fixture
+            .master_file()
+            .write_all(b"stale-input")
+            .expect("write pending serial input");
+        wait_until_input_is_pending(&channel);
+
+        drop(channel);
+
+        assert_eq!(pending_input_byte_count(observer_fd.as_raw_fd()), 0);
+    }
+
+    #[test]
+    fn serial_device_path_prefers_existing_callout_node() {
+        assert_eq!(
+            resolved_serial_device_path_with_exists("/dev/cu.NBEE_SPP_1103", |_| false),
+            "/dev/cu.NBEE_SPP_1103"
+        );
+        assert_eq!(
+            resolved_serial_device_path_with_exists("/dev/tty.NBEE_SPP_1103", |path| {
+                path == "/dev/cu.NBEE_SPP_1103"
+            }),
+            "/dev/cu.NBEE_SPP_1103"
+        );
+        assert_eq!(
+            resolved_serial_device_path_with_exists("/dev/tty.Missing-SPP", |_| false),
+            "/dev/tty.Missing-SPP"
+        );
+        assert_eq!(
+            resolved_serial_device_path_with_exists("/dev/ttyUSB0", |_| true),
+            "/dev/ttyUSB0"
+        );
+        assert_eq!(
+            resolved_serial_device_path_with_exists("COM3", |_| true),
+            "COM3"
+        );
     }
 
     #[test]
@@ -373,6 +560,28 @@ mod tests {
 
     fn read_until_non_empty(channel: &mut SerialShellChannel) -> Vec<u8> {
         read_until_non_empty_with_timeout(channel, Duration::from_secs(2))
+    }
+
+    fn wait_until_input_is_pending(channel: &SerialShellChannel) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if channel
+                .device
+                .bytes_to_read()
+                .expect("read pending byte count")
+                > 0
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("serial fixture did not receive pending input");
+    }
+
+    fn pending_input_byte_count(fd: std::os::fd::RawFd) -> libc::c_int {
+        let mut count = 0;
+        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut count) }, 0);
+        count
     }
 
     fn read_until_non_empty_with_timeout(

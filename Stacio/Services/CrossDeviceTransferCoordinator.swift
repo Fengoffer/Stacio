@@ -1,9 +1,84 @@
+import CryptoKit
 import Foundation
 import StacioCoreBindings
 
 public enum CrossDeviceTransferOperation: Equatable, Sendable {
     case copy
     case move
+}
+
+public protocol RemoteToRemoteTransferBridging: AnyObject, Sendable {
+    func runLiveRemoteToRemoteTransfer(
+        sourceConfig: SshConnectionConfig,
+        sourceSecret: SshAuthSecret,
+        sourceExpectedFingerprintSHA256: String,
+        destinationConfig: SshConnectionConfig,
+        destinationSecret: SshAuthSecret,
+        destinationExpectedFingerprintSHA256: String,
+        request: RemoteToRemoteTransferRequest
+    ) throws -> RemoteToRemoteTransferReport
+
+    func cancelLiveRemoteToRemoteTransfer(jobID: String) -> Bool
+    func takeLiveRemoteToRemoteTransferProgressBatch(jobID: String) -> [ScpTransferProgress]
+}
+
+public extension RemoteToRemoteTransferBridging {
+    func takeLiveRemoteToRemoteTransferProgressBatch(jobID: String) -> [ScpTransferProgress] {
+        []
+    }
+}
+
+public final class CoreBridgeRemoteToRemoteTransferBridge: RemoteToRemoteTransferBridging, @unchecked Sendable {
+    public init() {}
+
+    public func runLiveRemoteToRemoteTransfer(
+        sourceConfig: SshConnectionConfig,
+        sourceSecret: SshAuthSecret,
+        sourceExpectedFingerprintSHA256: String,
+        destinationConfig: SshConnectionConfig,
+        destinationSecret: SshAuthSecret,
+        destinationExpectedFingerprintSHA256: String,
+        request: RemoteToRemoteTransferRequest
+    ) throws -> RemoteToRemoteTransferReport {
+        try CoreBridge.runLiveRemoteToRemoteTransfer(
+            sourceConfig: sourceConfig,
+            sourceSecret: sourceSecret,
+            sourceExpectedFingerprintSHA256: sourceExpectedFingerprintSHA256,
+            destinationConfig: destinationConfig,
+            destinationSecret: destinationSecret,
+            destinationExpectedFingerprintSHA256: destinationExpectedFingerprintSHA256,
+            request: request
+        )
+    }
+
+    public func cancelLiveRemoteToRemoteTransfer(jobID: String) -> Bool {
+        (try? CoreBridge.cancelLiveSCPTransfer(jobID: jobID)) ?? false
+    }
+
+    public func takeLiveRemoteToRemoteTransferProgressBatch(jobID: String) -> [ScpTransferProgress] {
+        (try? CoreBridge.takeLiveSCPTransferProgressBatch(jobID: jobID)) ?? []
+    }
+}
+
+private final class CrossDeviceDirectRouteRegistry: @unchecked Sendable {
+    static let shared = CrossDeviceDirectRouteRegistry()
+
+    private let lock = NSLock()
+    private var activeRouteIDs = Set<String>()
+
+    private init() {}
+
+    func claim(_ routeID: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeRouteIDs.insert(routeID).inserted
+    }
+
+    func release(_ routeIDs: Set<String>) {
+        lock.lock()
+        activeRouteIDs.subtract(routeIDs)
+        lock.unlock()
+    }
 }
 
 public enum CrossDeviceConflictResolution: Equatable, Sendable {
@@ -38,6 +113,7 @@ public enum CrossDeviceTransferStatus: Equatable, Sendable {
 public struct CrossDeviceRemoteEndpoint {
     public let runtimeID: String
     public let title: String
+    public let protocolName: String
     public let context: TunnelLiveSessionContext
     public let bridge: RemoteFilesBridging
     public let transferScheduler: SCPTransferScheduling
@@ -45,12 +121,14 @@ public struct CrossDeviceRemoteEndpoint {
     public init(
         runtimeID: String,
         title: String,
+        protocolName: String = "sftp",
         context: TunnelLiveSessionContext,
         bridge: RemoteFilesBridging,
         transferScheduler: SCPTransferScheduling
     ) {
         self.runtimeID = runtimeID
         self.title = title
+        self.protocolName = protocolName
         self.context = context
         self.bridge = bridge
         self.transferScheduler = transferScheduler
@@ -71,6 +149,24 @@ public final class CrossDeviceTransferCoordinator {
         let replacesExistingItem: Bool
     }
 
+    private struct DirectTransferRoot: Sendable {
+        let item: ResolvedItem
+        let transferDestinationPath: String
+        let replacement: DirectTransferReplacement?
+    }
+
+    private struct DirectTransferReplacement: Sendable {
+        let stagingPath: String
+        let destinationPath: String
+        let isDirectory: Bool
+        let index: Int
+    }
+
+    private struct DirectTransferPlan: Sendable {
+        let items: [ResolvedItem]
+        let replacements: [DirectTransferReplacement]
+    }
+
     private struct StagedMoveItem: Sendable {
         let item: ResolvedItem
         let temporaryPath: String
@@ -78,12 +174,14 @@ public final class CrossDeviceTransferCoordinator {
 
     private struct WorkerEndpoint: @unchecked Sendable {
         let title: String
+        let protocolName: String
         let context: TunnelLiveSessionContext
         let bridge: RemoteFilesBridging
 
         @MainActor
         init(_ endpoint: CrossDeviceRemoteEndpoint) {
             title = endpoint.title
+            protocolName = endpoint.protocolName
             context = endpoint.context
             bridge = endpoint.bridge
         }
@@ -94,35 +192,117 @@ public final class CrossDeviceTransferCoordinator {
         let source: CrossDeviceRemoteEndpoint
         let destination: CrossDeviceRemoteEndpoint
         let operation: CrossDeviceTransferOperation
+        let selections: [RemoteFileSelection]
+        let startedAt: TimeInterval
         let statusHandler: (CrossDeviceTransferStatus) -> Void
         var items: [ResolvedItem] = []
         var currentItemIndex = 0
         var relayDirectory: URL?
         var activeJobs: [(scheduler: SCPTransferScheduling, jobID: String)] = []
+        var activeDirectJobIDs: Set<String> = []
         var cancelRequested = false
         var remoteTemporaryPaths: Set<String> = []
         var retryDiscarded = false
         var moveRecoveryItems: [ResolvedItem] = []
         var moveRecoveryItemIndex = 0
         var moveRecoveryCompletionStatus: CrossDeviceTransferStatus?
+        private let directTransferCondition = NSCondition()
+        private var nextDirectPauseGeneration: UInt64 = 0
+        private var pausedDirectJobGenerations: [String: UInt64] = [:]
+        private var pendingPauseCancellationGenerations: [String: [UInt64]] = [:]
 
         init(
             id: UUID,
             source: CrossDeviceRemoteEndpoint,
             destination: CrossDeviceRemoteEndpoint,
             operation: CrossDeviceTransferOperation,
+            selections: [RemoteFileSelection],
+            startedAt: TimeInterval,
             statusHandler: @escaping (CrossDeviceTransferStatus) -> Void
         ) {
             self.id = id
             self.source = source
             self.destination = destination
             self.operation = operation
+            self.selections = selections
+            self.startedAt = startedAt
             self.statusHandler = statusHandler
+        }
+
+        deinit {
+            CrossDeviceDirectRouteRegistry.shared.release(activeDirectJobIDs)
+        }
+
+        func beginPauseDirectTransfer(jobID: String) -> UInt64? {
+            directTransferCondition.lock()
+            defer { directTransferCondition.unlock() }
+            guard activeDirectJobIDs.contains(jobID),
+                  cancelRequested == false,
+                  pausedDirectJobGenerations[jobID] == nil
+            else { return nil }
+            nextDirectPauseGeneration += 1
+            let generation = nextDirectPauseGeneration
+            pausedDirectJobGenerations[jobID] = generation
+            pendingPauseCancellationGenerations[jobID, default: []].append(generation)
+            return generation
+        }
+
+        func undoPauseDirectTransfer(jobID: String, generation: UInt64) {
+            directTransferCondition.lock()
+            if pausedDirectJobGenerations[jobID] == generation {
+                pausedDirectJobGenerations[jobID] = nil
+            }
+            pendingPauseCancellationGenerations[jobID]?.removeAll { $0 == generation }
+            if pendingPauseCancellationGenerations[jobID]?.isEmpty == true {
+                pendingPauseCancellationGenerations[jobID] = nil
+            }
+            directTransferCondition.broadcast()
+            directTransferCondition.unlock()
+        }
+
+        func resumeDirectTransfer(jobID: String) -> Bool {
+            directTransferCondition.lock()
+            let wasPaused = pausedDirectJobGenerations.removeValue(forKey: jobID) != nil
+            directTransferCondition.broadcast()
+            directTransferCondition.unlock()
+            return wasPaused
+        }
+
+        func waitForDirectTransferResume(jobID: String) -> Bool {
+            directTransferCondition.lock()
+            guard var pendingGenerations = pendingPauseCancellationGenerations[jobID],
+                  pendingGenerations.isEmpty == false
+            else {
+                directTransferCondition.unlock()
+                return false
+            }
+            pendingGenerations.removeFirst()
+            pendingPauseCancellationGenerations[jobID] = pendingGenerations.isEmpty
+                ? nil
+                : pendingGenerations
+            while pausedDirectJobGenerations[jobID] != nil, cancelRequested == false {
+                directTransferCondition.wait()
+            }
+            let shouldResume = cancelRequested == false
+            directTransferCondition.unlock()
+            return shouldResume
+        }
+
+        func wakePausedDirectTransfers() {
+            directTransferCondition.lock()
+            pausedDirectJobGenerations.removeAll()
+            pendingPauseCancellationGenerations.removeAll()
+            directTransferCondition.broadcast()
+            directTransferCondition.unlock()
         }
     }
 
     private let fileManager: FileManager
     private let relayDirectoryProvider: () -> URL
+    private let remoteTransferBridge: RemoteToRemoteTransferBridging?
+    private let completionNotificationPresenter: TransferCompletionNotificationPresenting
+    private let nowProvider: () -> Date
+    private let monotonicTimeProvider: () -> TimeInterval
     private let workQueue: DispatchQueue
     private var activeOperations: [UUID: ActiveOperation] = [:]
 
@@ -132,10 +312,19 @@ public final class CrossDeviceTransferCoordinator {
             FileManager.default.temporaryDirectory
                 .appendingPathComponent("StacioCrossDeviceTransfers", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        }
+        },
+        remoteTransferBridge: RemoteToRemoteTransferBridging? = nil,
+        completionNotificationPresenter: TransferCompletionNotificationPresenting? = nil,
+        nowProvider: @escaping () -> Date = Date.init,
+        monotonicTimeProvider: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.fileManager = fileManager
         self.relayDirectoryProvider = relayDirectoryProvider
+        self.remoteTransferBridge = remoteTransferBridge
+        self.completionNotificationPresenter = completionNotificationPresenter
+            ?? NoopTransferCompletionNotificationPresenter()
+        self.nowProvider = nowProvider
+        self.monotonicTimeProvider = monotonicTimeProvider
         self.workQueue = DispatchQueue(
             label: "com.stacio.files.cross-device-transfer",
             qos: .userInitiated
@@ -184,6 +373,8 @@ public final class CrossDeviceTransferCoordinator {
             source: source,
             destination: destination,
             operation: operation,
+            selections: selections,
+            startedAt: monotonicTimeProvider(),
             statusHandler: statusHandler
         )
         activeOperations[operationID] = active
@@ -208,6 +399,12 @@ public final class CrossDeviceTransferCoordinator {
             return false
         }
         operation.cancelRequested = true
+        operation.wakePausedDirectTransfers()
+        if let remoteTransferBridge {
+            for jobID in operation.activeDirectJobIDs {
+                _ = remoteTransferBridge.cancelLiveRemoteToRemoteTransfer(jobID: jobID)
+            }
+        }
         for activeJob in operation.activeJobs {
             guard activeJob.scheduler.cancelTransfer(jobID: activeJob.jobID) else {
                 operation.statusHandler(.cancellationFailed("传输队列未接受取消请求，请重试。"))
@@ -324,7 +521,9 @@ public final class CrossDeviceTransferCoordinator {
                         self.finish(operation, status: .skipped)
                         return
                     }
-                    if operation.source.isSameHost(as: operation.destination) {
+                    if self.remoteTransferBridge != nil {
+                        self.performDirectRemoteTransfer(operation)
+                    } else if operation.source.isSameHost(as: operation.destination) {
                         self.performSameHostTransfer(operation)
                     } else {
                         self.prepareRelay(operation)
@@ -435,6 +634,405 @@ public final class CrossDeviceTransferCoordinator {
         }
     }
 
+    private func performDirectRemoteTransfer(_ operation: ActiveOperation) {
+        guard let bridge = remoteTransferBridge else {
+            prepareRelay(operation)
+            return
+        }
+        operation.statusHandler(.copying)
+        let source = WorkerEndpoint(operation.source)
+        let destination = WorkerEndpoint(operation.destination)
+        let roots = operation.items.enumerated().map { index, item in
+            let replacement: DirectTransferReplacement?
+            if item.selection.isDirectory, item.replacesExistingItem {
+                let stagingPath = Self.stableDirectReplacementPath(
+                    for: item,
+                    source: source,
+                    destination: destination
+                )
+                replacement = DirectTransferReplacement(
+                    stagingPath: stagingPath,
+                    destinationPath: item.destinationPath,
+                    isDirectory: true,
+                    index: index
+                )
+            } else {
+                replacement = nil
+            }
+            return DirectTransferRoot(
+                item: item,
+                transferDestinationPath: replacement?.stagingPath ?? item.destinationPath,
+                replacement: replacement
+            )
+        }
+        operation.remoteTemporaryPaths.formUnion(
+            roots.compactMap { $0.replacement?.stagingPath }
+        )
+        let bridgeBox = CrossDeviceUncheckedSendableBox(bridge)
+        workQueue.async { [weak self, weak operation] in
+            guard let self, let operation else { return }
+            do {
+                let plan = try Self.expandDirectRemoteItems(
+                    roots,
+                    source: source,
+                    destination: destination,
+                    isCancelled: { operation.cancelRequested }
+                )
+                DispatchQueue.main.async { [weak self, weak operation] in
+                    guard let self, let operation else { return }
+                    guard self.activeOperations[operation.id] === operation else { return }
+                    guard operation.cancelRequested == false else {
+                        self.cleanupRemoteTemporaryItemsAndFinish(operation, status: .cancelled)
+                        return
+                    }
+                    self.startDirectRemoteTransfer(
+                        operation,
+                        plan: plan,
+                        bridge: bridgeBox.value
+                    )
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self, weak operation] in
+                    guard let self, let operation else { return }
+                    if operation.cancelRequested {
+                        self.cleanupRemoteTemporaryItemsAndFinish(operation, status: .cancelled)
+                    } else {
+                        self.cleanupRemoteTemporaryItemsAndFinish(
+                            operation,
+                            status: .failed(error.localizedDescription)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func startDirectRemoteTransfer(
+        _ operation: ActiveOperation,
+        plan: DirectTransferPlan,
+        bridge: RemoteToRemoteTransferBridging
+    ) {
+        let items = plan.items
+        let source = WorkerEndpoint(operation.source)
+        let destination = WorkerEndpoint(operation.destination)
+        let sourceProtocol: RemoteTransferProtocol =
+            source.protocolName.lowercased().contains("scp") ? .scp : .sftp
+        let destinationProtocol: RemoteTransferProtocol =
+            destination.protocolName.lowercased().contains("scp") ? .scp : .sftp
+        let bridgeBox = CrossDeviceUncheckedSendableBox(bridge)
+        let queueCoordinator = (operation.destination.transferScheduler as? TransferQueueCoordinatorProviding)?
+            .transferQueueCoordinator
+            ?? (operation.source.transferScheduler as? TransferQueueCoordinatorProviding)?.transferQueueCoordinator
+        let limiter = DispatchSemaphore(value: min(2, max(1, items.count)))
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var failures: [String] = []
+        var completedCount = 0
+
+        // Once file transfers start, their hidden staging tree is recovery state.
+        // Keep it on interruption so the next identical route can validate and resume it.
+        operation.remoteTemporaryPaths.subtract(plan.replacements.map(\.stagingPath))
+
+        for item in items {
+            let jobID = Self.stableDirectJobID(
+                source: source,
+                destination: destination,
+                item: item
+            )
+            guard CrossDeviceDirectRouteRegistry.shared.claim(jobID) else {
+                lock.lock()
+                failures.append("相同的远端传输任务正在进行，请等待当前任务完成后重试。")
+                lock.unlock()
+                continue
+            }
+            operation.activeDirectJobIDs.insert(jobID)
+            let job = ScpTransferJob(
+                id: jobID,
+                direction: .upload,
+                sourcePath: item.selection.path,
+                destinationPath: item.destinationPath,
+                bytesTotal: item.selection.size
+            )
+            queueCoordinator?.registerExternalTransfer(
+                runtimeID: operation.destination.runtimeID,
+                job: job,
+                notificationPolicy: .silent,
+                progressProvider: { [weak bridge] in
+                    bridge?.takeLiveRemoteToRemoteTransferProgressBatch(jobID: jobID) ?? []
+                },
+                pause: { [weak operation, weak bridge] in
+                    guard let operation,
+                          let generation = operation.beginPauseDirectTransfer(jobID: jobID)
+                    else { return false }
+                    guard bridge?.cancelLiveRemoteToRemoteTransfer(jobID: jobID) == true else {
+                        operation.undoPauseDirectTransfer(jobID: jobID, generation: generation)
+                        return false
+                    }
+                    return true
+                },
+                resume: { [weak operation] in
+                    operation?.resumeDirectTransfer(jobID: jobID) ?? false
+                },
+                cancel: { [weak operation, weak bridge] in
+                    guard let operation, operation.cancelRequested == false else { return false }
+                    var accepted = bridge?.cancelLiveRemoteToRemoteTransfer(jobID: jobID) ?? false
+                    for otherJobID in operation.activeDirectJobIDs where otherJobID != jobID {
+                        accepted = (bridge?.cancelLiveRemoteToRemoteTransfer(jobID: otherJobID) ?? false) || accepted
+                    }
+                    if accepted {
+                        operation.cancelRequested = true
+                        operation.wakePausedDirectTransfers()
+                    }
+                    return accepted
+                }
+            )
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                limiter.wait()
+                defer {
+                    limiter.signal()
+                    group.leave()
+                }
+                guard operation.cancelRequested == false else {
+                    DispatchQueue.main.async { [weak queueCoordinator] in
+                        queueCoordinator?.finishExternalTransfer(
+                            jobID: jobID,
+                            status: "canceled",
+                            bytesDone: 0
+                        )
+                    }
+                    return
+                }
+                let request = RemoteToRemoteTransferRequest(
+                    job: job,
+                    sourceProtocol: sourceProtocol,
+                    destinationProtocol: destinationProtocol,
+                    requestedOffset: 0,
+                    forceRestart: false,
+                    chunkSizeBytes: 1 * 1_024 * 1_024,
+                    workerCount: 4
+                )
+                while operation.cancelRequested == false {
+                    do {
+                        _ = try bridgeBox.value.runLiveRemoteToRemoteTransfer(
+                            sourceConfig: source.context.config,
+                            sourceSecret: source.context.secret,
+                            sourceExpectedFingerprintSHA256: source.context.expectedFingerprintSHA256,
+                            destinationConfig: destination.context.config,
+                            destinationSecret: destination.context.secret,
+                            destinationExpectedFingerprintSHA256: destination.context.expectedFingerprintSHA256,
+                            request: request
+                        )
+                        lock.lock()
+                        completedCount += 1
+                        lock.unlock()
+                        DispatchQueue.main.async { [weak queueCoordinator] in
+                            queueCoordinator?.finishExternalTransfer(
+                                jobID: jobID,
+                                status: "completed",
+                                bytesDone: job.bytesTotal
+                            )
+                        }
+                        return
+                    } catch {
+                        if operation.waitForDirectTransferResume(jobID: jobID) {
+                            continue
+                        }
+                        guard operation.cancelRequested == false else { break }
+                        lock.lock()
+                        failures.append(error.localizedDescription)
+                        lock.unlock()
+                        DispatchQueue.main.async { [weak queueCoordinator] in
+                            queueCoordinator?.finishExternalTransfer(
+                                jobID: jobID,
+                                status: "failed",
+                                bytesDone: 0,
+                                diagnostic: error.localizedDescription
+                            )
+                        }
+                        return
+                    }
+                }
+                if operation.cancelRequested {
+                    DispatchQueue.main.async { [weak queueCoordinator] in
+                        queueCoordinator?.finishExternalTransfer(
+                            jobID: jobID,
+                            status: "canceled",
+                            bytesDone: 0
+                        )
+                    }
+                }
+            }
+        }
+
+        group.notify(queue: workQueue) { [weak self, weak operation] in
+            guard let self, let operation else { return }
+            var promotedStagingPaths = Set<String>()
+            var promotionFailure: String?
+            if operation.cancelRequested == false,
+               failures.isEmpty,
+               completedCount == items.count
+            {
+                do {
+                    for replacement in plan.replacements {
+                        guard operation.cancelRequested == false else { break }
+                        try Self.promoteRemoteReplacement(
+                            stagingPath: replacement.stagingPath,
+                            destinationPath: replacement.destinationPath,
+                            isDirectory: replacement.isDirectory,
+                            operationID: operation.id,
+                            index: replacement.index,
+                            endpoint: destination
+                        )
+                        promotedStagingPaths.insert(replacement.stagingPath)
+                    }
+                } catch {
+                    promotionFailure = error.localizedDescription
+                }
+            }
+            DispatchQueue.main.async { [weak self, weak operation] in
+                guard let self, let operation,
+                      self.activeOperations[operation.id] === operation
+                else { return }
+                CrossDeviceDirectRouteRegistry.shared.release(operation.activeDirectJobIDs)
+                operation.activeDirectJobIDs.removeAll()
+                operation.remoteTemporaryPaths.subtract(promotedStagingPaths)
+                if operation.cancelRequested {
+                    self.cleanupRemoteTemporaryItemsAndFinish(operation, status: .cancelled)
+                } else if let promotionFailure {
+                    self.cleanupRemoteTemporaryItemsAndFinish(
+                        operation,
+                        status: .failed(promotionFailure)
+                    )
+                } else if failures.isEmpty == false {
+                    self.cleanupRemoteTemporaryItemsAndFinish(
+                        operation,
+                        status: .failed(failures.first ?? "远端到远端传输失败。")
+                    )
+                } else if completedCount == items.count {
+                    if operation.operation == .move {
+                        self.commitMoveSources(operation)
+                    } else {
+                        self.finish(operation, status: .completed)
+                    }
+                } else {
+                    self.cleanupRemoteTemporaryItemsAndFinish(
+                        operation,
+                        status: .failed("远端到远端传输未完成。")
+                    )
+                }
+            }
+        }
+    }
+
+    private nonisolated static func expandDirectRemoteItems(
+        _ roots: [DirectTransferRoot],
+        source: WorkerEndpoint,
+        destination: WorkerEndpoint,
+        isCancelled: () -> Bool
+    ) throws -> DirectTransferPlan {
+        var expanded: [ResolvedItem] = []
+        var replacements: [DirectTransferReplacement] = []
+        for transferRoot in roots {
+            guard isCancelled() == false else {
+                throw CrossDeviceTransferError.transferCancelled
+            }
+            let item = transferRoot.item
+            if item.selection.isFile {
+                expanded.append(ResolvedItem(
+                    selection: item.selection,
+                    destinationPath: transferRoot.transferDestinationPath,
+                    replacesExistingItem: false
+                ))
+                continue
+            }
+            let root = item.selection.path
+            let destinationRoot = transferRoot.transferDestinationPath
+            try createRemoteDirectory(destinationRoot, endpoint: destination)
+            if let replacement = transferRoot.replacement {
+                replacements.append(replacement)
+            }
+            try appendDirectRemoteChildren(
+                sourcePath: root,
+                destinationPath: destinationRoot,
+                source: source,
+                destination: destination,
+                into: &expanded,
+                isCancelled: isCancelled
+            )
+        }
+        return DirectTransferPlan(items: expanded, replacements: replacements)
+    }
+
+    private nonisolated static func appendDirectRemoteChildren(
+        sourcePath: String,
+        destinationPath: String,
+        source: WorkerEndpoint,
+        destination: WorkerEndpoint,
+        into items: inout [ResolvedItem],
+        isCancelled: () -> Bool
+    ) throws {
+        guard isCancelled() == false else {
+            throw CrossDeviceTransferError.transferCancelled
+        }
+        let entries = try listRemoteDirectory(sourcePath, endpoint: source)
+        for entry in entries {
+            guard isCancelled() == false else {
+                throw CrossDeviceTransferError.transferCancelled
+            }
+            let name = (entry.path as NSString).lastPathComponent
+            guard name.isEmpty == false else { continue }
+            let destinationChild = Self.join(destinationPath, name)
+            let selection = RemoteFileSelection(
+                path: entry.path,
+                size: entry.kind == .symlink ? 0 : entry.size,
+                kind: entry.kind,
+                modifiedTime: entry.modifiedTime
+            )
+            if selection.isDirectory {
+                try createRemoteDirectory(destinationChild, endpoint: destination)
+                try appendDirectRemoteChildren(
+                    sourcePath: entry.path,
+                    destinationPath: destinationChild,
+                    source: source,
+                    destination: destination,
+                    into: &items,
+                    isCancelled: isCancelled
+                )
+            } else if selection.isFile {
+                items.append(ResolvedItem(
+                    selection: selection,
+                    destinationPath: destinationChild,
+                    replacesExistingItem: false
+                ))
+            }
+        }
+    }
+
+    private nonisolated static func listRemoteDirectory(
+        _ path: String,
+        endpoint: WorkerEndpoint
+    ) throws -> [RemoteFileEntry] {
+        return try endpoint.bridge.listLiveRemoteDirectory(
+            config: endpoint.context.config,
+            secret: endpoint.context.secret,
+            expectedFingerprintSHA256: endpoint.context.expectedFingerprintSHA256,
+            remotePath: path
+        )
+    }
+
+    private nonisolated static func createRemoteDirectory(
+        _ path: String,
+        endpoint: WorkerEndpoint
+    ) throws {
+        try endpoint.bridge.createLiveRemoteDirectory(
+            config: endpoint.context.config,
+            secret: endpoint.context.secret,
+            expectedFingerprintSHA256: endpoint.context.expectedFingerprintSHA256,
+            remotePath: path
+        )
+    }
+
     private func prepareRelay(_ operation: ActiveOperation) {
         let relayDirectory = relayDirectoryProvider().standardizedFileURL
         operation.relayDirectory = relayDirectory
@@ -519,6 +1117,7 @@ public final class CrossDeviceTransferCoordinator {
             secret: operation.source.context.secret,
             expectedFingerprintSHA256: operation.source.context.expectedFingerprintSHA256,
             job: job,
+            notificationPolicy: .silent,
             completion: { [weak self, weak operation] progress in
                 guard let self, let operation else { return }
                 operation.activeJobs = []
@@ -580,6 +1179,7 @@ public final class CrossDeviceTransferCoordinator {
             secret: operation.destination.context.secret,
             expectedFingerprintSHA256: operation.destination.context.expectedFingerprintSHA256,
             job: job,
+            notificationPolicy: .silent,
             completion: { [weak self, weak operation] progress in
                 guard let self, let operation else { return }
                 operation.activeJobs = []
@@ -898,6 +1498,7 @@ public final class CrossDeviceTransferCoordinator {
             secret: operation.source.context.secret,
             expectedFingerprintSHA256: operation.source.context.expectedFingerprintSHA256,
             job: job,
+            notificationPolicy: .silent,
             completion: { [weak self, weak operation] progress in
                 guard let self, let operation else { return }
                 operation.activeJobs = []
@@ -1026,6 +1627,57 @@ public final class CrossDeviceTransferCoordinator {
         guard activeOperations[operation.id] === operation else { return }
         activeOperations[operation.id] = nil
         operation.statusHandler(status)
+        presentCompletionNotification(for: operation, status: status)
+    }
+
+    private func presentCompletionNotification(
+        for operation: ActiveOperation,
+        status: CrossDeviceTransferStatus
+    ) {
+        let notificationStatus: TransferCompletionNotificationStatus
+        let diagnostic: String?
+        switch status {
+        case .completed:
+            notificationStatus = .completed
+            diagnostic = nil
+        case .failed(let message):
+            notificationStatus = .failed
+            diagnostic = message
+        default:
+            return
+        }
+        let byteCount = operation.selections.reduce(UInt64(0)) { total, selection in
+            let (sum, overflow) = total.addingReportingOverflow(selection.size)
+            return overflow ? UInt64.max : sum
+        }
+        let duration = max(monotonicTimeProvider() - operation.startedAt, 0)
+        let itemName: String
+        if operation.selections.count == 1,
+           let path = operation.selections.first?.path
+        {
+            let name = (path as NSString).lastPathComponent
+            itemName = name.isEmpty ? path : name
+        } else {
+            itemName = "\(operation.selections.count) 个项目"
+        }
+        let title = notificationStatus == .completed
+            ? L10n.Transfers.completedNotificationTitle
+            : L10n.Transfers.failedNotificationTitle
+        let body = notificationStatus == .completed
+            ? "已完成从 \(operation.source.title) 到 \(operation.destination.title) 的传输：\(itemName)"
+            : "从 \(operation.source.title) 到 \(operation.destination.title) 的传输失败：\(diagnostic ?? L10n.Transfers.transferFailed)"
+        completionNotificationPresenter.present(TransferCompletionNotificationPayload(
+            jobID: "cross-device-\(operation.id.uuidString.lowercased())",
+            runtimeID: operation.destination.runtimeID,
+            status: notificationStatus,
+            title: title,
+            body: body,
+            itemName: itemName,
+            byteCount: byteCount,
+            completedAt: nowProvider(),
+            duration: duration,
+            averageBytesPerSecond: duration > 0 ? Double(byteCount) / duration : 0
+        ))
     }
 
     private nonisolated static func normalizedRemoteDirectory(_ path: String) -> String {
@@ -1036,6 +1688,60 @@ public final class CrossDeviceTransferCoordinator {
     private nonisolated static func join(_ directory: String, _ name: String) -> String {
         if directory == "/" { return "/\(name)" }
         return directory.hasSuffix("/") ? directory + name : directory + "/" + name
+    }
+
+    private nonisolated static func stableDirectJobID(
+        source: WorkerEndpoint,
+        destination: WorkerEndpoint,
+        item: ResolvedItem
+    ) -> String {
+        "remote-to-remote-v1-" + stableDirectRouteDigest(
+            source: source,
+            destination: destination,
+            item: item
+        )
+    }
+
+    private nonisolated static func stableDirectReplacementPath(
+        for item: ResolvedItem,
+        source: WorkerEndpoint,
+        destination: WorkerEndpoint
+    ) -> String {
+        let parent = (item.destinationPath as NSString).deletingLastPathComponent
+        let name = (item.destinationPath as NSString).lastPathComponent
+        let digest = stableDirectRouteDigest(
+            source: source,
+            destination: destination,
+            item: item
+        )
+        let temporaryName = ".\(name).stacio-transfer-v1-\(digest).partial"
+        return join(parent.isEmpty ? "." : parent, temporaryName)
+    }
+
+    private nonisolated static func stableDirectRouteDigest(
+        source: WorkerEndpoint,
+        destination: WorkerEndpoint,
+        item: ResolvedItem
+    ) -> String {
+        let fields = [
+            "v1",
+            source.protocolName.lowercased(),
+            source.context.config.host.lowercased(),
+            String(source.context.config.port),
+            source.context.config.username,
+            source.context.expectedFingerprintSHA256,
+            destination.protocolName.lowercased(),
+            destination.context.config.host.lowercased(),
+            String(destination.context.config.port),
+            destination.context.config.username,
+            destination.context.expectedFingerprintSHA256,
+            item.selection.path,
+            item.destinationPath,
+            String(item.selection.size),
+            item.selection.modifiedTime ?? ""
+        ]
+        let digest = SHA256.hash(data: Data(fields.joined(separator: "\u{1F}").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private nonisolated static func comparableRemotePath(_ path: String) -> String {
@@ -1354,6 +2060,7 @@ private enum CrossDeviceTransferError: LocalizedError {
     case sourceEqualsDestination(String)
     case sourcePreflightFailed(String)
     case remoteReplacementFailed(String)
+    case transferCancelled
 
     var errorDescription: String? {
         switch self {
@@ -1363,6 +2070,8 @@ private enum CrossDeviceTransferError: LocalizedError {
             return "移动预检失败，未修改任何源文件：\(message)"
         case .remoteReplacementFailed(let message):
             return "远端安全替换失败：\(message)"
+        case .transferCancelled:
+            return "传输已取消。"
         }
     }
 }

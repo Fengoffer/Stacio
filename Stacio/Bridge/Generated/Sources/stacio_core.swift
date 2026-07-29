@@ -1773,6 +1773,648 @@ public func FfiConverterTypeBroadcastAuditRecord_lower(_ value: BroadcastAuditRe
 }
 
 
+public struct ConsoleBleConfig {
+    public var deviceName: String
+    public var profileId: String
+    public var serviceUuid: String
+    public var txCharacteristicUuid: String
+    public var rxCharacteristicUuid: String
+    public var writeType: String
+    public var platformBindings: ConsolePlatformBindings
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceName: String, profileId: String, serviceUuid: String, txCharacteristicUuid: String, rxCharacteristicUuid: String, writeType: String, platformBindings: ConsolePlatformBindings) {
+        self.deviceName = deviceName
+        self.profileId = profileId
+        self.serviceUuid = serviceUuid
+        self.txCharacteristicUuid = txCharacteristicUuid
+        self.rxCharacteristicUuid = rxCharacteristicUuid
+        self.writeType = writeType
+        self.platformBindings = platformBindings
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleBleConfig: Sendable {}
+#endif
+
+
+extension ConsoleBleConfig: Equatable, Hashable {
+    public static func ==(lhs: ConsoleBleConfig, rhs: ConsoleBleConfig) -> Bool {
+        if lhs.deviceName != rhs.deviceName {
+            return false
+        }
+        if lhs.profileId != rhs.profileId {
+            return false
+        }
+        if lhs.serviceUuid != rhs.serviceUuid {
+            return false
+        }
+        if lhs.txCharacteristicUuid != rhs.txCharacteristicUuid {
+            return false
+        }
+        if lhs.rxCharacteristicUuid != rhs.rxCharacteristicUuid {
+            return false
+        }
+        if lhs.writeType != rhs.writeType {
+            return false
+        }
+        if lhs.platformBindings != rhs.platformBindings {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceName)
+        hasher.combine(profileId)
+        hasher.combine(serviceUuid)
+        hasher.combine(txCharacteristicUuid)
+        hasher.combine(rxCharacteristicUuid)
+        hasher.combine(writeType)
+        hasher.combine(platformBindings)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleBleConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleBleConfig {
+        return
+            try ConsoleBleConfig(
+                deviceName: FfiConverterString.read(from: &buf),
+                profileId: FfiConverterString.read(from: &buf),
+                serviceUuid: FfiConverterString.read(from: &buf),
+                txCharacteristicUuid: FfiConverterString.read(from: &buf),
+                rxCharacteristicUuid: FfiConverterString.read(from: &buf),
+                writeType: FfiConverterString.read(from: &buf),
+                platformBindings: FfiConverterTypeConsolePlatformBindings.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleBleConfig, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceName, into: &buf)
+        FfiConverterString.write(value.profileId, into: &buf)
+        FfiConverterString.write(value.serviceUuid, into: &buf)
+        FfiConverterString.write(value.txCharacteristicUuid, into: &buf)
+        FfiConverterString.write(value.rxCharacteristicUuid, into: &buf)
+        FfiConverterString.write(value.writeType, into: &buf)
+        FfiConverterTypeConsolePlatformBindings.write(value.platformBindings, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleBleConfig_lift(_ buf: RustBuffer) throws -> ConsoleBleConfig {
+    return try FfiConverterTypeConsoleBleConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleBleConfig_lower(_ value: ConsoleBleConfig) -> RustBuffer {
+    return FfiConverterTypeConsoleBleConfig.lower(value)
+}
+
+
+public struct ConsoleCharacteristicMetadata {
+    public var uuid: String
+    public var supportsWrite: Bool
+    public var supportsWriteWithoutResponse: Bool
+    public var supportsNotify: Bool
+    public var supportsIndicate: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(uuid: String, supportsWrite: Bool, supportsWriteWithoutResponse: Bool, supportsNotify: Bool, supportsIndicate: Bool) {
+        self.uuid = uuid
+        self.supportsWrite = supportsWrite
+        self.supportsWriteWithoutResponse = supportsWriteWithoutResponse
+        self.supportsNotify = supportsNotify
+        self.supportsIndicate = supportsIndicate
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleCharacteristicMetadata: Sendable {}
+#endif
+
+
+extension ConsoleCharacteristicMetadata: Equatable, Hashable {
+    public static func ==(lhs: ConsoleCharacteristicMetadata, rhs: ConsoleCharacteristicMetadata) -> Bool {
+        if lhs.uuid != rhs.uuid {
+            return false
+        }
+        if lhs.supportsWrite != rhs.supportsWrite {
+            return false
+        }
+        if lhs.supportsWriteWithoutResponse != rhs.supportsWriteWithoutResponse {
+            return false
+        }
+        if lhs.supportsNotify != rhs.supportsNotify {
+            return false
+        }
+        if lhs.supportsIndicate != rhs.supportsIndicate {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(uuid)
+        hasher.combine(supportsWrite)
+        hasher.combine(supportsWriteWithoutResponse)
+        hasher.combine(supportsNotify)
+        hasher.combine(supportsIndicate)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleCharacteristicMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleCharacteristicMetadata {
+        return
+            try ConsoleCharacteristicMetadata(
+                uuid: FfiConverterString.read(from: &buf),
+                supportsWrite: FfiConverterBool.read(from: &buf),
+                supportsWriteWithoutResponse: FfiConverterBool.read(from: &buf),
+                supportsNotify: FfiConverterBool.read(from: &buf),
+                supportsIndicate: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleCharacteristicMetadata, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.uuid, into: &buf)
+        FfiConverterBool.write(value.supportsWrite, into: &buf)
+        FfiConverterBool.write(value.supportsWriteWithoutResponse, into: &buf)
+        FfiConverterBool.write(value.supportsNotify, into: &buf)
+        FfiConverterBool.write(value.supportsIndicate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleCharacteristicMetadata_lift(_ buf: RustBuffer) throws -> ConsoleCharacteristicMetadata {
+    return try FfiConverterTypeConsoleCharacteristicMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleCharacteristicMetadata_lower(_ value: ConsoleCharacteristicMetadata) -> RustBuffer {
+    return FfiConverterTypeConsoleCharacteristicMetadata.lower(value)
+}
+
+
+public struct ConsolePlatformBindings {
+    public var macOsPeripheralUuid: String?
+    public var windowsDeviceId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(macOsPeripheralUuid: String?, windowsDeviceId: String?) {
+        self.macOsPeripheralUuid = macOsPeripheralUuid
+        self.windowsDeviceId = windowsDeviceId
+    }
+}
+
+#if compiler(>=6)
+extension ConsolePlatformBindings: Sendable {}
+#endif
+
+
+extension ConsolePlatformBindings: Equatable, Hashable {
+    public static func ==(lhs: ConsolePlatformBindings, rhs: ConsolePlatformBindings) -> Bool {
+        if lhs.macOsPeripheralUuid != rhs.macOsPeripheralUuid {
+            return false
+        }
+        if lhs.windowsDeviceId != rhs.windowsDeviceId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(macOsPeripheralUuid)
+        hasher.combine(windowsDeviceId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsolePlatformBindings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsolePlatformBindings {
+        return
+            try ConsolePlatformBindings(
+                macOsPeripheralUuid: FfiConverterOptionString.read(from: &buf),
+                windowsDeviceId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsolePlatformBindings, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.macOsPeripheralUuid, into: &buf)
+        FfiConverterOptionString.write(value.windowsDeviceId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsolePlatformBindings_lift(_ buf: RustBuffer) throws -> ConsolePlatformBindings {
+    return try FfiConverterTypeConsolePlatformBindings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsolePlatformBindings_lower(_ value: ConsolePlatformBindings) -> RustBuffer {
+    return FfiConverterTypeConsolePlatformBindings.lower(value)
+}
+
+
+public struct ConsoleProfileMatch {
+    public var profileId: String
+    public var serviceUuid: String
+    public var txCharacteristicUuid: String
+    public var rxCharacteristicUuid: String
+    public var writeType: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(profileId: String, serviceUuid: String, txCharacteristicUuid: String, rxCharacteristicUuid: String, writeType: String) {
+        self.profileId = profileId
+        self.serviceUuid = serviceUuid
+        self.txCharacteristicUuid = txCharacteristicUuid
+        self.rxCharacteristicUuid = rxCharacteristicUuid
+        self.writeType = writeType
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleProfileMatch: Sendable {}
+#endif
+
+
+extension ConsoleProfileMatch: Equatable, Hashable {
+    public static func ==(lhs: ConsoleProfileMatch, rhs: ConsoleProfileMatch) -> Bool {
+        if lhs.profileId != rhs.profileId {
+            return false
+        }
+        if lhs.serviceUuid != rhs.serviceUuid {
+            return false
+        }
+        if lhs.txCharacteristicUuid != rhs.txCharacteristicUuid {
+            return false
+        }
+        if lhs.rxCharacteristicUuid != rhs.rxCharacteristicUuid {
+            return false
+        }
+        if lhs.writeType != rhs.writeType {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(profileId)
+        hasher.combine(serviceUuid)
+        hasher.combine(txCharacteristicUuid)
+        hasher.combine(rxCharacteristicUuid)
+        hasher.combine(writeType)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleProfileMatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleProfileMatch {
+        return
+            try ConsoleProfileMatch(
+                profileId: FfiConverterString.read(from: &buf),
+                serviceUuid: FfiConverterString.read(from: &buf),
+                txCharacteristicUuid: FfiConverterString.read(from: &buf),
+                rxCharacteristicUuid: FfiConverterString.read(from: &buf),
+                writeType: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleProfileMatch, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.profileId, into: &buf)
+        FfiConverterString.write(value.serviceUuid, into: &buf)
+        FfiConverterString.write(value.txCharacteristicUuid, into: &buf)
+        FfiConverterString.write(value.rxCharacteristicUuid, into: &buf)
+        FfiConverterString.write(value.writeType, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleProfileMatch_lift(_ buf: RustBuffer) throws -> ConsoleProfileMatch {
+    return try FfiConverterTypeConsoleProfileMatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleProfileMatch_lower(_ value: ConsoleProfileMatch) -> RustBuffer {
+    return FfiConverterTypeConsoleProfileMatch.lower(value)
+}
+
+
+public struct ConsoleServiceMetadata {
+    public var uuid: String
+    public var characteristics: [ConsoleCharacteristicMetadata]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(uuid: String, characteristics: [ConsoleCharacteristicMetadata]) {
+        self.uuid = uuid
+        self.characteristics = characteristics
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleServiceMetadata: Sendable {}
+#endif
+
+
+extension ConsoleServiceMetadata: Equatable, Hashable {
+    public static func ==(lhs: ConsoleServiceMetadata, rhs: ConsoleServiceMetadata) -> Bool {
+        if lhs.uuid != rhs.uuid {
+            return false
+        }
+        if lhs.characteristics != rhs.characteristics {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(uuid)
+        hasher.combine(characteristics)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleServiceMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleServiceMetadata {
+        return
+            try ConsoleServiceMetadata(
+                uuid: FfiConverterString.read(from: &buf),
+                characteristics: FfiConverterSequenceTypeConsoleCharacteristicMetadata.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleServiceMetadata, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.uuid, into: &buf)
+        FfiConverterSequenceTypeConsoleCharacteristicMetadata.write(value.characteristics, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleServiceMetadata_lift(_ buf: RustBuffer) throws -> ConsoleServiceMetadata {
+    return try FfiConverterTypeConsoleServiceMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleServiceMetadata_lower(_ value: ConsoleServiceMetadata) -> RustBuffer {
+    return FfiConverterTypeConsoleServiceMetadata.lower(value)
+}
+
+
+public struct ConsoleSessionConfig {
+    public var kind: String
+    public var schemaVersion: UInt32
+    public var transportPolicy: String
+    public var ble: ConsoleBleConfig
+    public var sppFallback: ConsoleSppFallbackConfig?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: String, schemaVersion: UInt32, transportPolicy: String, ble: ConsoleBleConfig, sppFallback: ConsoleSppFallbackConfig?) {
+        self.kind = kind
+        self.schemaVersion = schemaVersion
+        self.transportPolicy = transportPolicy
+        self.ble = ble
+        self.sppFallback = sppFallback
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleSessionConfig: Sendable {}
+#endif
+
+
+extension ConsoleSessionConfig: Equatable, Hashable {
+    public static func ==(lhs: ConsoleSessionConfig, rhs: ConsoleSessionConfig) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.schemaVersion != rhs.schemaVersion {
+            return false
+        }
+        if lhs.transportPolicy != rhs.transportPolicy {
+            return false
+        }
+        if lhs.ble != rhs.ble {
+            return false
+        }
+        if lhs.sppFallback != rhs.sppFallback {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(schemaVersion)
+        hasher.combine(transportPolicy)
+        hasher.combine(ble)
+        hasher.combine(sppFallback)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleSessionConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleSessionConfig {
+        return
+            try ConsoleSessionConfig(
+                kind: FfiConverterString.read(from: &buf),
+                schemaVersion: FfiConverterUInt32.read(from: &buf),
+                transportPolicy: FfiConverterString.read(from: &buf),
+                ble: FfiConverterTypeConsoleBleConfig.read(from: &buf),
+                sppFallback: FfiConverterOptionTypeConsoleSppFallbackConfig.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleSessionConfig, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterUInt32.write(value.schemaVersion, into: &buf)
+        FfiConverterString.write(value.transportPolicy, into: &buf)
+        FfiConverterTypeConsoleBleConfig.write(value.ble, into: &buf)
+        FfiConverterOptionTypeConsoleSppFallbackConfig.write(value.sppFallback, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleSessionConfig_lift(_ buf: RustBuffer) throws -> ConsoleSessionConfig {
+    return try FfiConverterTypeConsoleSessionConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleSessionConfig_lower(_ value: ConsoleSessionConfig) -> RustBuffer {
+    return FfiConverterTypeConsoleSessionConfig.lower(value)
+}
+
+
+public struct ConsoleSppFallbackConfig {
+    public var enabledPlatforms: [String]
+    public var windowsPort: String?
+    public var baudRate: UInt32
+    public var dataBits: UInt8
+    public var stopBits: UInt8
+    public var parity: String
+    public var flowControl: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabledPlatforms: [String], windowsPort: String?, baudRate: UInt32, dataBits: UInt8, stopBits: UInt8, parity: String, flowControl: String) {
+        self.enabledPlatforms = enabledPlatforms
+        self.windowsPort = windowsPort
+        self.baudRate = baudRate
+        self.dataBits = dataBits
+        self.stopBits = stopBits
+        self.parity = parity
+        self.flowControl = flowControl
+    }
+}
+
+#if compiler(>=6)
+extension ConsoleSppFallbackConfig: Sendable {}
+#endif
+
+
+extension ConsoleSppFallbackConfig: Equatable, Hashable {
+    public static func ==(lhs: ConsoleSppFallbackConfig, rhs: ConsoleSppFallbackConfig) -> Bool {
+        if lhs.enabledPlatforms != rhs.enabledPlatforms {
+            return false
+        }
+        if lhs.windowsPort != rhs.windowsPort {
+            return false
+        }
+        if lhs.baudRate != rhs.baudRate {
+            return false
+        }
+        if lhs.dataBits != rhs.dataBits {
+            return false
+        }
+        if lhs.stopBits != rhs.stopBits {
+            return false
+        }
+        if lhs.parity != rhs.parity {
+            return false
+        }
+        if lhs.flowControl != rhs.flowControl {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(enabledPlatforms)
+        hasher.combine(windowsPort)
+        hasher.combine(baudRate)
+        hasher.combine(dataBits)
+        hasher.combine(stopBits)
+        hasher.combine(parity)
+        hasher.combine(flowControl)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleSppFallbackConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleSppFallbackConfig {
+        return
+            try ConsoleSppFallbackConfig(
+                enabledPlatforms: FfiConverterSequenceString.read(from: &buf),
+                windowsPort: FfiConverterOptionString.read(from: &buf),
+                baudRate: FfiConverterUInt32.read(from: &buf),
+                dataBits: FfiConverterUInt8.read(from: &buf),
+                stopBits: FfiConverterUInt8.read(from: &buf),
+                parity: FfiConverterString.read(from: &buf),
+                flowControl: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsoleSppFallbackConfig, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.enabledPlatforms, into: &buf)
+        FfiConverterOptionString.write(value.windowsPort, into: &buf)
+        FfiConverterUInt32.write(value.baudRate, into: &buf)
+        FfiConverterUInt8.write(value.dataBits, into: &buf)
+        FfiConverterUInt8.write(value.stopBits, into: &buf)
+        FfiConverterString.write(value.parity, into: &buf)
+        FfiConverterString.write(value.flowControl, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleSppFallbackConfig_lift(_ buf: RustBuffer) throws -> ConsoleSppFallbackConfig {
+    return try FfiConverterTypeConsoleSppFallbackConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleSppFallbackConfig_lower(_ value: ConsoleSppFallbackConfig) -> RustBuffer {
+    return FfiConverterTypeConsoleSppFallbackConfig.lower(value)
+}
+
+
 public struct CoreHealth {
     public var ok: Bool
     public var app: String
@@ -4567,6 +5209,210 @@ public func FfiConverterTypeRemoteOperatingSystemInfo_lower(_ value: RemoteOpera
 }
 
 
+public struct RemoteToRemoteTransferReport {
+    public var jobId: String
+    public var bytesDone: UInt64
+    public var bytesTotal: UInt64
+    public var resumedFrom: UInt64
+    public var sha256Hex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(jobId: String, bytesDone: UInt64, bytesTotal: UInt64, resumedFrom: UInt64, sha256Hex: String) {
+        self.jobId = jobId
+        self.bytesDone = bytesDone
+        self.bytesTotal = bytesTotal
+        self.resumedFrom = resumedFrom
+        self.sha256Hex = sha256Hex
+    }
+}
+
+#if compiler(>=6)
+extension RemoteToRemoteTransferReport: Sendable {}
+#endif
+
+
+extension RemoteToRemoteTransferReport: Equatable, Hashable {
+    public static func ==(lhs: RemoteToRemoteTransferReport, rhs: RemoteToRemoteTransferReport) -> Bool {
+        if lhs.jobId != rhs.jobId {
+            return false
+        }
+        if lhs.bytesDone != rhs.bytesDone {
+            return false
+        }
+        if lhs.bytesTotal != rhs.bytesTotal {
+            return false
+        }
+        if lhs.resumedFrom != rhs.resumedFrom {
+            return false
+        }
+        if lhs.sha256Hex != rhs.sha256Hex {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(jobId)
+        hasher.combine(bytesDone)
+        hasher.combine(bytesTotal)
+        hasher.combine(resumedFrom)
+        hasher.combine(sha256Hex)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRemoteToRemoteTransferReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RemoteToRemoteTransferReport {
+        return
+            try RemoteToRemoteTransferReport(
+                jobId: FfiConverterString.read(from: &buf),
+                bytesDone: FfiConverterUInt64.read(from: &buf),
+                bytesTotal: FfiConverterUInt64.read(from: &buf),
+                resumedFrom: FfiConverterUInt64.read(from: &buf),
+                sha256Hex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RemoteToRemoteTransferReport, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.jobId, into: &buf)
+        FfiConverterUInt64.write(value.bytesDone, into: &buf)
+        FfiConverterUInt64.write(value.bytesTotal, into: &buf)
+        FfiConverterUInt64.write(value.resumedFrom, into: &buf)
+        FfiConverterString.write(value.sha256Hex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteToRemoteTransferReport_lift(_ buf: RustBuffer) throws -> RemoteToRemoteTransferReport {
+    return try FfiConverterTypeRemoteToRemoteTransferReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteToRemoteTransferReport_lower(_ value: RemoteToRemoteTransferReport) -> RustBuffer {
+    return FfiConverterTypeRemoteToRemoteTransferReport.lower(value)
+}
+
+
+public struct RemoteToRemoteTransferRequest {
+    public var job: ScpTransferJob
+    public var sourceProtocol: RemoteTransferProtocol
+    public var destinationProtocol: RemoteTransferProtocol
+    public var requestedOffset: UInt64
+    public var forceRestart: Bool
+    public var chunkSizeBytes: UInt64
+    public var workerCount: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(job: ScpTransferJob, sourceProtocol: RemoteTransferProtocol, destinationProtocol: RemoteTransferProtocol, requestedOffset: UInt64, forceRestart: Bool, chunkSizeBytes: UInt64, workerCount: UInt8) {
+        self.job = job
+        self.sourceProtocol = sourceProtocol
+        self.destinationProtocol = destinationProtocol
+        self.requestedOffset = requestedOffset
+        self.forceRestart = forceRestart
+        self.chunkSizeBytes = chunkSizeBytes
+        self.workerCount = workerCount
+    }
+}
+
+#if compiler(>=6)
+extension RemoteToRemoteTransferRequest: Sendable {}
+#endif
+
+
+extension RemoteToRemoteTransferRequest: Equatable, Hashable {
+    public static func ==(lhs: RemoteToRemoteTransferRequest, rhs: RemoteToRemoteTransferRequest) -> Bool {
+        if lhs.job != rhs.job {
+            return false
+        }
+        if lhs.sourceProtocol != rhs.sourceProtocol {
+            return false
+        }
+        if lhs.destinationProtocol != rhs.destinationProtocol {
+            return false
+        }
+        if lhs.requestedOffset != rhs.requestedOffset {
+            return false
+        }
+        if lhs.forceRestart != rhs.forceRestart {
+            return false
+        }
+        if lhs.chunkSizeBytes != rhs.chunkSizeBytes {
+            return false
+        }
+        if lhs.workerCount != rhs.workerCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(job)
+        hasher.combine(sourceProtocol)
+        hasher.combine(destinationProtocol)
+        hasher.combine(requestedOffset)
+        hasher.combine(forceRestart)
+        hasher.combine(chunkSizeBytes)
+        hasher.combine(workerCount)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRemoteToRemoteTransferRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RemoteToRemoteTransferRequest {
+        return
+            try RemoteToRemoteTransferRequest(
+                job: FfiConverterTypeScpTransferJob.read(from: &buf),
+                sourceProtocol: FfiConverterTypeRemoteTransferProtocol.read(from: &buf),
+                destinationProtocol: FfiConverterTypeRemoteTransferProtocol.read(from: &buf),
+                requestedOffset: FfiConverterUInt64.read(from: &buf),
+                forceRestart: FfiConverterBool.read(from: &buf),
+                chunkSizeBytes: FfiConverterUInt64.read(from: &buf),
+                workerCount: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RemoteToRemoteTransferRequest, into buf: inout [UInt8]) {
+        FfiConverterTypeScpTransferJob.write(value.job, into: &buf)
+        FfiConverterTypeRemoteTransferProtocol.write(value.sourceProtocol, into: &buf)
+        FfiConverterTypeRemoteTransferProtocol.write(value.destinationProtocol, into: &buf)
+        FfiConverterUInt64.write(value.requestedOffset, into: &buf)
+        FfiConverterBool.write(value.forceRestart, into: &buf)
+        FfiConverterUInt64.write(value.chunkSizeBytes, into: &buf)
+        FfiConverterUInt8.write(value.workerCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteToRemoteTransferRequest_lift(_ buf: RustBuffer) throws -> RemoteToRemoteTransferRequest {
+    return try FfiConverterTypeRemoteToRemoteTransferRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteToRemoteTransferRequest_lower(_ value: RemoteToRemoteTransferRequest) -> RustBuffer {
+    return FfiConverterTypeRemoteToRemoteTransferRequest.lower(value)
+}
+
+
 public struct ScpResumeOptions {
     public var requestedOffset: UInt64
     public var forceRestart: Bool
@@ -6948,6 +7794,225 @@ public func FfiConverterTypeX11ProbeInput_lower(_ value: X11ProbeInput) -> RustB
     return FfiConverterTypeX11ProbeInput.lower(value)
 }
 
+
+public enum ConsoleConfigError: Swift.Error {
+
+
+
+    case Invalid(message: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleConfigError: FfiConverterRustBuffer {
+    typealias SwiftType = ConsoleConfigError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleConfigError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+
+
+
+        case 1: return .Invalid(
+            message: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConsoleConfigError, into buf: inout [UInt8]) {
+        switch value {
+
+
+
+
+
+        case let .Invalid(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleConfigError_lift(_ buf: RustBuffer) throws -> ConsoleConfigError {
+    return try FfiConverterTypeConsoleConfigError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleConfigError_lower(_ value: ConsoleConfigError) -> RustBuffer {
+    return FfiConverterTypeConsoleConfigError.lower(value)
+}
+
+
+extension ConsoleConfigError: Equatable, Hashable {}
+
+
+
+
+extension ConsoleConfigError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ConsolePlatform {
+
+    case macos
+    case windows
+}
+
+
+#if compiler(>=6)
+extension ConsolePlatform: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsolePlatform: FfiConverterRustBuffer {
+    typealias SwiftType = ConsolePlatform
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsolePlatform {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .macos
+
+        case 2: return .windows
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConsolePlatform, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .macos:
+            writeInt(&buf, Int32(1))
+
+
+        case .windows:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsolePlatform_lift(_ buf: RustBuffer) throws -> ConsolePlatform {
+    return try FfiConverterTypeConsolePlatform.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsolePlatform_lower(_ value: ConsolePlatform) -> RustBuffer {
+    return FfiConverterTypeConsolePlatform.lower(value)
+}
+
+
+extension ConsolePlatform: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ConsoleTransportDecision {
+
+    case bleOnly
+    case bleThenBoundSpp(windowsPort: String
+    )
+}
+
+
+#if compiler(>=6)
+extension ConsoleTransportDecision: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsoleTransportDecision: FfiConverterRustBuffer {
+    typealias SwiftType = ConsoleTransportDecision
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsoleTransportDecision {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .bleOnly
+
+        case 2: return .bleThenBoundSpp(windowsPort: try FfiConverterString.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConsoleTransportDecision, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .bleOnly:
+            writeInt(&buf, Int32(1))
+
+
+        case let .bleThenBoundSpp(windowsPort):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(windowsPort, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleTransportDecision_lift(_ buf: RustBuffer) throws -> ConsoleTransportDecision {
+    return try FfiConverterTypeConsoleTransportDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsoleTransportDecision_lower(_ value: ConsoleTransportDecision) -> RustBuffer {
+    return FfiConverterTypeConsoleTransportDecision.lower(value)
+}
+
+
+extension ConsoleTransportDecision: Equatable, Hashable {}
+
+
+
+
+
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
@@ -7727,6 +8792,76 @@ public func FfiConverterTypeRemoteFileKind_lower(_ value: RemoteFileKind) -> Rus
 
 
 extension RemoteFileKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum RemoteTransferProtocol {
+
+    case scp
+    case sftp
+}
+
+
+#if compiler(>=6)
+extension RemoteTransferProtocol: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRemoteTransferProtocol: FfiConverterRustBuffer {
+    typealias SwiftType = RemoteTransferProtocol
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RemoteTransferProtocol {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .scp
+
+        case 2: return .sftp
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RemoteTransferProtocol, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .scp:
+            writeInt(&buf, Int32(1))
+
+
+        case .sftp:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteTransferProtocol_lift(_ buf: RustBuffer) throws -> RemoteTransferProtocol {
+    return try FfiConverterTypeRemoteTransferProtocol.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRemoteTransferProtocol_lower(_ value: RemoteTransferProtocol) -> RustBuffer {
+    return FfiConverterTypeRemoteTransferProtocol.lower(value)
+}
+
+
+extension RemoteTransferProtocol: Equatable, Hashable {}
 
 
 
@@ -8780,6 +9915,54 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeConsoleProfileMatch: FfiConverterRustBuffer {
+    typealias SwiftType = ConsoleProfileMatch?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeConsoleProfileMatch.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeConsoleProfileMatch.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeConsoleSppFallbackConfig: FfiConverterRustBuffer {
+    typealias SwiftType = ConsoleSppFallbackConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeConsoleSppFallbackConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeConsoleSppFallbackConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDeviceDiskIOSample: FfiConverterRustBuffer {
     typealias SwiftType = DeviceDiskIoSample?
 
@@ -9019,6 +10202,56 @@ fileprivate struct FfiConverterSequenceTypeBroadcastAuditRecord: FfiConverterRus
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeBroadcastAuditRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeConsoleCharacteristicMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [ConsoleCharacteristicMetadata]
+
+    public static func write(_ value: [ConsoleCharacteristicMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConsoleCharacteristicMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConsoleCharacteristicMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConsoleCharacteristicMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConsoleCharacteristicMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeConsoleServiceMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [ConsoleServiceMetadata]
+
+    public static func write(_ value: [ConsoleServiceMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConsoleServiceMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConsoleServiceMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConsoleServiceMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConsoleServiceMetadata.read(from: &buf))
         }
         return seq
     }
@@ -9711,6 +10944,14 @@ public func connectLiveSsh(config: SshConnectionConfig, secret: SshAuthSecret, e
     )
 })
 }
+public func consoleTransportPolicy(platform: ConsolePlatform, windowsPort: String?) -> ConsoleTransportDecision  {
+    return try!  FfiConverterTypeConsoleTransportDecision_lift(try! rustCall() {
+    uniffi_stacio_core_fn_func_console_transport_policy(
+        FfiConverterTypeConsolePlatform_lower(platform),
+        FfiConverterOptionString.lower(windowsPort),$0
+    )
+})
+}
 public func copyLiveFtpPath(config: FtpConnectionConfig, secret: FtpAuthSecret, fromPath: String, toPath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_copy_live_ftp_path(
         FfiConverterTypeFtpConnectionConfig_lower(config),
@@ -10102,12 +11343,29 @@ public func markSessionRecordOpened(databasePath: String, id: String)throws  -> 
     )
 })
 }
+public func matchBleConsoleProfile(services: [ConsoleServiceMetadata]) -> ConsoleProfileMatch?  {
+    return try!  FfiConverterOptionTypeConsoleProfileMatch.lift(try! rustCall() {
+    uniffi_stacio_core_fn_func_match_ble_console_profile(
+        FfiConverterSequenceTypeConsoleServiceMetadata.lower(services),$0
+    )
+})
+}
 public func moveSessionRecord(databasePath: String, id: String, targetFolderId: String?)throws  -> SessionRecord  {
     return try  FfiConverterTypeSessionRecord_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
     uniffi_stacio_core_fn_func_move_session_record(
         FfiConverterString.lower(databasePath),
         FfiConverterString.lower(id),
         FfiConverterOptionString.lower(targetFolderId),$0
+    )
+})
+}
+public func openExternalTerminalRuntime(kind: String, endpoint: String, cols: UInt32, rows: UInt32)throws  -> TerminalRuntime  {
+    return try  FfiConverterTypeTerminalRuntime_lift(try rustCallWithError(FfiConverterTypeTerminalRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_open_external_terminal_runtime(
+        FfiConverterString.lower(kind),
+        FfiConverterString.lower(endpoint),
+        FfiConverterUInt32.lower(cols),
+        FfiConverterUInt32.lower(rows),$0
     )
 })
 }
@@ -10156,6 +11414,13 @@ public func openRemoteSshRuntime(host: String, port: UInt16, username: String, c
         FfiConverterString.lower(username),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
+    )
+})
+}
+public func parseConsoleSessionConfig(json: String)throws  -> ConsoleSessionConfig  {
+    return try  FfiConverterTypeConsoleSessionConfig_lift(try rustCallWithError(FfiConverterTypeConsoleConfigError_lift) {
+    uniffi_stacio_core_fn_func_parse_console_session_config(
+        FfiConverterString.lower(json),$0
     )
 })
 }
@@ -10415,6 +11680,26 @@ public func runLiveFtpTransfer(config: FtpConnectionConfig, secret: FtpAuthSecre
     )
 })
 }
+/**
+ * Streams one remote file directly between two independently authenticated
+ * SSH/SFTP endpoints. Each range worker opens its own libssh2 session, keeps
+ * only a bounded in-memory pipeline, and persists a redacted checkpoint on
+ * the destination so an interrupted transfer can continue without a local
+ * relay file.
+ */
+public func runLiveRemoteToRemoteTransfer(sourceConfig: SshConnectionConfig, sourceSecret: SshAuthSecret, sourceExpectedFingerprintSha256: String, destinationConfig: SshConnectionConfig, destinationSecret: SshAuthSecret, destinationExpectedFingerprintSha256: String, request: RemoteToRemoteTransferRequest)throws  -> RemoteToRemoteTransferReport  {
+    return try  FfiConverterTypeRemoteToRemoteTransferReport_lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_run_live_remote_to_remote_transfer(
+        FfiConverterTypeSshConnectionConfig_lower(sourceConfig),
+        FfiConverterTypeSshAuthSecret_lower(sourceSecret),
+        FfiConverterString.lower(sourceExpectedFingerprintSha256),
+        FfiConverterTypeSshConnectionConfig_lower(destinationConfig),
+        FfiConverterTypeSshAuthSecret_lower(destinationSecret),
+        FfiConverterString.lower(destinationExpectedFingerprintSha256),
+        FfiConverterTypeRemoteToRemoteTransferRequest_lower(request),$0
+    )
+})
+}
 public func runLiveScpTransfer(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, job: ScpTransferJob)throws  -> [ScpTransferProgress]  {
     return try  FfiConverterSequenceTypeScpTransferProgress.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_run_live_scp_transfer(
@@ -10443,6 +11728,17 @@ public func runLiveSftpTransfer(config: SshConnectionConfig, secret: SshAuthSecr
         FfiConverterTypeSshAuthSecret_lower(secret),
         FfiConverterString.lower(expectedFingerprintSha256),
         FfiConverterTypeScpTransferJob_lower(job),$0
+    )
+})
+}
+public func runLiveSftpTransferWithResume(config: SshConnectionConfig, secret: SshAuthSecret, expectedFingerprintSha256: String, job: ScpTransferJob, resumeOptions: ScpResumeOptions)throws  -> [ScpTransferProgress]  {
+    return try  FfiConverterSequenceTypeScpTransferProgress.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_run_live_sftp_transfer_with_resume(
+        FfiConverterTypeSshConnectionConfig_lower(config),
+        FfiConverterTypeSshAuthSecret_lower(secret),
+        FfiConverterString.lower(expectedFingerprintSha256),
+        FfiConverterTypeScpTransferJob_lower(job),
+        FfiConverterTypeScpResumeOptions_lower(resumeOptions),$0
     )
 })
 }
@@ -10490,6 +11786,13 @@ public func searchLiveSftpFiles(config: SshConnectionConfig, secret: SshAuthSecr
         FfiConverterString.lower(remotePath),
         FfiConverterString.lower(keyword),
         FfiConverterUInt32.lower(depth),$0
+    )
+})
+}
+public func serializeConsoleSessionConfig(config: ConsoleSessionConfig)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeConsoleConfigError_lift) {
+    uniffi_stacio_core_fn_func_serialize_console_session_config(
+        FfiConverterTypeConsoleSessionConfig_lower(config),$0
     )
 })
 }
@@ -10778,6 +12081,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_connect_live_ssh() != 13080) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_console_transport_policy() != 43514) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_copy_live_ftp_path() != 59579) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10925,7 +12231,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_mark_session_record_opened() != 31065) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_match_ble_console_profile() != 38131) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_move_session_record() != 42239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_open_external_terminal_runtime() != 3478) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_open_live_remote_file_read_session() != 20923) {
@@ -10938,6 +12250,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_open_remote_ssh_runtime() != 26088) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_parse_console_session_config() != 33020) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_parse_quick_connect() != 53575) {
@@ -11027,6 +12342,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_run_live_ftp_transfer() != 35778) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_run_live_remote_to_remote_transfer() != 26979) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_run_live_scp_transfer() != 2650) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11034,6 +12352,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_run_live_sftp_transfer() != 34131) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_run_live_sftp_transfer_with_resume() != 53158) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_save_credential_record() != 32125) {
@@ -11049,6 +12370,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_search_live_sftp_files() != 3883) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_serialize_console_session_config() != 14803) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_serialize_macro_recording() != 48936) {

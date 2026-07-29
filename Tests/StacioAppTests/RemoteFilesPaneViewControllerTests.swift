@@ -588,6 +588,7 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
     }
 
     func testRemoteFilesPaneDoesNotScheduleDownloadsForOnlineMediaPreview() throws {
+        let mediaFileName = "files-pane-online-preview.png"
         weak var weakScheduler: RecordingRemoteFilesPaneTransferScheduler?
         let pane: RemoteFilesPaneViewController
         do {
@@ -599,7 +600,12 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
                 title: "远端文件",
                 bridge: RetryingRemoteFilesBridge(results: [
                     .success([
-                        RemoteFileEntry(kind: .file, path: "/srv/app/screenshot.png", size: 2_048, linkTarget: nil)
+                        RemoteFileEntry(
+                            kind: .file,
+                            path: "/srv/app/\(mediaFileName)",
+                            size: 2_048,
+                            linkTarget: nil
+                        )
                     ])
                 ]),
                 transferScheduler: scheduler,
@@ -614,10 +620,29 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
 
         let scheduler = try XCTUnwrap(weakScheduler)
         XCTAssertTrue(scheduler.jobs.isEmpty)
-        let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
-        XCTAssertEqual(editor.activeFileNameForTesting, "screenshot.png")
-        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "image")
+        XCTAssertTrue(waitUntil {
+            NSApp.windows.contains {
+                $0.title == mediaFileName
+                    && $0.contentViewController is FileWorkspaceMediaViewController
+            }
+        })
+        let mediaWindow = try XCTUnwrap(NSApp.windows.first {
+            $0.title == mediaFileName
+                && $0.contentViewController is FileWorkspaceMediaViewController
+        })
+        defer { mediaWindow.close() }
+        let mediaViewController = try XCTUnwrap(
+            mediaWindow.contentViewController as? FileWorkspaceMediaViewController
+        )
+        XCTAssertEqual(mediaViewController.document.sourceURL.scheme, "http")
+        XCTAssertEqual(mediaViewController.document.sourceURL.host, "127.0.0.1")
+        XCTAssertNil(pane.textEditorViewControllerForTesting)
+        XCTAssertNil(pane.mediaPreviewViewControllerForTesting)
         XCTAssertNil(pane.openProgressViewControllerForTesting)
+
+        pane.closeRemoteFilesRuntime()
+
+        XCTAssertTrue(waitUntil { mediaWindow.isVisible == false })
     }
 
     func testRightWorkspaceKeepsDirtyEditorOpenWhenClosePromptIsCanceled() throws {

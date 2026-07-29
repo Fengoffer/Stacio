@@ -5,6 +5,9 @@ import SwiftTerm
         public var fontZoomSettingsStore: AppSettingsStore = .shared
         public var contextMenuProvider: ((String?) -> NSMenu?)?
         public var onSearchViewportChanged: (() -> Void)?
+        public var semanticHighlightProfile: TerminalSemanticHighlightProfile = .generalPurpose
+        public var semanticHighlightThemeOverride: TerminalColorTheme?
+        public private(set) var isProcessingRemoteOutput = false
         public var acceptsLocalFileDrops: (() -> Bool)? {
             didSet {
                 LocalFileDropHandler.register(self)
@@ -17,6 +20,9 @@ import SwiftTerm
             }
         }
         public private(set) var lastFeedAppliedSemanticHighlightingForTesting = false
+        private let semanticOutputProcessor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.terminal.semantic.remote.\(UUID().uuidString)"
+        )
         private var controlScrollZoomMonitor: Any?
         private var linkInteractionMonitor: Any?
 
@@ -31,6 +37,7 @@ import SwiftTerm
         }
 
     deinit {
+        semanticOutputProcessor.cancel()
         if let controlScrollZoomMonitor {
             NSEvent.removeMonitor(controlScrollZoomMonitor)
         }
@@ -44,21 +51,33 @@ import SwiftTerm
     }
 
         public func feedRemoteOutput(_ bytes: [UInt8], applySemanticHighlighting: Bool = true) {
-            let displayBytes: [UInt8]
+            let configuration: TerminalSemanticHighlightConfiguration?
             if applySemanticHighlighting {
                 let settings = fontZoomSettingsStore.snapshot()
-                displayBytes = TerminalSemanticOutputHighlighter.highlight(
-                    bytes,
+                configuration = TerminalSemanticHighlightConfiguration(
                     level: settings.terminalHighlightLevel,
                     richHighlightingEnabled: settings.terminalRichHighlightingEnabled,
-                    theme: TerminalAppearanceApplier.highlightTheme(for: settings)
+                    theme: semanticHighlightThemeOverride ?? TerminalAppearanceApplier.highlightTheme(for: settings),
+                    profile: semanticHighlightProfile
                 )
             } else {
-                displayBytes = bytes
+                configuration = nil
             }
             lastFeedAppliedSemanticHighlightingForTesting = applySemanticHighlighting
-            feed(byteArray: ArraySlice(displayBytes))
-            onSearchViewportChanged?()
+            semanticOutputProcessor.process(
+                bytes: bytes,
+                configuration: configuration
+            ) { [weak self] displayBytes in
+                guard let self else { return }
+                self.isProcessingRemoteOutput = true
+                defer { self.isProcessingRemoteOutput = false }
+                self.feed(byteArray: ArraySlice(displayBytes))
+                self.onSearchViewportChanged?()
+            }
+        }
+
+        func cancelPendingSemanticOutput() {
+            semanticOutputProcessor.cancel()
         }
 
         private func configureStacioLinkInteraction() {

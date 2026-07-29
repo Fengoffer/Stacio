@@ -60,6 +60,30 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         XCTAssertEqual(restoredBrowser.layoutControlForTesting.selectedSegment, 1)
     }
 
+    func testRestoringSavedGridWorkspaceDoesNotChangeNewSessionLayoutPreference() throws {
+        let defaults = makeIsolatedDefaults()
+        let restoredGroupBrowser = makeIndependentBrowser(
+            runtimeID: "sftp_layout_group_restore",
+            defaults: defaults
+        )
+        restoredGroupBrowser.loadView()
+
+        restoredGroupBrowser.restoreWorkspace(
+            additionalLocalDirectoryPaths: [],
+            layout: .grid
+        )
+
+        let newSessionBrowser = makeIndependentBrowser(
+            runtimeID: "sftp_layout_after_group_restore",
+            defaults: defaults
+        )
+        newSessionBrowser.loadView()
+
+        XCTAssertEqual(restoredGroupBrowser.layoutModeForTesting, .grid)
+        XCTAssertEqual(newSessionBrowser.layoutModeForTesting, .columns)
+        XCTAssertEqual(newSessionBrowser.fileTransferSplitViewForTesting.arrangedSubviews.count, 2)
+    }
+
     func testIndependentBrowserGridPlacesLocalFirstAndThreeRemotesInTwoByTwo() throws {
         let defaults = makeIsolatedDefaults()
         let bridge = IndependentTransferBrowserBridge()
@@ -281,6 +305,50 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         XCTAssertTrue(arrangedSubviews[3] === third.view)
     }
 
+    func testSwitchingFourPaneWorkspaceFromGridToColumnsDistributesEqualWidths() throws {
+        let defaults = makeIsolatedDefaults()
+        let bridge = IndependentTransferBrowserBridge()
+        bridge.entriesByPath["~"] = []
+        let browser = makeIndependentBrowser(
+            runtimeID: "sftp_layout_columns_equal_widths",
+            defaults: defaults,
+            bridge: bridge
+        )
+        browser.loadView()
+        _ = browser.addRemotePane(
+            runtimeID: "sftp_layout_columns_equal_second",
+            context: Self.liveContext(host: "backup.example.com"),
+            title: "备份服务器",
+            bridge: bridge,
+            transferScheduler: nil,
+            remoteProtocolName: "SFTP",
+            initialRemotePath: "~",
+            initialLoadPresentation: .immediate
+        )
+        _ = browser.addRemotePane(
+            runtimeID: "sftp_layout_columns_equal_third",
+            context: Self.liveContext(host: "archive.example.com"),
+            title: "归档服务器",
+            bridge: bridge,
+            transferScheduler: nil,
+            remoteProtocolName: "SFTP",
+            initialRemotePath: "~",
+            initialLoadPresentation: .immediate
+        )
+        browser.view.frame = NSRect(x: 0, y: 0, width: 1_280, height: 800)
+        browser.setLayoutModeForTesting(.grid)
+        browser.view.layoutSubtreeIfNeeded()
+
+        browser.setLayoutModeForTesting(.columns)
+        browser.view.layoutSubtreeIfNeeded()
+
+        let widths = browser.fileTransferSplitViewForTesting.arrangedSubviews.map(\.frame.width)
+        XCTAssertEqual(widths.count, 4)
+        for width in widths.dropFirst() {
+            XCTAssertEqual(width, widths[0], accuracy: 1)
+        }
+    }
+
     func testBrowserOffersSavedUnattachedRemoteDevicesAndRequestsConnection() {
         let browser = makeIndependentBrowser(
             runtimeID: "sftp_saved_device_primary",
@@ -300,21 +368,30 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
                     title: "备份服务器",
                     protocolName: "SCP",
                     endpoint: "backup.example.com:22"
+                ),
+                FileTransferRemoteDeviceOption(
+                    sessionID: "archive-session",
+                    title: "归档服务器",
+                    protocolName: "SFTP",
+                    endpoint: "archive.example.com:22"
                 )
             ]
         }
         var requestedSessionID: String?
+        var requestedProtocol: String?
         browser.onRequestConnectRemoteDevice = { requestedSessionID = $0 }
-        browser.onRequestCreateRemoteDevice = {}
+        browser.onRequestCreateRemoteDevice = { requestedProtocol = $0 }
 
-        XCTAssertEqual(browser.availableRemoteDeviceSessionIDsForTesting, ["backup-session"])
+        XCTAssertEqual(browser.availableRemoteDeviceSessionIDsForTesting, ["archive-session"])
         XCTAssertEqual(
             browser.addRemoteDeviceMenuTitlesForTesting,
-            ["备份服务器 · backup.example.com:22 (SCP)", "新建 SCP/SFTP 会话..."]
+            ["归档服务器 · archive.example.com:22 (SFTP)", "新建 SFTP 连接..."]
         )
 
-        browser.requestRemoteDeviceConnectionForTesting(sessionID: "backup-session")
-        XCTAssertEqual(requestedSessionID, "backup-session")
+        browser.requestRemoteDeviceConnectionForTesting(sessionID: "archive-session")
+        browser.requestRemoteDeviceCreationForTesting()
+        XCTAssertEqual(requestedSessionID, "archive-session")
+        XCTAssertEqual(requestedProtocol, "SFTP")
     }
 
     func testClosingAttachedSavedSessionRestoresMenuAndAllowsReconnectWithoutAffectingOtherDevices() {
@@ -349,7 +426,7 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
                 FileTransferRemoteDeviceOption(
                     sessionID: "backup-session",
                     title: "备份服务器",
-                    protocolName: "SCP",
+                    protocolName: "SFTP",
                     endpoint: "backup.example.com:22"
                 ),
                 FileTransferRemoteDeviceOption(
@@ -366,7 +443,7 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
             title: "备份服务器",
             bridge: bridge,
             transferScheduler: scheduler,
-            remoteProtocolName: "SCP",
+            remoteProtocolName: "SFTP",
             initialRemotePath: "~",
             remoteFilePathTerminalSender: { _ in }
         )
@@ -469,6 +546,8 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         XCTAssertEqual(browser.addLocalDirectoryButtonForTesting.title, "添加本地目录")
+        XCTAssertTrue(browser.addLocalDirectoryButtonForTesting.imageHugsTitle)
+        XCTAssertTrue(browser.addRemoteDeviceButtonForTesting.imageHugsTitle)
         XCTAssertEqual(
             browser.addLocalDirectoryButtonForTesting.accessibilityIdentifier(),
             "Stacio.FileTransferBrowser.addLocalDirectory"
@@ -479,6 +558,50 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         XCTAssertEqual(browser.localFilesViewControllersForTesting.count, 2)
         XCTAssertEqual(browser.localFilesViewControllersForTesting.last?.directoryURL, directory)
         XCTAssertEqual(browser.workspacePaneCountForTesting, 3)
+    }
+
+    func testFileTransferWorkspaceBuildsRestorableGroupFromCurrentPaneLayout() throws {
+        let bridge = IndependentTransferBrowserBridge()
+        bridge.entriesByPath["~"] = []
+        bridge.entriesByPath["/srv/backup"] = []
+        let browser = makeIndependentBrowser(
+            runtimeID: "sftp_group_primary",
+            defaults: makeIsolatedDefaults(),
+            bridge: bridge
+        )
+        browser.loadView()
+        browser.markPrimaryRemoteDevice(sessionID: "primary-session")
+        let extraDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioGroupLocal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: extraDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: extraDirectory) }
+        _ = browser.addLocalDirectoryPane(extraDirectory)
+        _ = browser.addRemotePane(
+            runtimeID: "sftp_group_backup_runtime",
+            context: Self.liveContext(host: "backup.example.com"),
+            title: "备份服务器",
+            bridge: bridge,
+            transferScheduler: nil,
+            remoteProtocolName: "SFTP",
+            initialRemotePath: "/srv/backup",
+            initialLoadPresentation: .immediate,
+            sourceRuntimeID: "saved:backup-session"
+        )
+        browser.setLayoutModeForTesting(.grid)
+
+        let definition = try XCTUnwrap(browser.workspaceSessionGroupDefinitionForTesting)
+
+        XCTAssertEqual(definition.kind, .sftp)
+        XCTAssertEqual(definition.layout, .grid)
+        XCTAssertEqual(definition.panes.map(\.kind), [
+            .localDirectory,
+            .localDirectory,
+            .remoteSession,
+            .remoteSession
+        ])
+        XCTAssertEqual(definition.panes.compactMap(\.sessionID), ["primary-session", "backup-session"])
+        XCTAssertEqual(definition.panes.last?.path, "/srv/backup")
+        XCTAssertTrue(definition.shouldOfferSaveOnClose)
     }
 
     func testAdvancedContextMenusOfferDeviceAwareTransferTargetsAndExcludeCurrentDevice() throws {
@@ -615,6 +738,40 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         XCTAssertEqual(clipboard.payload?.sourceDeviceID, "remote-one")
         XCTAssertEqual(clipboard.payload?.localURLs, [])
         XCTAssertEqual(clipboard.payload?.remoteSelections, [remote])
+    }
+
+    func testLocalFileURLDropCopiesIntoAnotherLocalPane() throws {
+        let sourceDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioLocalDragSource-\(UUID().uuidString)", isDirectory: true)
+        let destinationDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioLocalDragDestination-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: sourceDirectory)
+            try? FileManager.default.removeItem(at: destinationDirectory)
+        }
+        let sourceURL = sourceDirectory.appendingPathComponent("large-transfer.bin")
+        try Data("payload".utf8).write(to: sourceURL)
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StacioLocalDrag.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects([sourceURL as NSURL]))
+        let pane = LocalFilePaneViewController(
+            runtimeID: "local-drop-destination",
+            directoryURL: destinationDirectory,
+            title: "本地文件"
+        )
+        pane.loadView()
+
+        let urls = LocalFileDragPayload.urls(from: pasteboard)
+        XCTAssertEqual(urls, [sourceURL.standardizedFileURL])
+        XCTAssertTrue(pane.acceptLocalFileDrop(urls, destination: destinationDirectory))
+
+        let destinationURL = destinationDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+        XCTAssertTrue(waitUntil {
+            FileManager.default.fileExists(atPath: destinationURL.path)
+        })
+        XCTAssertEqual(try Data(contentsOf: destinationURL), Data("payload".utf8))
     }
 
     func testWorkspaceClipboardInvalidatesOwnedCutAfterExternalPasteboardChange() {
@@ -2424,6 +2581,98 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         pane.closeRemoteFilesRuntime()
 
         XCTAssertEqual(scheduler.disconnectedRuntimeIDs, ["sftp_browser_close"])
+    }
+
+    func testTransferBrowserPlacesNativeQueueButtonBeforeLayoutControl() {
+        let bridge = IndependentTransferBrowserBridge()
+        bridge.entriesByPath["~"] = []
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: queueView)
+        let browser = IndependentFileTransferBrowserViewController(
+            runtimeID: "scp-queue-toolbar",
+            context: Self.liveContext(),
+            title: "生产服务器",
+            bridge: bridge,
+            transferScheduler: queue,
+            remoteProtocolName: "SCP",
+            initialRemotePath: "~",
+            initialLoadPresentation: .immediate,
+            localFilesViewController: LocalFilePaneViewController(
+                runtimeID: "scp-queue-toolbar-local",
+                directoryURL: FileManager.default.homeDirectoryForCurrentUser,
+                title: "本地文件"
+            )
+        )
+        browser.loadView()
+        browser.view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 800)
+        browser.view.layoutSubtreeIfNeeded()
+
+        let button = browser.transferQueueButtonForTesting
+        XCTAssertEqual(button.accessibilityLabel(), "传输队列")
+        XCTAssertNotNil(button.image)
+        XCTAssertTrue(button.isEnabled)
+        XCTAssertLessThan(button.frame.maxX, browser.layoutControlForTesting.frame.minX)
+        XCTAssertTrue(browser.hasTransferQueuePopoverForTesting)
+    }
+
+    func testTransferBrowserAutomaticallyPresentsQueueWhenNewTransferBatchStarts() {
+        let bridge = IndependentTransferBrowserBridge()
+        bridge.entriesByPath["~"] = []
+        let queueView = TransferQueueViewController()
+        queueView.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: queueView)
+        let browser = IndependentFileTransferBrowserViewController(
+            runtimeID: "scp-queue-auto-present",
+            context: Self.liveContext(),
+            title: "生产服务器",
+            bridge: bridge,
+            transferScheduler: queue,
+            remoteProtocolName: "SCP",
+            initialRemotePath: "~",
+            initialLoadPresentation: .immediate,
+            localFilesViewController: LocalFilePaneViewController(
+                runtimeID: "scp-queue-auto-present-local",
+                directoryURL: FileManager.default.homeDirectoryForCurrentUser,
+                title: "本地文件"
+            )
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1_200, height: 800),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = browser
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        browser.view.layoutSubtreeIfNeeded()
+        let job = ScpTransferJob(
+            id: "queue-auto-present-job",
+            direction: .upload,
+            sourcePath: "/tmp/archive.iso",
+            destinationPath: "/srv/archive.iso",
+            bytesTotal: 100
+        )
+
+        queue.registerExternalTransfer(
+            runtimeID: "scp-queue-auto-present-local",
+            job: job,
+            progressProvider: { [] },
+            pause: { true },
+            resume: { true },
+            cancel: { true }
+        )
+
+        XCTAssertTrue(waitUntil {
+            guard let storedPopover = Mirror(reflecting: browser).children
+                .first(where: { $0.label == "transferQueuePopover" })?
+                .value,
+                let popover = Mirror(reflecting: storedPopover).children.first?.value as? NSPopover
+            else { return false }
+            return popover.isShown
+        })
+        queue.finishExternalTransfer(jobID: job.id, status: "completed", bytesDone: 100)
     }
 
     func testClosingIndependentBrowserClosesSharedDocumentWindows() throws {

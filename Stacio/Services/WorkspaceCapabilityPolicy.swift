@@ -18,6 +18,7 @@ public enum WorkspaceSessionProtocol: Equatable, Sendable {
     case sftp
     case vnc
     case serial
+    case console
     case telnet
     case unsupportedRemote(String)
     case unmanaged
@@ -30,6 +31,7 @@ public enum WorkspaceSessionProtocol: Equatable, Sendable {
         case "sftp": self = .sftp
         case "vnc": self = .vnc
         case "serial": self = .serial
+        case "console": self = .console
         case "telnet": self = .telnet
         default: self = .unsupportedRemote(normalized)
         }
@@ -44,6 +46,8 @@ public enum WorkspaceCapabilityPolicy {
         switch sessionProtocol {
         case .ssh, .noSession, .local, .browser, .unmanaged:
             return true
+        case .console:
+            return capability == .ai || capability == .diagnostics
         case .scp, .sftp, .vnc, .serial, .telnet, .unsupportedRemote:
             return false
         }

@@ -116,6 +116,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let statusLabel = NSTextField(labelWithString: "")
     private var commandCards: [AICommandCardView] = []
     private var transcriptEntries: [AITranscriptEntry] = []
+    private var transcriptViewsByEntryID: [UUID: AITranscriptBubbleView] = [:]
+    private var transcriptProcessGroupViewsByID: [UUID: AITranscriptProcessGroupView] = [:]
+    private var transcriptWidthConstraintsByViewID: [ObjectIdentifier: NSLayoutConstraint] = [:]
+    private var streamingTranscriptRenderTimer: Timer?
     private var traceEventsByRequestID: [String: [AgentTraceEvent]] = [:]
     private var traceActorKindsByRequest: [AgentTraceOwnershipKey: AgentActorKind] = [:]
     private var traceRuntimeTitlesByRequestID: [String: String] = [:]
@@ -235,6 +239,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     deinit {
+        streamingTranscriptRenderTimer?.invalidate()
         if let traceObserver {
             NotificationCenter.default.removeObserver(traceObserver)
         }
@@ -1944,6 +1949,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     @objc private func newConversationButtonPressed(_ sender: Any?) {
         guard let historyScopeID = resolvedTargetContext()?.historyScopeID else { return }
+        cancelPendingStreamingTranscriptRender()
         activeConversationIDs[historyScopeID] = UUID().uuidString.lowercased()
         loadedConversationHistoryRuntimeID = nil
         activeStreamingAssistantIndex = nil
@@ -4108,6 +4114,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return }
+        flushPendingStreamingTranscriptRender()
         let processEntry = isProcessEntry ?? role.isProcessRole
         let entry = AITranscriptEntry(
             role: role,
@@ -4144,6 +4151,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     ) {
         let trimmedDelta = delta.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedDelta.isEmpty == false || delta.isEmpty == false else { return }
+        var createdEntry = false
         if let index = activeStreamingAssistantIndex,
            transcriptEntries.indices.contains(index),
            transcriptEntries[index].role == .assistant {
@@ -4163,8 +4171,67 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptEntries.append(entry)
             activeStreamingAssistantIndex = transcriptEntries.count - 1
             messageLabel.isHidden = true
+            createdEntry = true
         }
-        renderTranscriptEntries()
+        if createdEntry {
+            renderTranscriptEntries()
+        } else {
+            schedulePendingStreamingTranscriptRender()
+        }
+    }
+
+    private func schedulePendingStreamingTranscriptRender() {
+        guard streamingTranscriptRenderTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.1, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.streamingTranscriptRenderTimer = nil
+            self.renderActiveStreamingTranscriptEntry()
+        }
+        streamingTranscriptRenderTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func cancelPendingStreamingTranscriptRender() {
+        streamingTranscriptRenderTimer?.invalidate()
+        streamingTranscriptRenderTimer = nil
+    }
+
+    private func flushPendingStreamingTranscriptRender() {
+        cancelPendingStreamingTranscriptRender()
+        renderActiveStreamingTranscriptEntry()
+    }
+
+    private func renderActiveStreamingTranscriptEntry() {
+        guard let index = activeStreamingAssistantIndex,
+              transcriptEntries.indices.contains(index)
+        else {
+            return
+        }
+        let entry = transcriptEntries[index]
+        if entry.isProcessEntry, let processGroupID = entry.processGroupID {
+            guard let processView = transcriptProcessGroupViewsByID[processGroupID] else {
+                renderTranscriptEntries()
+                return
+            }
+            let groupedEntries = transcriptEntries.filter {
+                $0.isProcessEntry && $0.processGroupID == processGroupID
+            }
+            processView.update(
+                entries: groupedEntries,
+                elapsedText: processGroupElapsedText(
+                    timing: processGroupTimings[processGroupID],
+                    entries: groupedEntries
+                )
+            )
+        } else {
+            guard let bubble = transcriptViewsByEntryID[entry.id],
+                  bubble.update(entry: entry)
+            else {
+                renderTranscriptEntries()
+                return
+            }
+        }
+        scrollTranscriptToBottom()
     }
 
     @discardableResult
@@ -4190,9 +4257,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
               transcriptEntries[index].role == .assistant,
               transcriptEntries[index].isProcessEntry
         else {
+            cancelPendingStreamingTranscriptRender()
             activeStreamingAssistantIndex = nil
             return
         }
+        cancelPendingStreamingTranscriptRender()
         transcriptEntries.remove(at: index)
         activeStreamingAssistantIndex = nil
         renderTranscriptEntries()
@@ -4247,6 +4316,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else {
+            flushPendingStreamingTranscriptRender()
             activeStreamingAssistantIndex = nil
             return
         }
@@ -4265,7 +4335,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                     requestID: nil
                 )
             }
-            renderTranscriptEntries()
+            flushPendingStreamingTranscriptRender()
         } else {
             appendTranscript(
                 .assistant,
@@ -4307,34 +4377,102 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func renderTranscriptEntries() {
-        transcriptStack.arrangedSubviews.forEach { view in
-            transcriptStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
+        cancelPendingStreamingTranscriptRender()
+
+        var processEntriesByGroupID: [UUID: [AITranscriptEntry]] = [:]
+        for entry in transcriptEntries where entry.isProcessEntry {
+            guard let processGroupID = entry.processGroupID else { continue }
+            processEntriesByGroupID[processGroupID, default: []].append(entry)
         }
+
+        var desiredViews: [NSView] = []
+        var desiredEntryIDs: Set<UUID> = []
+        var desiredProcessGroupIDs: Set<UUID> = []
         var renderedProcessGroupIDs: Set<UUID> = []
         for entry in transcriptEntries {
             if entry.isProcessEntry, let processGroupID = entry.processGroupID {
                 guard renderedProcessGroupIDs.insert(processGroupID).inserted else { continue }
-                let groupedEntries = transcriptEntries.filter {
-                    $0.isProcessEntry && $0.processGroupID == processGroupID
-                }
+                let groupedEntries = processEntriesByGroupID[processGroupID] ?? []
                 let timing = processGroupTimings[processGroupID]
-                let processView = AITranscriptProcessGroupView(
-                    entries: groupedEntries,
-                    elapsedText: processGroupElapsedText(timing: timing, entries: groupedEntries),
-                    onToggle: { [weak self] in
-                        self?.toggleProcessGroup(processGroupID)
-                    }
-                )
-                transcriptStack.addArrangedSubview(processView)
-                processView.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor).isActive = true
+                let elapsedText = processGroupElapsedText(timing: timing, entries: groupedEntries)
+                desiredProcessGroupIDs.insert(processGroupID)
+                let processView: AITranscriptProcessGroupView
+                if let existingView = transcriptProcessGroupViewsByID[processGroupID] {
+                    existingView.update(entries: groupedEntries, elapsedText: elapsedText)
+                    processView = existingView
+                } else {
+                    processView = AITranscriptProcessGroupView(
+                        entries: groupedEntries,
+                        elapsedText: elapsedText,
+                        onToggle: { [weak self] in
+                            self?.toggleProcessGroup(processGroupID)
+                        }
+                    )
+                    transcriptProcessGroupViewsByID[processGroupID] = processView
+                }
+                desiredViews.append(processView)
                 continue
             }
-            let bubble = makeTranscriptBubble(for: entry)
-            transcriptStack.addArrangedSubview(bubble)
-            bubble.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor).isActive = true
+
+            desiredEntryIDs.insert(entry.id)
+            let bubble: AITranscriptBubbleView
+            if let existingBubble = transcriptViewsByEntryID[entry.id],
+               existingBubble.update(entry: entry) {
+                bubble = existingBubble
+            } else {
+                if let existingBubble = transcriptViewsByEntryID.removeValue(forKey: entry.id) {
+                    removeTranscriptView(existingBubble)
+                }
+                bubble = makeTranscriptBubble(for: entry)
+                transcriptViewsByEntryID[entry.id] = bubble
+            }
+            desiredViews.append(bubble)
         }
+
+        for entryID in Array(transcriptViewsByEntryID.keys) where desiredEntryIDs.contains(entryID) == false {
+            guard let view = transcriptViewsByEntryID.removeValue(forKey: entryID) else { continue }
+            removeTranscriptView(view)
+        }
+        for processGroupID in Array(transcriptProcessGroupViewsByID.keys)
+        where desiredProcessGroupIDs.contains(processGroupID) == false {
+            guard let view = transcriptProcessGroupViewsByID.removeValue(forKey: processGroupID) else { continue }
+            removeTranscriptView(view)
+        }
+
+        reconcileTranscriptViews(desiredViews)
         scrollTranscriptToBottom()
+    }
+
+    private func reconcileTranscriptViews(_ desiredViews: [NSView]) {
+        let desiredViewIDs = Set(desiredViews.map(ObjectIdentifier.init))
+        for view in transcriptStack.arrangedSubviews
+        where desiredViewIDs.contains(ObjectIdentifier(view)) == false {
+            removeTranscriptView(view)
+        }
+
+        for (index, view) in desiredViews.enumerated() {
+            if let currentIndex = transcriptStack.arrangedSubviews.firstIndex(where: { $0 === view }) {
+                guard currentIndex != index else { continue }
+                transcriptStack.removeArrangedSubview(view)
+                transcriptStack.insertArrangedSubview(view, at: index)
+                continue
+            }
+
+            transcriptStack.insertArrangedSubview(view, at: index)
+            let widthConstraint = view.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor)
+            widthConstraint.isActive = true
+            transcriptWidthConstraintsByViewID[ObjectIdentifier(view)] = widthConstraint
+        }
+    }
+
+    private func removeTranscriptView(_ view: NSView) {
+        if transcriptStack.arrangedSubviews.contains(where: { $0 === view }) {
+            transcriptStack.removeArrangedSubview(view)
+        }
+        if let widthConstraint = transcriptWidthConstraintsByViewID.removeValue(forKey: ObjectIdentifier(view)) {
+            widthConstraint.isActive = false
+        }
+        view.removeFromSuperview()
     }
 
     private func toggleProcessGroup(_ processGroupID: UUID) {
@@ -4366,7 +4504,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let bubble = AITranscriptBubbleView(
             entry: entry,
             onOpenLink: { [weak self] url in self?.openAssistantLink(url) },
-            onToggle: { [weak self] in self?.toggleTranscriptEntry(entry) }
+            onToggle: { [weak self] in self?.toggleTranscriptEntry(id: entry.id) }
         )
         bubble.preferredTextWidth = max(80, conversationContainer.bounds.width)
         return bubble
@@ -4381,13 +4519,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
-    private func toggleTranscriptEntry(_ entry: AITranscriptEntry) {
-        guard let index = transcriptEntries.firstIndex(where: {
-            $0.role == entry.role
-                && $0.requestID == entry.requestID
-                && $0.text == entry.text
-                && $0.isProcessEntry == entry.isProcessEntry
-        }) else { return }
+    private func toggleTranscriptEntry(id: UUID) {
+        guard let index = transcriptEntries.firstIndex(where: { $0.id == id }) else { return }
         transcriptEntries[index].isCollapsed.toggle()
         renderTranscriptEntries()
     }
@@ -4597,6 +4730,81 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     var transcriptTextForTesting: String {
         transcriptEntries.map(\.displayText).joined(separator: "\n")
+    }
+
+    @discardableResult
+    func loadTranscriptEntriesForPerformanceTesting(count: Int) -> TimeInterval {
+        activeStreamingAssistantIndex = nil
+        transcriptEntries = (0..<count).map { index in
+            AITranscriptEntry(
+                role: .assistant,
+                text: "### Check \(index)\n- Result remains available\n`status --index \(index)`",
+                requestID: "perf-\(index)"
+            )
+        }
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        renderTranscriptEntries()
+        return CFAbsoluteTimeGetCurrent() - startedAt
+    }
+
+    @discardableResult
+    func appendTranscriptEntryForPerformanceTesting(_ text: String) -> TimeInterval {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        appendTranscript(.assistant, text, persistHistory: false)
+        return CFAbsoluteTimeGetCurrent() - startedAt
+    }
+
+    @discardableResult
+    func rerenderTranscriptForPerformanceTesting() -> TimeInterval {
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        renderTranscriptEntries()
+        return CFAbsoluteTimeGetCurrent() - startedAt
+    }
+
+    @discardableResult
+    func appendAssistantStreamingDeltasForPerformanceTesting(count: Int) -> TimeInterval {
+        cancelPendingStreamingTranscriptRender()
+        activeStreamingAssistantIndex = nil
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<count {
+            appendAssistantStreamingDelta("x")
+        }
+        return CFAbsoluteTimeGetCurrent() - startedAt
+    }
+
+    func flushStreamingTranscriptRenderForTesting() {
+        flushPendingStreamingTranscriptRender()
+    }
+
+    func removeTranscriptEntryForTesting(at index: Int) {
+        guard transcriptEntries.indices.contains(index) else { return }
+        cancelPendingStreamingTranscriptRender()
+        activeStreamingAssistantIndex = nil
+        transcriptEntries.remove(at: index)
+        renderTranscriptEntries()
+    }
+
+    var hasPendingStreamingTranscriptRenderForTesting: Bool {
+        streamingTranscriptRenderTimer != nil
+    }
+
+    var transcriptCachedEntryViewCountForTesting: Int {
+        transcriptViewsByEntryID.count
+    }
+
+    var lastRenderedAssistantTextForTesting: String? {
+        transcriptStack.arrangedSubviews.reversed().compactMap { view in
+            guard let bubble = view as? AITranscriptBubbleView,
+                  bubble.isAssistantForTesting
+            else {
+                return nil
+            }
+            return bubble.attributedStringForTesting.string
+        }.first
+    }
+
+    var transcriptViewObjectIdentifiersForTesting: [ObjectIdentifier] {
+        transcriptStack.arrangedSubviews.map(ObjectIdentifier.init)
     }
 
     var rawTranscriptTextForTesting: String {
@@ -5138,12 +5346,17 @@ private struct AIProcessGroupTiming {
 }
 
 private final class AITranscriptProcessGroupView: NSView {
-    private let entries: [AITranscriptEntry]
-    private let elapsedText: String
+    private var entries: [AITranscriptEntry]
+    private var elapsedText: String
     private let onToggle: () -> Void
     private let disclosureButton = NSButton()
     private let detailLabel = NSTextField(labelWithString: "")
     private let separator = NSBox()
+    private var renderedDetailMarkdown = ""
+    private var detailTopConstraint: NSLayoutConstraint?
+    private var separatorTopToDisclosureConstraint: NSLayoutConstraint?
+    private var separatorTopToDetailConstraint: NSLayoutConstraint?
+    private var lastAppliedCollapsedState: Bool?
 
     init(
         entries: [AITranscriptEntry],
@@ -5174,17 +5387,19 @@ private final class AITranscriptProcessGroupView: NSView {
         detailLabel.attributedStringValue
     }
 
+    func update(entries: [AITranscriptEntry], elapsedText: String) {
+        self.entries = entries
+        self.elapsedText = elapsedText
+        updateDetailContentIfNeeded()
+        updatePresentation()
+    }
+
     private func configure() {
         setAccessibilityIdentifier("Stacio.AI.transcript.processGroup")
         translatesAutoresizingMaskIntoConstraints = false
 
-        disclosureButton.title = elapsedText
         disclosureButton.font = .systemFont(ofSize: 12, weight: .medium)
         disclosureButton.contentTintColor = .secondaryLabelColor
-        disclosureButton.image = NSImage(
-            systemSymbolName: isCollapsed ? "chevron.right" : "chevron.down",
-            accessibilityDescription: isCollapsed ? "展开处理过程" : "折叠处理过程"
-        )
         disclosureButton.imagePosition = .imageTrailing
         disclosureButton.imageScaling = .scaleProportionallyDown
         disclosureButton.alignment = .left
@@ -5192,23 +5407,15 @@ private final class AITranscriptProcessGroupView: NSView {
         disclosureButton.bezelStyle = .inline
         disclosureButton.target = self
         disclosureButton.action = #selector(togglePressed(_:))
-        disclosureButton.toolTip = isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
         disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
         disclosureButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let detailMarkdown = entries.map(\.text).joined(separator: "\n\n")
-        detailLabel.attributedStringValue = AIAssistantMarkdownRenderer.attributedString(
-            from: detailMarkdown,
-            baseFont: .systemFont(ofSize: 11),
-            textColor: .secondaryLabelColor
-        )
         detailLabel.maximumNumberOfLines = 0
         detailLabel.lineBreakMode = .byCharWrapping
         detailLabel.cell?.wraps = true
         detailLabel.cell?.usesSingleLineMode = false
         detailLabel.isSelectable = true
         detailLabel.allowsEditingTextAttributes = true
-        detailLabel.isHidden = isCollapsed
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -5219,7 +5426,14 @@ private final class AITranscriptProcessGroupView: NSView {
         addSubview(detailLabel)
         addSubview(separator)
         let detailTop = detailLabel.topAnchor.constraint(equalTo: disclosureButton.bottomAnchor, constant: 8)
-        detailTop.priority = isCollapsed ? .defaultLow : .required
+        let separatorTopToDisclosure = separator.topAnchor.constraint(
+            equalTo: disclosureButton.bottomAnchor,
+            constant: 8
+        )
+        let separatorTopToDetail = separator.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 8)
+        detailTopConstraint = detailTop
+        separatorTopToDisclosureConstraint = separatorTopToDisclosure
+        separatorTopToDetailConstraint = separatorTopToDetail
         NSLayoutConstraint.activate([
             disclosureButton.leadingAnchor.constraint(equalTo: leadingAnchor),
             disclosureButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
@@ -5229,12 +5443,45 @@ private final class AITranscriptProcessGroupView: NSView {
             detailTop,
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
-            separator.topAnchor.constraint(
-                equalTo: isCollapsed ? disclosureButton.bottomAnchor : detailLabel.bottomAnchor,
-                constant: 8
-            ),
+            separatorTopToDisclosure,
+            separatorTopToDetail,
             separator.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
         ])
+        updateDetailContentIfNeeded()
+        updatePresentation()
+    }
+
+    private func updateDetailContentIfNeeded() {
+        let detailMarkdown = entries.map(\.text).joined(separator: "\n\n")
+        guard detailMarkdown != renderedDetailMarkdown else { return }
+        renderedDetailMarkdown = detailMarkdown
+        detailLabel.attributedStringValue = AIAssistantMarkdownRenderer.attributedString(
+            from: detailMarkdown,
+            baseFont: .systemFont(ofSize: 11),
+            textColor: .secondaryLabelColor
+        )
+        detailLabel.invalidateIntrinsicContentSize()
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    private func updatePresentation() {
+        let collapsed = isCollapsed
+        if disclosureButton.title != elapsedText {
+            disclosureButton.title = elapsedText
+        }
+        guard lastAppliedCollapsedState != collapsed else { return }
+        lastAppliedCollapsedState = collapsed
+        disclosureButton.image = NSImage(
+            systemSymbolName: collapsed ? "chevron.right" : "chevron.down",
+            accessibilityDescription: collapsed ? "展开处理过程" : "折叠处理过程"
+        )
+        disclosureButton.toolTip = collapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
+        detailLabel.isHidden = collapsed
+        detailTopConstraint?.priority = collapsed ? .defaultLow : .required
+        separatorTopToDisclosureConstraint?.priority = collapsed ? .required : .defaultLow
+        separatorTopToDetailConstraint?.priority = collapsed ? .defaultLow : .required
+        needsLayout = true
     }
 
     @objc private func togglePressed(_ sender: Any?) {
@@ -5332,7 +5579,7 @@ private final class AITranscriptLinkLabel: NSTextField {
 }
 
 private final class AITranscriptBubbleView: NSView {
-    private let entry: AITranscriptEntry
+    private var entry: AITranscriptEntry
     private let onToggle: () -> Void
     private let bubbleView = NSView()
     private let label = AITranscriptLinkLabel(frame: .zero)
@@ -5372,6 +5619,48 @@ private final class AITranscriptBubbleView: NSView {
 
     var attributedStringForTesting: NSAttributedString {
         label.attributedStringValue
+    }
+
+    @discardableResult
+    func update(entry newEntry: AITranscriptEntry) -> Bool {
+        guard entry.role == newEntry.role,
+              entry.isProcessEntry == newEntry.isProcessEntry
+        else {
+            return false
+        }
+
+        let displayTextChanged = entry.displayText != newEntry.displayText
+        entry = newEntry
+        setAccessibilityIdentifier(entry.bubbleAccessibilityIdentifier)
+        bubbleView.layer?.cornerRadius = entry.bubbleCornerRadius
+        StacioDesignSystem.setLayerBackgroundColor(bubbleView, color: entry.bubbleColor)
+        StacioDesignSystem.setLayerBorderColor(bubbleView, color: entry.borderColor)
+        bubbleView.layer?.borderWidth = entry.borderColor == nil ? 0 : 1
+        label.setAccessibilityIdentifier(entry.textAccessibilityIdentifier)
+        label.font = entry.font
+        label.textColor = entry.textColor
+
+        if displayTextChanged {
+            if entry.role == .assistant {
+                let renderedString = AIAssistantMarkdownRenderer.attributedString(
+                    from: entry.displayText,
+                    baseFont: entry.font,
+                    textColor: entry.textColor
+                )
+                renderedAssistantString = renderedString
+                label.attributedStringValue = renderedString
+            } else {
+                renderedAssistantString = nil
+                label.stringValue = entry.displayText
+            }
+            label.invalidateIntrinsicContentSize()
+            bubbleView.invalidateIntrinsicContentSize()
+            invalidateIntrinsicContentSize()
+        }
+        updateDisclosureButton()
+        updatePreferredWidth()
+        needsLayout = true
+        return true
     }
 
     override func layout() {
@@ -5433,16 +5722,12 @@ private final class AITranscriptBubbleView: NSView {
         if entry.isProcessEntry {
             disclosureButton.title = ""
             disclosureButton.isBordered = false
-            disclosureButton.image = NSImage(
-                systemSymbolName: entry.isCollapsed ? "chevron.right" : "chevron.down",
-                accessibilityDescription: entry.isCollapsed ? "展开过程" : "折叠过程"
-            )
             disclosureButton.imageScaling = .scaleProportionallyDown
             disclosureButton.target = self
             disclosureButton.action = #selector(togglePressed(_:))
-            disclosureButton.toolTip = entry.isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
             disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
             disclosureButton.translatesAutoresizingMaskIntoConstraints = false
+            updateDisclosureButton()
             bubbleView.addSubview(disclosureButton)
         }
 
@@ -5498,6 +5783,15 @@ private final class AITranscriptBubbleView: NSView {
 
     @objc private func togglePressed(_ sender: Any?) {
         onToggle()
+    }
+
+    private func updateDisclosureButton() {
+        guard entry.isProcessEntry else { return }
+        disclosureButton.image = NSImage(
+            systemSymbolName: entry.isCollapsed ? "chevron.right" : "chevron.down",
+            accessibilityDescription: entry.isCollapsed ? "展开过程" : "折叠过程"
+        )
+        disclosureButton.toolTip = entry.isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
     }
 
     func resetAssistantAttributedStringForTesting() {
@@ -6927,6 +7221,7 @@ private enum AITranscriptRole {
 }
 
 private struct AITranscriptEntry {
+    let id: UUID = UUID()
     let role: AITranscriptRole
     var text: String
     let requestID: String?

@@ -10,6 +10,8 @@ public struct SessionTabIconDescriptor: Equatable {
     private let resourceIconID: String?
     private let symbolName: String?
 
+    public var systemSymbolName: String? { symbolName }
+
     public init(
         identifier: String,
         accessibilityLabel: String,
@@ -33,6 +35,16 @@ public struct SessionTabIconDescriptor: Equatable {
         accessibilityLabel: "SSH",
         shortLabel: ">_",
         backgroundColor: NSColor(calibratedRed: 0.18, green: 0.22, blue: 0.29, alpha: 1)
+    )
+
+    public static let consoleSystemSymbolName = "bluetooth"
+
+    public static let console = SessionTabIconDescriptor(
+        identifier: "console-default",
+        accessibilityLabel: "蓝牙 Console",
+        shortLabel: "",
+        backgroundColor: .clear,
+        symbolName: consoleSystemSymbolName
     )
 
     public static func catalogIcon(id: String, accessibilityLabel: String? = nil) -> SessionTabIconDescriptor? {
@@ -109,13 +121,11 @@ public struct SessionTabIconDescriptor: Equatable {
 
     public func image(size: NSSize = NSSize(width: 18, height: 18)) -> NSImage {
         if let symbolName,
-           let image = NSImage(
-               systemSymbolName: symbolName,
-               accessibilityDescription: accessibilityLabel
+           let image = StacioSymbolImage.image(
+               named: symbolName,
+               accessibilityDescription: accessibilityLabel,
+               size: size
            ) {
-            image.isTemplate = true
-            image.size = size
-            image.accessibilityDescription = accessibilityLabel
             return image
         }
         if let resourceIconID,

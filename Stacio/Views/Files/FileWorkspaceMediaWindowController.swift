@@ -138,6 +138,7 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
         let source = Self.jsonString(document.sourceURL.absoluteString)
         let fileName = Self.jsonString(document.fileName)
         let sizeText = Self.jsonString(ByteCountFormatter.string(fromByteCount: Int64(clamping: document.byteCount), countStyle: .file))
+        let symbolSources = Self.nativeSymbolSourcesJSON
         let mode: String
         switch document.contentKind {
         case .image: mode = "image"
@@ -173,6 +174,9 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
     .control:active { background: rgba(255,255,255,.22); }
     .control.primary { background: #f4f5f6; color: #111216; }
     .control.primary:hover { background: #fff; }
+    .sf-symbol { width: 16px; height: 16px; display: block; object-fit: contain; filter: brightness(0) invert(1); pointer-events: none; }
+    .control.primary .sf-symbol, .audio-art .sf-symbol { filter: none; }
+    .audio-art .sf-symbol { width: 30px; height: 30px; }
     .range { accent-color: #f2f3f4; min-width: 120px; flex: 1 1 260px; }
     .volume-range { accent-color: #f2f3f4; width: 82px; min-width: 82px; flex: 0 0 82px; }
     .time { min-width: 42px; color: rgba(255,255,255,.72); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -196,16 +200,30 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
     const fileName = \#(fileName);
     const fileSize = \#(sizeText);
     const mode = "\#(mode)";
+    const symbolSources = \#(symbolSources);
     const app = document.getElementById('app');
     let hideTimer = 0;
 
     function post(action, values = {}) {
       window.webkit.messageHandlers.stacioMedia.postMessage(Object.assign({ action }, values));
     }
-    function control(label, title, action, primary = false) {
+    function symbol(name) {
+      const image = document.createElement('img');
+      image.className = 'sf-symbol';
+      image.src = symbolSources[name] || '';
+      image.alt = '';
+      image.setAttribute('aria-hidden', 'true');
+      image.dataset.sfSymbol = name;
+      return image;
+    }
+    function setControlSymbol(button, name) {
+      button.replaceChildren(symbol(name));
+      button.dataset.sfSymbol = name;
+    }
+    function control(symbolName, title, action, primary = false) {
       const button = document.createElement('button');
       button.className = `control${primary ? ' primary' : ''}`;
-      button.innerHTML = label;
+      setControlSymbol(button, symbolName);
       button.title = title;
       button.setAttribute('aria-label', title);
       button.addEventListener('click', event => { event.stopPropagation(); action(); });
@@ -231,7 +249,7 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       const controls = document.createElement('div');
       controls.className = 'floating top';
       extra.forEach(item => controls.appendChild(item));
-      controls.appendChild(control('&#x2715;', '关闭', () => post('close')));
+      controls.appendChild(control('xmark', '关闭', () => post('close')));
       app.appendChild(controls);
       return controls;
     }
@@ -242,7 +260,7 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
         progress.value = player.currentTime || 0;
         elapsed.textContent = formatTime(player.currentTime);
         duration.textContent = formatTime(total);
-        playButton.innerHTML = player.paused ? '&#x25B6;' : '&#x23F8;';
+        setControlSymbol(playButton, player.paused ? 'play.fill' : 'pause.fill');
         playButton.title = player.paused ? '播放' : '暂停';
       };
       player.addEventListener('timeupdate', sync);
@@ -257,7 +275,10 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       const sync = () => {
         const silent = player.muted || player.volume === 0;
         volumeSlider.value = silent ? '0' : String(player.volume);
-        muteButton.innerHTML = silent ? '&#x1F507;' : (player.volume < .5 ? '&#x1F509;' : '&#x1F50A;');
+        setControlSymbol(
+          muteButton,
+          silent ? 'speaker.slash.fill' : (player.volume < .5 ? 'speaker.wave.1.fill' : 'speaker.wave.2.fill')
+        );
         muteButton.title = silent ? '取消静音' : '静音';
         muteButton.setAttribute('aria-label', muteButton.title);
         muteButton.style.opacity = silent ? '.62' : '1';
@@ -299,10 +320,10 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       image.alt = fileName;
       stage.appendChild(image);
       makeTopControls([
-        control('&#x2212;', '缩小', () => { scale = Math.max(.2, scale - .1); apply(); }),
-        control('&#x2B;', '放大', () => { scale = Math.min(5, scale + .1); apply(); }),
-        control('1:1', '实际大小', () => { fit = !fit; scale = 1; apply(); }),
-        control('&#x21BB;', '顺时针旋转', () => { rotation = (rotation + 90) % 360; apply(); })
+        control('minus.magnifyingglass', '缩小', () => { scale = Math.max(.2, scale - .1); apply(); }),
+        control('plus.magnifyingglass', '放大', () => { scale = Math.min(5, scale + .1); apply(); }),
+        control('viewfinder', '实际大小', () => { fit = !fit; scale = 1; apply(); }),
+        control('rotate.right', '顺时针旋转', () => { rotation = (rotation + 90) % 360; apply(); })
       ]);
       apply();
       installAutoHide();
@@ -319,13 +340,13 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       makeTopControls();
       const transport = document.createElement('div');
       transport.className = 'floating transport';
-      const rewind = control('-10', '快退 10 秒', () => { video.currentTime = Math.max(0, video.currentTime - 10); });
-      const play = control('&#x25B6;', '播放', () => video.paused ? video.play() : video.pause(), true);
-      const forward = control('+10', '快进 10 秒', () => { video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10); });
+      const rewind = control('gobackward.10', '快退 10 秒', () => { video.currentTime = Math.max(0, video.currentTime - 10); });
+      const play = control('play.fill', '播放', () => video.paused ? video.play() : video.pause(), true);
+      const forward = control('goforward.10', '快进 10 秒', () => { video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10); });
       const elapsed = document.createElement('span'); elapsed.className = 'time';
       const duration = document.createElement('span'); duration.className = 'time';
       const progress = document.createElement('input'); progress.className = 'range'; progress.type = 'range'; progress.min = '0'; progress.step = '.05';
-      const mute = control('&#x1F50A;', '静音', () => {});
+      const mute = control('speaker.wave.2.fill', '静音', () => {});
       const volume = document.createElement('input'); volume.id = 'video-volume'; volume.className = 'volume-range'; volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '.01'; volume.value = '1'; volume.setAttribute('aria-label', '视频音量');
       [rewind, play, forward, elapsed, progress, duration, mute, volume].forEach(item => transport.appendChild(item));
       app.appendChild(transport);
@@ -335,7 +356,8 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       installAutoHide();
     }
     function renderAudio() {
-      app.innerHTML = '<div class="audio-shell"><div class="audio-art">&#x266B;</div><div class="audio-main"><div><div class="audio-title"></div><div class="audio-meta"></div></div><div class="audio-progress"><span class="time elapsed"></span><input class="range" type="range" min="0" step=".05"><span class="time duration"></span></div><div class="audio-actions"></div></div><div class="audio-close"></div></div>';
+      app.innerHTML = '<div class="audio-shell"><div class="audio-art"></div><div class="audio-main"><div><div class="audio-title"></div><div class="audio-meta"></div></div><div class="audio-progress"><span class="time elapsed"></span><input class="range" type="range" min="0" step=".05"><span class="time duration"></span></div><div class="audio-actions"></div></div><div class="audio-close"></div></div>';
+      app.querySelector('.audio-art').appendChild(symbol('music.note'));
       app.querySelector('.audio-title').textContent = fileName;
       app.querySelector('.audio-meta').textContent = fileSize;
       const audio = document.createElement('audio');
@@ -345,13 +367,13 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
       audio.src = sourceURL;
       app.appendChild(audio);
       const actions = app.querySelector('.audio-actions');
-      const rewind = control('-10', '快退 10 秒', () => { audio.currentTime = Math.max(0, audio.currentTime - 10); });
-      const play = control('&#x25B6;', '播放', () => audio.paused ? audio.play() : audio.pause(), true);
-      const forward = control('+10', '快进 10 秒', () => { audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 10); });
-      const mute = control('&#x1F50A;', '静音', () => {});
+      const rewind = control('gobackward.10', '快退 10 秒', () => { audio.currentTime = Math.max(0, audio.currentTime - 10); });
+      const play = control('play.fill', '播放', () => audio.paused ? audio.play() : audio.pause(), true);
+      const forward = control('goforward.10', '快进 10 秒', () => { audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 10); });
+      const mute = control('speaker.wave.2.fill', '静音', () => {});
       const volume = document.createElement('input'); volume.id = 'audio-volume'; volume.className = 'volume-range'; volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '.01'; volume.value = '1'; volume.setAttribute('aria-label', '音频音量');
       [rewind, play, forward, mute, volume].forEach(item => actions.appendChild(item));
-      app.querySelector('.audio-close').appendChild(control('&#x2715;', '关闭', () => post('close')));
+      app.querySelector('.audio-close').appendChild(control('xmark', '关闭', () => post('close')));
       bindPlayer(audio, app.querySelector('.range'), app.querySelector('.elapsed'), app.querySelector('.duration'), play);
       bindVolume(audio, mute, volume);
     }
@@ -371,6 +393,46 @@ public final class FileWorkspaceMediaViewController: NSViewController, WKNavigat
 </body>
 </html>
 """#
+    }
+
+    private static let nativeSymbolNames = [
+        "xmark",
+        "minus.magnifyingglass",
+        "plus.magnifyingglass",
+        "viewfinder",
+        "rotate.right",
+        "play.fill",
+        "pause.fill",
+        "gobackward.10",
+        "goforward.10",
+        "speaker.wave.2.fill",
+        "speaker.wave.1.fill",
+        "speaker.slash.fill",
+        "music.note"
+    ]
+
+    private static let nativeSymbolSourcesJSON: String = {
+        let sources = Dictionary(uniqueKeysWithValues: nativeSymbolNames.compactMap { name in
+            nativeSymbolDataURL(named: name).map { (name, $0) }
+        })
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard let data = try? encoder.encode(sources),
+              let json = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return json
+    }()
+
+    private static func nativeSymbolDataURL(named name: String) -> String? {
+        guard let image = NSImage(
+            systemSymbolName: name,
+            accessibilityDescription: nil
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)),
+            let tiff = image.tiffRepresentation,
+            let bitmap = NSBitmapImageRep(data: tiff),
+            let png = bitmap.representation(using: .png, properties: [:])
+        else { return nil }
+        return "data:image/png;base64,\(png.base64EncodedString())"
     }
 
     private static func jsonString(_ value: String) -> String {

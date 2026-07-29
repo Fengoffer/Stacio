@@ -5,7 +5,7 @@ SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="${STACIO_PACKAGE_ROOT_OVERRIDE:-$SCRIPT_ROOT_DIR}"
 APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"
-VERSION="${STACIO_VERSION:-0.14.1}"
+VERSION="${STACIO_VERSION:-0.14.2}"
 BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
 SWIFT_BUILD_TRIPLE="${STACIO_SWIFT_BUILD_TRIPLE:-}"
 CARGO_BUILD_TARGET="${STACIO_CARGO_BUILD_TARGET:-}"
@@ -726,6 +726,8 @@ cat >"$PLIST_PATH" <<PLIST
   <string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Stacio 使用蓝牙连接你选择的 BLE Console 设备。</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsArbitraryLoadsInWebContent</key>

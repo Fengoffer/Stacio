@@ -30,8 +30,14 @@ final class ProductOpsWindowControllerTests: XCTestCase {
             content.firstSubview(withIdentifier: "Stacio.Feedback.contact") as? NSTextField
         )
         XCTAssertEqual(contact.placeholderString, "邮箱，选填")
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Feedback.includeDiagnostics") as? NSButton)
-        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Feedback.previewDiagnostics") as? NSButton)
+        let includeDiagnostics = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.includeDiagnostics") as? NSButton
+        )
+        XCTAssertEqual(includeDiagnostics.state, .on)
+        let previewDiagnostics = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.previewDiagnostics") as? NSButton
+        )
+        XCTAssertTrue(previewDiagnostics.isEnabled)
         let typePopup = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.type") as? NSPopUpButton)
         XCTAssertEqual(typePopup.itemTitles, FeedbackType.allCases.map(\.displayName))
         let diagnostics = try XCTUnwrap(
@@ -42,6 +48,243 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         XCTAssertTrue(diagnostics.stringValue.contains("SSH 配置"))
         let submit = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.submit") as? NSButton)
         XCTAssertEqual(submit.title, "提交反馈")
+    }
+
+    func testFeedbackWindowFreezesOneConsentedDiagnosticSnapshotForPreviewKeyAndPayload() async throws {
+        let timestamp = Date()
+        let firstTrace = try XCTUnwrap(FeedbackDiagnosticTrace(events: [
+            FeedbackDiagnosticTraceEvent(
+                timestamp: timestamp,
+                stage: .preview,
+                sourceType: .bastionHost,
+                vendor: "topsec",
+                sessionCount: 1,
+                conflictCount: 0,
+                result: .ready,
+                errorCode: nil,
+                routeIdentity: "route-a",
+                hasTargetMetadata: true
+            )
+        ]).encodedJSONString())
+        let secondTrace = try XCTUnwrap(FeedbackDiagnosticTrace(events: [
+            FeedbackDiagnosticTraceEvent(
+                timestamp: timestamp,
+                stage: .apply,
+                sourceType: .bastionHost,
+                vendor: "topsec",
+                sessionCount: 1,
+                conflictCount: 0,
+                result: .succeeded,
+                errorCode: nil,
+                routeIdentity: "route-a",
+                hasTargetMetadata: true
+            )
+        ]).encodedJSONString())
+        let environment = FeedbackDiagnosticLogEnvironment(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS 27.0",
+            architecture: "arm64"
+        )
+        let firstLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: environment,
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .importFlow,
+                    eventCode: .sessionImportStage,
+                    stage: .preview,
+                    result: .ready,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        let secondLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: environment,
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .importFlow,
+                    eventCode: .sessionImportStage,
+                    stage: .apply,
+                    result: .succeeded,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        var currentContext = FeedbackDiagnosticContext(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS",
+            deviceID: "anonymous-device",
+            diagnostics: [
+                FeedbackDiagnosticTraceStore.diagnosticsKey: firstTrace,
+                FeedbackDiagnosticLogStore.diagnosticsKey: firstLog
+            ]
+        )
+        let submitter = StubFeedbackSubmitting()
+        let idempotencyStore = RecordingFeedbackIdempotencyStore()
+        let submitted = expectation(description: "submitted with frozen diagnostics")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            contextProvider: { currentContext },
+            submitter: submitter,
+            idempotencyStore: idempotencyStore
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.setIncludeDiagnosticsForTesting(true)
+        let previewText = controller.diagnosticsPreviewTextForTesting()
+        currentContext.diagnostics[FeedbackDiagnosticTraceStore.diagnosticsKey] = secondTrace
+        currentContext.diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey] = secondLog
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.succeeded, in: controller)
+
+        let submittedContext = try XCTUnwrap(submitter.contexts.first)
+        XCTAssertTrue(previewText.contains("阶段=preview"))
+        XCTAssertTrue(previewText.contains("结果=ready"))
+        XCTAssertFalse(previewText.contains("阶段=apply"))
+        XCTAssertFalse(previewText.contains("结果=succeeded"))
+        XCTAssertEqual(submittedContext.diagnostics[FeedbackDiagnosticTraceStore.diagnosticsKey], firstTrace)
+        XCTAssertEqual(submittedContext.diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey], firstLog)
+        XCTAssertEqual(idempotencyStore.keyedContexts, [submittedContext])
+        XCTAssertEqual(idempotencyStore.clearedContexts, [submittedContext])
+        let submittedReport = try XCTUnwrap(submitter.reports.first)
+        let payload = try FeedbackSubmissionService.payload(
+            report: submittedReport,
+            context: submittedContext,
+            configuration: ProductOpsConfiguration(productID: "stacio")
+        )
+        XCTAssertEqual(payload.diagnostics?[FeedbackDiagnosticTraceStore.diagnosticsKey], firstTrace)
+        XCTAssertEqual(payload.diagnostics?[FeedbackDiagnosticLogStore.diagnosticsKey], firstLog)
+    }
+
+    func testFeedbackWindowCanExcludeDiagnosticsCompletely() async throws {
+        let timestamp = Date()
+        let diagnosticLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: FeedbackDiagnosticLogEnvironment(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                architecture: "arm64"
+            ),
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .application,
+                    eventCode: .applicationStarted,
+                    stage: .startup,
+                    result: .succeeded,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        let submitter = StubFeedbackSubmitting()
+        let submitted = expectation(description: "submitted without diagnostics")
+        submitter.onSubmission = { submitted.fulfill() }
+        let configuration = ProductOpsConfiguration(productID: "stacio")
+        let controller = FeedbackWindowController(
+            configuration: configuration,
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device",
+                diagnostics: [FeedbackDiagnosticLogStore.diagnosticsKey: diagnosticLog]
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.setIncludeDiagnosticsForTesting(false)
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+
+        let report = try XCTUnwrap(submitter.reports.first)
+        let context = try XCTUnwrap(submitter.contexts.first)
+        let payload = try FeedbackSubmissionService.payload(
+            report: report,
+            context: context,
+            configuration: configuration
+        )
+        XCTAssertFalse(report.includeDiagnostics)
+        XCTAssertNil(payload.diagnostics)
+    }
+
+    func testFeedbackWindowRecordsOpenStartedAndSuccessfulSubmissionEvents() async throws {
+        let recorder = makeFeedbackDiagnosticLogStoreForWindowTests()
+        let submitter = StubFeedbackSubmitting()
+        let submitted = expectation(description: "successful feedback submission")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(productID: "stacio"),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device"
+            ),
+            submitter: submitter,
+            diagnosticLogRecorder: recorder
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.succeeded, in: controller)
+
+        XCTAssertEqual(
+            recorder.snapshot().events.map(\.eventCode),
+            [.feedbackWindowOpened, .feedbackSubmissionStarted, .feedbackSubmissionSucceeded]
+        )
+    }
+
+    func testFeedbackWindowRecordsFailedSubmissionWithoutRawErrorText() async throws {
+        let recorder = makeFeedbackDiagnosticLogStoreForWindowTests()
+        let submitter = StubFeedbackSubmitting(error: ProductOpsError.timeout)
+        let submitted = expectation(description: "failed feedback submission")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(productID: "stacio"),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device"
+            ),
+            submitter: submitter,
+            diagnosticLogRecorder: recorder
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.failed, in: controller)
+
+        let events = recorder.snapshot().events
+        XCTAssertEqual(
+            events.map(\.eventCode),
+            [.feedbackWindowOpened, .feedbackSubmissionStarted, .feedbackSubmissionFailed]
+        )
+        XCTAssertEqual(events.last?.errorCategory, .timeout)
+        let json = try XCTUnwrap(recorder.snapshot().encodedJSONString())
+        XCTAssertFalse(json.contains(ProductOpsError.timeout.localizedDescription))
     }
 
     func testFeedbackWindowKeepsDraftWhenSubmissionFails() throws {
@@ -360,6 +603,74 @@ final class ProductOpsWindowControllerTests: XCTestCase {
         XCTAssertEqual(actions.downloadedUpdates, [update])
         XCTAssertEqual(actions.remindedLaterUpdates, [update])
         XCTAssertEqual(actions.skippedUpdates, [update])
+    }
+
+    func testUpdatePromptRendersMarkdownReleaseNotesConsistentlyAcrossUpdateSources() throws {
+        let releaseNotes = """
+        # Stacio 0.14.1 本次更新重点
+        ## SCP 与 SFTP 文件传输
+        - 左侧管理本地文件
+        - 右侧管理远端文件
+        """
+        let productController = UpdatePromptWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            checker: StubUpdateChecking(status: .upToDate),
+            urlOpener: StubProductOpsURLOpener()
+        )
+        let sparkleController = UpdatePromptWindowController(
+            sparkleChecker: StubSparkleManualUpdateChecker(),
+            actionHandler: RecordingSparkleUpdateActions()
+        )
+        productController.showWindow(nil)
+        sparkleController.showWindow(nil)
+        defer {
+            productController.close()
+            sparkleController.close()
+        }
+
+        productController.renderStatusForTesting(.updateAvailable(UpdateInfo(
+            version: "0.14.1",
+            build: "298",
+            channel: .stable,
+            releaseNotes: releaseNotes,
+            artifactURL: URL(string: "https://download.example.test/Stacio.dmg"),
+            publishedAt: nil,
+            minSupportedVersion: nil
+        )))
+        sparkleController.renderManualStateForTesting(.available(SparkleUpdatePromptInfo(
+            version: "0.14.1",
+            build: "298",
+            releaseNotes: releaseNotes,
+            packageSize: 30_500_000
+        )))
+
+        let productNotesView = try XCTUnwrap(
+            productController.window?.contentView?.firstSubview(withIdentifier: "Stacio.Update.releaseNotes")
+                as? NSTextView
+        )
+        let sparkleNotesView = try XCTUnwrap(
+            sparkleController.window?.contentView?.firstSubview(withIdentifier: "Stacio.Update.releaseNotes")
+                as? NSTextView
+        )
+        let productNotes = productNotesView.attributedString()
+        let sparkleNotes = sparkleNotesView.attributedString()
+
+        XCTAssertTrue(productNotes.isEqual(to: sparkleNotes))
+        XCTAssertFalse(productNotes.string.contains("# "))
+        XCTAssertFalse(productNotes.string.contains("## "))
+        XCTAssertFalse(productNotes.string.contains("- 左侧"))
+        XCTAssertTrue(productNotes.string.contains("• 左侧管理本地文件"))
+        XCTAssertTrue(productNotes.string.contains("• 右侧管理远端文件"))
+
+        let titleRange = (productNotes.string as NSString).range(of: "Stacio 0.14.1 本次更新重点")
+        let bodyRange = (productNotes.string as NSString).range(of: "左侧管理本地文件")
+        let titleFont = try XCTUnwrap(
+            productNotes.attribute(.font, at: titleRange.location, effectiveRange: nil) as? NSFont
+        )
+        let bodyFont = try XCTUnwrap(
+            productNotes.attribute(.font, at: bodyRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertGreaterThan(titleFont.pointSize, bodyFont.pointSize)
     }
 
     func testReleaseNotesRestoreEscapedLineBreaksAndRenderItemsAsAList() {
@@ -1384,9 +1695,25 @@ private func makeProductOpsWindowDefaults() throws -> UserDefaults {
     return defaults
 }
 
+private func makeFeedbackDiagnosticLogStoreForWindowTests() -> FeedbackDiagnosticLogStore {
+    FeedbackDiagnosticLogStore(
+        routeHashKey: Data(repeating: 0x42, count: 32),
+        environmentProvider: {
+            FeedbackDiagnosticLogEnvironment(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                architecture: "arm64"
+            )
+        }
+    )
+}
+
 private final class StubFeedbackSubmitting: FeedbackSubmitting {
     private var outcomes: [Result<FeedbackSubmissionResult, Error>]
     private(set) var idempotencyKeys: [String] = []
+    private(set) var contexts: [FeedbackDiagnosticContext] = []
+    private(set) var reports: [FeedbackReport] = []
     var onSubmission: (() -> Void)?
 
     init(error: Error? = nil) {
@@ -1411,11 +1738,31 @@ private final class StubFeedbackSubmitting: FeedbackSubmitting {
         idempotencyKey: String
     ) async throws -> FeedbackSubmissionResult {
         idempotencyKeys.append(idempotencyKey)
+        contexts.append(context)
+        reports.append(report)
         onSubmission?()
         guard outcomes.isEmpty == false else {
             return FeedbackSubmissionResult(id: "feedback-1", message: "ok")
         }
         return try outcomes.removeFirst().get()
+    }
+}
+
+private final class RecordingFeedbackIdempotencyStore: FeedbackIdempotencyKeyStoring {
+    private(set) var keyedContexts: [FeedbackDiagnosticContext] = []
+    private(set) var clearedContexts: [FeedbackDiagnosticContext] = []
+
+    func key(for report: FeedbackReport, context: FeedbackDiagnosticContext) -> String {
+        keyedContexts.append(context)
+        return "frozen-diagnostic-key"
+    }
+
+    func clearKey(
+        for report: FeedbackReport,
+        context: FeedbackDiagnosticContext,
+        matching idempotencyKey: String
+    ) {
+        clearedContexts.append(context)
     }
 }
 

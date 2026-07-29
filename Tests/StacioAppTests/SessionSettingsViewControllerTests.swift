@@ -58,6 +58,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
                 "SFTP（安全文件传输）",
                 "SCP（安全复制）",
                 "串口",
+                "蓝牙 Console",
                 "本地终端"
             ]
         )
@@ -77,9 +78,24 @@ final class SessionSettingsViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             controller.protocolSourceListLabelsForTesting,
-            ["SSH", "Telnet", "VNC", "SFTP", "SCP", "串口", "本地终端"]
+            ["SSH", "Telnet", "VNC", "SFTP", "SCP", "串口", "蓝牙 Console", "本地终端"]
         )
         XCTAssertFalse(controller.protocolSourceListLabelsForTesting.contains { $0.contains("（") })
+    }
+
+    func testTransientFileTransferEditorRestrictsProtocolToCurrentWorkspace() {
+        let controller = SessionSettingsViewController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            initialProtocol: .scp,
+            selectableProtocols: [.scp]
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.selectedProtocolForTesting, .scp)
+        XCTAssertEqual(controller.protocolSourceListLabelsForTesting, ["SCP"])
     }
 
     func testSFTPAndSCPSessionTypesUseDistinctAvailableSymbols() {
@@ -190,6 +206,181 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("SFTP"))
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("SCP"))
         XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("串口"))
+        XCTAssertTrue(controller.protocolSourceListLabelsForTesting.contains("蓝牙 Console"))
+    }
+
+    func testConsoleProtocolUsesBluetoothSymbolAndRequiresBindingBeforeNewSessionCanSave() {
+        let scanner = RecordingBLEConsoleScannerPresenter(result: nil)
+        let controller = SessionSettingsViewController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            bleConsoleScannerPresenter: scanner
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.console)
+
+        XCTAssertEqual(SessionSettingsProtocol.console.storageKey, "console")
+        XCTAssertEqual(SessionSettingsProtocol.console.systemSymbolName, "bluetooth")
+        XCTAssertFalse(controller.hostRowIsHiddenForTesting)
+        XCTAssertTrue(controller.portRowIsHiddenForTesting)
+        XCTAssertTrue(controller.userRowIsHiddenForTesting)
+        XCTAssertTrue(controller.authRowIsHiddenForTesting)
+        XCTAssertTrue(controller.privateKeyRowIsHiddenForTesting)
+        XCTAssertTrue(controller.credentialSecretRowIsHiddenForTesting)
+        XCTAssertTrue(controller.consoleScanButtonIsVisibleForTesting)
+        XCTAssertFalse(controller.saveButtonIsEnabledForTesting)
+        XCTAssertNil(try? controller.draft() ?? nil)
+    }
+
+    func testConsoleBindingAutofillsEmptySessionNameFromSelectedDevice() throws {
+        let config = makeConsoleConfig(deviceID: UUID())
+        let controller = makeController(
+            bleConsoleScannerPresenter: RecordingBLEConsoleScannerPresenter(result: config)
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.console)
+        controller.setSSHValuesForTesting(
+            SessionSidebarSessionFormValues(
+                name: "",
+                host: "",
+                port: "0",
+                username: "",
+                authMode: .agent,
+                privateKeyPath: "",
+                credentialSecret: "",
+                tags: ""
+            )
+        )
+        controller.requestConsoleBindingForTesting()
+
+        XCTAssertEqual(controller.nameValueForTesting, "NBEE_BLE_1103")
+        XCTAssertEqual(try XCTUnwrap(controller.draft()).name, "NBEE_BLE_1103")
+    }
+
+    func testConsoleBindingPreservesUserProvidedSessionName() throws {
+        let config = makeConsoleConfig(deviceID: UUID())
+        let controller = makeController(
+            bleConsoleScannerPresenter: RecordingBLEConsoleScannerPresenter(result: config)
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.console)
+        controller.setSSHValuesForTesting(
+            SessionSidebarSessionFormValues(
+                name: "核心交换机",
+                host: "",
+                port: "0",
+                username: "",
+                authMode: .agent,
+                privateKeyPath: "",
+                credentialSecret: "",
+                tags: ""
+            )
+        )
+        controller.requestConsoleBindingForTesting()
+
+        XCTAssertEqual(controller.nameValueForTesting, "核心交换机")
+        XCTAssertEqual(try XCTUnwrap(controller.draft()).name, "核心交换机")
+    }
+
+    func testConsoleBindingBuildsConsoleOnlyDraft() throws {
+        let deviceID = UUID()
+        let config = makeConsoleConfig(deviceID: deviceID)
+        let scanner = RecordingBLEConsoleScannerPresenter(result: config)
+        let controller = SessionSettingsViewController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            bleConsoleScannerPresenter: scanner
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.console)
+        controller.setSSHValuesForTesting(
+            SessionSidebarSessionFormValues(
+                name: "NBEE Console",
+                host: "ignored",
+                port: "22",
+                username: "ignored",
+                authMode: .privateKey,
+                privateKeyPath: "~/.ssh/ignored",
+                credentialSecret: "ignored",
+                tags: "ble"
+            )
+        )
+        controller.setPostConnectScriptForTesting("echo should-not-be-in-console-config")
+        controller.requestConsoleBindingForTesting()
+
+        let draft = try XCTUnwrap(controller.draft())
+        XCTAssertEqual(scanner.presentCount, 1)
+        XCTAssertEqual(draft.protocol, "console")
+        XCTAssertEqual(draft.host, "NBEE_BLE_1103 (BLE)")
+        XCTAssertEqual(draft.port, 0)
+        XCTAssertNil(draft.username)
+        XCTAssertNil(draft.privateKeyPath)
+        XCTAssertNil(draft.credentialId)
+        let configJSON = try XCTUnwrap(draft.configJson)
+        let decoded = try CoreBridge.parseConsoleSessionConfig(json: configJSON)
+        XCTAssertEqual(decoded.ble.profileId, "bterm-ffe1-split-v1")
+        XCTAssertEqual(decoded.ble.platformBindings.macOsPeripheralUuid, deviceID.uuidString)
+        XCTAssertNil(decoded.sppFallback)
+        let configObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(configJSON.utf8)) as? [String: Any])
+        XCTAssertNil(configObject["postConnectScript"])
+        XCTAssertNil(configObject["sessionIconID"])
+    }
+
+    func testExistingConsoleConfigWithoutMacOSBindingIsSaveableButRequiresRebind() throws {
+        let config = makeConsoleConfig(deviceID: nil)
+        let controller = SessionSettingsViewController(
+            existingSession: SessionRecord(
+                id: "console_import",
+                folderId: nil,
+                name: "Imported BLE",
+                protocol: "console",
+                host: "NBEE_BLE_1103 (BLE)",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                lastOpenedAt: nil
+            ),
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            existingSerialConfigJSON: try CoreBridge.serializeConsoleSessionConfig(config: config),
+            bleConsoleScannerPresenter: RecordingBLEConsoleScannerPresenter(result: nil)
+        )
+
+        controller.loadView()
+
+        XCTAssertTrue(controller.saveButtonIsEnabledForTesting)
+        XCTAssertTrue(controller.consoleEditorRequiresRebindForTesting)
+        XCTAssertEqual(try XCTUnwrap(controller.draft()).port, 0)
+    }
+
+    func testSelectingSerialDoesNotStartBLEScanningOrChangeNBEEDeviceDiscovery() {
+        var serialDiscoveryCalls = 0
+        let scanner = RecordingBLEConsoleScannerPresenter(result: nil)
+        let controller = SessionSettingsViewController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            serialDevicePathProvider: {
+                serialDiscoveryCalls += 1
+                return ["/dev/tty.NBEE_SPP_1103"]
+            },
+            bleConsoleScannerPresenter: scanner
+        )
+
+        controller.loadView()
+        controller.selectProtocolForTesting(.serial)
+
+        XCTAssertEqual(scanner.presentCount, 0)
+        XCTAssertGreaterThan(serialDiscoveryCalls, 0)
+        XCTAssertEqual(controller.hostSuggestionsForTesting, ["/dev/tty.NBEE_SPP_1103"])
     }
 
     func testSessionSettingsCopyUsesChineseMacOSTerms() {
@@ -197,8 +388,8 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(L10n.SessionSettings.agent, "SSH 代理")
         XCTAssertEqual(L10n.SessionSettings.storedInKeychain, "已保存到 Stacio 凭据库")
         XCTAssertEqual(L10n.SessionErrors.keychainAccessDenied, "Stacio 凭据库无法读写，请检查本机文件权限后再试。")
-        XCTAssertEqual(L10n.DeleteSession.oneMessage, "保存的会话将被移除，并同时清除该会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。")
-        XCTAssertEqual(L10n.DeleteSession.manyMessage(2), "2 个保存的会话将被移除，并同时清除这些会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。")
+        XCTAssertEqual(L10n.DeleteSession.oneMessage, "保存的会话将被移除，并同时清除该会话的本地编辑缓存。如该会话正在连接，相关连接将立即断开。Stacio 凭据库中的凭据不会被删除。")
+        XCTAssertEqual(L10n.DeleteSession.manyMessage(2), "2 个保存的会话将被移除，并同时清除这些会话的本地编辑缓存。如这些会话正在连接，相关连接将立即断开。Stacio 凭据库中的凭据不会被删除。")
         XCTAssertEqual(L10n.QuickConnect.message, "输入 SSH 目标，例如 用户名@主机:22。")
         XCTAssertEqual(L10n.Import.chooseFile, "选择要导入的会话文件。")
     }
@@ -1077,7 +1268,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.hostValueForTesting, "/dev/cu.Custom-Console")
     }
 
-    func testSerialProtocolPrefersNBEETTYDeviceWithoutChangingOtherSerialDevices() throws {
+    func testSerialProtocolPrefersNBEECUDeviceWithoutChangingOtherSerialDevices() throws {
         let controller = SessionSettingsViewController(
             existingSession: nil,
             selectedFolderID: nil,
@@ -1100,7 +1291,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
             controller.serialDevicePathChoicesForTesting,
             [
                 "/dev/cu.usbserial-001",
-                "/dev/tty.NBEE_SPP_1103",
+                "/dev/cu.NBEE_SPP_1103",
                 "/dev/cu.Other-Bluetooth"
             ]
         )
@@ -1423,7 +1614,10 @@ final class SessionSettingsViewControllerTests: XCTestCase {
 
     func testAvailableProtocolsCanBuildSessionDrafts() throws {
         for sessionProtocol in SessionSettingsProtocol.allCases where sessionProtocol.isAvailableForSaving {
-            let controller = makeController()
+            let scanner = sessionProtocol == .console
+                ? RecordingBLEConsoleScannerPresenter(result: makeConsoleConfig(deviceID: UUID()))
+                : nil
+            let controller = makeController(bleConsoleScannerPresenter: scanner)
             controller.loadView()
             controller.selectProtocolForTesting(sessionProtocol)
             controller.setSSHValuesForTesting(
@@ -1438,11 +1632,18 @@ final class SessionSettingsViewControllerTests: XCTestCase {
                     tags: ""
                 )
             )
+            if sessionProtocol == .console {
+                controller.requestConsoleBindingForTesting()
+            }
 
             let draft = try XCTUnwrap(controller.draft(), "Expected draft for \(sessionProtocol.label)")
 
             XCTAssertEqual(draft.protocol, sessionProtocol.storageKey)
-            XCTAssertGreaterThan(draft.port, 0, "Expected positive port/default parameter for \(sessionProtocol.label)")
+            if sessionProtocol == .console {
+                XCTAssertEqual(draft.port, 0)
+            } else {
+                XCTAssertGreaterThan(draft.port, 0, "Expected positive port/default parameter for \(sessionProtocol.label)")
+            }
         }
     }
 
@@ -1526,11 +1727,14 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(windowController.window?.title, "新建会话")
     }
 
-    private func makeController() -> SessionSettingsViewController {
+    private func makeController(
+        bleConsoleScannerPresenter: BLEConsoleScannerPresenting? = nil
+    ) -> SessionSettingsViewController {
         SessionSettingsViewController(
             existingSession: nil,
             selectedFolderID: nil,
-            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" })
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            bleConsoleScannerPresenter: bleConsoleScannerPresenter
         )
     }
 
@@ -1566,10 +1770,49 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         )
     }
 
+    private func makeConsoleConfig(deviceID: UUID?) -> ConsoleSessionConfig {
+        ConsoleSessionConfig(
+            kind: "console",
+            schemaVersion: 1,
+            transportPolicy: "prefer_ble",
+            ble: ConsoleBleConfig(
+                deviceName: "NBEE_BLE_1103",
+                profileId: "bterm-ffe1-split-v1",
+                serviceUuid: "FFE1",
+                txCharacteristicUuid: "FFE3",
+                rxCharacteristicUuid: "FFE2",
+                writeType: "without_response",
+                platformBindings: ConsolePlatformBindings(
+                    macOsPeripheralUuid: deviceID?.uuidString,
+                    windowsDeviceId: nil
+                )
+            ),
+            sppFallback: nil
+        )
+    }
+
     private func serialConfigDictionary(from draft: SessionDraft) throws -> [String: Any] {
         let configJSON = try XCTUnwrap(draft.configJson)
         let object = try JSONSerialization.jsonObject(with: Data(configJSON.utf8))
         return try XCTUnwrap(object as? [String: Any])
+    }
+}
+
+@MainActor
+private final class RecordingBLEConsoleScannerPresenter: BLEConsoleScannerPresenting {
+    private let result: ConsoleSessionConfig?
+    private(set) var presentCount = 0
+
+    init(result: ConsoleSessionConfig?) {
+        self.result = result
+    }
+
+    func presentBLEConsoleScanner(
+        parentWindow: NSWindow?,
+        initialConfig: ConsoleSessionConfig?
+    ) -> ConsoleSessionConfig? {
+        presentCount += 1
+        return result
     }
 }
 

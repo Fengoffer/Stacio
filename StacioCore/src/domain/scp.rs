@@ -7,6 +7,32 @@ pub enum ScpDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Enum)]
+pub enum RemoteTransferProtocol {
+    Scp,
+    Sftp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct RemoteToRemoteTransferRequest {
+    pub job: ScpTransferJob,
+    pub source_protocol: RemoteTransferProtocol,
+    pub destination_protocol: RemoteTransferProtocol,
+    pub requested_offset: u64,
+    pub force_restart: bool,
+    pub chunk_size_bytes: u64,
+    pub worker_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct RemoteToRemoteTransferReport {
+    pub job_id: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub resumed_from: u64,
+    pub sha256_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Enum)]
 pub enum ScpConflictPolicy {
     Overwrite,
     Skip,
@@ -101,8 +127,8 @@ fn path_with_suffix(path: &str, suffix: &str) -> String {
 #[cfg(test)]
 mod scp_domain_tests {
     use super::{
-        resolve_conflict_path, ScpConflictPolicy, ScpDirection, ScpResumeOptions, ScpTransferJob,
-        ScpTransferProgress,
+        resolve_conflict_path, RemoteTransferProtocol, ScpConflictPolicy, ScpDirection,
+        ScpResumeOptions, ScpTransferJob, ScpTransferProgress,
     };
 
     #[test]
@@ -143,6 +169,18 @@ mod scp_domain_tests {
 
         assert_eq!(options.requested_offset, 0);
         assert!(!options.force_restart);
+    }
+
+    #[test]
+    fn remote_transfer_protocol_round_trips_through_uniffi_serialization_shape() {
+        assert_eq!(
+            serde_json::to_string(&RemoteTransferProtocol::Scp).expect("scp protocol"),
+            "\"Scp\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteTransferProtocol::Sftp).expect("sftp protocol"),
+            "\"Sftp\""
+        );
     }
 
     #[test]

@@ -3,6 +3,143 @@ import XCTest
 @testable import StacioApp
 
 final class ProductOpsServicesTests: XCTestCase {
+    func testPublicFeedbackContractCarriesDecodableSafeRecentDiagnosticLogOnlyWithConsent() throws {
+        let timestamp = Date()
+        let diagnosticLog = FeedbackDiagnosticLogSnapshot(
+            environment: FeedbackDiagnosticLogEnvironment(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                architecture: "arm64"
+            ),
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .session,
+                    eventCode: .sessionCreated,
+                    stage: .create,
+                    result: .succeeded,
+                    errorCategory: nil,
+                    resourceHashes: [String(repeating: "a", count: 64)]
+                )
+            ]
+        )
+        let diagnosticJSON = try XCTUnwrap(diagnosticLog.encodedJSONString())
+        let context = FeedbackDiagnosticContext(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS 27.0",
+            deviceID: "anonymous-device",
+            diagnostics: [FeedbackDiagnosticLogStore.diagnosticsKey: diagnosticJSON]
+        )
+        let configuration = ProductOpsConfiguration(
+            apiBaseURL: try XCTUnwrap(URL(string: "https://ops.example.test")),
+            feedbackProductAPIKey: "public-feedback-key",
+            productID: "stacio"
+        )
+        let report = FeedbackReport(
+            title: "Session issue",
+            type: .bug,
+            description: "The saved session did not refresh.",
+            contact: nil,
+            includeDiagnostics: true
+        )
+
+        let request = try FeedbackSubmissionService.makeRequest(
+            report: report,
+            context: context,
+            configuration: configuration,
+            idempotencyKey: "safe-diagnostic-contract"
+        )
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let diagnostics = try XCTUnwrap(object["diagnosticsSummary"] as? [String: String])
+        let storedJSON = try XCTUnwrap(diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey])
+        let storedSnapshot = try JSONDecoder.productOps.decode(
+            FeedbackDiagnosticLogSnapshot.self,
+            from: Data(storedJSON.utf8)
+        )
+
+        XCTAssertEqual(storedJSON, diagnosticJSON)
+        XCTAssertEqual(storedSnapshot.environment, diagnosticLog.environment)
+        XCTAssertEqual(storedSnapshot.events.map(\.eventCode), [.sessionCreated])
+        XCTAssertEqual(storedSnapshot.events.map(\.resourceHashes), [[String(repeating: "a", count: 64)]])
+        XCTAssertLessThan(
+            abs(try XCTUnwrap(storedSnapshot.events.first?.timestamp).timeIntervalSince(timestamp)),
+            1
+        )
+        XCTAssertTrue(context.visibleSummary.contains("session.created"))
+
+        let declinedPayload = try FeedbackSubmissionService.payload(
+            report: FeedbackReport(
+                title: report.title,
+                type: report.type,
+                description: report.description,
+                contact: report.contact,
+                includeDiagnostics: false
+            ),
+            context: context,
+            configuration: configuration
+        )
+        XCTAssertNil(declinedPayload.diagnostics)
+    }
+
+    func testFeedbackPayloadIncludesSafeImportTraceOnlyWithConsent() throws {
+        let trace = FeedbackDiagnosticTrace(
+            version: 1,
+            events: [
+                FeedbackDiagnosticTraceEvent(
+                    timestamp: Date(),
+                    stage: .apply,
+                    sourceType: .bastionHost,
+                    vendor: "topsec",
+                    sessionCount: 2,
+                    conflictCount: 0,
+                    result: .succeeded,
+                    errorCode: nil,
+                    routeIdentity: "topsec|gateway|target-a",
+                    hasTargetMetadata: true
+                )
+            ]
+        )
+        let traceJSON = try XCTUnwrap(trace.encodedJSONString())
+        let context = FeedbackDiagnosticContext(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS",
+            deviceID: "anonymous-device",
+            diagnostics: [FeedbackDiagnosticTraceStore.diagnosticsKey: traceJSON]
+        )
+        let configuration = ProductOpsConfiguration(productID: "stacio")
+
+        let consented = try FeedbackSubmissionService.payload(
+            report: FeedbackReport(
+                title: "Bastion import conflict",
+                type: .bug,
+                description: "The imported session remains after deletion.",
+                contact: nil,
+                includeDiagnostics: true
+            ),
+            context: context,
+            configuration: configuration
+        )
+        let declined = try FeedbackSubmissionService.payload(
+            report: FeedbackReport(
+                title: "Bastion import conflict",
+                type: .bug,
+                description: "The imported session remains after deletion.",
+                contact: nil,
+                includeDiagnostics: false
+            ),
+            context: context,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(consented.diagnostics?[FeedbackDiagnosticTraceStore.diagnosticsKey], traceJSON)
+        XCTAssertNil(declined.diagnostics)
+    }
+
     func testServiceErrorsDoNotExposeInternalPlatformName() {
         XCTAssertFalse(ProductOpsError.missingAPIBaseURL.localizedDescription.contains("Product Ops"))
         XCTAssertFalse(ProductOpsError.invalidURL.localizedDescription.contains("Product Ops"))

@@ -1,9 +1,37 @@
+import AppKit
 import XCTest
 import StacioCoreBindings
 @testable import StacioApp
 
 @MainActor
 final class SessionTabIconDescriptorTests: XCTestCase {
+    func testBluetoothConsoleIconProvidesReusableTemplateImage() throws {
+        let image = try XCTUnwrap(
+            StacioSymbolImage.image(
+                named: "bluetooth",
+                accessibilityDescription: "蓝牙 Console",
+                size: NSSize(width: 18, height: 18)
+            )
+        )
+
+        XCTAssertEqual(image.size, NSSize(width: 18, height: 18))
+        XCTAssertTrue(image.isTemplate)
+        XCTAssertEqual(image.accessibilityDescription, "蓝牙 Console")
+        XCTAssertFalse(try XCTUnwrap(image.tiffRepresentation).isEmpty)
+    }
+
+    func testConsoleUsesNativeBluetoothSymbolInSidebarAndTab() {
+        let sidebarIcon = SessionSidebarViewController.sessionProtocolIconDescriptor(for: " Console ")
+        let tabIcon = SessionTabIconDescriptor.console
+
+        XCTAssertEqual(sidebarIcon.symbolName, "bluetooth")
+        XCTAssertEqual(sidebarIcon.accessibilityDescription, "蓝牙 Console")
+        XCTAssertEqual(tabIcon.identifier, "console-default")
+        XCTAssertEqual(tabIcon.systemSymbolName, "bluetooth")
+        XCTAssertEqual(tabIcon.accessibilityLabel, "蓝牙 Console")
+        XCTAssertNotNil(tabIcon.image())
+    }
+
     func testMapsUbuntuReleaseToUbuntuIcon() {
         let descriptor = SessionTabIconDescriptor.operatingSystem(remoteOS(
             id: "ubuntu",

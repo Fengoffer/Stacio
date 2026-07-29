@@ -22,6 +22,18 @@ public struct MultiExecSessionSelection: Equatable {
     }
 }
 
+public struct MultiExecTargetChoice: Equatable {
+    public let target: MultiExecTarget
+    public let sessionProtocol: WorkspaceSessionProtocol
+
+    public init(target: MultiExecTarget, sessionProtocol: WorkspaceSessionProtocol) {
+        self.target = target
+        self.sessionProtocol = sessionProtocol
+    }
+
+    public var id: String { target.id }
+}
+
 public struct MultiExecCommandSnippet: Equatable {
     public let title: String
     public let command: String
@@ -463,13 +475,20 @@ public struct MultiExecTargetPreviewRow: Equatable {
     public let stateLabel: String
     public let isEnabled: Bool
     public let requiresProductionConfirmation: Bool
+    public let sessionProtocol: WorkspaceSessionProtocol
 
     public var summary: String {
         "\(label) - \(environmentLabel) - \(stateLabel)"
     }
 
     public static func rows(for targets: [MultiExecTarget]) -> [MultiExecTargetPreviewRow] {
-        targets.map(Self.init(target:))
+        rows(for: targets.map {
+            MultiExecTargetChoice(target: $0, sessionProtocol: .unmanaged)
+        })
+    }
+
+    public static func rows(for targetChoices: [MultiExecTargetChoice]) -> [MultiExecTargetPreviewRow] {
+        targetChoices.map(Self.init(targetChoice:))
     }
 
     public static func requiresProductionConfirmation(environment: String) -> Bool {
@@ -478,24 +497,26 @@ public struct MultiExecTargetPreviewRow: Equatable {
             .caseInsensitiveCompare("production") == .orderedSame
     }
 
-    private init(target: MultiExecTarget) {
+    private init(targetChoice: MultiExecTargetChoice) {
+        let target = targetChoice.target
         id = target.id
         label = target.label
         requiresProductionConfirmation = Self.requiresProductionConfirmation(environment: target.environment)
         environmentLabel = requiresProductionConfirmation ? L10n.MultiExec.production : L10n.MultiExec.development
         stateLabel = target.enabled ? L10n.MultiExec.executable : L10n.MultiExec.unavailable
         isEnabled = target.enabled
+        sessionProtocol = targetChoice.sessionProtocol
     }
 }
 
 public protocol MultiExecPromptPresenting {
     @MainActor
-    func promptMultiExec(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecPromptRequest?
+    func promptMultiExec(targetChoices: [MultiExecTargetChoice], parentWindow: NSWindow?) -> MultiExecPromptRequest?
 }
 
 public protocol MultiExecSessionSelecting {
     @MainActor
-    func selectMultiExecTargets(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecSessionSelection?
+    func selectMultiExecTargets(targetChoices: [MultiExecTargetChoice], parentWindow: NSWindow?) -> MultiExecSessionSelection?
     @MainActor
     func presentMultiExecError(_ error: Error, parentWindow: NSWindow?)
 }
@@ -588,16 +609,19 @@ public struct AppKitMultiExecPromptPresenter: MultiExecPromptPresenting {
         self.init(macroLibrary: MultiExecMacroLibrary(macros: savedMacros))
     }
 
-    public func promptMultiExec(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecPromptRequest? {
+    public func promptMultiExec(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecPromptRequest? {
         let alert = NSAlert()
         alert.messageText = L10n.MultiExec.title
-        alert.informativeText = targets.isEmpty
+        alert.informativeText = targetChoices.isEmpty
             ? L10n.MultiExec.noTargets
             : L10n.MultiExec.message
         alert.addButton(withTitle: L10n.MultiExec.execute)
         alert.addButton(withTitle: L10n.Common.cancel)
 
-        let form = MultiExecPromptForm(targets: targets, savedMacros: macroLibrary.macros)
+        let form = MultiExecPromptForm(targetChoices: targetChoices, savedMacros: macroLibrary.macros)
         alert.accessoryView = form.view
         alert.buttons.first?.isEnabled = form.canSubmit
         form.onValidationChanged = { [weak alert] canSubmit in
@@ -613,16 +637,19 @@ public struct AppKitMultiExecPromptPresenter: MultiExecPromptPresenting {
 public struct AppKitMultiExecSessionSelector: MultiExecSessionSelecting {
     public init() {}
 
-    public func selectMultiExecTargets(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecSessionSelection? {
+    public func selectMultiExecTargets(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecSessionSelection? {
         let alert = NSAlert()
         alert.messageText = L10n.MultiExec.title
-        alert.informativeText = targets.count < 2
+        alert.informativeText = targetChoices.count < 2
             ? L10n.MultiExec.requiresMultipleTargets
             : L10n.MultiExec.interactiveMessage
         alert.addButton(withTitle: L10n.MultiExec.start)
         alert.addButton(withTitle: L10n.Common.cancel)
 
-        let form = MultiExecSessionSelectionForm(targets: targets)
+        let form = MultiExecSessionSelectionForm(targetChoices: targetChoices)
         alert.accessoryView = form.view
         alert.buttons.first?.isEnabled = form.canSubmit
         form.onValidationChanged = { [weak alert] canSubmit in
@@ -655,6 +682,199 @@ private final class MultiExecTargetListStackView: NSStackView {
     }
 }
 
+private extension WorkspaceSessionProtocol {
+    var multiExecProtocolLabel: String {
+        switch self {
+        case .ssh:
+            return "SSH"
+        case .serial:
+            return "串口"
+        case .console:
+            return "蓝牙 Console"
+        case .telnet:
+            return "Telnet"
+        case .local:
+            return "本地终端"
+        default:
+            return "终端"
+        }
+    }
+
+    var multiExecProtocolSymbolName: String {
+        switch self {
+        case .ssh:
+            return "key.fill"
+        case .serial:
+            return "cable.connector"
+        case .console:
+            return "bluetooth"
+        case .telnet:
+            return "diamond.fill"
+        case .local:
+            return "terminal"
+        default:
+            return "terminal"
+        }
+    }
+
+    var multiExecProtocolAccentColor: NSColor {
+        switch self {
+        case .ssh:
+            return .systemGreen
+        case .serial:
+            return .systemOrange
+        case .console:
+            return .systemBlue
+        case .telnet:
+            return .systemPurple
+        case .local:
+            return .systemGray
+        default:
+            return .secondaryLabelColor
+        }
+    }
+
+    var multiExecProtocolAccentIdentifier: String {
+        switch self {
+        case .ssh:
+            return "green"
+        case .serial:
+            return "orange"
+        case .console:
+            return "blue"
+        case .telnet:
+            return "purple"
+        case .local:
+            return "gray"
+        default:
+            return "secondary"
+        }
+    }
+}
+
+@MainActor
+private final class MultiExecTargetSelectionRowView: NSView {
+    static let minimumHeight: CGFloat = 40
+
+    let targetID: String
+    let checkbox: NSButton
+    let protocolLabel: String
+    let protocolSymbolName: String
+    let protocolAccentIdentifier: String
+
+    init(
+        targetRow: MultiExecTargetPreviewRow,
+        accessibilityIdentifier: String,
+        target: AnyObject?,
+        action: Selector?
+    ) {
+        targetID = targetRow.id
+        protocolLabel = targetRow.sessionProtocol.multiExecProtocolLabel
+        protocolSymbolName = targetRow.sessionProtocol.multiExecProtocolSymbolName
+        protocolAccentIdentifier = targetRow.sessionProtocol.multiExecProtocolAccentIdentifier
+        checkbox = NSButton(checkboxWithTitle: "", target: target, action: action)
+        super.init(frame: .zero)
+
+        translatesAutoresizingMaskIntoConstraints = false
+        toolTip = "\(protocolLabel) · \(targetRow.label)"
+
+        checkbox.identifier = NSUserInterfaceItemIdentifier(targetRow.id)
+        checkbox.state = targetRow.isEnabled ? .on : .off
+        checkbox.isEnabled = targetRow.isEnabled
+        checkbox.setAccessibilityIdentifier(accessibilityIdentifier)
+        checkbox.setAccessibilityLabel(
+            "\(protocolLabel)，\(targetRow.label)，\(targetRow.environmentLabel)，\(targetRow.stateLabel)"
+        )
+        checkbox.translatesAutoresizingMaskIntoConstraints = false
+
+        let accentColor = targetRow.sessionProtocol.multiExecProtocolAccentColor
+        let iconView = NSImageView()
+        iconView.image = StacioSymbolImage.image(
+            named: protocolSymbolName,
+            accessibilityDescription: protocolLabel,
+            size: NSSize(width: 18, height: 18)
+        )
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.contentTintColor = targetRow.isEnabled ? accentColor : .tertiaryLabelColor
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: targetRow.label)
+        titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        titleLabel.textColor = targetRow.isEnabled
+            ? StacioDesignSystem.theme.primaryTextColor
+            : .tertiaryLabelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.toolTip = targetRow.label
+
+        let detailLabel = NSTextField(
+            labelWithString: "\(targetRow.environmentLabel) · \(targetRow.stateLabel)"
+        )
+        detailLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        detailLabel.textColor = targetRow.isEnabled
+            ? StacioDesignSystem.theme.secondaryTextColor
+            : .tertiaryLabelColor
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.maximumNumberOfLines = 1
+
+        let textStack = NSStackView(views: [titleLabel, detailLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let protocolLabelView = NSTextField(labelWithString: protocolLabel)
+        protocolLabelView.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        protocolLabelView.textColor = targetRow.isEnabled ? accentColor : .tertiaryLabelColor
+        protocolLabelView.alignment = .right
+        protocolLabelView.lineBreakMode = .byTruncatingTail
+        protocolLabelView.maximumNumberOfLines = 1
+        protocolLabelView.setAccessibilityIdentifier(
+            "Stacio.MultiExec.targetProtocol.\(targetRow.id)"
+        )
+        protocolLabelView.translatesAutoresizingMaskIntoConstraints = false
+        protocolLabelView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        addSubview(checkbox)
+        addSubview(iconView)
+        addSubview(textStack)
+        addSubview(protocolLabelView)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(greaterThanOrEqualToConstant: Self.minimumHeight),
+            checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 8),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 20),
+            iconView.heightAnchor.constraint(equalToConstant: 20),
+            textStack.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            textStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            protocolLabelView.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 12),
+            protocolLabelView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            protocolLabelView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            protocolLabelView.widthAnchor.constraint(greaterThanOrEqualToConstant: 74)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        let checkboxPoint = convert(point, to: checkbox)
+        return checkbox.bounds.contains(checkboxPoint) ? checkbox : self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard checkbox.isEnabled else { return }
+        checkbox.state = checkbox.state == .on ? .off : .on
+        checkbox.sendAction(checkbox.action, to: checkbox.target)
+    }
+}
+
 @MainActor
 final class MultiExecSessionSelectionForm: NSObject {
     let view: NSView
@@ -663,18 +883,25 @@ final class MultiExecSessionSelectionForm: NSObject {
     private let targets: [MultiExecTarget]
     private let targetRows: [MultiExecTargetPreviewRow]
     private var targetCheckboxes: [NSButton] = []
+    private var targetSelectionRows: [MultiExecTargetSelectionRowView] = []
 
-    init(targets: [MultiExecTarget]) {
-        self.targets = targets
-        self.targetRows = MultiExecTargetPreviewRow.rows(for: targets)
+    convenience init(targets: [MultiExecTarget]) {
+        self.init(targetChoices: targets.map {
+            MultiExecTargetChoice(target: $0, sessionProtocol: .unmanaged)
+        })
+    }
+
+    init(targetChoices: [MultiExecTargetChoice]) {
+        self.targets = targetChoices.map(\.target)
+        self.targetRows = MultiExecTargetPreviewRow.rows(for: targetChoices)
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 180))
         container.translatesAutoresizingMaskIntoConstraints = false
 
         let targetStack = MultiExecTargetListStackView()
         targetStack.orientation = .vertical
-        targetStack.spacing = 6
-        targetStack.alignment = .leading
+        targetStack.spacing = 4
+        targetStack.alignment = .width
         targetStack.translatesAutoresizingMaskIntoConstraints = false
 
         let targetScrollView = NSScrollView()
@@ -731,23 +958,38 @@ final class MultiExecSessionSelectionForm: NSObject {
         }
 
         for target in targetRows {
-            let checkbox = NSButton(
-                checkboxWithTitle: target.summary,
+            let row = MultiExecTargetSelectionRowView(
+                targetRow: target,
+                accessibilityIdentifier: "Stacio.MultiExec.sessionTarget.\(target.id)",
                 target: self,
                 action: #selector(refreshValidation)
             )
-            checkbox.identifier = NSUserInterfaceItemIdentifier(target.id)
-            checkbox.state = target.isEnabled ? .on : .off
-            checkbox.isEnabled = target.isEnabled
-            checkbox.setAccessibilityIdentifier("Stacio.MultiExec.sessionTarget.\(target.id)")
-            targetCheckboxes.append(checkbox)
-            stack.addArrangedSubview(checkbox)
+            targetCheckboxes.append(row.checkbox)
+            targetSelectionRows.append(row)
+            stack.addArrangedSubview(row)
         }
     }
 
     @objc
     private func refreshValidation() {
         onValidationChanged?(canSubmit)
+    }
+
+    var protocolLabelsForTesting: [String: String] {
+        Dictionary(uniqueKeysWithValues: targetSelectionRows.map { ($0.targetID, $0.protocolLabel) })
+    }
+
+    var protocolSymbolNamesForTesting: [String: String] {
+        Dictionary(uniqueKeysWithValues: targetSelectionRows.map { ($0.targetID, $0.protocolSymbolName) })
+    }
+
+    var protocolLabelsUseDistinctAccentColorsForTesting: Bool {
+        let identifiers = targetSelectionRows.map(\.protocolAccentIdentifier)
+        return Set(identifiers).count == identifiers.count
+    }
+
+    var minimumTargetRowHeightForTesting: CGFloat {
+        MultiExecTargetSelectionRowView.minimumHeight
     }
 }
 
@@ -768,9 +1010,18 @@ private final class MultiExecPromptForm: NSObject {
     private let savedMacros: [MultiExecSavedMacro]
     private var targetCheckboxes: [NSButton] = []
 
-    init(targets: [MultiExecTarget], savedMacros: [MultiExecSavedMacro] = []) {
-        self.targets = targets
-        self.targetRows = MultiExecTargetPreviewRow.rows(for: targets)
+    convenience init(targets: [MultiExecTarget], savedMacros: [MultiExecSavedMacro] = []) {
+        self.init(
+            targetChoices: targets.map {
+                MultiExecTargetChoice(target: $0, sessionProtocol: .unmanaged)
+            },
+            savedMacros: savedMacros
+        )
+    }
+
+    init(targetChoices: [MultiExecTargetChoice], savedMacros: [MultiExecSavedMacro] = []) {
+        self.targets = targetChoices.map(\.target)
+        self.targetRows = MultiExecTargetPreviewRow.rows(for: targetChoices)
         self.savedMacros = savedMacros
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 300))
@@ -778,8 +1029,8 @@ private final class MultiExecPromptForm: NSObject {
 
         let targetStack = MultiExecTargetListStackView()
         targetStack.orientation = .vertical
-        targetStack.spacing = 6
-        targetStack.alignment = .leading
+        targetStack.spacing = 4
+        targetStack.alignment = .width
         targetStack.translatesAutoresizingMaskIntoConstraints = false
 
         let inputScrollView = NSScrollView()
@@ -907,17 +1158,14 @@ private final class MultiExecPromptForm: NSObject {
         }
 
         for target in targetRows {
-            let checkbox = NSButton(
-                checkboxWithTitle: target.summary,
+            let row = MultiExecTargetSelectionRowView(
+                targetRow: target,
+                accessibilityIdentifier: "Stacio.MultiExec.target.\(target.id)",
                 target: self,
                 action: #selector(refreshValidation)
             )
-            checkbox.identifier = NSUserInterfaceItemIdentifier(target.id)
-            checkbox.state = target.isEnabled ? .on : .off
-            checkbox.isEnabled = target.isEnabled
-            checkbox.setAccessibilityIdentifier("Stacio.MultiExec.target.\(target.id)")
-            targetCheckboxes.append(checkbox)
-            stack.addArrangedSubview(checkbox)
+            targetCheckboxes.append(row.checkbox)
+            stack.addArrangedSubview(row)
         }
     }
 

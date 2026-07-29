@@ -7,6 +7,7 @@ pub mod db;
 pub mod files;
 pub mod import_repository;
 pub mod known_host_repository;
+pub mod remote_transfer;
 pub mod scp;
 pub mod serial;
 pub mod session_repository;

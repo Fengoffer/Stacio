@@ -1404,7 +1404,8 @@ fn parse_remote_file_identity_output(output: &str) -> Result<Option<ScpResumeMet
     if line.is_empty() || line == "missing" {
         return Ok(None);
     }
-    let mut fields = line.split('\t');
+    let separator = if line.contains('\t') { "\t" } else { "\\t" };
+    let mut fields = line.split(separator);
     let size = fields
         .next()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1932,6 +1933,24 @@ mod libssh2_scp_tests {
         assert!(command.contains("skip=131072"));
         assert!(!command.contains("scp "));
         assert!(!command.contains("sftp "));
+    }
+
+    #[test]
+    fn remote_file_identity_accepts_literal_and_actual_tab_stat_output() {
+        let expected = super::ScpResumeMetadata {
+            source_size: 1_099_511_627_776,
+            source_mtime_unix: 1_721_891_200,
+        };
+
+        for output in [
+            "1099511627776\\t1721891200\n",
+            "1099511627776\t1721891200\n",
+        ] {
+            assert_eq!(
+                super::parse_remote_file_identity_output(output).expect("stat output"),
+                Some(expected.clone())
+            );
+        }
     }
 
     #[test]

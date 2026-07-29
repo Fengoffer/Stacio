@@ -10,7 +10,6 @@ final class SessionSidebarSessionFormTests: XCTestCase {
             selectedFolderID: nil,
             draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" })
         )
-
         form.selectAuthModeForTesting(.agent)
 
         XCTAssertTrue(form.privateKeyRowIsHiddenForTesting)
@@ -198,6 +197,75 @@ final class SessionSidebarSessionFormTests: XCTestCase {
         XCTAssertEqual(form.selectedAuthModeForTesting, .password)
         XCTAssertFalse(form.credentialSecretRowIsHiddenForTesting)
         XCTAssertEqual(form.secretLabelForTesting, "密码")
+    }
+
+    func testConsoleModeUsesReadOnlyEndpointAndFixedHiddenZeroPortWithoutCredentials() {
+        let form = SessionSidebarSessionForm(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" })
+        )
+        form.applyModeForTesting(.console)
+
+        XCTAssertFalse(form.hostRowIsHiddenForTesting)
+        XCTAssertTrue(form.portRowIsHiddenForTesting)
+        XCTAssertTrue(form.userRowIsHiddenForTesting)
+        XCTAssertTrue(form.authRowIsHiddenForTesting)
+        XCTAssertTrue(form.privateKeyRowIsHiddenForTesting)
+        XCTAssertTrue(form.credentialSecretRowIsHiddenForTesting)
+        XCTAssertTrue(form.activeHostControlForTesting.isEditable == false)
+        XCTAssertEqual(form.portValueForTesting, "0")
+    }
+
+    func testConsoleModePlacesScanDeviceButtonAfterReadOnlyDeviceField() throws {
+        let form = SessionSidebarSessionForm(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" })
+        )
+        var scanRequestCount = 0
+        form.onRequestConsoleScan = {
+            scanRequestCount += 1
+        }
+
+        form.applyModeForTesting(.console)
+        form.view.frame = NSRect(x: 0, y: 0, width: 416, height: 294)
+        form.layoutForTesting()
+
+        let button = try XCTUnwrap(
+            form.view.firstSubview(withIdentifier: "Stacio.SessionEditor.consoleScan") as? NSButton
+        )
+        XCTAssertEqual(form.hostLabelForTesting, "蓝牙设备")
+        XCTAssertEqual(form.hostPlaceholderForTesting, "尚未选择蓝牙设备")
+        XCTAssertFalse(form.activeHostControlForTesting.isEditable)
+        XCTAssertEqual(button.title, "扫描设备")
+        XCTAssertEqual(button.accessibilityLabel(), "扫描蓝牙设备")
+        XCTAssertFalse(button.isHidden)
+        XCTAssertGreaterThan(button.frame.minX, form.activeHostControlForTesting.frame.maxX)
+
+        button.performClick(nil)
+        XCTAssertEqual(scanRequestCount, 1)
+    }
+
+    func testSerialDiscoveryRemainsSeparateFromConsoleMode() {
+        var discoveryCalls = 0
+        let form = SessionSidebarSessionForm(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(defaultUsername: { "local" }),
+            serialDevicePathProvider: {
+                discoveryCalls += 1
+                return ["/dev/tty.NBEE_SPP_1103"]
+            }
+        )
+
+        form.applyModeForTesting(.console)
+        XCTAssertEqual(discoveryCalls, 0)
+        XCTAssertEqual(form.hostSuggestionsForTesting, [])
+
+        form.applyModeForTesting(.serial)
+        XCTAssertGreaterThan(discoveryCalls, 0)
+        XCTAssertEqual(form.hostSuggestionsForTesting, ["/dev/tty.NBEE_SPP_1103"])
     }
 
     func testHostFilledFirstAutofillsEmptyNameWithoutOverwritingCustomName() {

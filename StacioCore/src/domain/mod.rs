@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod console;
 pub mod credential;
 pub mod device_metrics;
 pub mod diagnostics;

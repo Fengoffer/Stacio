@@ -112,7 +112,24 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.1"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.2"))
+    }
+
+    func testApplicationDidFinishLaunchingRecordsSafeDiagnosticEvent() {
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let delegate = AppDelegate(
+            factory: { FakeWorkbenchWindowController() },
+            appLog: nil,
+            diagnosticLogRecorder: diagnosticLog
+        )
+
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+
+        let events = diagnosticLog.snapshot().events
+        XCTAssertEqual(events.map(\.eventCode), [.applicationStarted])
+        XCTAssertEqual(events.map(\.stage), [.startup])
+        XCTAssertEqual(events.map(\.result), [.succeeded])
+        XCTAssertTrue(events.allSatisfy(\.resourceHashes.isEmpty))
     }
 
     func testApplicationLaunchDoesNotRevalidatePersistedLicenseOrStartNetworkMonitoring() async {
@@ -610,7 +627,7 @@ final class StacioApplicationTests: XCTestCase {
         let textView = try XCTUnwrap(scrollView.documentView as? NSTextView)
         XCTAssertFalse(textView.isEditable)
         XCTAssertTrue(textView.isSelectable)
-        XCTAssertTrue(textView.string.hasPrefix("更新内容 1\n- 这是一条"))
+        XCTAssertTrue(textView.string.hasPrefix("更新内容 1\n• 这是一条"))
         XCTAssertFalse(textView.string.contains("sparkle-sign-warning"))
         XCTAssertFalse(textView.string.contains("## 更新内容"))
         XCTAssertTrue(textView.string.contains("更新内容 80"))
@@ -644,7 +661,7 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.1")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.2")
         XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
         XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")

@@ -10,6 +10,100 @@ enum L10n {
         static let delete = "删除"
     }
 
+    enum BLEConsole {
+        static let unnamedDevice = "未命名设备"
+        static let scannerTitle = "选择蓝牙 Console"
+        static let scannerSearchPlaceholder = "搜索设备名称或 UUID"
+        static let scannerScanning = "正在扫描附近的蓝牙设备..."
+        static let scannerEmpty = "没有发现蓝牙设备"
+        static let scannerNoMatch = "没有匹配的蓝牙设备"
+        static let scannerRescan = "重新扫描"
+        static let scannerConnect = "连接"
+        static let scannerBind = "绑定设备"
+        static let scannerRecognized = "已识别蓝牙 Console"
+        static let scannerRSSIUnavailable = "信号强度未知"
+        static let scannerProfileMapping = "选择蓝牙 Console 通道"
+        static let scannerService = "Service"
+        static let scannerTX = "发送通道（TX）"
+        static let scannerRX = "接收通道（RX）"
+        static let scannerWriteType = "写入方式"
+        static let scannerWithoutResponse = "无需响应"
+        static let scannerWithResponse = "需要响应"
+        static let scannerMapperHint = "请选择一个可写入的 TX 和一个支持通知或指示的 RX。"
+        static let scannerNoWritableTX = "没有可写入的 TX Characteristic"
+        static let scannerNoReadableRX = "没有支持通知或指示的 RX Characteristic"
+        static let scannerBindingProbeFailed = "无法读取设备的蓝牙 Console 通道。"
+        static let scannerBindingReady = "已识别蓝牙 Console Profile。"
+        static let scannerBindingCustom = "已保存自定义蓝牙 Console Profile。"
+        static let scannerCancel = "取消"
+
+        static func errorTitle(_ code: BLEConsoleErrorCode) -> String {
+            switch code {
+            case .permissionDenied: "蓝牙权限被拒绝"
+            case .poweredOff: "蓝牙已关闭"
+            case .unavailable: "蓝牙不可用"
+            case .scanTimeout: "扫描超时"
+            case .deviceNotFound: "找不到蓝牙 Console 设备"
+            case .connectFailed: "无法连接蓝牙 Console"
+            case .serviceMissing: "找不到蓝牙 Console 服务"
+            case .txMissing: "找不到发送通道"
+            case .rxMissing: "找不到接收通道"
+            case .subscribeFailed: "无法订阅蓝牙 Console 输出"
+            case .writeFailed: "蓝牙 Console 写入失败"
+            case .txQueueFull: "发送队列已满"
+            case .disconnected: "蓝牙 Console 已断开"
+            case .configInvalid: "蓝牙 Console 配置无效"
+            case .profileChanged: "蓝牙 Console Profile 已变化"
+            case .sppFallbackNotBound: "尚未绑定 Windows COM 端口"
+            case .sppFallbackFailed: "Windows SPP 连接失败"
+            }
+        }
+
+        static func errorMessage(_ code: BLEConsoleErrorCode) -> String {
+            switch code {
+            case .permissionDenied: "Stacio 未获准访问蓝牙。"
+            case .poweredOff: "当前 Mac 的蓝牙处于关闭状态。"
+            case .unavailable: "当前设备或系统不支持所需的 BLE 功能。"
+            case .scanTimeout: "在扫描时限内没有发现可用的蓝牙 Console 设备。"
+            case .deviceNotFound: "保存的 CoreBluetooth 设备绑定已失效或当前不可见。"
+            case .connectFailed: "无法建立 BLE GATT 连接，设备可能正被其他客户端占用。"
+            case .serviceMissing: "设备没有提供已保存或内置 Profile 所需的 GATT Service。"
+            case .txMissing: "设备没有提供可写入的 TX Characteristic。"
+            case .rxMissing: "设备没有提供可通知或指示的 RX Characteristic。"
+            case .subscribeFailed: "设备拒绝或未能完成 RX 通知订阅。"
+            case .writeFailed: "BLE GATT 数据写入未成功完成。"
+            case .txQueueFull: "待发送数据超过 256 KiB 队列上限。"
+            case .disconnected: "蓝牙 Console 连接意外中断。"
+            case .configInvalid: "保存的蓝牙 Console schema、UUID 或 Profile 配置无法验证。"
+            case .profileChanged: "设备当前的 GATT 属性与保存的蓝牙 Console Profile 不一致。"
+            case .sppFallbackNotBound: "Windows 会话没有保存精确的 COM 端口绑定。"
+            case .sppFallbackFailed: "Windows 无法打开已保存的 SPP COM 端口。"
+            }
+        }
+
+        static func errorRecovery(_ code: BLEConsoleErrorCode) -> String {
+            switch code {
+            case .permissionDenied: "在系统设置的隐私与安全性中允许 Stacio 使用蓝牙。"
+            case .poweredOff: "打开蓝牙后重新扫描。"
+            case .unavailable: "改用支持 BLE 的设备；Windows 可检查已绑定的 SPP 端口。"
+            case .scanTimeout: "确认设备空闲并靠近 Mac，然后重新扫描。"
+            case .deviceNotFound: "重新扫描，并由你重新选择和绑定设备。"
+            case .connectFailed: "先断开手机 BTerm 等其他客户端，再重试连接。"
+            case .serviceMissing: "打开 Characteristic 映射器，或选择其他设备。"
+            case .txMissing: "重新选择具有可写 TX 的 Profile。"
+            case .rxMissing: "重新选择具有通知或指示 RX 的 Profile。"
+            case .subscribeFailed: "断开设备后重新连接。"
+            case .writeFailed: "保留未提交队列并重新连接设备。"
+            case .txQueueFull: "等待当前数据发送完成，或缩短本次输入。"
+            case .disconnected: "等待自动重连；仍失败时手动重试或重新扫描。"
+            case .configInvalid: "编辑会话并重新选择设备和 Profile。"
+            case .profileChanged: "重新发现设备并确认新的 Profile。"
+            case .sppFallbackNotBound: "在 Windows 上由用户选择并保存准确的 COM 端口。"
+            case .sppFallbackFailed: "检查端口占用、蓝牙配对和 COM 状态。"
+            }
+        }
+    }
+
     enum Menu {
         static let about = "关于 Stacio"
         static let file = "文件"
@@ -885,7 +979,7 @@ enum L10n {
                 "------------------------------------------------------------",
                 "会话已停止"
             ]
-            if connectionKind == .serial {
+            if connectionKind == .serial || connectionKind == .console {
                 lines.append("按 <回车> 或 R 重新连接会话")
             } else {
                 lines.append("按 <回车> 关闭标签页")
@@ -1309,9 +1403,9 @@ enum L10n {
     enum DeleteSession {
         static let oneTitle = "删除会话？"
         static let manyTitle = "删除会话？"
-        static let oneMessage = "保存的会话将被移除，并同时清除该会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。"
+        static let oneMessage = "保存的会话将被移除，并同时清除该会话的本地编辑缓存。如该会话正在连接，相关连接将立即断开。Stacio 凭据库中的凭据不会被删除。"
         static func manyMessage(_ count: Int) -> String {
-            "\(count) 个保存的会话将被移除，并同时清除这些会话的本地编辑缓存。Stacio 凭据库中的凭据不会被删除。"
+            "\(count) 个保存的会话将被移除，并同时清除这些会话的本地编辑缓存。如这些会话正在连接，相关连接将立即断开。Stacio 凭据库中的凭据不会被删除。"
         }
     }
 

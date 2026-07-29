@@ -1520,6 +1520,37 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertEqual(RemoteFileDragPayload.sourceRuntimeID(from: pasteboard), "sftp_drag_source")
     }
 
+    func testLocalFilePaneRoutesLocalDropThroughTransferQueueScheduler() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioLocalPaneQueue-\(UUID().uuidString)", isDirectory: true)
+        let sourceDirectory = root.appendingPathComponent("source", isDirectory: true)
+        let destinationDirectory = root.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sourceURL = sourceDirectory.appendingPathComponent("report.txt")
+        try Data("queued".utf8).write(to: sourceURL)
+        let scheduler = RecordingWorkspaceLocalTransferScheduler()
+        let pane = LocalFilePaneViewController(
+            runtimeID: "local-destination-pane",
+            directoryURL: destinationDirectory,
+            title: "本地目标"
+        )
+        pane.localFileTransferScheduler = scheduler
+        pane.loadView()
+
+        XCTAssertTrue(pane.acceptLocalFileDrop([sourceURL], destination: destinationDirectory))
+
+        XCTAssertEqual(scheduler.requests.count, 1)
+        XCTAssertEqual(scheduler.requests.first?.runtimeID, pane.runtimeID)
+        XCTAssertEqual(scheduler.requests.first?.sourceURL, sourceURL.standardizedFileURL)
+        XCTAssertEqual(
+            scheduler.requests.first?.destinationURL,
+            destinationDirectory.appendingPathComponent("report.txt").standardizedFileURL
+        )
+        XCTAssertEqual(scheduler.requests.first?.operation, .copy)
+    }
+
     func testLocalFilePaneShowsChineseErrorForUnreadablePath() throws {
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("stacio-unreadable-\(UUID().uuidString)", isDirectory: true)
@@ -1649,6 +1680,199 @@ final class WorkspaceLocalShellTests: XCTestCase {
 
         XCTAssertEqual(scheduler.disconnectedRuntimeIDs, [runtimeID])
         XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+    }
+
+    func testSavedSessionDeletionClosesBoundSSHRuntimeInEveryWorkspace() {
+        let firstSink = RecordingWorkspaceRemoteTerminalEventSink()
+        let firstBridge = RecordingWorkspaceRemoteTerminalBridge()
+        let secondSink = RecordingWorkspaceRemoteTerminalEventSink()
+        let secondBridge = RecordingWorkspaceRemoteTerminalBridge()
+        let firstDiagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let secondDiagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let unaffectedDiagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let firstWorkspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { firstSink },
+            remoteTerminalBridgeFactory: { firstBridge },
+            startsRemoteTerminalPollingAutomatically: false,
+            diagnosticLogRecorder: firstDiagnosticLog
+        )
+        let secondWorkspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { secondSink },
+            remoteTerminalBridgeFactory: { secondBridge },
+            startsRemoteTerminalPollingAutomatically: false,
+            diagnosticLogRecorder: secondDiagnosticLog
+        )
+        let unaffectedWorkspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            startsRemoteTerminalPollingAutomatically: false,
+            diagnosticLogRecorder: unaffectedDiagnosticLog
+        )
+        firstWorkspace.loadView()
+        secondWorkspace.loadView()
+        unaffectedWorkspace.loadView()
+        firstWorkspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "First SSH",
+            connectionKind: .ssh
+        )
+        secondWorkspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "Second SSH",
+            connectionKind: .ssh
+        )
+        firstWorkspace.setSavedSessionID("shared-session", runtimeID: "term_first")
+        secondWorkspace.setSavedSessionID("shared-session", runtimeID: "term_second")
+
+        postSavedSessionDeletion(["shared-session"])
+
+        XCTAssertEqual(firstWorkspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(secondWorkspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(firstBridge.closedRuntimeIDs, ["term_first"])
+        XCTAssertEqual(secondBridge.closedRuntimeIDs, ["term_second"])
+        XCTAssertEqual(firstSink.closedRuntimeIDs, ["term_first"])
+        XCTAssertEqual(secondSink.closedRuntimeIDs, ["term_second"])
+        XCTAssertEqual(firstDiagnosticLog.snapshot().events.map(\.eventCode), [.sessionRuntimeCleanup])
+        XCTAssertEqual(secondDiagnosticLog.snapshot().events.map(\.eventCode), [.sessionRuntimeCleanup])
+        XCTAssertTrue(unaffectedDiagnosticLog.snapshot().events.isEmpty)
+        XCTAssertFalse(
+            try! XCTUnwrap(firstDiagnosticLog.snapshot().encodedJSONString()).contains("shared-session")
+        )
+    }
+
+    func testSavedSessionDeletionRemovesPaneFromSplitWithoutRestoringDeletedPane() throws {
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let bridge = RecordingWorkspaceRemoteTerminalBridge()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_deleted", status: "running", diagnostic: "running"),
+            title: "Deleted SSH",
+            connectionKind: .ssh
+        )
+        workspace.setSavedSessionID("deleted-session", runtimeID: "term_deleted")
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remaining", status: "running", diagnostic: "running"),
+            title: "Remaining SSH",
+            connectionKind: .ssh
+        )
+        workspace.setSavedSessionID("remaining-session", runtimeID: "term_remaining")
+        try workspace.splitExistingTerminals(
+            targetIDs: ["term_deleted", "term_remaining"],
+            layout: .vertical
+        )
+
+        postSavedSessionDeletion(["deleted-session"])
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["Remaining SSH"])
+        XCTAssertTrue(workspace.currentSplitTargetIDs().isEmpty)
+        XCTAssertEqual(bridge.closedRuntimeIDs, ["term_deleted"])
+        XCTAssertEqual(sink.closedRuntimeIDs, ["term_deleted"])
+    }
+
+    func testSavedSessionDeletionCollapsesMultiExecToOrdinaryRemainingPane() throws {
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let bridge = RecordingWorkspaceRemoteTerminalBridge()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_deleted", status: "running", diagnostic: "running"),
+            title: "Deleted SSH",
+            connectionKind: .ssh
+        )
+        workspace.setSavedSessionID("deleted-session", runtimeID: "term_deleted")
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remaining", status: "running", diagnostic: "running"),
+            title: "Remaining Serial",
+            connectionKind: .serial
+        )
+        workspace.setSavedSessionID("remaining-session", runtimeID: "term_remaining")
+        try workspace.startMultiExecSession(targetIDs: ["term_deleted", "term_remaining"])
+
+        postSavedSessionDeletion(["deleted-session"])
+
+        XCTAssertFalse(workspace.isMultiExecSessionActiveForTesting)
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["Remaining Serial"])
+        XCTAssertTrue(workspace.currentSplitTargetIDs().isEmpty)
+        XCTAssertEqual(bridge.closedRuntimeIDs, ["term_deleted"])
+        XCTAssertEqual(sink.closedRuntimeIDs, ["term_deleted"])
+    }
+
+    func testSavedSessionDeletionRemovesOnlyMatchingAttachedSFTPAndSCPRemotePanes() throws {
+        let bridge = RecordingWorkspaceRemoteFilesBridge(entries: [])
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        var closedAttachedRuntimeIDs: [String] = []
+        workspace.loadView()
+
+        let sftpRuntimeID = try workspace.openSFTPFilesSession(
+            context: liveContext(host: "sftp-primary.example.com"),
+            title: "SFTP Primary",
+            bridge: bridge
+        )
+        let sftpPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        sftpPane.markPrimaryFileTransferRemoteDevice(sessionID: "sftp-primary")
+        workspace.setSavedSessionID("sftp-primary", runtimeID: sftpRuntimeID)
+        _ = sftpPane.attachFileTransferRemoteDevice(
+            FileTransferRemotePaneConfiguration(
+                sourceRuntimeID: "saved:sftp-secondary",
+                context: liveContext(host: "sftp-secondary.example.com"),
+                title: "SFTP Secondary",
+                bridge: SFTPRemoteFilesBridgeAdapter(base: bridge),
+                transferScheduler: nil,
+                remoteProtocolName: "SFTP",
+                initialRemotePath: "~",
+                remoteFilePathTerminalSender: { _ in },
+                onRuntimeClosed: { closedAttachedRuntimeIDs.append("sftp-secondary") }
+            )
+        )
+
+        let scpRuntimeID = try workspace.openRemoteFilesSession(
+            context: liveContext(host: "scp-primary.example.com"),
+            title: "SCP Primary",
+            bridge: bridge,
+            transferScheduler: nil
+        )
+        let scpPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        scpPane.markPrimaryFileTransferRemoteDevice(sessionID: "scp-primary")
+        workspace.setSavedSessionID("scp-primary", runtimeID: scpRuntimeID)
+        _ = scpPane.attachFileTransferRemoteDevice(
+            FileTransferRemotePaneConfiguration(
+                sourceRuntimeID: "saved:scp-secondary",
+                context: liveContext(host: "scp-secondary.example.com"),
+                title: "SCP Secondary",
+                bridge: bridge,
+                transferScheduler: nil,
+                remoteProtocolName: "SCP",
+                initialRemotePath: "~",
+                remoteFilePathTerminalSender: { _ in },
+                onRuntimeClosed: { closedAttachedRuntimeIDs.append("scp-secondary") }
+            )
+        )
+
+        postSavedSessionDeletion(["sftp-secondary", "scp-secondary"])
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+        XCTAssertEqual(sftpPane.independentTransferBrowserForTesting?.remoteFilesViewControllersForTesting.count, 1)
+        XCTAssertEqual(scpPane.independentTransferBrowserForTesting?.remoteFilesViewControllersForTesting.count, 1)
+        XCTAssertEqual(Set(closedAttachedRuntimeIDs), ["sftp-secondary", "scp-secondary"])
+
+        postSavedSessionDeletion(["sftp-primary", "scp-primary"])
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(workspace.tabLabelsForTesting, [])
     }
 
     func testOpenGraphicsSessionAddsNativeGraphicsDiagnosticPane() throws {
@@ -3818,6 +4042,14 @@ private func liveContext(host: String) -> TunnelLiveSessionContext {
     )
 }
 
+private func postSavedSessionDeletion(_ sessionIDs: Set<String>) {
+    NotificationCenter.default.post(
+        name: Notification.Name("Stacio.SavedSessions.didDelete"),
+        object: nil,
+        userInfo: ["sessionIDs": sessionIDs.sorted()]
+    )
+}
+
 private func mouseMovedEvent(overSegment index: Int, in control: NSSegmentedControl, window: NSWindow) -> NSEvent {
     let leading = (0..<index).reduce(CGFloat(0)) { partial, segment in
         partial + control.width(forSegment: segment)
@@ -4111,6 +4343,36 @@ private final class RecordingWorkspaceSCPTransferScheduler: SCPTransferSchedulin
     }
 
     func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {}
+}
+
+@MainActor
+private final class RecordingWorkspaceLocalTransferScheduler: LocalFileTransferScheduling {
+    struct Request: Equatable {
+        let runtimeID: String
+        let sourceURL: URL
+        let destinationURL: URL
+        let operation: LocalFileTransferOperation
+    }
+
+    private(set) var requests: [Request] = []
+
+    func scheduleLocalFileTransfer(
+        runtimeID: String,
+        sourceURL: URL,
+        destinationURL: URL,
+        operation: LocalFileTransferOperation,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((LocalFileTransferResult) -> Void)?
+    ) -> String {
+        requests.append(Request(
+            runtimeID: runtimeID,
+            sourceURL: sourceURL,
+            destinationURL: destinationURL,
+            operation: operation
+        ))
+        completion?(.completed)
+        return "local-test-job"
+    }
 }
 
 private final class RecordingWorkspaceTabDetacher: WorkspaceTabDetaching {

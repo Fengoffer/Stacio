@@ -146,6 +146,35 @@ final class FileWorkspaceMediaWindowControllerTests: XCTestCase {
         XCTAssertTrue(html.contains("bindVolume(video, mute, volume)"))
     }
 
+    func testAudioAndVideoControlsUseNativeMacOSSFSymbols() {
+        for kind in [RemoteFileContentKind.video, .audio] {
+            let fileName = kind == .video ? "demo.mp4" : "recording.m4a"
+            let html = FileWorkspaceMediaWindowController(document: FileWorkspaceMediaDocument(
+                sourceID: "native-symbols-\(kind)",
+                fileName: fileName,
+                sourceURL: URL(fileURLWithPath: "/tmp/\(fileName)"),
+                contentKind: kind,
+                byteCount: 1_024
+            )).mediaViewController.htmlForTesting
+
+            for symbolName in [
+                "play.fill",
+                "pause.fill",
+                "gobackward.10",
+                "goforward.10",
+                "speaker.wave.2.fill",
+                "speaker.wave.1.fill",
+                "speaker.slash.fill"
+            ] {
+                XCTAssertTrue(html.contains(symbolName), "missing SF Symbol \(symbolName) for \(kind)")
+            }
+            XCTAssertTrue(html.contains("data:image/png;base64,"))
+            XCTAssertFalse(html.contains("&#x25B6;"))
+            XCTAssertFalse(html.contains("&#x23F8;"))
+            XCTAssertFalse(html.contains("&#x1F50A;"))
+        }
+    }
+
     func testImageAndVideoMetadataApplyAStableContentAspectRatio() throws {
         for kind in [RemoteFileContentKind.image, .video] {
             let document = FileWorkspaceMediaDocument(

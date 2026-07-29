@@ -350,6 +350,7 @@ public final class RemoteSSHSessionCoordinator {
     private let defaultCols: UInt32
     private let defaultRows: UInt32
     private let appLog: StacioLogWriting?
+    private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
     private let clock: () -> Date
 
     public init(
@@ -361,6 +362,7 @@ public final class RemoteSSHSessionCoordinator {
         defaultCols: UInt32 = 80,
         defaultRows: UInt32 = 24,
         appLog: StacioLogWriting? = nil,
+        diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared,
         clock: @escaping () -> Date = Date.init
     ) {
         self.contextBuilder = contextBuilder
@@ -371,6 +373,7 @@ public final class RemoteSSHSessionCoordinator {
         self.defaultCols = defaultCols
         self.defaultRows = defaultRows
         self.appLog = appLog
+        self.diagnosticLogRecorder = diagnosticLogRecorder
         self.clock = clock
     }
 
@@ -495,6 +498,17 @@ public final class RemoteSSHSessionCoordinator {
                 liveSessionContext: nil
             )
         }
+        if let pane {
+            let diagnosticLogRecorder = diagnosticLogRecorder
+            let resourceIdentity = Self.resourceIdentity(for: config)
+            pane.onTerminalClosed = { didEstablishRuntime in
+                guard didEstablishRuntime else { return }
+                FeedbackDiagnosticLogConnectionLifecycle.recordDisconnected(
+                    recorder: diagnosticLogRecorder,
+                    resourceIdentity: resourceIdentity
+                )
+            }
+        }
         pane?.setConnectionEndpoint("\(config.username)@\(Self.endpointDescription(for: config))")
         pane?.displayConnectionStarting()
         let pendingStatus = LiveShellStatus(
@@ -540,6 +554,7 @@ public final class RemoteSSHSessionCoordinator {
         let liveShellStarter = RemoteSSHUncheckedSendable(value: liveShellStarter)
         let contextStore = RemoteSSHUncheckedSendable(value: contextStore)
         let appLog = RemoteSSHUncheckedSendable(value: appLog)
+        let diagnosticLogRecorder = RemoteSSHUncheckedSendable(value: diagnosticLogRecorder)
         let clock = RemoteSSHUncheckedSendable(value: clock)
         let endpointDescription = Self.endpointDescription(for: config)
         let requestDescription = Self.connectionRequestDescription(for: config)
@@ -603,6 +618,11 @@ public final class RemoteSSHSessionCoordinator {
                         "total_ms=\(totalElapsedMs)"
                     ].joined(separator: " ")
                 )
+                FeedbackDiagnosticLogConnectionLifecycle.recordSucceeded(
+                    recorder: diagnosticLogRecorder.value,
+                    resourceIdentity: Self.resourceIdentity(for: config),
+                    reconnect: false
+                )
                 DispatchQueue.main.async {
                     guard let pane, pane.lifecycleState != .closed else {
                         if let current = contextStore.value.current(),
@@ -630,6 +650,11 @@ public final class RemoteSSHSessionCoordinator {
                 }
             } catch {
                 let diagnostic = RuntimeDiagnosticFormatter.userMessage(for: error)
+                FeedbackDiagnosticLogConnectionLifecycle.recordFailed(
+                    recorder: diagnosticLogRecorder.value,
+                    resourceIdentity: Self.resourceIdentity(for: config),
+                    reconnect: false
+                )
                 appLog.value?.append(
                     level: .error,
                     category: "SSH",
@@ -853,6 +878,11 @@ public final class RemoteSSHSessionCoordinator {
         config: SshConnectionConfig,
         mode: String
     ) {
+        FeedbackDiagnosticLogConnectionLifecycle.recordStarted(
+            recorder: diagnosticLogRecorder,
+            resourceIdentity: Self.resourceIdentity(for: config),
+            reconnect: mode == "reconnect" || mode == "auto_reconnect"
+        )
         appLog?.append(
             level: .info,
             category: "SSH",
@@ -874,6 +904,11 @@ public final class RemoteSSHSessionCoordinator {
         status: LiveShellStatus,
         mode: String
     ) {
+        FeedbackDiagnosticLogConnectionLifecycle.recordSucceeded(
+            recorder: diagnosticLogRecorder,
+            resourceIdentity: Self.resourceIdentity(for: config),
+            reconnect: mode == "reconnect" || mode == "auto_reconnect"
+        )
         appLog?.append(
             level: .info,
             category: "SSH",
@@ -886,6 +921,11 @@ public final class RemoteSSHSessionCoordinator {
         error: Error,
         mode: String
     ) {
+        FeedbackDiagnosticLogConnectionLifecycle.recordFailed(
+            recorder: diagnosticLogRecorder,
+            resourceIdentity: Self.resourceIdentity(for: config),
+            reconnect: mode == "reconnect" || mode == "auto_reconnect"
+        )
         appLog?.append(
             level: .error,
             category: "SSH",
@@ -895,6 +935,10 @@ public final class RemoteSSHSessionCoordinator {
 
     private static func endpointDescription(for config: SshConnectionConfig) -> String {
         "\(config.host):\(config.port)"
+    }
+
+    nonisolated private static func resourceIdentity(for config: SshConnectionConfig) -> String {
+        "ssh|\(config.host):\(config.port)|\(config.username)"
     }
 
     private static func connectionRequestDescription(for config: SshConnectionConfig) -> String {

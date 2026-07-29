@@ -1626,6 +1626,207 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(sink.userInputEvents.contains { $0.bytes == [9] })
     }
 
+    func testSerialAndBluetoothConsoleBypassApplicationCompletionAndForwardTabUnchanged() {
+        for (runtimeID, kind) in [
+            ("term_serial_native_tab", RemoteTerminalConnectionKind.serial),
+            ("term_ble_native_tab", RemoteTerminalConnectionKind.console)
+        ] {
+            let sink = RecordingRemoteTerminalEventSink()
+            let controller = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: "Network Device",
+                connectionKind: kind,
+                eventSink: sink,
+                startsPollingAutomatically: false
+            )
+
+            controller.loadView()
+            controller.sendInput(Array("dnf in".utf8))
+            controller.sendInput([9])
+
+            XCTAssertEqual(
+                sink.userInputEvents.map(\.bytes),
+                [Array("dnf in".utf8), [9]],
+                "\(kind) must leave Tab completion to the connected device"
+            )
+            XCTAssertEqual(controller.commandHintPresentationKindForTesting, .hidden)
+            XCTAssertEqual(controller.commandHintVisibleTextForTesting, "")
+        }
+    }
+
+    func testSerialAndBluetoothConsoleDiscardImmediateDeviceTabEchoBeforeNativeCompletion() {
+        for (runtimeID, kind) in [
+            ("term_serial_tab_echo", RemoteTerminalConnectionKind.serial),
+            ("term_ble_tab_echo", RemoteTerminalConnectionKind.console)
+        ] {
+            let controller = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: "Network Device",
+                connectionKind: kind,
+                eventSink: RecordingRemoteTerminalEventSink(),
+                startsPollingAutomatically: false
+            )
+
+            controller.loadView()
+            controller.feedRemoteOutput(Array("Switch# show ru".utf8), applySemanticHighlighting: false)
+            controller.sendInput([9])
+            controller.feedRemoteOutput([9] + Array("nning-config".utf8), applySemanticHighlighting: false)
+
+            XCTAssertEqual(
+                controller.terminalOutputTranscript,
+                "Switch# show running-config",
+                "\(kind) must not render an echoed horizontal tab as spacing before device completion"
+            )
+        }
+    }
+
+    func testBluetoothConsoleDiscardsDeviceTabEchoSplitAcrossBLEOutputBatches() {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_ble_split_tab_echo",
+            title: "Network Device",
+            connectionKind: .console,
+            eventSink: RecordingRemoteTerminalEventSink(),
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.feedRemoteOutput(Array("Switch# show ru".utf8), applySemanticHighlighting: false)
+        controller.sendInput([9])
+        controller.feedRemoteOutput([27, 91, 48, 109], applySemanticHighlighting: false)
+        controller.feedRemoteOutput([9] + Array("nning-config".utf8), applySemanticHighlighting: false)
+
+        XCTAssertEqual(controller.terminalOutputTranscript, "Switch# show ru\u{1B}[0mnning-config")
+        XCTAssertFalse(controller.terminalOutputTranscript.contains("\t"))
+    }
+
+    func testBluetoothConsoleDoesNotForwardTerminalGeneratedRepliesAsDeviceInput() {
+        let sink = RecordingRemoteTerminalEventSink()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_ble_terminal_reply",
+            title: "Network Device",
+            connectionKind: .console,
+            eventSink: sink,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.feedRemoteOutput([0x1B, 0x5B, 0x36, 0x6E], applySemanticHighlighting: false)
+
+        XCTAssertTrue(
+            sink.inputEvents.isEmpty,
+            "terminal status replies generated while rendering device output must not be written back over BLE"
+        )
+
+        let asynchronousOutput = Array((String(repeating: "x", count: 512) + "\u{1B}[6n").utf8)
+        controller.feedRemoteOutput(asynchronousOutput, applySemanticHighlighting: false)
+        XCTAssertTrue(waitForRemoteTerminalCondition {
+            controller.terminalOutputTranscript.contains(String(repeating: "x", count: 512))
+        })
+        XCTAssertTrue(
+            sink.inputEvents.isEmpty,
+            "terminal replies produced by asynchronous output delivery must also stay off the BLE link"
+        )
+
+        let userInput = Array("show version\r".utf8)
+        controller.send(source: controller.terminalView, data: ArraySlice(userInput))
+
+        XCTAssertEqual(sink.inputEvents.map(\.bytes), [userInput])
+    }
+
+    func testSSHStillForwardsTerminalGeneratedRepliesToRemoteHost() {
+        let sink = RecordingRemoteTerminalEventSink()
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_ssh_terminal_reply",
+            title: "SSH",
+            connectionKind: .ssh,
+            eventSink: sink,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.feedRemoteOutput([0x1B, 0x5B, 0x36, 0x6E], applySemanticHighlighting: false)
+
+        XCTAssertEqual(sink.inputEvents.map(\.bytes), [[0x1B, 0x5B, 0x31, 0x3B, 0x31, 0x52]])
+    }
+
+    func testSerialAndBluetoothConsoleUseDedicatedNetworkDeviceHighlightProfileAndOneHalfTheme() {
+        for (runtimeID, kind) in [
+            ("term_serial_network_profile", RemoteTerminalConnectionKind.serial),
+            ("term_ble_network_profile", RemoteTerminalConnectionKind.console)
+        ] {
+            let suiteName = "StacioNetworkConsoleTheme-\(runtimeID)-\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let settingsStore = AppSettingsStore(defaults: defaults)
+            settingsStore.update { settings in
+                settings.terminalTheme = .dark
+                settings.terminalBuiltInThemeID = TerminalColorTheme.tokyoNight.id!
+            }
+            let controller = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: "Network Device",
+                connectionKind: kind,
+                eventSink: RecordingRemoteTerminalEventSink(),
+                settingsStore: settingsStore,
+                startsPollingAutomatically: false
+            )
+
+            controller.loadView()
+
+            XCTAssertEqual(controller.terminalView.semanticHighlightProfile, .networkDeviceConsole)
+            XCTAssertEqual(controller.terminalView.nativeForegroundColor.portDeskHexString, TerminalColorTheme.oneHalfDark.foregroundHex)
+            XCTAssertEqual(controller.terminalView.nativeBackgroundColor.portDeskHexString, TerminalColorTheme.oneHalfDark.backgroundHex)
+        }
+    }
+
+    func testNetworkDeviceConsoleUsesOneHalfLightWhenTerminalPreferenceIsLight() {
+        let suiteName = "StacioNetworkConsoleLightTheme-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalTheme = .light
+        }
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_serial_network_light",
+            title: "Network Device",
+            connectionKind: .serial,
+            eventSink: RecordingRemoteTerminalEventSink(),
+            settingsStore: settingsStore,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.terminalView.nativeForegroundColor.portDeskHexString, TerminalColorTheme.oneHalfLight.foregroundHex)
+        XCTAssertEqual(controller.terminalView.nativeBackgroundColor.portDeskHexString, TerminalColorTheme.oneHalfLight.backgroundHex)
+    }
+
+    func testSSHRetainsConfiguredThemeAndGeneralPurposeHighlightProfile() {
+        let suiteName = "StacioSSHThemeRegression-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = TerminalColorTheme.tokyoNight.id!
+        }
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_ssh_theme_regression",
+            title: "SSH",
+            connectionKind: .ssh,
+            eventSink: RecordingRemoteTerminalEventSink(),
+            settingsStore: settingsStore,
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(controller.terminalView.semanticHighlightProfile, .generalPurpose)
+        XCTAssertEqual(controller.terminalView.nativeForegroundColor.portDeskHexString, TerminalColorTheme.tokyoNight.foregroundHex)
+        XCTAssertEqual(controller.terminalView.nativeBackgroundColor.portDeskHexString, TerminalColorTheme.tokyoNight.backgroundHex)
+    }
+
     func testRemoteTerminalCompletesPathsWithoutSendingProbeCommandsToTTY() {
         let sink = RecordingRemoteTerminalEventSink()
         let provider = RecordingTerminalPathCompletionProvider(candidates: [
@@ -1703,6 +1904,58 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         ])
         XCTAssertFalse(sink.userInputEvents.contains { $0.bytes == [27, 91, 66] })
         XCTAssertFalse(sink.userInputEvents.contains { $0.bytes == [9] })
+        XCTAssertEqual(controller.commandHintVisibleTextForTesting, "")
+    }
+
+    func testRemoteTerminalClearsCompletionOverlayDuringRapidUnacknowledgedInput() {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_remote_fast_completion",
+            title: "root@remote",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
+        controller.view.layoutSubtreeIfNeeded()
+        controller.feedRemoteOutput(Array("root@remote:~# ".utf8))
+        controller.sendInput(Array("d".utf8))
+
+        XCTAssertEqual(controller.commandHintPresentationKindForTesting, .completion)
+
+        controller.sendInput(Array("o".utf8))
+
+        XCTAssertEqual(controller.commandHintPresentationKindForTesting, .hidden)
+        XCTAssertEqual(controller.commandHintVisibleTextForTesting, "")
+
+        controller.feedRemoteOutput(Array("do".utf8))
+        Thread.sleep(forTimeInterval: 0.1)
+        controller.sendInput(Array("c".utf8))
+
+        XCTAssertEqual(controller.commandHintPresentationKindForTesting, .completion)
+        XCTAssertTrue(controller.commandHintVisibleTextForTesting.contains("docker"))
+    }
+
+    func testRemoteTerminalSuppressesCompletionOverlayWhenEchoCaretFallsBehindShadowInput() {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_remote_delayed_echo_completion",
+            title: "root@remote",
+            eventSink: RecordingRemoteTerminalEventSink(),
+            startsPollingAutomatically: false
+        )
+
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
+        controller.view.layoutSubtreeIfNeeded()
+        controller.feedRemoteOutput(Array("root@remote:~# ".utf8))
+        controller.sendInput(Array("d".utf8))
+
+        XCTAssertEqual(controller.commandHintPresentationKindForTesting, .completion)
+
+        Thread.sleep(forTimeInterval: 0.1)
+        controller.sendInput(Array("ock".utf8))
+
+        XCTAssertEqual(controller.commandHintPresentationKindForTesting, .hidden)
         XCTAssertEqual(controller.commandHintVisibleTextForTesting, "")
     }
 
@@ -2782,6 +3035,37 @@ final class RemoteTerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(serialReconnecter.reconnectedTitles, ["串口控制台"])
         XCTAssertEqual(serialController.runtimeID, "term_serial_recovered")
         XCTAssertEqual(serialController.lifecycleState, .running)
+    }
+
+    func testConsoleUsesNativeProtocolNameAndReturnRequestsBLEOnlyRetry() {
+        let controller = RemoteTerminalPaneViewController(
+            runtimeID: "term_ble_console",
+            title: "NBEE_BLE_1103",
+            connectionKind: .console,
+            eventSink: RecordingRemoteTerminalEventSink(),
+            startsPollingAutomatically: false
+        )
+        var retryCount = 0
+        var closeCount = 0
+        controller.onConsoleRetryRequested = {
+            retryCount += 1
+            controller.displayConnectionStarting()
+        }
+        controller.onRequestClose = { _ in closeCount += 1 }
+        controller.loadView()
+        controller.displayConnectionStarting()
+
+        XCTAssertEqual(
+            controller.connectionStateVisibleTextForTesting,
+            "正在连接...\n蓝牙 Console · NBEE_BLE_1103"
+        )
+
+        controller.displayConnectionFailure("BLE_CONSOLE_CONNECT_FAILED")
+        controller.send(source: controller.terminalView, data: ArraySlice(Array("\r".utf8)))
+
+        XCTAssertEqual(retryCount, 1)
+        XCTAssertEqual(closeCount, 0)
+        XCTAssertEqual(controller.lifecycleState, .connecting)
     }
 
     func testReconnectUpdatesLiveContextWithoutWritingStartupSummary() throws {

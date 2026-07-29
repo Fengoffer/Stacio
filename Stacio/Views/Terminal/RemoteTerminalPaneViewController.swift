@@ -23,6 +23,7 @@ public enum RemoteTerminalConnectionKind: Equatable {
     case ssh
     case serial
     case telnet
+    case console
 }
 
 public struct SessionAutomationPolicy: Equatable, Sendable {
@@ -260,6 +261,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public var onRequestClose: ((RemoteTerminalPaneViewController) -> Void)?
     public var onRequestSaveOutput: ((RemoteTerminalPaneViewController) -> Void)?
     public var onRuntimeAttached: ((RemoteTerminalPaneViewController, LiveShellStatus, TunnelLiveSessionContext?) -> Void)?
+    public var onTerminalClosed: ((Bool) -> Void)?
     public var onRuntimeReattached: ((RemoteTerminalPaneViewController, String, LiveShellStatus, TunnelLiveSessionContext?) -> Void)?
     public var onRemoteDirectoryChanged: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
@@ -267,6 +269,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public var onMultiExecPresentationChanged: ((RemoteTerminalPaneViewController) -> Void)?
     public var onCommandSubmitted: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onCommandFinished: ((RemoteTerminalPaneViewController) -> Void)?
+    public var onConsoleRetryRequested: (() -> Void)?
     public private(set) var commandCompletionGeneration: UInt64 = 0
     private var agentInteractionLocked = false
     public var onUploadDroppedFiles: ((String, [String]) -> Void)?
@@ -278,7 +281,14 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         case .ssh: .ssh
         case .serial: .serial
         case .telnet: .telnet
+        case .console: .console
         }
+    }
+    private var usesApplicationCommandSuggestions: Bool {
+        connectionKind != .serial && connectionKind != .console
+    }
+    private var usesNetworkDeviceConsolePresentation: Bool {
+        connectionKind == .serial || connectionKind == .console
     }
 
     private let bridge: RemoteTerminalBridging
@@ -364,7 +374,10 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private var remoteInputLineUsedCompletion = false
     private var remoteInputLineAnchorCaretFrame: NSRect?
     private var remoteInputLineAnchorLength = 0
+    private var pendingNetworkDeviceTabEchoDeadline: Date?
+    private var pendingNetworkDeviceTabEchoScannedByteCount = 0
     private var remoteCompletionInputLine = ""
+    private var lastCompletionSensitiveInputAt: Date?
     private var osc7OutputBuffer: [UInt8] = []
     private var pendingSilentInputEchoFilters: [PendingSilentInputEchoFilter] = []
     private var silentInputEchoRecoveryDeadline: Date?
@@ -462,6 +475,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.terminalDelegate = self
         terminalView.fontZoomSettingsStore = settingsStore
+        terminalView.semanticHighlightProfile = usesNetworkDeviceConsolePresentation
+            ? .networkDeviceConsole
+            : .generalPurpose
         terminalView.notifyUpdateChanges = true
         terminalView.acceptsLocalFileDrops = { [weak self] in
             self?.canAcceptDroppedLocalFiles ?? false
@@ -474,7 +490,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             self.terminalSearchController.terminalContentDidChange()
             self.refreshLineInfoGutter()
         }
-        TerminalAppearanceApplier.apply(settings: settingsStore.snapshot(), to: terminalView)
+        applyTerminalAppearance(settingsStore.snapshot())
         observeSettingsChanges()
         syncLiveShellKeepaliveInterval(settingsStore.snapshot())
         terminalView.contextMenuProvider = { [weak self] selectedText in
@@ -721,7 +737,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     public func feedRemoteOutput(_ bytes: [UInt8], applySemanticHighlighting: Bool = true) {
-        let filteredOutput = filterPendingSilentInputEcho(from: bytes)
+        let tabEchoFilteredBytes = filterPendingNetworkDeviceTabEcho(from: bytes)
+        let filteredOutput = filterPendingSilentInputEcho(from: tabEchoFilteredBytes)
         let visibleBytes = filteredOutput.bytes
         guard visibleBytes.isEmpty == false else {
             if filteredOutput.didRemoveEcho {
@@ -741,7 +758,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             visibleBytes,
             applySemanticHighlighting: applySemanticHighlighting
         )
-        resetRemoteInputLineAnchor()
+        resetRemoteInputLineAnchor(
+            anchorLength: String(decoding: remoteInputLineBuffer, as: UTF8.self).count
+        )
         let wasCollectingOSC7Sequence = osc7OutputBuffer.isEmpty == false
         var didFinishCommand = recordOSC7DirectoryFromOutput(visibleBytes)
         if wasCollectingOSC7Sequence == false,
@@ -886,7 +905,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public func closeTerminal() {
         guard didClose == false else { return }
+        let closedEstablishedRuntime = hasEstablishedRuntime
         didClose = true
+        terminalView.cancelPendingSemanticOutput()
         reconnectGeneration &+= 1
         cancelAutomaticReconnect()
         (reconnecter as? RemoteTerminalBackgroundReconnecting)?.cancelPendingReconnects()
@@ -895,6 +916,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         stopOutputPolling()
         _ = try? bridge.closeLiveSSHShell(runtimeID: runtimeID)
         try? eventSink.terminalDidClose(runtimeID: runtimeID)
+        onTerminalClosed?(closedEstablishedRuntime)
     }
 
     public func sendInput(_ bytes: [UInt8]) {
@@ -934,18 +956,34 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func sendInputImmediately(_ bytes: [UInt8], broadcastUserInput: Bool) {
-        let observation = commandInputObserver.ingest(
-            bytes: bytes,
-            settings: settingsStore.snapshot(),
-            historyCommands: commandSuggestionHistoryCommands,
-            pathCompletionProvider: pathCompletionProviderForCurrentInput()
-        )
-        remoteCompletionInputLine = observation.currentLine
-        renderCommandInputObservation(observation)
-        if observation.shouldConsumeInput && observation.acceptedCompletionBytes == nil {
-            return
+        let outgoingBytes: [UInt8]
+        if usesApplicationCommandSuggestions {
+            let isRapidCompletionSensitiveInput = recordCompletionSensitiveInputTiming(bytes)
+            let observation = commandInputObserver.ingest(
+                bytes: bytes,
+                settings: settingsStore.snapshot(),
+                historyCommands: commandSuggestionHistoryCommands,
+                pathCompletionProvider: pathCompletionProviderForCurrentInput()
+            )
+            remoteCompletionInputLine = observation.currentLine
+            if isRapidCompletionSensitiveInput {
+                commandHintOverlay.clear()
+                resetRemoteInputLineAnchor(anchorLength: observation.currentLine.count)
+            } else {
+                renderCommandInputObservation(observation)
+            }
+            if observation.shouldConsumeInput && observation.acceptedCompletionBytes == nil {
+                return
+            }
+            outgoingBytes = observation.acceptedCompletionBytes ?? bytes
+        } else {
+            commandInputObserver.reset()
+            commandHintOverlay.clear()
+            resetRemoteInputLineAnchor()
+            lastCompletionSensitiveInputAt = nil
+            outgoingBytes = bytes
         }
-        let outgoingBytes = observation.acceptedCompletionBytes ?? bytes
+        updatePendingNetworkDeviceTabEcho(for: outgoingBytes)
         do {
             if broadcastUserInput {
                 TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: outgoingBytes)
@@ -955,9 +993,55 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             recordRemoteInputForDirectoryTracking(outgoingBytes)
             scheduleImmediateRemoteOutputDrain()
         } catch {
+            resetPendingNetworkDeviceTabEcho()
             stopOutputPolling()
             displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
         }
+    }
+
+    private func updatePendingNetworkDeviceTabEcho(for bytes: [UInt8]) {
+        guard usesNetworkDeviceConsolePresentation else { return }
+        guard bytes == [9] else {
+            resetPendingNetworkDeviceTabEcho()
+            return
+        }
+        pendingNetworkDeviceTabEchoDeadline = Date().addingTimeInterval(0.75)
+        pendingNetworkDeviceTabEchoScannedByteCount = 0
+    }
+
+    private func filterPendingNetworkDeviceTabEcho(from bytes: [UInt8]) -> [UInt8] {
+        guard bytes.isEmpty == false,
+              usesNetworkDeviceConsolePresentation,
+              let deadline = pendingNetworkDeviceTabEchoDeadline
+        else {
+            return bytes
+        }
+        guard Date() <= deadline else {
+            resetPendingNetworkDeviceTabEcho()
+            return bytes
+        }
+        let remainingScanCount = max(0, 16 - pendingNetworkDeviceTabEchoScannedByteCount)
+        guard remainingScanCount > 0 else {
+            resetPendingNetworkDeviceTabEcho()
+            return bytes
+        }
+        let prefix = bytes.prefix(remainingScanCount)
+        guard let tabIndex = prefix.firstIndex(of: 9) else {
+            pendingNetworkDeviceTabEchoScannedByteCount += prefix.count
+            if pendingNetworkDeviceTabEchoScannedByteCount >= 16 {
+                resetPendingNetworkDeviceTabEcho()
+            }
+            return bytes
+        }
+        var filtered = bytes
+        filtered.remove(at: tabIndex)
+        resetPendingNetworkDeviceTabEcho()
+        return filtered
+    }
+
+    private func resetPendingNetworkDeviceTabEcho() {
+        pendingNetworkDeviceTabEchoDeadline = nil
+        pendingNetworkDeviceTabEchoScannedByteCount = 0
     }
 
     private func writePostConnectScriptIfNeeded() {
@@ -1095,6 +1179,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func resetTerminalOutputForConnectedRuntime() {
+        terminalView.cancelPendingSemanticOutput()
         transcriptRecorder.reset()
         terminalView.getTerminal().resetToInitialState()
         terminalView.needsDisplay = true
@@ -1386,6 +1471,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     public func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        if connectionKind == .console, terminalView.isProcessingRemoteOutput {
+            return
+        }
         let bytes = Array(data)
         if onUserInput?(self, bytes) == true {
             return
@@ -1646,6 +1734,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     deinit {
+        terminalView.cancelPendingSemanticOutput()
         outputPollTimer?.invalidate()
         automaticReconnectWorkItem?.cancel()
         silentInputEchoRecoveryTimeoutWorkItem?.cancel()
@@ -1772,7 +1861,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         if text == "r" {
-            reconnectFromStoppedPrompt()
+            retryStoppedSession()
             return
         }
         if text == "s" {
@@ -1780,8 +1869,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return
         }
         if isReturnKey(bytes) {
-            if connectionKind == .serial {
-                reconnectFromStoppedPrompt()
+            if connectionKind == .serial || connectionKind == .console {
+                retryStoppedSession()
             } else if let onRequestClose {
                 onRequestClose(self)
             } else {
@@ -2333,7 +2422,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return
         }
         terminalView.appearance = terminalView.window?.effectiveAppearance ?? view.effectiveAppearance
-        TerminalAppearanceApplier.apply(settings: snapshot, to: terminalView)
+        applyTerminalAppearance(snapshot)
     }
 
     private func observeSettingsChanges() {
@@ -2345,7 +2434,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         ) { [weak self] _ in
             guard let self else { return }
             let snapshot = self.settingsStore.snapshot()
-            TerminalAppearanceApplier.apply(settings: snapshot, to: self.terminalView)
+            self.applyTerminalAppearance(snapshot)
             self.applyTerminalRuntimeSettings(snapshot)
             self.syncLiveShellKeepaliveInterval(snapshot)
             self.commandInputObserver.reset()
@@ -2357,7 +2446,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private func terminalEffectiveAppearanceDidChange() {
         guard isViewLoaded else { return }
         let snapshot = settingsStore.snapshot()
-        TerminalAppearanceApplier.apply(settings: snapshot, to: terminalView)
+        applyTerminalAppearance(snapshot)
         applyTerminalRuntimeSettings(snapshot)
         refreshLineInfoGutter()
         guard commandHintOverlay.presentationKind == .completion,
@@ -2433,6 +2522,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return "Serial"
         case .telnet:
             return "Telnet"
+        case .console:
+            return "蓝牙 Console"
         }
     }
 
@@ -2449,6 +2540,11 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     private func renderCommandInputObservation(_ observation: TerminalCommandInputObservation) {
         if let completionSuggestion = observation.completionSuggestion {
+            guard isRemoteCompletionCaretAligned() else {
+                commandHintOverlay.clear()
+                resetRemoteInputLineAnchor(anchorLength: observation.currentLine.count)
+                return
+            }
             applyCommandCompletionTheme()
             commandHintOverlay.renderCompletion(completionSuggestion)
             positionCommandCompletionOverlayIfNeeded()
@@ -2475,6 +2571,38 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return
         }
         renderCommandInputObservation(observation)
+    }
+
+    private func applyTerminalAppearance(_ settings: AppSettings) {
+        let networkTheme = usesNetworkDeviceConsolePresentation
+            ? networkDeviceConsoleTheme(for: settings)
+            : nil
+        terminalView.semanticHighlightThemeOverride = networkTheme
+        TerminalAppearanceApplier.apply(
+            settings: settings,
+            to: terminalView,
+            colorThemeOverride: networkTheme
+        )
+    }
+
+    private func networkDeviceConsoleTheme(for settings: AppSettings) -> TerminalColorTheme {
+        switch settings.terminalTheme {
+        case .light:
+            return .oneHalfLight
+        case .system:
+            let match = terminalView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+            return match == .darkAqua ? .oneHalfDark : .oneHalfLight
+        case .custom:
+            guard let background = settings.customTerminalTheme?.backgroundColor.usingColorSpace(.deviceRGB) else {
+                return .oneHalfDark
+            }
+            let luminance = 0.2126 * background.redComponent
+                + 0.7152 * background.greenComponent
+                + 0.0722 * background.blueComponent
+            return luminance >= 0.5 ? .oneHalfLight : .oneHalfDark
+        case .dark:
+            return .oneHalfDark
+        }
     }
 
     private func pathCompletionProviderForCurrentInput() -> TerminalPathCompletionProviding? {
@@ -2563,16 +2691,53 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         view.needsLayout = true
     }
 
-    private func resetRemoteInputLineAnchor() {
+    private func resetRemoteInputLineAnchor(anchorLength: Int = 0) {
         remoteInputLineAnchorCaretFrame = nil
-        remoteInputLineAnchorLength = 0
+        remoteInputLineAnchorLength = max(0, anchorLength)
         remoteCompletionInputLine = ""
+    }
+
+    private func recordCompletionSensitiveInputTiming(_ bytes: [UInt8]) -> Bool {
+        guard Self.isCompletionSensitiveTextInput(bytes) else {
+            if bytes.contains(10) || bytes.contains(13) {
+                lastCompletionSensitiveInputAt = nil
+            }
+            return false
+        }
+        let now = Date()
+        defer { lastCompletionSensitiveInputAt = now }
+        guard let lastCompletionSensitiveInputAt else { return false }
+        let interval = now.timeIntervalSince(lastCompletionSensitiveInputAt)
+        return interval >= 0 && interval < 0.08
+    }
+
+    private static func isCompletionSensitiveTextInput(_ bytes: [UInt8]) -> Bool {
+        guard bytes.isEmpty == false,
+              bytes.contains(10) == false,
+              bytes.contains(13) == false,
+              bytes.contains(9) == false,
+              bytes.contains(27) == false
+        else { return false }
+        return bytes.contains { byte in
+            byte >= 32 || byte == 8 || byte == 127
+        }
+    }
+
+    private func isRemoteCompletionCaretAligned() -> Bool {
+        guard let anchor = remoteInputLineAnchorCaretFrame else {
+            return true
+        }
+        let actualCaret = TerminalCommandHintOverlayLayout.caretFrame(for: terminalView)
+        guard let expectedCaret = remoteCompletionCaretFrameForCurrentInput() else {
+            return false
+        }
+        let characterWidth = max(anchor.width, actualCaret.width, 1)
+        return abs(actualCaret.minX - expectedCaret.minX) <= characterWidth * 2
     }
 
     private func remoteCompletionCaretFrameForCurrentInput() -> NSRect? {
         if remoteInputLineAnchorCaretFrame == nil {
             remoteInputLineAnchorCaretFrame = TerminalCommandHintOverlayLayout.caretFrame(for: terminalView)
-            remoteInputLineAnchorLength = 0
         }
         guard let anchor = remoteInputLineAnchorCaretFrame,
               anchor.width > 0,
@@ -2602,11 +2767,19 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     @objc
     private func reconnectButtonPressed() {
-        _ = try? reconnectTerminal()
+        retryStoppedSession()
     }
 
     private func retryFromConnectionState() {
         guard lifecycleState == .disconnected else { return }
-        _ = try? reconnectTerminal()
+        retryStoppedSession()
+    }
+
+    private func retryStoppedSession() {
+        if connectionKind == .console, let onConsoleRetryRequested {
+            onConsoleRetryRequested()
+            return
+        }
+        reconnectFromStoppedPrompt()
     }
 }

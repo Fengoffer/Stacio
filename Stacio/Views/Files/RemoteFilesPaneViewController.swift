@@ -83,6 +83,7 @@ public final class RemoteFilesPaneViewController: NSViewController {
         transferScheduler: SCPTransferScheduling?,
         remoteProtocolName: String = "SCP",
         initialRemotePath: String = "~",
+        initialLocalDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
         initialLoadPresentation: RemoteFilesInitialLoadPresentation = .immediate,
         rightCapabilityWidthDefaults: UserDefaults = .standard,
         presentationMode: RemoteFilesPanePresentationMode = .inspector,
@@ -92,7 +93,7 @@ public final class RemoteFilesPaneViewController: NSViewController {
         self.context = context
         self.localFilesViewController = LocalFilePaneViewController(
             runtimeID: "\(runtimeID)_local",
-            directoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            directoryURL: URL(fileURLWithPath: (initialLocalDirectory as NSString).expandingTildeInPath, isDirectory: true),
             title: "本地文件"
         )
         self.bridge = bridge
@@ -328,10 +329,19 @@ public final class RemoteFilesPaneViewController: NSViewController {
         independentTransferBrowser
     }
 
+    var workspaceSessionGroupDefinition: WorkspaceSessionGroupDefinition? {
+        independentTransferBrowser?.workspaceSessionGroupDefinition
+    }
+
+    var fileTransferProtocolName: String? {
+        guard presentationMode == .transferBrowser else { return nil }
+        return remoteProtocolName.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+
     func setFileTransferRemoteDeviceActions(
         optionsProvider: @escaping () -> [FileTransferRemoteDeviceOption],
         connectHandler: @escaping (String) -> Void,
-        createHandler: @escaping () -> Void
+        createHandler: @escaping (String) -> Void
     ) {
         independentTransferBrowser?.remoteDeviceOptionsProvider = optionsProvider
         independentTransferBrowser?.onRequestConnectRemoteDevice = connectHandler
@@ -340,6 +350,21 @@ public final class RemoteFilesPaneViewController: NSViewController {
 
     func markPrimaryFileTransferRemoteDevice(sessionID: String) {
         independentTransferBrowser?.markPrimaryRemoteDevice(sessionID: sessionID)
+    }
+
+    @discardableResult
+    func removeAttachedFileTransferRemoteDevices(savedSessionIDs: Set<String>) -> Int {
+        independentTransferBrowser?.removeAttachedRemoteDevices(savedSessionIDs: savedSessionIDs) ?? 0
+    }
+
+    func restoreFileTransferWorkspace(
+        additionalLocalDirectoryPaths: [String],
+        layout: FileTransferWorkspaceLayoutMode
+    ) {
+        independentTransferBrowser?.restoreWorkspace(
+            additionalLocalDirectoryPaths: additionalLocalDirectoryPaths,
+            layout: layout
+        )
     }
 
     @discardableResult
@@ -363,6 +388,7 @@ public final class RemoteFilesPaneViewController: NSViewController {
             return
         }
         _ = transferScheduler?.disconnectTransfers(runtimeID: runtimeID)
+        filesCoordinator?.closeDocumentWindows()
         clearTransientOpenProgress()
     }
 

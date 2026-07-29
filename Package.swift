@@ -66,7 +66,8 @@ let package = Package(
                 .copy("Resources/Fonts")
             ],
             linkerSettings: [
-                .linkedFramework("IOKit")
+                .linkedFramework("IOKit"),
+                .linkedFramework("CoreBluetooth")
             ]
         ),
         .executableTarget(

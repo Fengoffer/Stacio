@@ -7,6 +7,9 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
     public var onSearchViewportChanged: (() -> Void)?
     public var fontZoomSettingsStore: AppSettingsStore = .shared
     public var contextMenuProvider: ((String?) -> NSMenu?)?
+    private let semanticOutputProcessor = TerminalSemanticOutputProcessor(
+        label: "cn.stacio.terminal.semantic.local.\(UUID().uuidString)"
+    )
     private var controlScrollZoomMonitor: Any?
     private var linkInteractionMonitor: Any?
 
@@ -21,6 +24,7 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
     }
 
     deinit {
+        semanticOutputProcessor.cancel()
         if let controlScrollZoomMonitor {
             NSEvent.removeMonitor(controlScrollZoomMonitor)
         }
@@ -37,12 +41,24 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
         let bytes = Array(slice)
         onOutput?(bytes)
         let settings = fontZoomSettingsStore.snapshot()
-        let displayBytes = TerminalSemanticOutputHighlighter.highlight(
-            bytes,
+        let configuration = TerminalSemanticHighlightConfiguration(
             level: settings.terminalHighlightLevel,
             richHighlightingEnabled: settings.terminalRichHighlightingEnabled,
             theme: TerminalAppearanceApplier.highlightTheme(for: settings)
         )
+        semanticOutputProcessor.process(
+            bytes: bytes,
+            configuration: configuration
+        ) { [weak self] displayBytes in
+            self?.feedProcessedOutput(displayBytes)
+        }
+    }
+
+    func cancelPendingSemanticOutput() {
+        semanticOutputProcessor.cancel()
+    }
+
+    private func feedProcessedOutput(_ displayBytes: [UInt8]) {
         super.dataReceived(slice: ArraySlice(displayBytes))
         onSearchViewportChanged?()
     }

@@ -28,6 +28,41 @@ public enum CoreBridge {
         StacioCoreBindings.openLocalShellRuntime(shellPath: shellPath, cols: cols, rows: rows)
     }
 
+    public static func openExternalTerminalRuntime(
+        kind: String,
+        endpoint: String,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> TerminalRuntime {
+        try StacioCoreBindings.openExternalTerminalRuntime(
+            kind: kind,
+            endpoint: endpoint,
+            cols: cols,
+            rows: rows
+        )
+    }
+
+    public static func parseConsoleSessionConfig(json: String) throws -> ConsoleSessionConfig {
+        try StacioCoreBindings.parseConsoleSessionConfig(json: json)
+    }
+
+    public static func serializeConsoleSessionConfig(config: ConsoleSessionConfig) throws -> String {
+        try StacioCoreBindings.serializeConsoleSessionConfig(config: config)
+    }
+
+    public static func matchBLEConsoleProfile(
+        services: [ConsoleServiceMetadata]
+    ) -> ConsoleProfileMatch? {
+        StacioCoreBindings.matchBleConsoleProfile(services: services)
+    }
+
+    public static func consoleTransportPolicy(
+        platform: ConsolePlatform,
+        windowsPort: String?
+    ) -> ConsoleTransportDecision {
+        StacioCoreBindings.consoleTransportPolicy(platform: platform, windowsPort: windowsPort)
+    }
+
     public static func openRemoteSSHRuntime(
         host: String,
         port: UInt16,
@@ -869,6 +904,42 @@ public enum CoreBridge {
             secret: secret,
             expectedFingerprintSha256: expectedFingerprintSHA256,
             job: job
+        )
+    }
+
+    public static func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        resumeOptions: ScpResumeOptions
+    ) throws -> [ScpTransferProgress] {
+        try StacioCoreBindings.runLiveSftpTransferWithResume(
+            config: config,
+            secret: secret,
+            expectedFingerprintSha256: expectedFingerprintSHA256,
+            job: job,
+            resumeOptions: resumeOptions
+        )
+    }
+
+    public static func runLiveRemoteToRemoteTransfer(
+        sourceConfig: SshConnectionConfig,
+        sourceSecret: SshAuthSecret,
+        sourceExpectedFingerprintSHA256: String,
+        destinationConfig: SshConnectionConfig,
+        destinationSecret: SshAuthSecret,
+        destinationExpectedFingerprintSHA256: String,
+        request: RemoteToRemoteTransferRequest
+    ) throws -> RemoteToRemoteTransferReport {
+        try StacioCoreBindings.runLiveRemoteToRemoteTransfer(
+            sourceConfig: sourceConfig,
+            sourceSecret: sourceSecret,
+            sourceExpectedFingerprintSha256: sourceExpectedFingerprintSHA256,
+            destinationConfig: destinationConfig,
+            destinationSecret: destinationSecret,
+            destinationExpectedFingerprintSha256: destinationExpectedFingerprintSHA256,
+            request: request
         )
     }
 

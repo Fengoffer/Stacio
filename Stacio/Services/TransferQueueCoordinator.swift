@@ -128,10 +128,32 @@ public protocol SFTPTransferBridging {
         expectedFingerprintSHA256: String,
         job: ScpTransferJob
     ) throws -> [ScpTransferProgress]
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        resumeOptions: ScpResumeOptions
+    ) throws -> [ScpTransferProgress]
     func cancelLiveSFTPTransfer(jobID: String) -> Bool
 }
 
 public extension SFTPTransferBridging {
+    func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        resumeOptions: ScpResumeOptions
+    ) throws -> [ScpTransferProgress] {
+        try runLiveSFTPTransfer(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job
+        )
+    }
+
     func cancelLiveSFTPTransfer(jobID: String) -> Bool {
         false
     }
@@ -154,6 +176,22 @@ public struct CoreBridgeSFTPTransferBridge: SFTPTransferBridging {
         )
     }
 
+    public func runLiveSFTPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        resumeOptions: ScpResumeOptions
+    ) throws -> [ScpTransferProgress] {
+        try CoreBridge.runLiveSFTPTransfer(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            resumeOptions: resumeOptions
+        )
+    }
+
     public func cancelLiveSFTPTransfer(jobID: String) -> Bool {
         (try? CoreBridge.cancelLiveSCPTransfer(jobID: jobID)) ?? false
     }
@@ -168,6 +206,35 @@ public protocol SCPTransferHistoryStoring {
     func clearFinishedJobs() throws -> UInt32
 }
 
+public enum TransferCompletionNotificationPolicy: Equatable, Sendable {
+    case userVisible
+    case silent
+}
+
+public enum LocalFileTransferOperation: Equatable, Sendable {
+    case copy
+    case move
+}
+
+public enum LocalFileTransferResult: Equatable, Sendable {
+    case completed
+    case cancelled
+    case failed(String)
+}
+
+@MainActor
+public protocol LocalFileTransferScheduling: AnyObject {
+    @discardableResult
+    func scheduleLocalFileTransfer(
+        runtimeID: String,
+        sourceURL: URL,
+        destinationURL: URL,
+        operation: LocalFileTransferOperation,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((LocalFileTransferResult) -> Void)?
+    ) -> String
+}
+
 public struct TransferQueueSnapshot: Equatable {
     public struct Row: Equatable {
         public let jobID: String
@@ -178,6 +245,9 @@ public struct TransferQueueSnapshot: Equatable {
         public let bytesTotal: UInt64
         public let rawStatus: String
         public let diagnostic: String?
+        public let runtimeID: String?
+        public let elapsedTime: TimeInterval
+        public let finishedAt: Date?
 
         public init(
             jobID: String,
@@ -187,7 +257,10 @@ public struct TransferQueueSnapshot: Equatable {
             bytesDone: UInt64,
             bytesTotal: UInt64,
             rawStatus: String,
-            diagnostic: String?
+            diagnostic: String?,
+            runtimeID: String? = nil,
+            elapsedTime: TimeInterval = 0,
+            finishedAt: Date? = nil
         ) {
             self.jobID = jobID
             self.direction = direction
@@ -197,6 +270,9 @@ public struct TransferQueueSnapshot: Equatable {
             self.bytesTotal = bytesTotal
             self.rawStatus = rawStatus
             self.diagnostic = diagnostic
+            self.runtimeID = runtimeID
+            self.elapsedTime = elapsedTime
+            self.finishedAt = finishedAt
         }
     }
 
@@ -309,6 +385,20 @@ public final class TransferQueueCoordinator {
     private var retryableTransfersByJobID: [String: ScheduledSCPTransfer] = [:]
     private var retryableFTPTransfersByJobID: [String: ScheduledFTPTransfer] = [:]
     private var completionByJobID: [String: (ScpTransferProgress) -> Void] = [:]
+    private var notificationPolicyByJobID: [String: TransferCompletionNotificationPolicy] = [:]
+    private var finishedAtByJobID: [String: Date] = [:]
+    private struct QueueObservation {
+        let runtimeIDs: () -> Set<String>
+        let handler: (TransferQueueSnapshot) -> Void
+    }
+    private var queueObservations: [UUID: QueueObservation] = [:]
+    private struct ExternalTransferControl {
+        let progressProvider: @Sendable () -> [ScpTransferProgress]
+        let pause: () -> Bool
+        let resume: () -> Bool
+        let cancel: () -> Bool
+    }
+    private var externalTransferControlsByJobID: [String: ExternalTransferControl] = [:]
     private struct OrchestratedRetry {
         let runtimeIDs: Set<String>
         let retry: () -> Bool
@@ -332,6 +422,7 @@ public final class TransferQueueCoordinator {
     private var progressPollTimer: Timer?
     private var progressPollInFlight = false
     private let maxConcurrentTransfers: Int
+    private let localFileTransferExecutor: LocalFileTransferExecutor
     private let nowProvider: () -> Date
     private let monotonicTimeProvider: () -> TimeInterval
     private var timingByJobID: [String: TransferTimingState] = [:]
@@ -360,6 +451,9 @@ public final class TransferQueueCoordinator {
             ?? NoopTransferCompletionNotificationPresenter()
         self.queueViewController = queueViewController
         self.maxConcurrentTransfers = max(1, maxConcurrentTransfers)
+        self.localFileTransferExecutor = LocalFileTransferExecutor(
+            maxConcurrentTransfers: max(1, maxConcurrentTransfers)
+        )
         self.nowProvider = nowProvider
         self.monotonicTimeProvider = monotonicTimeProvider
         queueViewController.onTransferAction = { [weak self] action, jobID in
@@ -387,6 +481,157 @@ public final class TransferQueueCoordinator {
         progressPollTimer?.invalidate()
     }
 
+    @discardableResult
+    public func observeQueue(
+        runtimeIDs: @escaping () -> Set<String>,
+        handler: @escaping (TransferQueueSnapshot) -> Void
+    ) -> UUID {
+        let observationID = UUID()
+        let observation = QueueObservation(runtimeIDs: runtimeIDs, handler: handler)
+        queueObservations[observationID] = observation
+        handler(makeSessionSnapshot(runtimeIDs: runtimeIDs()))
+        return observationID
+    }
+
+    public func removeQueueObservation(_ observationID: UUID) {
+        queueObservations[observationID] = nil
+    }
+
+    public func registerExternalTransfer(
+        runtimeID: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy = .silent,
+        progressProvider: @escaping @Sendable () -> [ScpTransferProgress],
+        pause: @escaping () -> Bool,
+        resume: @escaping () -> Bool,
+        cancel: @escaping () -> Bool
+    ) {
+        if let existingStatus = progressByJobID[job.id]?.last?.status {
+            guard Self.finishedStatuses.contains(existingStatus) else { return }
+            removeTransfer(jobID: job.id)
+        } else if jobsByID[job.id] != nil {
+            return
+        }
+        notificationPolicyByJobID[job.id] = notificationPolicy
+        enqueueTransfer(runtimeID: runtimeID, job: job)
+        externalTransferControlsByJobID[job.id] = ExternalTransferControl(
+            progressProvider: progressProvider,
+            pause: pause,
+            resume: resume,
+            cancel: cancel
+        )
+        beginTransferTiming(jobID: job.id)
+        runningJobIDs.append(job.id)
+        runningSCPJobIDs.insert(job.id)
+        progressByJobID[job.id] = [ScpTransferProgress(
+            jobId: job.id,
+            bytesDone: 0,
+            bytesTotal: job.bytesTotal,
+            status: "running"
+        )]
+        startProgressPollingIfNeeded()
+        refreshQueueView()
+    }
+
+    public func finishExternalTransfer(
+        jobID: String,
+        status: String,
+        bytesDone: UInt64,
+        diagnostic: String? = nil
+    ) {
+        guard let job = jobsByID[jobID] else { return }
+        runningJobIDs.removeAll { $0 == jobID }
+        runningSCPJobIDs.remove(jobID)
+        externalTransferControlsByJobID[jobID] = nil
+        pausedJobIDs.remove(jobID)
+        _ = endTransferTiming(jobID: jobID)
+        if Self.finishedStatuses.contains(status) {
+            finishedAtByJobID[jobID] = nowProvider()
+        }
+        let latest = progressByJobID[jobID]?.last
+        let progress = ScpTransferProgress(
+            jobId: jobID,
+            bytesDone: max(bytesDone, latest?.bytesDone ?? 0),
+            bytesTotal: max(job.bytesTotal, latest?.bytesTotal ?? 0),
+            status: status
+        )
+        progressByJobID[jobID] = [progress]
+        diagnosticsByJobID[jobID] = diagnostic
+        _ = try? historyStore.appendProgress(progress, message: diagnostic)
+        presentCompletionNotificationIfNeeded(jobID: jobID, progress: progress)
+        stopProgressPollingIfIdle()
+        refreshQueueView()
+    }
+
+    @discardableResult
+    public func scheduleLocalFileTransfer(
+        runtimeID: String,
+        sourceURL: URL,
+        destinationURL: URL,
+        operation: LocalFileTransferOperation,
+        notificationPolicy: TransferCompletionNotificationPolicy = .userVisible,
+        completion: ((LocalFileTransferResult) -> Void)? = nil
+    ) -> String {
+        let source = sourceURL.standardizedFileURL
+        let destination = destinationURL.standardizedFileURL
+        let jobID = "local_file_\(UUID().uuidString)"
+        let task = LocalFileTransferTask(
+            jobID: jobID,
+            sourceURL: source,
+            destinationURL: destination,
+            operation: operation
+        )
+        let job = ScpTransferJob(
+            id: jobID,
+            direction: .upload,
+            sourcePath: source.path,
+            destinationPath: destination.path,
+            bytesTotal: task.initialByteCount
+        )
+        registerExternalTransfer(
+            runtimeID: runtimeID,
+            job: job,
+            notificationPolicy: notificationPolicy,
+            progressProvider: { [task] in task.takeProgressBatch() },
+            pause: { [task] in task.pause() },
+            resume: { [task] in task.resume() },
+            cancel: { [task] in task.cancel() }
+        )
+        localFileTransferExecutor.submit(task) { [weak self] result, progress in
+            guard let self else {
+                completion?(result)
+                return
+            }
+            if progress.bytesTotal > 0 {
+                self.updateScheduledTransferEstimatedByteTotal(
+                    jobID: jobID,
+                    bytesTotal: progress.bytesTotal
+                )
+            }
+            let status: String
+            let diagnostic: String?
+            switch result {
+            case .completed:
+                status = "completed"
+                diagnostic = nil
+            case .cancelled:
+                status = "canceled"
+                diagnostic = nil
+            case .failed(let message):
+                status = "failed"
+                diagnostic = message
+            }
+            self.finishExternalTransfer(
+                jobID: jobID,
+                status: status,
+                bytesDone: progress.bytesDone,
+                diagnostic: diagnostic
+            )
+            completion?(result)
+        }
+        return jobID
+    }
+
     public func enqueueTransfer(job: ScpTransferJob) {
         enqueueTransfer(runtimeID: nil, job: job)
     }
@@ -399,6 +644,10 @@ public final class TransferQueueCoordinator {
         record(job: job)
         timingByJobID[job.id] = TransferTimingState()
         terminalObservationByJobID[job.id] = nil
+        finishedAtByJobID[job.id] = nil
+        if notificationPolicyByJobID[job.id] == nil {
+            notificationPolicyByJobID[job.id] = .userVisible
+        }
         pendingRequeueByJobID[job.id] = nil
         if let runtimeID {
             runtimeIDByJobID[job.id] = runtimeID
@@ -423,9 +672,30 @@ public final class TransferQueueCoordinator {
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)? = nil
     ) {
+        scheduleLiveTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: .userVisible,
+            completion: completion
+        )
+    }
+
+    public func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)? = nil
+    ) {
         guard !isActiveScheduledTransfer(jobID: job.id) else {
             return
         }
+        notificationPolicyByJobID[job.id] = notificationPolicy
         enqueueTransfer(runtimeID: runtimeID, job: job)
         scheduledTransfersByJobID[job.id] = ScheduledSCPTransfer(
             config: config,
@@ -507,9 +777,30 @@ public final class TransferQueueCoordinator {
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)? = nil
     ) {
+        scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: .userVisible,
+            completion: completion
+        )
+    }
+
+    public func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)? = nil
+    ) {
         guard !isActiveScheduledTransfer(jobID: job.id) else {
             return
         }
+        notificationPolicyByJobID[job.id] = notificationPolicy
         enqueueTransfer(runtimeID: runtimeID, job: job)
         scheduledTransfersByJobID[job.id] = ScheduledSCPTransfer(
             config: config,
@@ -555,6 +846,9 @@ public final class TransferQueueCoordinator {
             return []
         }
         for jobID in jobIDs {
+            if let externalControl = externalTransferControlsByJobID[jobID] {
+                _ = externalControl.cancel()
+            }
             let latest = progressByJobID[jobID]?.last
             let canceled = ScpTransferProgress(
                 jobId: jobID,
@@ -639,18 +933,45 @@ public final class TransferQueueCoordinator {
 
     @discardableResult
     public func cancelTransfer(jobID: String) -> Bool {
-        markTransferInterrupted(jobID: jobID, status: "canceled", keepsRetryableTransfer: false)
+        if let control = externalTransferControlsByJobID[jobID] {
+            guard control.cancel() else { return false }
+            return markExternalTransferInterrupted(jobID: jobID, status: "canceled", keepsControl: false)
+        }
+        return markTransferInterrupted(jobID: jobID, status: "canceled", keepsRetryableTransfer: false)
     }
 
     @discardableResult
     public func pauseTransfer(jobID: String) -> Bool {
-        markTransferInterrupted(jobID: jobID, status: "paused", keepsRetryableTransfer: true)
+        if let control = externalTransferControlsByJobID[jobID] {
+            guard control.pause() else { return false }
+            return markExternalTransferInterrupted(jobID: jobID, status: "paused", keepsControl: true)
+        }
+        return markTransferInterrupted(jobID: jobID, status: "paused", keepsRetryableTransfer: true)
     }
 
     @discardableResult
     public func resumeTransfer(jobID: String) -> Bool {
         guard progressByJobID[jobID]?.last?.status == "paused" else {
             return false
+        }
+        if let control = externalTransferControlsByJobID[jobID] {
+            guard control.resume() else { return false }
+            pausedJobIDs.remove(jobID)
+            beginTransferTiming(jobID: jobID)
+            if runningJobIDs.contains(jobID) == false {
+                runningJobIDs.append(jobID)
+            }
+            runningSCPJobIDs.insert(jobID)
+            let latest = progressByJobID[jobID]?.last
+            progressByJobID[jobID] = [ScpTransferProgress(
+                jobId: jobID,
+                bytesDone: latest?.bytesDone ?? 0,
+                bytesTotal: latest?.bytesTotal ?? jobsByID[jobID]?.bytesTotal ?? 0,
+                status: "resuming"
+            )]
+            startProgressPollingIfNeeded()
+            refreshQueueView()
+            return true
         }
         return requeueRetryableTransfer(jobID: jobID, bytesDone: progressByJobID[jobID]?.last?.bytesDone ?? 0)
     }
@@ -779,6 +1100,9 @@ public final class TransferQueueCoordinator {
         retryableTransfersByJobID = [:]
         retryableFTPTransfersByJobID = [:]
         completionByJobID = [:]
+        notificationPolicyByJobID = [:]
+        finishedAtByJobID = [:]
+        externalTransferControlsByJobID = [:]
         queuedScheduledJobIDs = []
         runningJobIDs = []
         runningSCPJobIDs = []
@@ -881,6 +1205,9 @@ public final class TransferQueueCoordinator {
             retryableTransfersByJobID[jobID] = nil
             retryableFTPTransfersByJobID[jobID] = nil
             completionByJobID[jobID] = nil
+            notificationPolicyByJobID[jobID] = nil
+            finishedAtByJobID[jobID] = nil
+            externalTransferControlsByJobID[jobID] = nil
             runningSCPJobIDs.remove(jobID)
             canceledJobIDs.remove(jobID)
             pausedJobIDs.remove(jobID)
@@ -911,6 +1238,12 @@ public final class TransferQueueCoordinator {
                 status: status
             )
         ]
+        if Self.finishedStatuses.contains(status) {
+            finishedAtByJobID[jobID] = nowProvider()
+            _ = endTransferTiming(jobID: jobID)
+        } else {
+            finishedAtByJobID[jobID] = nil
+        }
         refreshQueueView()
     }
 
@@ -948,6 +1281,7 @@ public final class TransferQueueCoordinator {
 
         pendingRequeueByJobID[jobID] = nil
         terminalObservationByJobID[jobID] = nil
+        finishedAtByJobID[jobID] = nil
         if forceRestart {
             timingByJobID[jobID] = TransferTimingState()
         }
@@ -1032,6 +1366,40 @@ public final class TransferQueueCoordinator {
     }
 
     @discardableResult
+    private func markExternalTransferInterrupted(
+        jobID: String,
+        status: String,
+        keepsControl: Bool
+    ) -> Bool {
+        guard let job = jobsByID[jobID],
+              let latest = progressByJobID[jobID]?.last
+        else { return false }
+        runningJobIDs.removeAll { $0 == jobID }
+        runningSCPJobIDs.remove(jobID)
+        _ = endTransferTiming(jobID: jobID)
+        let interrupted = ScpTransferProgress(
+            jobId: jobID,
+            bytesDone: latest.bytesDone,
+            bytesTotal: latest.bytesTotal > 0 ? latest.bytesTotal : job.bytesTotal,
+            status: status
+        )
+        progressByJobID[jobID] = [interrupted]
+        if status == "paused" {
+            pausedJobIDs.insert(jobID)
+        } else {
+            pausedJobIDs.remove(jobID)
+            finishedAtByJobID[jobID] = nowProvider()
+        }
+        if keepsControl == false {
+            externalTransferControlsByJobID[jobID] = nil
+        }
+        _ = try? historyStore.appendProgress(interrupted)
+        stopProgressPollingIfIdle()
+        refreshQueueView()
+        return true
+    }
+
+    @discardableResult
     private func markTransferInterrupted(
         jobID: String,
         status: String,
@@ -1113,6 +1481,9 @@ public final class TransferQueueCoordinator {
         }
         stopProgressPollingIfIdle()
         progressByJobID[jobID] = [interrupted]
+        if Self.finishedStatuses.contains(status) {
+            finishedAtByJobID[jobID] = nowProvider()
+        }
         _ = try? historyStore.appendProgress(interrupted)
         refreshQueueView()
         if isCancellation && hasActiveWorker == false {
@@ -1148,7 +1519,8 @@ public final class TransferQueueCoordinator {
                         config: scheduledTransfer.config,
                         secret: scheduledTransfer.secret,
                         expectedFingerprintSHA256: scheduledTransfer.expectedFingerprintSHA256,
-                        job: scheduledTransfer.job
+                        job: scheduledTransfer.job,
+                        resumeOptions: scheduledTransfer.resumeOptions
                     )
                 }
             }
@@ -1189,14 +1561,14 @@ public final class TransferQueueCoordinator {
 
     private func beginTransferTiming(jobID: String) {
         var timing = timingByJobID[jobID] ?? TransferTimingState()
-        timing.begin(at: monotonicTimeProvider())
+        timing.begin(at: monotonicTimeProvider(), displayDate: nowProvider())
         timingByJobID[jobID] = timing
     }
 
     @discardableResult
     private func endTransferTiming(jobID: String) -> TimeInterval {
         var timing = timingByJobID[jobID] ?? TransferTimingState()
-        let duration = timing.end(at: monotonicTimeProvider())
+        let duration = timing.end(at: monotonicTimeProvider(), displayDate: nowProvider())
         timingByJobID[jobID] = timing
         return duration
     }
@@ -1210,10 +1582,12 @@ public final class TransferQueueCoordinator {
         else {
             return
         }
+        let completedAt = nowProvider()
         terminalObservationByJobID[jobID] = TransferTerminalObservation(
-            completedAt: nowProvider(),
+            completedAt: completedAt,
             duration: endTransferTiming(jobID: jobID)
         )
+        finishedAtByJobID[jobID] = completedAt
     }
 
     private func markScheduledTransferRunning(jobID: String, job: ScpTransferJob) {
@@ -1366,6 +1740,10 @@ public final class TransferQueueCoordinator {
         }
 
         recordTerminalObservationIfNeeded(jobID: jobID, progress: progress)
+        guard notificationPolicyByJobID[jobID] != .silent else {
+            terminalObservationByJobID[jobID] = nil
+            return
+        }
         let observation = terminalObservationByJobID.removeValue(forKey: jobID)
             ?? TransferTerminalObservation(completedAt: nowProvider(), duration: endTransferTiming(jobID: jobID))
         let byteCount: UInt64
@@ -1440,11 +1818,15 @@ public final class TransferQueueCoordinator {
             return
         }
         progressPollInFlight = true
+        let externalProgressProviders = Dictionary(uniqueKeysWithValues: jobIDs.compactMap { jobID in
+            externalTransferControlsByJobID[jobID].map { (jobID, $0.progressProvider) }
+        })
 
-        let task = Task.detached(priority: .utility) { [bridge] in
+        let task = Task.detached(priority: .utility) { [bridge, externalProgressProviders] in
             var batches: [String: [ScpTransferProgress]] = [:]
             for jobID in jobIDs {
-                let progress = bridge.takeLiveSCPTransferProgressBatch(jobID: jobID)
+                let progress = externalProgressProviders[jobID]?()
+                    ?? bridge.takeLiveSCPTransferProgressBatch(jobID: jobID)
                 if !progress.isEmpty {
                     batches[jobID] = progress
                 }
@@ -1460,6 +1842,9 @@ public final class TransferQueueCoordinator {
     private func applyPolledTransferProgress(_ batches: [String: [ScpTransferProgress]]) {
         progressPollInFlight = false
         guard !batches.isEmpty else {
+            if runningSCPJobIDs.isEmpty == false {
+                refreshQueueView()
+            }
             return
         }
 
@@ -1561,10 +1946,12 @@ public final class TransferQueueCoordinator {
             return true
         }
         return scheduledTransfersByJobID[jobID] != nil || scheduledFTPTransfersByJobID[jobID] != nil
+            || externalTransferControlsByJobID[jobID] != nil
     }
 
     private var activeWorkerCount: Int {
-        runningJobIDs.count + drainingRunTokensByJobID.count
+        runningJobIDs.lazy.filter { self.externalTransferControlsByJobID[$0] == nil }.count
+            + drainingRunTokensByJobID.count
     }
 
     @discardableResult
@@ -1625,6 +2012,8 @@ public final class TransferQueueCoordinator {
         retryableTransfersByJobID[jobID] = nil
         retryableFTPTransfersByJobID[jobID] = nil
         completionByJobID[jobID] = nil
+        notificationPolicyByJobID[jobID] = nil
+        externalTransferControlsByJobID[jobID] = nil
         queuedScheduledJobIDs.removeAll { $0 == jobID }
         runningJobIDs.removeAll { $0 == jobID }
         runningSCPJobIDs.remove(jobID)
@@ -1636,6 +2025,7 @@ public final class TransferQueueCoordinator {
         runtimeIDByJobID[jobID] = nil
         timingByJobID[jobID] = nil
         terminalObservationByJobID[jobID] = nil
+        finishedAtByJobID[jobID] = nil
     }
 
     private func discardOrchestratedRetry(jobID: String) {
@@ -1659,6 +2049,33 @@ public final class TransferQueueCoordinator {
             eventLogsByJobID: eventLogsByJobID
         )
         onSnapshotChanged?(makeTransferStatusSnapshot())
+        for observation in Array(queueObservations.values) {
+            observation.handler(makeSessionSnapshot(runtimeIDs: observation.runtimeIDs()))
+        }
+    }
+
+    private func makeSessionSnapshot(runtimeIDs: Set<String>) -> TransferQueueSnapshot {
+        guard runtimeIDs.isEmpty == false else {
+            return TransferQueueSnapshot(rows: [], capturedAt: nowProvider())
+        }
+        let matchingJobIDs = orderedJobIDs.filter { jobID in
+            runtimeIDByJobID[jobID].map(runtimeIDs.contains) == true
+        }
+        let activeJobIDs = matchingJobIDs.filter { jobID in
+            guard let status = progressByJobID[jobID]?.last?.status else { return false }
+            return Self.finishedStatuses.contains(status) == false
+        }
+        let historyJobIDs = matchingJobIDs
+            .filter { !activeJobIDs.contains($0) }
+            .sorted { lhs, rhs in
+                let lhsFinishedAt = finishedAtByJobID[lhs] ?? .distantPast
+                let rhsFinishedAt = finishedAtByJobID[rhs] ?? .distantPast
+                if lhsFinishedAt != rhsFinishedAt {
+                    return lhsFinishedAt > rhsFinishedAt
+                }
+                return (orderedJobIDs.firstIndex(of: lhs) ?? 0) > (orderedJobIDs.firstIndex(of: rhs) ?? 0)
+            }
+        return makeSnapshot(jobIDs: activeJobIDs + historyJobIDs)
     }
 
     private func makeTransferStatusSnapshot() -> TransferQueueSnapshot {
@@ -1694,10 +2111,13 @@ public final class TransferQueueCoordinator {
                     estimatedBytesTotal: estimatedBytesTotalByJobID[job.id]
                 ),
                 rawStatus: latest?.status ?? "queued",
-                diagnostic: diagnosticsByJobID[job.id]
+                diagnostic: diagnosticsByJobID[job.id],
+                runtimeID: runtimeIDByJobID[job.id],
+                elapsedTime: timingByJobID[job.id]?.displayElapsed(at: nowProvider()) ?? 0,
+                finishedAt: finishedAtByJobID[job.id]
             )
         }
-        return TransferQueueSnapshot(rows: rows)
+        return TransferQueueSnapshot(rows: rows, capturedAt: nowProvider())
     }
 
     private static func displayBytesTotal(
@@ -1813,25 +2233,430 @@ public final class TransferQueueCoordinator {
     private static let largeFileEstimateBytesPerSecond: Double = 20 * 1024 * 1024
 }
 
+extension TransferQueueCoordinator: LocalFileTransferScheduling {}
+
+private final class LocalFileTransferExecutor: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "com.stacio.files.local-transfer",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let limiter: DispatchSemaphore
+
+    init(maxConcurrentTransfers: Int) {
+        limiter = DispatchSemaphore(value: max(1, maxConcurrentTransfers))
+    }
+
+    func submit(
+        _ task: LocalFileTransferTask,
+        completion: @escaping @MainActor (LocalFileTransferResult, ScpTransferProgress) -> Void
+    ) {
+        queue.async {
+            self.limiter.wait()
+            let result = task.run()
+            let progress = task.currentProgress
+            self.limiter.signal()
+            DispatchQueue.main.async {
+                completion(result, progress)
+            }
+        }
+    }
+}
+
+final class LocalFileTransferTask: @unchecked Sendable {
+    private enum TaskError: Error, LocalizedError {
+        case cancelled
+        case invalidSource(String)
+        case destinationInsideSource
+        case unsupportedItem(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .cancelled:
+                return "本地传输已取消"
+            case .invalidSource(let path):
+                return "本地源文件不存在或不可读取：\(path)"
+            case .destinationInsideSource:
+                return "目标目录不能位于源目录内部"
+            case .unsupportedItem(let path):
+                return "不支持传输此本地项目：\(path)"
+            }
+        }
+    }
+
+    let initialByteCount: UInt64
+
+    private let jobID: String
+    private let sourceURL: URL
+    private let destinationURL: URL
+    private let operation: LocalFileTransferOperation
+    private let fileManager: FileManager
+    private let chunkSize: Int
+    private let chunkDelay: TimeInterval
+    private let state = NSCondition()
+    private var isPaused = false
+    private var isCancelled = false
+    private var isFinished = false
+    private var pendingProgress: ScpTransferProgress?
+    private var latestProgress: ScpTransferProgress
+    private var temporaryURL: URL?
+
+    init(
+        jobID: String,
+        sourceURL: URL,
+        destinationURL: URL,
+        operation: LocalFileTransferOperation,
+        fileManager: FileManager = .default,
+        chunkSize: Int = 1_024 * 1_024,
+        chunkDelay: TimeInterval = 0
+    ) {
+        self.jobID = jobID
+        self.sourceURL = sourceURL
+        self.destinationURL = destinationURL
+        self.operation = operation
+        self.fileManager = fileManager
+        self.chunkSize = max(64 * 1_024, chunkSize)
+        self.chunkDelay = max(0, chunkDelay)
+        self.initialByteCount = Self.fileByteCount(at: sourceURL, fileManager: fileManager) ?? 0
+        self.latestProgress = ScpTransferProgress(
+            jobId: jobID,
+            bytesDone: 0,
+            bytesTotal: initialByteCount,
+            status: "running"
+        )
+    }
+
+    var currentProgress: ScpTransferProgress {
+        state.lock()
+        defer { state.unlock() }
+        return latestProgress
+    }
+
+    func takeProgressBatch() -> [ScpTransferProgress] {
+        state.lock()
+        defer { state.unlock() }
+        guard let pendingProgress else { return [] }
+        self.pendingProgress = nil
+        return [pendingProgress]
+    }
+
+    func pause() -> Bool {
+        state.lock()
+        defer { state.unlock() }
+        guard isFinished == false, isCancelled == false, isPaused == false else { return false }
+        isPaused = true
+        return true
+    }
+
+    func resume() -> Bool {
+        state.lock()
+        defer { state.unlock() }
+        guard isFinished == false, isCancelled == false, isPaused else { return false }
+        isPaused = false
+        state.broadcast()
+        return true
+    }
+
+    func cancel() -> Bool {
+        state.lock()
+        defer { state.unlock() }
+        guard isFinished == false, isCancelled == false else { return false }
+        isCancelled = true
+        isPaused = false
+        state.broadcast()
+        return true
+    }
+
+    func run() -> LocalFileTransferResult {
+        do {
+            try checkpoint()
+            let values = try sourceURL.resourceValues(forKeys: [
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ])
+            guard values.isDirectory == true
+                    || values.isRegularFile == true
+                    || values.isSymbolicLink == true
+            else {
+                throw TaskError.invalidSource(sourceURL.path)
+            }
+            if values.isDirectory == true,
+               Self.isDescendant(destinationURL, of: sourceURL)
+            {
+                throw TaskError.destinationInsideSource
+            }
+
+            let bytesTotal = try totalByteCount(at: sourceURL)
+            recordProgress(bytesDone: 0, bytesTotal: bytesTotal)
+            if operation == .move, try canMoveAtomically() {
+                try checkpoint()
+                try promote(sourceURL, to: destinationURL)
+                recordProgress(bytesDone: bytesTotal, bytesTotal: bytesTotal)
+                markFinished()
+                return .completed
+            }
+
+            let stagingURL = Self.stagingURL(for: destinationURL, jobID: jobID)
+            temporaryURL = stagingURL
+            try? fileManager.removeItem(at: stagingURL)
+            var bytesDone: UInt64 = 0
+            try copyItem(
+                at: sourceURL,
+                to: stagingURL,
+                bytesDone: &bytesDone,
+                bytesTotal: bytesTotal
+            )
+            try checkpoint()
+            try promote(stagingURL, to: destinationURL)
+            temporaryURL = nil
+            if operation == .move {
+                try fileManager.removeItem(at: sourceURL)
+            }
+            recordProgress(bytesDone: bytesTotal, bytesTotal: bytesTotal)
+            markFinished()
+            return .completed
+        } catch TaskError.cancelled {
+            cleanupTemporaryItem()
+            markFinished()
+            return .cancelled
+        } catch {
+            cleanupTemporaryItem()
+            markFinished()
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    private func totalByteCount(at url: URL) throws -> UInt64 {
+        try checkpoint()
+        let values = try url.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey
+        ])
+        if values.isSymbolicLink == true { return 0 }
+        if values.isRegularFile == true {
+            return UInt64(max(values.fileSize ?? 0, 0))
+        }
+        guard values.isDirectory == true else {
+            throw TaskError.unsupportedItem(url.path)
+        }
+        var total: UInt64 = 0
+        for child in try fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) {
+            let value = try totalByteCount(at: child)
+            let (sum, overflow) = total.addingReportingOverflow(value)
+            total = overflow ? UInt64.max : sum
+        }
+        return total
+    }
+
+    private func copyItem(
+        at source: URL,
+        to destination: URL,
+        bytesDone: inout UInt64,
+        bytesTotal: UInt64
+    ) throws {
+        try checkpoint()
+        let values = try source.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey
+        ])
+        if values.isSymbolicLink == true {
+            let target = try fileManager.destinationOfSymbolicLink(atPath: source.path)
+            try fileManager.createSymbolicLink(atPath: destination.path, withDestinationPath: target)
+            return
+        }
+        if values.isDirectory == true {
+            try fileManager.createDirectory(at: destination, withIntermediateDirectories: false)
+            for child in try fileManager.contentsOfDirectory(
+                at: source,
+                includingPropertiesForKeys: nil,
+                options: []
+            ) {
+                try copyItem(
+                    at: child,
+                    to: destination.appendingPathComponent(child.lastPathComponent),
+                    bytesDone: &bytesDone,
+                    bytesTotal: bytesTotal
+                )
+            }
+            try applyMetadata(from: source, to: destination)
+            return
+        }
+        guard values.isRegularFile == true else {
+            throw TaskError.unsupportedItem(source.path)
+        }
+
+        guard fileManager.createFile(atPath: destination.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let reader = try FileHandle(forReadingFrom: source)
+        let writer = try FileHandle(forWritingTo: destination)
+        defer {
+            try? reader.close()
+            try? writer.close()
+        }
+        while true {
+            try checkpoint()
+            guard let data = try reader.read(upToCount: chunkSize), data.isEmpty == false else { break }
+            try writer.write(contentsOf: data)
+            let (sum, overflow) = bytesDone.addingReportingOverflow(UInt64(data.count))
+            bytesDone = overflow ? UInt64.max : sum
+            recordProgress(bytesDone: bytesDone, bytesTotal: bytesTotal)
+            if chunkDelay > 0 {
+                Thread.sleep(forTimeInterval: chunkDelay)
+            }
+        }
+        try writer.synchronize()
+        try applyMetadata(from: source, to: destination)
+    }
+
+    private func applyMetadata(from source: URL, to destination: URL) throws {
+        let attributes = try fileManager.attributesOfItem(atPath: source.path)
+        var preserved: [FileAttributeKey: Any] = [:]
+        for key in [FileAttributeKey.posixPermissions, .modificationDate] {
+            if let value = attributes[key] {
+                preserved[key] = value
+            }
+        }
+        if preserved.isEmpty == false {
+            try fileManager.setAttributes(preserved, ofItemAtPath: destination.path)
+        }
+    }
+
+    private func canMoveAtomically() throws -> Bool {
+        let sourceVolume = try sourceURL.resourceValues(forKeys: [.volumeIdentifierKey]).volumeIdentifier
+        let destinationVolume = try destinationURL.deletingLastPathComponent()
+            .resourceValues(forKeys: [.volumeIdentifierKey])
+            .volumeIdentifier
+        guard let sourceVolume, let destinationVolume else { return false }
+        return sourceVolume.isEqual(destinationVolume)
+    }
+
+    private func promote(_ source: URL, to destination: URL) throws {
+        let parent = destination.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        guard fileManager.fileExists(atPath: destination.path) else {
+            try fileManager.moveItem(at: source, to: destination)
+            return
+        }
+
+        let backup = parent.appendingPathComponent(
+            ".\(destination.lastPathComponent).stacio-backup-\(UUID().uuidString)",
+            isDirectory: destination.hasDirectoryPath
+        )
+        try fileManager.moveItem(at: destination, to: backup)
+        do {
+            try fileManager.moveItem(at: source, to: destination)
+            try fileManager.removeItem(at: backup)
+        } catch {
+            if fileManager.fileExists(atPath: destination.path) {
+                try? fileManager.moveItem(at: destination, to: source)
+            }
+            if fileManager.fileExists(atPath: backup.path) {
+                try? fileManager.moveItem(at: backup, to: destination)
+            }
+            throw error
+        }
+    }
+
+    private func checkpoint() throws {
+        state.lock()
+        while isPaused, isCancelled == false {
+            state.wait()
+        }
+        let cancelled = isCancelled
+        state.unlock()
+        if cancelled { throw TaskError.cancelled }
+    }
+
+    private func recordProgress(bytesDone: UInt64, bytesTotal: UInt64) {
+        let progress = ScpTransferProgress(
+            jobId: jobID,
+            bytesDone: min(bytesDone, bytesTotal),
+            bytesTotal: bytesTotal,
+            status: "running"
+        )
+        state.lock()
+        latestProgress = progress
+        pendingProgress = progress
+        state.unlock()
+    }
+
+    private func markFinished() {
+        state.lock()
+        isFinished = true
+        isPaused = false
+        state.broadcast()
+        state.unlock()
+    }
+
+    private func cleanupTemporaryItem() {
+        guard let temporaryURL else { return }
+        try? fileManager.removeItem(at: temporaryURL)
+        self.temporaryURL = nil
+    }
+
+    private static func stagingURL(for destination: URL, jobID: String) -> URL {
+        destination.deletingLastPathComponent().appendingPathComponent(
+            ".\(destination.lastPathComponent).stacio-transfer-\(jobID).partial",
+            isDirectory: destination.hasDirectoryPath
+        )
+    }
+
+    private static func isDescendant(_ candidate: URL, of directory: URL) -> Bool {
+        let directoryPath = directory.standardizedFileURL.path
+        let candidatePath = candidate.standardizedFileURL.path
+        return candidatePath.hasPrefix(directoryPath.hasSuffix("/") ? directoryPath : directoryPath + "/")
+    }
+
+    private static func fileByteCount(at url: URL, fileManager: FileManager) -> UInt64? {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let type = attributes[.type] as? FileAttributeType,
+              type == .typeRegular,
+              let size = attributes[.size] as? NSNumber
+        else { return nil }
+        return size.uint64Value
+    }
+}
+
 private func resumeOptions(requestedOffset: UInt64, forceRestart: Bool) -> ScpResumeOptions {
     ScpResumeOptions(requestedOffset: forceRestart ? 0 : requestedOffset, forceRestart: forceRestart)
 }
 
 private struct TransferTimingState {
     private var activeStartedAt: TimeInterval?
+    private var displayActiveStartedAt: Date?
     private(set) var accumulatedDuration: TimeInterval = 0
+    private(set) var displayAccumulatedDuration: TimeInterval = 0
 
-    mutating func begin(at timestamp: TimeInterval) {
+    mutating func begin(at timestamp: TimeInterval, displayDate: Date) {
         guard activeStartedAt == nil else { return }
         activeStartedAt = timestamp
+        displayActiveStartedAt = displayDate
     }
 
-    mutating func end(at timestamp: TimeInterval) -> TimeInterval {
+    mutating func end(at timestamp: TimeInterval, displayDate: Date) -> TimeInterval {
         if let activeStartedAt {
             accumulatedDuration += max(timestamp - activeStartedAt, 0)
             self.activeStartedAt = nil
         }
+        if let displayActiveStartedAt {
+            displayAccumulatedDuration += max(displayDate.timeIntervalSince(displayActiveStartedAt), 0)
+            self.displayActiveStartedAt = nil
+        }
         return accumulatedDuration
+    }
+
+    func displayElapsed(at date: Date) -> TimeInterval {
+        displayAccumulatedDuration
+            + (displayActiveStartedAt.map { max(date.timeIntervalSince($0), 0) } ?? 0)
     }
 }
 

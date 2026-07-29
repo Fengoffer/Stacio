@@ -3516,6 +3516,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         controller.performSplitTerminalFromToolbar(nil)
 
         XCTAssertEqual(selector.presentedTargets.map(\.id), ["term_one", "term_two"])
+        XCTAssertEqual(selector.presentedTargetChoices.map(\.sessionProtocol), [.ssh, .ssh])
         XCTAssertEqual(workspace.currentTerminalSplitLayoutModeForTesting, .vertical)
     }
 
@@ -3577,6 +3578,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         controller.performMultiExecFromToolbar(nil)
 
         XCTAssertEqual(selector.presentedTargets.map(\.id), ["term_one", "term_two"])
+        XCTAssertEqual(selector.presentedTargetChoices.map(\.sessionProtocol), [.ssh, .serial])
         XCTAssertEqual(workspace.currentSplitPaneRuntimeIDsForTesting, ["term_one", "term_two"])
     }
 
@@ -5508,6 +5510,180 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(filesBridge.liveHosts, ["files.example.com"])
         XCTAssertTrue(workspace.currentTerminalPane is RemoteFilesPaneViewController)
         XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testNewSFTPRemoteDeviceStaysInCurrentWorkspaceWithoutSavingSidebarSession() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioTransientSFTP-\(UUID().uuidString)")
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let primary = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "主文件服务器",
+                protocol: "sftp",
+                host: "primary.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let contextBuilder = RecordingWorkbenchTunnelContextBuilder(
+            context: workbenchLiveContext(host: "connected.example.com")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        var requestedProtocols: [String] = []
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+            savedSessionContextBuilder: contextBuilder,
+            fileTransferRemoteSessionDraftProvider: { protocolName, _ in
+                requestedProtocols.append(protocolName)
+                return SessionDraft(
+                    folderId: nil,
+                    name: "临时备份服务器",
+                    protocol: protocolName.lowercased(),
+                    host: "backup.example.com",
+                    port: 2222,
+                    username: "backup",
+                    privateKeyPath: nil,
+                    credentialId: nil,
+                    tags: [],
+                    configJson: nil
+                )
+            },
+            databasePathProvider: { databaseURL.path }
+        )
+        controller.loadWindow()
+        _ = try controller.openSavedSession(primary)
+        let filesPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        let browser = try XCTUnwrap(filesPane.independentTransferBrowserForTesting)
+
+        browser.requestRemoteDeviceCreationForTesting()
+
+        XCTAssertEqual(requestedProtocols, ["SFTP"])
+        XCTAssertEqual(contextBuilder.configs.map(\.host), ["primary.example.com", "backup.example.com"])
+        XCTAssertEqual(contextBuilder.configs.map(\.port), [22, 2222])
+        XCTAssertEqual(browser.workspacePaneCountForTesting, 3)
+        XCTAssertEqual(workspace.tabLabelsForWorkbenchTesting, ["主文件服务器"])
+        XCTAssertEqual(try CoreBridge.listAllSessionRecords(databasePath: databaseURL.path).map(\.id), [primary.id])
+    }
+
+    func testBastionFileTransferDeviceOptionUsesTrueTargetWithoutCompositeAccount() {
+        let session = SessionRecord(
+            id: "session_bastion_sftp",
+            folderId: nil,
+            name: "生产文件服务器",
+            protocol: "sftp",
+            host: "192.0.2.10",
+            port: 22,
+            username: "SSH@fileadmin@10.20.30.50@internal-account-id",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+        let configJSON = """
+        {"bastionVendor":"topsec","bastionTargetHost":"10.20.30.50","bastionTargetPort":22,"bastionTargetUsername":"fileadmin"}
+        """
+
+        let option = WorkbenchWindowController.fileTransferRemoteDeviceOptionForTesting(
+            session: session,
+            configJSON: configJSON
+        )
+
+        XCTAssertEqual(option?.endpoint, "fileadmin@10.20.30.50:22 · 经由 192.0.2.10:22")
+        XCTAssertFalse(option?.menuTitle.contains("internal-account-id") ?? true)
+        XCTAssertFalse(option?.menuTitle.contains("SSH@fileadmin") ?? true)
+    }
+
+    func testWorkbenchRestoresSavedSFTPWorkspaceGroupInsideOneTab() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioSFTPGroup-\(UUID().uuidString)")
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let primary = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "主文件服务器",
+                protocol: "sftp",
+                host: "primary.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let backup = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "备份文件服务器",
+                protocol: "scp",
+                host: "backup.example.com",
+                port: 22,
+                username: "backup",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let definition = WorkspaceSessionGroupDefinition(
+            kind: .sftp,
+            layout: .grid,
+            panes: [
+                .localDirectory(path: "/tmp/local-primary"),
+                .localDirectory(path: "/tmp/local-release"),
+                .remoteSession(sessionID: primary.id, path: "/srv/app"),
+                .remoteSession(sessionID: backup.id, path: "/srv/backup")
+            ]
+        )
+        let contextBuilder = RecordingWorkbenchTunnelContextBuilder(
+            context: workbenchLiveContext(host: "group.example.com")
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+        let closePresenter = RecordingWorkbenchWorkspaceGroupClosePresenter()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            workspaceGroupClosePresenter: closePresenter
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: filesBridge,
+            savedSessionContextBuilder: contextBuilder,
+            databasePathProvider: { databaseURL.path }
+        )
+        controller.loadWindow()
+        let group = try controller.saveWorkspaceSessionGroup(
+            name: "发布文件工作区",
+            definition: definition
+        )
+
+        let status = try controller.openSavedSession(group)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("sftp_"))
+        XCTAssertEqual(workspace.tabLabelsForWorkbenchTesting, ["发布文件工作区"])
+        XCTAssertEqual(contextBuilder.configs.map(\.host), ["primary.example.com", "backup.example.com"])
+        let filesPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        let browser = try XCTUnwrap(filesPane.independentTransferBrowserForTesting)
+        XCTAssertEqual(browser.workspacePaneCountForTesting, 4)
+        XCTAssertEqual(browser.workspaceSessionGroupDefinitionForTesting, definition)
+        XCTAssertTrue(waitUntil {
+            Set(filesBridge.liveRemotePaths).isSuperset(of: ["/srv/app", "/srv/backup"])
+        })
+
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertTrue(closePresenter.requests.isEmpty)
+        XCTAssertTrue(workspace.tabLabelsForWorkbenchTesting.isEmpty)
     }
 
     func testWorkbenchRejectsLegacyFTPSessionWithoutStartingRuntime() throws {
@@ -8540,20 +8716,26 @@ private final class RecordingSessionImportErrorPresenter: SessionImportErrorPres
 
 private final class RecordingMultiExecPromptPresenter: MultiExecPromptPresenting {
     var presentedTargets: [MultiExecTarget] = []
+    var presentedTargetChoices: [MultiExecTargetChoice] = []
     private let request: MultiExecPromptRequest?
 
     init(request: MultiExecPromptRequest?) {
         self.request = request
     }
 
-    func promptMultiExec(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecPromptRequest? {
-        presentedTargets = targets
+    func promptMultiExec(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecPromptRequest? {
+        presentedTargetChoices = targetChoices
+        presentedTargets = targetChoices.map(\.target)
         return request
     }
 }
 
 private final class RecordingMultiExecSessionSelector: MultiExecSessionSelecting {
     var presentedTargets: [MultiExecTarget] = []
+    var presentedTargetChoices: [MultiExecTargetChoice] = []
     var presentedErrorMessages: [String] = []
     private let selection: MultiExecSessionSelection?
 
@@ -8561,8 +8743,12 @@ private final class RecordingMultiExecSessionSelector: MultiExecSessionSelecting
         self.selection = selection
     }
 
-    func selectMultiExecTargets(targets: [MultiExecTarget], parentWindow: NSWindow?) -> MultiExecSessionSelection? {
-        presentedTargets = targets
+    func selectMultiExecTargets(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecSessionSelection? {
+        presentedTargetChoices = targetChoices
+        presentedTargets = targetChoices.map(\.target)
         return selection
     }
 
@@ -8938,6 +9124,20 @@ private final class RecordingWorkbenchRemoteFilesBridge: RemoteFilesBridging {
         return result.0
     }
 
+    func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try listLiveRemoteDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
     func listLiveFTPDirectory(
         config: FtpConnectionConfig,
         secret: FtpAuthSecret,
@@ -9246,6 +9446,20 @@ private func workbenchLiveContext(
         secret: .agent,
         expectedFingerprintSHA256: expectedFingerprintSHA256 ?? "SHA256:\(host)"
     )
+}
+
+@MainActor
+private final class RecordingWorkbenchWorkspaceGroupClosePresenter: WorkspaceSessionGroupClosePresenting {
+    private(set) var requests: [WorkspaceSessionGroupDefinition] = []
+
+    func decisionForClosingGroup(
+        definition: WorkspaceSessionGroupDefinition,
+        suggestedName: String,
+        parentWindow: NSWindow?
+    ) -> WorkspaceSessionGroupCloseDecision {
+        requests.append(definition)
+        return .cancel
+    }
 }
 
 private final class MutableWorkbenchLicenseAccessProvider: LicenseFeatureAccessProviding {

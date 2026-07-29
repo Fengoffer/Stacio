@@ -2463,6 +2463,98 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(assistantText.isSelectable)
     }
 
+    func testAssistantTranscriptPerformanceCheckpoint() {
+        let panel = makeAssistantPanel()
+        panel.loadView()
+        panel.view.frame = NSRect(x: 0, y: 0, width: 420, height: 640)
+
+        let initialRender = panel.loadTranscriptEntriesForPerformanceTesting(count: 100)
+        let existingViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+        let rerender = panel.rerenderTranscriptForPerformanceTesting()
+        let rerenderedViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+        let append = panel.appendTranscriptEntryForPerformanceTesting("### Final\n- Complete")
+        let appendedViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+        let streaming = panel.appendAssistantStreamingDeltasForPerformanceTesting(count: 100)
+
+        print(String(
+            format: "AI_TRANSCRIPT_PERF initial=%.3fms rerender=%.3fms append=%.3fms streaming100=%.3fms reused_rerender=%d reused_append=%d",
+            initialRender * 1_000,
+            rerender * 1_000,
+            append * 1_000,
+            streaming * 1_000,
+            existingViews.intersection(rerenderedViews).count,
+            rerenderedViews.intersection(appendedViews).count
+        ))
+        XCTAssertEqual(panel.transcriptViewObjectIdentifiersForTesting.count, 102)
+        XCTAssertTrue(panel.transcriptTextForTesting.contains("Complete"))
+        XCTAssertEqual(existingViews.intersection(rerenderedViews).count, 100)
+        XCTAssertEqual(rerenderedViews.intersection(appendedViews).count, 100)
+        XCTAssertLessThan(rerender, 0.005)
+        XCTAssertLessThan(append, 0.005)
+        XCTAssertLessThan(streaming, 0.005)
+    }
+
+    func testAssistantTranscriptIncrementalRendererRemovesStaleViewAndCacheEntry() {
+        let panel = makeAssistantPanel()
+        panel.loadView()
+        panel.loadTranscriptEntriesForPerformanceTesting(count: 20)
+        let originalViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+
+        panel.removeTranscriptEntryForTesting(at: 10)
+
+        let retainedViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+        XCTAssertEqual(panel.transcriptViewObjectIdentifiersForTesting.count, 19)
+        XCTAssertEqual(panel.transcriptCachedEntryViewCountForTesting, 19)
+        XCTAssertEqual(originalViews.intersection(retainedViews).count, 19)
+    }
+
+    func testAssistantStreamingCoalescesDeltasAndFlushesOnlyActiveBubble() {
+        let panel = makeAssistantPanel()
+        panel.loadView()
+        panel.loadTranscriptEntriesForPerformanceTesting(count: 20)
+        let existingViews = Set(panel.transcriptViewObjectIdentifiersForTesting)
+
+        panel.appendAssistantStreamingDeltasForPerformanceTesting(count: 100)
+
+        XCTAssertTrue(panel.hasPendingStreamingTranscriptRenderForTesting)
+        XCTAssertEqual(panel.lastRenderedAssistantTextForTesting, "x")
+        XCTAssertEqual(existingViews.intersection(Set(panel.transcriptViewObjectIdentifiersForTesting)).count, 20)
+
+        panel.flushStreamingTranscriptRenderForTesting()
+
+        XCTAssertFalse(panel.hasPendingStreamingTranscriptRenderForTesting)
+        XCTAssertEqual(panel.lastRenderedAssistantTextForTesting, String(repeating: "x", count: 100))
+        XCTAssertEqual(panel.transcriptCachedEntryViewCountForTesting, 21)
+    }
+
+    func testAssistantStreamingTimerAutomaticallyRefreshesActiveBubble() {
+        let panel = makeAssistantPanel()
+        panel.loadView()
+
+        panel.appendAssistantStreamingDeltasForPerformanceTesting(count: 10)
+        XCTAssertTrue(panel.hasPendingStreamingTranscriptRenderForTesting)
+        XCTAssertEqual(panel.lastRenderedAssistantTextForTesting, "x")
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+
+        XCTAssertFalse(panel.hasPendingStreamingTranscriptRenderForTesting)
+        XCTAssertEqual(panel.lastRenderedAssistantTextForTesting, String(repeating: "x", count: 10))
+    }
+
+    func testAssistantStreamingTimerDoesNotRetainPanel() {
+        weak var weakPanel: AIAssistantPanelViewController?
+        autoreleasepool {
+            var panel: AIAssistantPanelViewController? = makeAssistantPanel()
+            panel?.loadView()
+            panel?.appendAssistantStreamingDeltasForPerformanceTesting(count: 2)
+            XCTAssertTrue(panel?.hasPendingStreamingTranscriptRenderForTesting == true)
+            weakPanel = panel
+            panel = nil
+        }
+
+        XCTAssertNil(weakPanel)
+    }
+
     func testAssistantClearsInputAndStopsThinkingWhenProviderFails() throws {
         let panel = makeAssistantPanel(provider: ThrowingAIAssistantProvider(
             error: AIAssistantProviderError.invalidResponse
@@ -2759,7 +2851,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         panel.setQuestionForTesting("查看 CPU")
         panel.performAskForTesting()
 
-        XCTAssertTrue(waitUntil { panel.assistantTranscriptTextForTesting.contains(conclusion) })
+        XCTAssertTrue(waitUntil { panel.assistantConclusionTextsForTesting.contains(conclusion) })
         XCTAssertEqual(
             panel.assistantTranscriptTextForTesting.components(separatedBy: conclusion).count - 1,
             1

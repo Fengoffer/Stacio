@@ -433,6 +433,91 @@ final class TerminalThemeImportTests: XCTestCase {
         }
     }
 
+    func testNetworkDeviceConsoleHighlighterLeavesInteractiveCommandAndTabCompletionByteExact() {
+        let interactiveChunks = [
+            "Switch# show ru",
+            "nning-config",
+            "<HUAWEI> display current-configuration",
+            "[H3C-GigabitEthernet1/0/1] shutdown"
+        ]
+
+        for chunk in interactiveChunks {
+            XCTAssertEqual(
+                TerminalSemanticOutputHighlighter.highlight(
+                    chunk,
+                    level: .commandLineEnhanced,
+                    richHighlightingEnabled: true,
+                    theme: .oneHalfDark,
+                    profile: .networkDeviceConsole
+                ),
+                chunk,
+                "unfinished network-device input must not gain ANSI resets, colors, or whitespace"
+            )
+        }
+    }
+
+    func testNetworkDeviceConsoleHighlighterUsesReadableOneHalfColorsForCompletedDiagnostics() {
+        let text = """
+        Interface              IP-Address      Protocol Status
+        GigabitEthernet0/1     192.168.10.1    OSPF     up
+        GigabitEthernet0/2     unassigned               administratively down
+        Neighbor 0011.2233.4455 VLAN 120 established
+        CRC errors 18, input drops 3
+        % Invalid input detected at '^' marker.
+        """ + "\n"
+
+        let highlighted = TerminalSemanticOutputHighlighter.highlight(
+            text,
+            level: .commandLineEnhanced,
+            richHighlightingEnabled: true,
+            theme: .oneHalfDark,
+            profile: .networkDeviceConsole
+        )
+
+        [
+            "Interface",
+            "GigabitEthernet0/1",
+            "192.168.10.1",
+            "OSPF",
+            "up",
+            "administratively down",
+            "0011.2233.4455",
+            "VLAN",
+            "established",
+            "CRC errors",
+            "input drops",
+            "% Invalid input detected at '^' marker."
+        ].forEach { token in
+            XCTAssertTrue(highlighted.containsStyledToken(token), token)
+        }
+        XCTAssertEqual(TerminalSemanticOutputHighlighter.strippingStacioDisplayMarkup(from: highlighted), text)
+        XCTAssertEqual(TerminalColorTheme.oneHalfDark.foregroundHex, "#DCDFE4")
+        XCTAssertEqual(TerminalColorTheme.oneHalfDark.backgroundHex, "#282C34")
+    }
+
+    func testNetworkDeviceConsoleOneHalfThemesKeepCriticalSemanticColorsReadable() {
+        let criticalRoles: [TerminalHighlightSemanticRole] = [
+            .error,
+            .warning,
+            .success,
+            .info,
+            .resource,
+            .address,
+            .command
+        ]
+
+        for theme in [TerminalColorTheme.oneHalfDark, .oneHalfLight] {
+            let palette = TerminalHighlightPalette(theme: theme)
+            for role in criticalRoles {
+                XCTAssertGreaterThanOrEqual(
+                    palette.contrastRatio(for: role),
+                    4.5,
+                    "\(theme.name) \(role.rawValue) must remain readable instead of falling back to muted gray"
+                )
+            }
+        }
+    }
+
     func testTerminalSemanticOutputHighlighterCanDefensivelyStripOnlyStacioDisplayMarkup() {
         let nativeANSI = "\u{001B}[31mNative red\u{001B}[0m"
         let nativeTrueColorANSI = "\u{001B}[38;2;1;2;3mNative truecolor\u{001B}[0m"
@@ -476,6 +561,327 @@ final class TerminalThemeImportTests: XCTestCase {
             ),
             oversizedChunk
         )
+    }
+
+    func testRemoteTerminalSemanticHighlightingDoesNotBlockFeedCaller() {
+        let suiteName = "StacioRemoteSemanticFeedPerformance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalHighlightLevel = .commandLineEnhanced
+            settings.terminalRichHighlightingEnabled = true
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = "tokyo-night"
+        }
+        let terminal = StacioRemoteTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        terminal.fontZoomSettingsStore = settingsStore
+        let displayed = expectation(description: "remote semantic output displayed")
+        displayed.assertForOverFulfill = false
+        var displayCallbackWasOnMainThread = false
+        terminal.onSearchViewportChanged = {
+            displayCallbackWasOnMainThread = Thread.isMainThread
+            displayed.fulfill()
+        }
+        let bytes = semanticHighlightingStressBytes(finalLine: "REMOTE_FINAL 192.168.1.10")
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        terminal.feedRemoteOutput(bytes)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        print(String(format: "TERMINAL_SEMANTIC_REMOTE_FEED %.3fms", elapsed * 1_000))
+        XCTAssertLessThan(elapsed, 0.002)
+        wait(for: [displayed], timeout: 5)
+        XCTAssertTrue(displayCallbackWasOnMainThread)
+        let snapshot = String(
+            decoding: terminal.terminal.getBufferAsData(kind: .active, encoding: .utf8),
+            as: UTF8.self
+        )
+        XCTAssertTrue(snapshot.contains("REMOTE_FINAL 192.168.1.10"))
+    }
+
+    func testLocalTerminalSemanticHighlightingDoesNotBlockOutputCallback() {
+        let suiteName = "StacioLocalSemanticFeedPerformance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalHighlightLevel = .commandLineEnhanced
+            settings.terminalRichHighlightingEnabled = true
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = "tokyo-night"
+        }
+        let terminal = StacioLocalTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        terminal.fontZoomSettingsStore = settingsStore
+        let displayed = expectation(description: "local semantic output displayed")
+        displayed.assertForOverFulfill = false
+        var displayCallbackWasOnMainThread = false
+        terminal.onSearchViewportChanged = {
+            displayCallbackWasOnMainThread = Thread.isMainThread
+            displayed.fulfill()
+        }
+        let bytes = semanticHighlightingStressBytes(finalLine: "LOCAL_FINAL 172.16.10.100")
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        terminal.dataReceived(slice: ArraySlice(bytes))
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        print(String(format: "TERMINAL_SEMANTIC_LOCAL_FEED %.3fms", elapsed * 1_000))
+        XCTAssertLessThan(elapsed, 0.002)
+        wait(for: [displayed], timeout: 5)
+        XCTAssertTrue(displayCallbackWasOnMainThread)
+        let snapshot = String(
+            decoding: terminal.terminal.getBufferAsData(kind: .active, encoding: .utf8),
+            as: UTF8.self
+        )
+        XCTAssertTrue(snapshot.contains("LOCAL_FINAL 172.16.10.100"))
+    }
+
+    func testTerminalSemanticOutputProcessorKeepsQueuedOutputInOrderOnMainThread() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.order.\(UUID().uuidString)"
+        )
+        let delivered = expectation(description: "queued semantic output delivered in order")
+        delivered.expectedFulfillmentCount = 3
+        let chunks = (0..<3).map { index in
+            Array((String(repeating: "chunk-\(index) ", count: 256) + "END-\(index)\n").utf8)
+        }
+        var deliveredSuffixes: [String] = []
+        var deliveriesWereOnMainThread = true
+
+        for chunk in chunks {
+            processor.process(bytes: chunk, configuration: nil) { bytes in
+                deliveriesWereOnMainThread = deliveriesWereOnMainThread && Thread.isMainThread
+                deliveredSuffixes.append(String(decoding: bytes.suffix(6), as: UTF8.self))
+                delivered.fulfill()
+            }
+        }
+
+        wait(for: [delivered], timeout: 5)
+        XCTAssertTrue(deliveriesWereOnMainThread)
+        XCTAssertEqual(deliveredSuffixes, ["END-0\n", "END-1\n", "END-2\n"])
+    }
+
+    func testTerminalSemanticOutputProcessorBatchesQueuedOutputIntoOneMainQueueTurn() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.batch.\(UUID().uuidString)"
+        )
+        let delivered = expectation(description: "queued semantic output delivered as one batch")
+        delivered.expectedFulfillmentCount = 3
+        let sentinelReached = expectation(description: "next main queue turn reached")
+        var events: [String] = []
+
+        for index in 0..<3 {
+            let bytes = Array((String(repeating: "chunk-\(index) ", count: 128) + "END-\(index)\n").utf8)
+            processor.process(bytes: bytes, configuration: nil) { _ in
+                events.append("delivery-\(index)")
+                delivered.fulfill()
+            }
+        }
+
+        Thread.sleep(forTimeInterval: 0.1)
+        DispatchQueue.main.async {
+            events.append("sentinel")
+            sentinelReached.fulfill()
+        }
+
+        wait(for: [delivered, sentinelReached], timeout: 5)
+        XCTAssertEqual(events, ["delivery-0", "delivery-1", "delivery-2", "sentinel"])
+    }
+
+    func testTerminalSemanticOutputProcessorHandlesSub512ByteOutputSynchronouslyOnMainThread() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.small-sync.\(UUID().uuidString)"
+        )
+        var deliveredSynchronously = false
+
+        processor.process(bytes: Array(repeating: 65, count: 256), configuration: nil) { _ in
+            deliveredSynchronously = true
+        }
+
+        XCTAssertTrue(deliveredSynchronously)
+    }
+
+    func testTerminalSemanticOutputProcessorDoesNotLetSmallOutputOvertakeQueuedBatch() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.batch-order.\(UUID().uuidString)"
+        )
+        let delivered = expectation(description: "large batch and following small output delivered")
+        delivered.expectedFulfillmentCount = 3
+        var markers: [String] = []
+
+        for index in 0..<2 {
+            processor.process(bytes: Array(repeating: UInt8(65 + index), count: 1_024), configuration: nil) { _ in
+                markers.append("large-\(index)")
+                delivered.fulfill()
+            }
+        }
+
+        Thread.sleep(forTimeInterval: 0.1)
+        processor.process(bytes: Array(repeating: 90, count: 64), configuration: nil) { _ in
+            markers.append("small")
+            delivered.fulfill()
+        }
+
+        wait(for: [delivered], timeout: 5)
+        XCTAssertEqual(markers, ["large-0", "large-1", "small"])
+    }
+
+    func testTerminalSemanticOutputProcessorCancelPreventsStaleDelivery() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.cancel.\(UUID().uuidString)"
+        )
+        let currentDelivered = expectation(description: "current semantic output delivered")
+        let staleBytes = Array((String(repeating: "STALE ", count: 512) + "END-STALE\n").utf8)
+        let currentBytes = Array((String(repeating: "CURRENT ", count: 256) + "END-CURRENT\n").utf8)
+        var deliveredMarkers: [String] = []
+
+        processor.process(bytes: staleBytes, configuration: nil) { bytes in
+            deliveredMarkers.append(String(decoding: bytes.suffix(10), as: UTF8.self))
+        }
+        processor.cancel()
+        processor.process(bytes: currentBytes, configuration: nil) { bytes in
+            deliveredMarkers.append(String(decoding: bytes.suffix(12), as: UTF8.self))
+            currentDelivered.fulfill()
+        }
+
+        wait(for: [currentDelivered], timeout: 5)
+        XCTAssertEqual(deliveredMarkers, ["END-CURRENT\n"])
+    }
+
+    func testTerminalSemanticOutputProcessorDrainsBacklogWithoutDroppingOrReorderingText() {
+        let processor = TerminalSemanticOutputProcessor(
+            label: "cn.stacio.tests.terminal.semantic.backlog.\(UUID().uuidString)"
+        )
+        let configuration = TerminalSemanticHighlightConfiguration(
+            level: .commandLineEnhanced,
+            richHighlightingEnabled: true,
+            theme: .tokyoNight
+        )
+        let delivered = expectation(description: "semantic output backlog drained")
+        delivered.expectedFulfillmentCount = 8
+        let baseLine = "ERROR status=1 pid=2405 /var/log/app.log 192.168.8.10:8080\r\n"
+        let chunks = (0..<8).map { index in
+            String(repeating: baseLine, count: 1_100) + "BACKLOG-END-\(index)\r\n"
+        }
+        var deliveredStrings: [String] = []
+
+        for chunk in chunks {
+            processor.process(bytes: Array(chunk.utf8), configuration: configuration) { bytes in
+                deliveredStrings.append(String(decoding: bytes, as: UTF8.self))
+                delivered.fulfill()
+            }
+        }
+
+        wait(for: [delivered], timeout: 10)
+        XCTAssertEqual(deliveredStrings.count, chunks.count)
+        for (deliveredString, originalChunk) in zip(deliveredStrings, chunks) {
+            XCTAssertEqual(
+                TerminalSemanticOutputHighlighter.strippingStacioDisplayMarkup(from: deliveredString),
+                originalChunk
+            )
+        }
+        XCTAssertNotEqual(deliveredStrings.first, chunks.first)
+        XCTAssertEqual(deliveredStrings.last, chunks.last)
+    }
+
+    func testSmallSemanticOutputStaysWithinMainThreadFeedBudget() {
+        let suiteName = "StacioSmallSemanticFeedPerformance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalHighlightLevel = .commandLineEnhanced
+            settings.terminalRichHighlightingEnabled = true
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = "tokyo-night"
+        }
+        let terminal = StacioRemoteTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        terminal.fontZoomSettingsStore = settingsStore
+        let displayed = expectation(description: "small semantic output displayed")
+        terminal.onSearchViewportChanged = {
+            displayed.fulfill()
+        }
+        let line = "ERROR status=1 pid=2405 /var/log/app.log 192.168.8.10:8080 -rwxr-xr-x\r\n"
+        let bytes = Array((String(repeating: line, count: 12) + "END\r\n").utf8)
+        XCTAssertLessThan(bytes.count, 1_024)
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        terminal.feedRemoteOutput(bytes)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        print(String(format: "TERMINAL_SEMANTIC_SMALL_FEED %.3fms", elapsed * 1_000))
+        XCTAssertLessThan(elapsed, 0.002)
+        wait(for: [displayed], timeout: 5)
+        let snapshot = String(
+            decoding: terminal.terminal.getBufferAsData(kind: .active, encoding: .utf8),
+            as: UTF8.self
+        )
+        XCTAssertTrue(snapshot.contains("END"))
+    }
+
+    func testTypicalPromptSemanticOutputStaysWithinMainThreadFeedBudget() {
+        let suiteName = "StacioPromptSemanticFeedPerformance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalHighlightLevel = .commandLineEnhanced
+            settings.terminalRichHighlightingEnabled = true
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = "tokyo-night"
+        }
+        let terminal = StacioRemoteTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        terminal.fontZoomSettingsStore = settingsStore
+        let bytes = Array("deploy@example.com:/srv/app$ ".utf8)
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        terminal.feedRemoteOutput(bytes)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        print(String(format: "TERMINAL_SEMANTIC_PROMPT_FEED %.3fms", elapsed * 1_000))
+        XCTAssertLessThan(elapsed, 0.002)
+        let snapshot = String(
+            decoding: terminal.terminal.getBufferAsData(kind: .active, encoding: .utf8),
+            as: UTF8.self
+        )
+        XCTAssertTrue(snapshot.contains("deploy@example.com:/srv/app$"))
+    }
+
+    func testMaximumSynchronousSemanticOutputStaysWithinMainThreadFeedBudget() {
+        let suiteName = "StacioSynchronousSemanticFeedPerformance-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalHighlightLevel = .commandLineEnhanced
+            settings.terminalRichHighlightingEnabled = true
+            settings.terminalTheme = .dark
+            settings.terminalBuiltInThemeID = "tokyo-night"
+        }
+        let terminal = StacioRemoteTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        terminal.fontZoomSettingsStore = settingsStore
+        let token = "ERROR status=1 pid=2405 /var/log/app.log 192.168.8.10:8080 "
+        let bytes = Array((String(repeating: token, count: 2) + "END").utf8)
+        XCTAssertLessThan(bytes.count, 128)
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        terminal.feedRemoteOutput(bytes)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        print(String(format: "TERMINAL_SEMANTIC_SYNC_LIMIT_FEED %.3fms", elapsed * 1_000))
+        XCTAssertLessThan(elapsed, 0.002)
+        let snapshot = String(
+            decoding: terminal.terminal.getBufferAsData(kind: .active, encoding: .utf8),
+            as: UTF8.self
+        )
+        XCTAssertTrue(snapshot.contains("END"))
+    }
+
+    private func semanticHighlightingStressBytes(finalLine: String) -> [UInt8] {
+        let line = "ERROR status=1 pid=2405 git branch main modified /var/log/app.log "
+            + "192.168.8.10:8080 -rwxr-xr-x 0755 deploy:staff 42% 1.30GB\r\n"
+        return Array((String(repeating: line, count: 256) + finalLine + "\r\n").utf8)
     }
 
     func testTerminalHighlightPaletteKeepsSemanticRolesReadableAcrossThemes() {

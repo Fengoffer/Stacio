@@ -10,6 +10,7 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
     case sftp
     case scp
     case serial
+    case console
     case file
     case shell
     case browser
@@ -35,6 +36,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "SCP（安全复制）"
         case .serial:
             return "串口"
+        case .console:
+            return "蓝牙 Console"
         case .file:
             return "本地文件"
         case .shell:
@@ -68,6 +71,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "SCP"
         case .serial:
             return "串口"
+        case .console:
+            return "蓝牙 Console"
         case .file:
             return "本地文件"
         case .shell:
@@ -101,6 +106,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "scp"
         case .serial:
             return "serial"
+        case .console:
+            return "console"
         case .file:
             return "file"
         case .shell:
@@ -130,6 +137,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return 5900
         case .serial:
             return 9600
+        case .console:
+            return 0
         case .file, .shell, .wsl:
             return 1
         case .browser, .awsS3:
@@ -157,6 +166,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             self = .scp
         case "serial":
             self = .serial
+        case "console":
+            self = .console
         case "file":
             self = .file
         case "shell":
@@ -192,6 +203,8 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
             return "arrow.up.arrow.down.square.fill"
         case .serial:
             return "cable.connector"
+        case .console:
+            return "bluetooth"
         case .file:
             return "folder"
         case .shell:
@@ -209,7 +222,7 @@ enum SessionSettingsProtocol: Int, CaseIterable, Equatable, Hashable {
 
     var isAvailableForSaving: Bool {
         switch self {
-        case .ssh, .telnet, .vnc, .sftp, .scp, .serial, .file, .shell, .browser:
+        case .ssh, .telnet, .vnc, .sftp, .scp, .serial, .console, .file, .shell, .browser:
             return true
         case .rsh, .xdmcp, .mosh, .awsS3, .wsl:
             return false
@@ -455,13 +468,16 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     private let footerSeparator = NSBox()
     private let existingSession: SessionRecord?
     private let existingSerialConfigJSON: String?
+    private let bleConsoleScannerPresenter: BLEConsoleScannerPresenting
     private let licenseAccess: any LicenseFeatureAccessProviding
+    private let selectableProtocols: [SessionSettingsProtocol]
     private var licenseAuthorizationObserver: NSObjectProtocol?
     private weak var testingSaveButton: NSButton?
     private var selectedProtocol: SessionSettingsProtocol = .ssh
     private var initialSerialAdvancedSelection: SerialAdvancedSelection?
     private var existingSerialConfigLoaded = false
     private var existingSerialConnectionFields: SerialConnectionFields?
+    private var consoleConfig: ConsoleSessionConfig?
     private var protocolFormSnapshots: [SessionSettingsProtocol: SessionProtocolFormSnapshot] = [:]
     private var isSyncingProtocolListSelection = false
     private var existingAutomationSelection = SessionAutomationSelection(
@@ -486,11 +502,23 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         draftFactory: SessionSidebarSessionDraftFactory,
         existingSerialConfigJSON: String? = nil,
         serialDevicePathProvider: @escaping () -> [String] = SerialConnectionSupport.defaultDevicePaths,
-        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider()
+        bleConsoleScannerPresenter: BLEConsoleScannerPresenting? = nil,
+        licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
+        initialProtocol: SessionSettingsProtocol? = nil,
+        selectableProtocols: [SessionSettingsProtocol] = SessionSettingsProtocol.selectableCases
     ) {
         self.existingSession = existingSession
         self.existingSerialConfigJSON = existingSerialConfigJSON
+        self.bleConsoleScannerPresenter = bleConsoleScannerPresenter ?? CoreBluetoothBLEConsoleScannerPresenter()
         self.licenseAccess = licenseAccess
+        let offeredProtocols = selectableProtocols.filter(\.isOfferedInNewSessionSettings)
+        self.selectableProtocols = offeredProtocols.isEmpty
+            ? SessionSettingsProtocol.selectableCases
+            : offeredProtocols.reduce(into: []) { result, sessionProtocol in
+                if result.contains(sessionProtocol) == false {
+                    result.append(sessionProtocol)
+                }
+            }
         selectedSessionIconID = SessionIconConfigCodec.iconID(from: existingSerialConfigJSON)
         sshForm = SessionSidebarSessionForm(
             existingSession: existingSession,
@@ -502,6 +530,14 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
            let existingProtocol = SessionSettingsProtocol(storageKey: existingSession.protocol)
         {
             selectedProtocol = existingProtocol
+        } else if let initialProtocol,
+                  self.selectableProtocols.contains(initialProtocol) {
+            selectedProtocol = initialProtocol
+        }
+        if selectedProtocol == .console,
+           let existingSerialConfigJSON
+        {
+            consoleConfig = try? CoreBridge.parseConsoleSessionConfig(json: existingSerialConfigJSON)
         }
         super.init(nibName: nil, bundle: nil)
         licenseAuthorizationObserver = NotificationCenter.default.addObserver(
@@ -572,6 +608,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         sshForm.view.translatesAutoresizingMaskIntoConstraints = false
         sshForm.bind(saveButton: saveButton)
         configureSerialAdvancedView()
+        configureConsoleScanAction()
         configureSessionIconView()
         applyExistingSerialAdvancedConfigIfNeeded()
         initialSerialAdvancedSelection = currentSerialAdvancedSelection()
@@ -746,6 +783,23 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         }
         guard let draft = try sshForm.draft() else {
             return nil
+        }
+        if selectedProtocol == .console {
+            guard let consoleConfig else {
+                return nil
+            }
+            return SessionDraft(
+                folderId: draft.folderId,
+                name: draft.name,
+                protocol: SessionSettingsProtocol.console.storageKey,
+                host: consoleEndpointSummary(for: consoleConfig),
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: draft.tags,
+                configJson: try CoreBridge.serializeConsoleSessionConfig(config: consoleConfig)
+            )
         }
         let serialConnectionFields = effectiveSerialConnectionFields(for: draft)
         return SessionDraft(
@@ -1110,7 +1164,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        SessionSettingsProtocol.selectableCases.count
+        selectableProtocols.count
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -1118,10 +1172,10 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             return
         }
         let selectedRow = protocolListView.selectedRow
-        guard SessionSettingsProtocol.selectableCases.indices.contains(selectedRow) else {
+        guard selectableProtocols.indices.contains(selectedRow) else {
             return
         }
-        applySelectedProtocol(SessionSettingsProtocol.selectableCases[selectedRow])
+        applySelectedProtocol(selectableProtocols[selectedRow])
     }
 
     func tableView(
@@ -1129,19 +1183,20 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         viewFor tableColumn: NSTableColumn?,
         row: Int
     ) -> NSView? {
-        guard SessionSettingsProtocol.selectableCases.indices.contains(row) else {
+        guard selectableProtocols.indices.contains(row) else {
             return nil
         }
-        let sessionProtocol = SessionSettingsProtocol.selectableCases[row]
+        let sessionProtocol = selectableProtocols[row]
         let identifier = NSUserInterfaceItemIdentifier("SessionSettingsProtocolCell")
         let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
             ?? NSTableCellView()
         cell.identifier = identifier
 
         let imageView = cell.imageView ?? NSImageView()
-        imageView.image = NSImage(
-            systemSymbolName: sessionProtocol.systemSymbolName,
-            accessibilityDescription: sessionProtocol.label
+        imageView.image = StacioSymbolImage.image(
+            named: sessionProtocol.systemSymbolName,
+            accessibilityDescription: sessionProtocol.label,
+            size: NSSize(width: 16, height: 16)
         )
         imageView.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         imageView.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
@@ -1187,7 +1242,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     }
 
     @objc private func protocolSelectionChanged(_ sender: NSSegmentedControl) {
-        let selectableProtocols = SessionSettingsProtocol.selectableCases
         let selectedIndex = sender.selectedSegment
         let sessionProtocol = selectableProtocols.indices.contains(selectedIndex)
             ? selectableProtocols[selectedIndex]
@@ -1212,7 +1266,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
 
     private func selectProtocolInList(_ sessionProtocol: SessionSettingsProtocol) {
         guard protocolListView.numberOfRows > 0,
-              let index = SessionSettingsProtocol.selectableCases.firstIndex(of: sessionProtocol),
+              let index = selectableProtocols.firstIndex(of: sessionProtocol),
               protocolListView.selectedRow != index
         else {
             return
@@ -1285,6 +1339,8 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         switch sessionProtocol {
         case .serial:
             return .serial
+        case .console:
+            return .console
         case .browser:
             return .browser
         case .file:
@@ -1400,7 +1456,8 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         unsupportedLabel.stringValue = selectedProtocol.isAvailableForSaving
             ? ""
             : L10n.SessionSettings.unsupportedProtocol(selectedProtocol.label)
-        automationView.isHidden = !selectedProtocol.isAvailableForSaving
+        automationView.isHidden = !selectedProtocol.isAvailableForSaving || selectedProtocol == .console
+        startupActionsView.isHidden = !selectedProtocol.isAvailableForSaving || selectedProtocol == .console
         proxyJumpView.isHidden = selectedProtocol != .ssh
             && selectedProtocol != .sftp
             && selectedProtocol != .scp
@@ -1409,12 +1466,37 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         sessionIconHeightConstraint?.constant = showsSessionIcon ? 36 : 0
 
         if selectedProtocol.isAvailableForSaving {
-            saveButton.isEnabled = sshForm.isValidForSaving
-            testingSaveButton?.isEnabled = sshForm.isValidForSaving
+            let canSave = sshForm.isValidForSaving && (selectedProtocol != .console || consoleConfig != nil)
+            saveButton.isEnabled = canSave
+            testingSaveButton?.isEnabled = canSave
         } else {
             saveButton.isEnabled = false
             testingSaveButton?.isEnabled = false
         }
+    }
+
+    private func configureConsoleScanAction() {
+        sshForm.onRequestConsoleScan = { [weak self] in
+            self?.requestConsoleBinding()
+        }
+    }
+
+    private func requestConsoleBinding() {
+        guard selectedProtocol == .console,
+              let config = bleConsoleScannerPresenter.presentBLEConsoleScanner(
+                  parentWindow: view.window,
+                  initialConfig: consoleConfig
+              )
+        else {
+            return
+        }
+        consoleConfig = config
+        sshForm.applyConsoleDevice(named: config.ble.deviceName)
+        refreshProtocolState()
+    }
+
+    private func consoleEndpointSummary(for config: ConsoleSessionConfig) -> String {
+        "\(config.ble.deviceName) (BLE)"
     }
 
     private func configureSerialAdvancedView() {
@@ -1867,11 +1949,11 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     }
 
     var protocolLabelsForTesting: [String] {
-        SessionSettingsProtocol.selectableCases.map(\.label)
+        selectableProtocols.map(\.label)
     }
 
     var protocolSourceListLabelsForTesting: [String] {
-        SessionSettingsProtocol.selectableCases.map(\.sourceListLabel)
+        selectableProtocols.map(\.sourceListLabel)
     }
 
     var selectedProtocolForTesting: SessionSettingsProtocol {
@@ -1884,6 +1966,14 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
 
     var sessionIconRowIsHiddenForTesting: Bool {
         sessionIconView.isHidden
+    }
+
+    var consoleScanButtonIsVisibleForTesting: Bool {
+        sshForm.consoleScanButtonIsVisibleForTesting
+    }
+
+    var consoleEditorRequiresRebindForTesting: Bool {
+        consoleConfig?.ble.platformBindings.macOsPeripheralUuid == nil
     }
 
     var selectedSessionIconIDForTesting: String? {
@@ -1901,6 +1991,18 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
 
     var saveButtonIsEnabledForTesting: Bool {
         saveButton.isEnabled
+    }
+
+    var privateKeyRowIsHiddenForTesting: Bool {
+        sshForm.privateKeyRowIsHiddenForTesting
+    }
+
+    var credentialSecretRowIsHiddenForTesting: Bool {
+        sshForm.credentialSecretRowIsHiddenForTesting
+    }
+
+    var hostSuggestionsForTesting: [String] {
+        sshForm.hostSuggestionsForTesting
     }
 
     var validationMessageForTesting: String {
@@ -1922,6 +2024,10 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     func setSSHValuesForTesting(_ values: SessionSidebarSessionFormValues) {
         sshForm.setValuesForTesting(values)
         refreshProtocolState()
+    }
+
+    func requestConsoleBindingForTesting() {
+        requestConsoleBinding()
     }
 
     func setTagColorForTesting(_ hexRGB: String) {
@@ -2325,6 +2431,8 @@ final class SessionSettingsWindowController: NSWindowController, NSWindowDelegat
         errorPresenter: SessionSidebarErrorPresenting,
         existingSerialConfigJSON: String? = nil,
         licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
+        initialProtocol: SessionSettingsProtocol? = nil,
+        selectableProtocols: [SessionSettingsProtocol] = SessionSettingsProtocol.selectableCases,
         parentWindowProvider: @escaping () -> NSWindow?
     ) {
         settingsViewController = SessionSettingsViewController(
@@ -2332,7 +2440,9 @@ final class SessionSettingsWindowController: NSWindowController, NSWindowDelegat
             selectedFolderID: selectedFolderID,
             draftFactory: draftFactory,
             existingSerialConfigJSON: existingSerialConfigJSON,
-            licenseAccess: licenseAccess
+            licenseAccess: licenseAccess,
+            initialProtocol: initialProtocol,
+            selectableProtocols: selectableProtocols
         )
 
         let window = NSWindow(

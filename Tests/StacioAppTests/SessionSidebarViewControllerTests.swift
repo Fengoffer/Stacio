@@ -234,6 +234,67 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(protocolIcon.contentTintColor, StacioDesignSystem.theme.secondaryTextColor)
     }
 
+    func testBastionSessionSidebarUsesTrueTargetAndHidesCompositeGatewayAccount() {
+        let session = SessionRecord(
+            id: "session_bastion_db",
+            folderId: nil,
+            name: "生产数据库",
+            protocol: "ssh",
+            host: "192.0.2.10",
+            port: 22,
+            username: "SSH@dbadmin@10.20.30.40@internal-account-id",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "2026-07-28T10:00:00Z"
+        )
+        let configJSON = """
+        {"bastionVendor":"topsec","bastionTargetHost":"10.20.30.40","bastionTargetPort":2222,"bastionTargetUsername":"dbadmin"}
+        """
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]],
+            configJSONByID: [session.id: configJSON]
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+
+        controller.loadView()
+
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("dbadmin@10.20.30.40:2222"))
+        XCTAssertTrue(controller.sessionOutlineTextSnapshot.contains("经由 192.0.2.10:22"))
+        XCTAssertFalse(controller.sessionOutlineTextSnapshot.contains("internal-account-id"))
+        XCTAssertFalse(controller.sessionOutlineTextSnapshot.contains("SSH@dbadmin"))
+
+        let recentController = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: makeSettingsStore(showRecentSessions: true)
+        )
+        recentController.loadView()
+
+        let recentGroup = recentController.outlineView(
+            recentController.outlineView,
+            child: 0,
+            ofItem: nil
+        )
+        let recentItem = recentController.outlineView(
+            recentController.outlineView,
+            child: 0,
+            ofItem: recentGroup
+        )
+        let recentCell = recentController.outlineView(
+            recentController.outlineView,
+            viewFor: nil,
+            item: recentItem
+        )
+        let recentText = recentCell?.textFieldSnapshot.joined(separator: "\n") ?? ""
+        XCTAssertTrue(recentText.contains("生产数据库"), recentText)
+        XCTAssertTrue(recentText.contains("dbadmin@10.20.30.40:2222"), recentText)
+        XCTAssertFalse(recentText.contains("internal-account-id"))
+    }
+
     func testSidebarShowsDisclosureForEmptyPersistedFolder() throws {
         let folder = SessionFolder(id: "folder_empty", parentId: nil, name: "Empty Group")
         let store = RecordingSessionSidebarStore(folders: [folder])
@@ -296,6 +357,90 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertNotEqual(
             controller.sessionProtocolIconSymbolNameForTesting("sftp"),
             controller.sessionProtocolIconSymbolNameForTesting("ftp")
+        )
+    }
+
+    func testSidebarPresentsWorkspaceGroupsAsSessionsWithDedicatedIconsAndActions() {
+        let sessions = [
+            SessionRecord(
+                id: "scp_group",
+                folderId: nil,
+                name: "制品传输",
+                protocol: "scp-group",
+                host: "4 个文件面板",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                lastOpenedAt: nil
+            ),
+            SessionRecord(
+                id: "sftp_group",
+                folderId: nil,
+                name: "发布目录",
+                protocol: "sftp-group",
+                host: "5 个文件面板",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                lastOpenedAt: nil
+            ),
+            SessionRecord(
+                id: "terminal_group",
+                folderId: nil,
+                name: "四机巡检",
+                protocol: "terminal-group",
+                host: "4 个终端",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                lastOpenedAt: nil
+            ),
+            SessionRecord(
+                id: "multi_exec_group",
+                folderId: nil,
+                name: "批量升级",
+                protocol: "multi-exec-group",
+                host: "6 个终端",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                lastOpenedAt: nil
+            )
+        ]
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: sessions]
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+
+        controller.loadView()
+
+        XCTAssertEqual(
+            controller.sessionOutlineTextSnapshot,
+            [
+                "制品传输", "SCP 分组 · 4 个文件面板",
+                "发布目录", "SFTP 分组 · 5 个文件面板",
+                "四机巡检", "终端分屏分组 · 4 个终端",
+                "批量升级", "终端多执行分组 · 6 个终端"
+            ].joined(separator: "\n")
+        )
+        XCTAssertEqual(controller.sessionProtocolIconSymbolNameForTesting("scp-group"), "rectangle.split.3x1")
+        XCTAssertEqual(controller.sessionProtocolIconSymbolNameForTesting("sftp-group"), "square.grid.2x2")
+        XCTAssertEqual(controller.sessionProtocolIconSymbolNameForTesting("terminal-group"), "rectangle.split.2x1")
+        XCTAssertEqual(controller.sessionProtocolIconSymbolNameForTesting("multi-exec-group"), "terminal.fill")
+        XCTAssertEqual(
+            controller.contextMenuTitlesForTesting(id: "sftp_group"),
+            ["执行", "-", "重命名会话", "删除会话", "复制会话", "移动会话"]
         )
     }
 
@@ -1649,10 +1794,12 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             createdSession: created
         )
         let editor = RecordingSessionEditor(draft: draft)
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
         let controller = SessionSidebarViewController(
             sessionStore: store,
             sessionEditor: editor,
-            settingsStore: makeSettingsStore(showRecentSessions: false)
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            diagnosticLogRecorder: diagnosticLog
         )
         controller.loadView()
 
@@ -1661,6 +1808,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertEqual(editor.requests, ["new:nil"])
         XCTAssertEqual(store.createdDrafts, [draft])
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "New API\nops@new-api.example.com:2200")
+        XCTAssertEqual(diagnosticLog.snapshot().events.map(\.eventCode), [.sessionCreated])
+        XCTAssertFalse(try! XCTUnwrap(diagnosticLog.snapshot().encodedJSONString()).contains(created.id))
     }
 
     func testAddSessionPresentsStoreCreateError() {
@@ -1683,10 +1832,12 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         )
         let editor = RecordingSessionEditor(draft: draft)
         let errorPresenter = RecordingSessionSidebarErrorPresenter()
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
         let controller = SessionSidebarViewController(
             sessionStore: store,
             sessionEditor: editor,
-            errorPresenter: errorPresenter
+            errorPresenter: errorPresenter,
+            diagnosticLogRecorder: diagnosticLog
         )
         controller.loadView()
 
@@ -1694,6 +1845,8 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         XCTAssertEqual(errorPresenter.contexts, [.createSession])
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "")
+        XCTAssertEqual(diagnosticLog.snapshot().events.map(\.eventCode), [.sessionCreationFailed])
+        XCTAssertEqual(diagnosticLog.snapshot().events.last?.errorCategory, .persistence)
     }
 
     func testEditSessionUsesEditorStoreAndRefreshesOutline() {
@@ -2366,9 +2519,11 @@ final class SessionSidebarViewControllerTests: XCTestCase {
             sessionsByFolderID: [nil: [session]]
         )
         let confirmer = RecordingSessionDeleteConfirmer(shouldDelete: true)
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
         let controller = SessionSidebarViewController(
             sessionStore: store,
-            sessionDeleteConfirmer: confirmer
+            sessionDeleteConfirmer: confirmer,
+            diagnosticLogRecorder: diagnosticLog
         )
         controller.loadView()
 
@@ -2376,6 +2531,232 @@ final class SessionSidebarViewControllerTests: XCTestCase {
 
         XCTAssertEqual(confirmer.requestedIDs, ["session_api"])
         XCTAssertEqual(store.deletedIDs, ["session_api"])
+        XCTAssertEqual(controller.sessionOutlineTextSnapshot, "")
+        XCTAssertEqual(diagnosticLog.snapshot().events.map(\.eventCode), [.sessionDeleted])
+    }
+
+    func testDeleteRecentSessionBroadcastsSuccessfullyDeletedSessionID() {
+        let session = SessionRecord(
+            id: "session_recent",
+            folderId: nil,
+            name: "Recent Server",
+            protocol: "ssh",
+            host: "recent.example.com",
+            port: 22,
+            username: "ops",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "2026-07-27T12:00:00Z"
+        )
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: [session]]
+        )
+        let deletion = expectation(
+            forNotification: Notification.Name("Stacio.SavedSessions.didDelete"),
+            object: nil
+        ) { notification in
+            Set(notification.userInfo?["sessionIDs"] as? [String] ?? []) == [session.id]
+        }
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionDeleteConfirmer: RecordingSessionDeleteConfirmer(shouldDelete: true),
+            settingsStore: makeSettingsStore(showRecentSessions: true)
+        )
+        controller.loadView()
+
+        controller.performContextMenuActionForTesting(.delete, id: session.id)
+
+        wait(for: [deletion], timeout: 0.2)
+        XCTAssertEqual(store.deletedIDs, [session.id])
+    }
+
+    func testDeleteFolderAndSessionsBroadcastsAllSuccessfullyDeletedSessionIDs() {
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let sessions = [
+            makeSession(id: "one", protocolName: "ssh", name: "One", folderID: folder.id),
+            makeSession(id: "two", protocolName: "ssh", name: "Two", folderID: folder.id)
+        ]
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [folder.id: sessions]
+        )
+        let deletion = expectation(
+            forNotification: Notification.Name("Stacio.SavedSessions.didDelete"),
+            object: nil
+        ) { notification in
+            Set(notification.userInfo?["sessionIDs"] as? [String] ?? []) == Set(sessions.map(\.id))
+        }
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: RecordingSessionSidebarOperationsPresenter(
+                folderDeletionChoice: .deleteFolderAndSessions
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+
+        controller.performFolderContextMenuActionForTesting(.delete, folderID: folder.id)
+
+        wait(for: [deletion], timeout: 0.2)
+        XCTAssertEqual(Set(store.deletedIDs), Set(sessions.map(\.id)))
+        XCTAssertEqual(store.deletedFolderIDs, [folder.id])
+    }
+
+    func testBatchDeleteBroadcastsEarlierSuccessWhenLaterStoreDeleteFails() {
+        let sessions = [
+            makeSession(id: "one", protocolName: "ssh", name: "One"),
+            makeSession(id: "two", protocolName: "ssh", name: "Two")
+        ]
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: sessions],
+            deleteErrorsByID: [sessions[1].id: TestSessionSidebarError.failed]
+        )
+        let errorPresenter = RecordingSessionSidebarErrorPresenter()
+        let diagnosticLog = makeTestFeedbackDiagnosticLogStore()
+        let deletion = expectation(
+            forNotification: Notification.Name("Stacio.SavedSessions.didDelete"),
+            object: nil
+        ) { notification in
+            Set(notification.userInfo?["sessionIDs"] as? [String] ?? []) == [sessions[0].id]
+        }
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionDeleteConfirmer: RecordingSessionDeleteConfirmer(shouldDelete: true),
+            errorPresenter: errorPresenter,
+            settingsStore: makeSettingsStore(showRecentSessions: false),
+            diagnosticLogRecorder: diagnosticLog
+        )
+        controller.loadView()
+        controller.outlineView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+
+        controller.outlineView.keyDown(with: makeSidebarDeleteKeyEvent(keyCode: 51))
+
+        wait(for: [deletion], timeout: 0.2)
+        XCTAssertEqual(store.deletedIDs, [sessions[0].id])
+        XCTAssertEqual(errorPresenter.contexts, [.deleteSession])
+        XCTAssertEqual(
+            diagnosticLog.snapshot().events.map(\.eventCode),
+            [.sessionDeleted, .sessionDeleteFailed]
+        )
+    }
+
+    func testSidebarAllowsCommandAndShiftStyleMultipleSelection() {
+        let sessions = [
+            makeSession(id: "one", protocolName: "ssh", name: "One"),
+            makeSession(id: "two", protocolName: "ssh", name: "Two"),
+            makeSession(id: "three", protocolName: "ssh", name: "Three")
+        ]
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [],
+                sessionsByFolderID: [nil: sessions]
+            ),
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+
+        controller.loadView()
+
+        XCTAssertTrue(controller.outlineView.allowsMultipleSelection)
+        controller.outlineView.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+        XCTAssertEqual(controller.outlineView.selectedRowIndexes, IndexSet([0, 2]))
+        controller.outlineView.selectRowIndexes(IndexSet(integersIn: 0...2), byExtendingSelection: false)
+        XCTAssertEqual(controller.outlineView.selectedRowIndexes, IndexSet(integersIn: 0...2))
+    }
+
+    func testDeleteKeyDeletesAllSelectedSessionsWithOneConfirmation() {
+        let sessions = [
+            makeSession(id: "one", protocolName: "ssh", name: "One"),
+            makeSession(id: "two", protocolName: "ssh", name: "Two"),
+            makeSession(id: "three", protocolName: "ssh", name: "Three")
+        ]
+        let store = RecordingSessionSidebarStore(
+            folders: [],
+            sessionsByFolderID: [nil: sessions]
+        )
+        let confirmer = RecordingSessionDeleteConfirmer(shouldDelete: true)
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionDeleteConfirmer: confirmer,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+        controller.outlineView.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+
+        controller.outlineView.keyDown(with: makeSidebarDeleteKeyEvent(keyCode: 51))
+
+        XCTAssertEqual(confirmer.requestedIDs, ["session_one", "session_three"])
+        XCTAssertEqual(store.deletedIDs, ["session_one", "session_three"])
+        XCTAssertEqual(controller.sessionOutlineTextSnapshot, "Two\nops@two.example.com:22")
+    }
+
+    func testForwardDeleteKeyDeletesAllSelectedSessionGroups() {
+        let folders = [
+            SessionFolder(id: "folder_one", parentId: nil, name: "One"),
+            SessionFolder(id: "folder_two", parentId: nil, name: "Two")
+        ]
+        let store = RecordingSessionSidebarStore(folders: folders)
+        let operations = RecordingSessionSidebarOperationsPresenter(
+            folderDeletionChoice: .deleteFolderOnly
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+        controller.outlineView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
+
+        controller.outlineView.keyDown(with: makeSidebarDeleteKeyEvent(keyCode: 117))
+
+        XCTAssertEqual(operations.deleteFolderRequestIDs, ["folder_one", "folder_two"])
+        XCTAssertEqual(store.deletedFolderIDs, ["folder_one", "folder_two"])
+        XCTAssertEqual(controller.sessionOutlineTextSnapshot, "")
+    }
+
+    func testDeleteKeyDoesNotDeleteSessionTwiceWhenItsSelectedGroupDeletesSessions() {
+        let folder = SessionFolder(id: "folder_prod", parentId: nil, name: "Production")
+        let groupedSession = makeSession(
+            id: "grouped",
+            protocolName: "ssh",
+            name: "Grouped",
+            folderID: folder.id
+        )
+        let rootSession = makeSession(id: "root", protocolName: "ssh", name: "Root")
+        let store = RecordingSessionSidebarStore(
+            folders: [folder],
+            sessionsByFolderID: [nil: [rootSession], folder.id: [groupedSession]]
+        )
+        let confirmer = RecordingSessionDeleteConfirmer(shouldDelete: true)
+        let operations = RecordingSessionSidebarOperationsPresenter(
+            folderDeletionChoice: .deleteFolderAndSessions
+        )
+        let controller = SessionSidebarViewController(
+            sessionStore: store,
+            sessionDeleteConfirmer: confirmer,
+            operationsPresenter: operations,
+            settingsStore: makeSettingsStore(showRecentSessions: false)
+        )
+        controller.loadView()
+        let rootSessionItem = controller.outlineView(controller.outlineView, child: 0, ofItem: nil)
+        let folderItem = controller.outlineView(controller.outlineView, child: 1, ofItem: nil)
+        controller.outlineView.expandItem(folderItem)
+        let groupedSessionItem = controller.outlineView(controller.outlineView, child: 0, ofItem: folderItem)
+        let selectedRows = IndexSet([
+            controller.outlineView.row(forItem: rootSessionItem),
+            controller.outlineView.row(forItem: folderItem),
+            controller.outlineView.row(forItem: groupedSessionItem)
+        ])
+        controller.outlineView.selectRowIndexes(selectedRows, byExtendingSelection: false)
+
+        controller.outlineView.keyDown(with: makeSidebarDeleteKeyEvent(keyCode: 51))
+
+        XCTAssertEqual(operations.deleteFolderRequestIDs, [folder.id])
+        XCTAssertEqual(confirmer.requestedIDs, [rootSession.id])
+        XCTAssertEqual(store.deletedIDs.filter { $0 == groupedSession.id }.count, 1)
+        XCTAssertEqual(store.deletedIDs.filter { $0 == rootSession.id }.count, 1)
         XCTAssertEqual(controller.sessionOutlineTextSnapshot, "")
     }
 
@@ -2874,6 +3255,22 @@ private func makeSession(
     )
 }
 
+private func makeSidebarDeleteKeyEvent(keyCode: UInt16) -> NSEvent {
+    let characters = keyCode == 117 ? "\u{f728}" : "\u{7f}"
+    return NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: characters,
+        isARepeat: false,
+        keyCode: keyCode
+    )!
+}
+
 private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     var events: [String] = []
     var createdDrafts: [SessionDraft] = []
@@ -2901,6 +3298,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
     private let createError: Error?
     private let updateError: Error?
     private let deleteError: Error?
+    private let deleteErrorsByID: [String: Error]
     private let placeError: Error?
 
     init(
@@ -2918,6 +3316,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         createError: Error? = nil,
         updateError: Error? = nil,
         deleteError: Error? = nil,
+        deleteErrorsByID: [String: Error] = [:],
         placeError: Error? = nil
     ) {
         self.folders = folders
@@ -2934,6 +3333,7 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         self.createError = createError
         self.updateError = updateError
         self.deleteError = deleteError
+        self.deleteErrorsByID = deleteErrorsByID
         self.placeError = placeError
         rebuildSidebarOrder()
     }
@@ -3226,11 +3626,18 @@ private final class RecordingSessionSidebarStore: SessionSidebarStoring {
         return configJSONByID[id]
     }
 
+    func sessionConfigJSONs(ids: [String]) throws -> [String: String] {
+        configJSONByID.filter { ids.contains($0.key) }
+    }
+
     func credentialRecord(id: String) throws -> CredentialRecord? {
         credentialRecordsByID[id]
     }
 
     func deleteSession(id: String) throws {
+        if let error = deleteErrorsByID[id] {
+            throw error
+        }
         if let deleteError {
             throw deleteError
         }

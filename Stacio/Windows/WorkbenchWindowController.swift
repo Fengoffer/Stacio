@@ -258,6 +258,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var licenseAuthorizationObserver: NSObjectProtocol?
     private let licensedFeatureMenuDelegate = WorkbenchLicensedFeatureMenuDelegate()
     private var serialSessionStarter: SerialSessionStarting?
+    private var consoleSessionStarter: ConsoleSessionStarting?
     private var savedSessionContextBuilder: TunnelLiveSessionContextBuilding?
     private let quickConnectPromptPresenter: QuickConnectPromptPresenting
     private let quickConnectErrorPresenter: QuickConnectErrorPresenting
@@ -276,6 +277,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let savedSessionCredentialPromptPresenter: SavedSessionCredentialPrompting
     private let savedSessionCredentialSaver: SessionSidebarCredentialSaving?
     private let quickConnectCredentialSaver: (SessionSidebarCredentialSaving & SessionSidebarCredentialCleaning)?
+    private let fileTransferRemoteSessionDraftProvider: ((String, NSWindow?) -> SessionDraft?)?
     private let graphicsCredentialStore: KeychainCredentialStore
     private let aiAPIKeyStore: AIApiKeyStoring
     private let aiHTTPTransport: AIAssistantHTTPTransport
@@ -372,6 +374,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         remoteSessionStarter: RemoteSSHSessionStarting? = nil,
         telnetSessionStarter: TelnetSessionStarting? = nil,
         serialSessionStarter: SerialSessionStarting? = nil,
+        consoleSessionStarter: ConsoleSessionStarting? = nil,
         savedSessionContextBuilder: TunnelLiveSessionContextBuilding? = nil,
         quickConnectPromptPresenter: QuickConnectPromptPresenting = AppKitQuickConnectPromptPresenter(),
         quickConnectErrorPresenter: QuickConnectErrorPresenting? = nil,
@@ -389,6 +392,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         savedSessionCredentialPromptPresenter: SavedSessionCredentialPrompting? = nil,
         savedSessionCredentialSaver: SessionSidebarCredentialSaving? = nil,
         quickConnectCredentialSaver: (SessionSidebarCredentialSaving & SessionSidebarCredentialCleaning)? = nil,
+        fileTransferRemoteSessionDraftProvider: ((String, NSWindow?) -> SessionDraft?)? = nil,
         graphicsCredentialStore: KeychainCredentialStore = KeychainCredentialStore(),
         aiAPIKeyStore: AIApiKeyStoring = KeychainAIApiKeyStore(),
         aiHTTPTransport: AIAssistantHTTPTransport = URLSessionAIAssistantHTTPTransport(),
@@ -429,6 +433,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         self.remoteSessionStarter = remoteSessionStarter
         self.telnetSessionStarter = telnetSessionStarter
         self.serialSessionStarter = serialSessionStarter
+        self.consoleSessionStarter = consoleSessionStarter
         self.savedSessionContextBuilder = savedSessionContextBuilder
         self.quickConnectPromptPresenter = quickConnectPromptPresenter
         self.quickConnectErrorPresenter = quickConnectErrorPresenter ?? AppKitQuickConnectErrorPresenter()
@@ -445,6 +450,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             ?? AppKitSavedSessionCredentialPromptPresenter()
         self.savedSessionCredentialSaver = savedSessionCredentialSaver
         self.quickConnectCredentialSaver = quickConnectCredentialSaver
+        self.fileTransferRemoteSessionDraftProvider = fileTransferRemoteSessionDraftProvider
         self.graphicsCredentialStore = graphicsCredentialStore
         self.aiAPIKeyStore = aiAPIKeyStore
         self.aiHTTPTransport = aiHTTPTransport
@@ -479,8 +485,14 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         workspaceViewController.onRequestConnectFileTransferRemoteDevice = { [weak self] filesPane, sessionID in
             self?.connectFileTransferRemoteDevice(sessionID: sessionID, to: filesPane)
         }
-        workspaceViewController.onRequestCreateFileTransferRemoteDevice = { [weak self] in
-            self?.performNewSessionFromToolbar(nil)
+        workspaceViewController.onRequestCreateFileTransferRemoteDevice = { [weak self] filesPane, protocolName in
+            self?.createFileTransferRemoteDevice(protocolName: protocolName, in: filesPane)
+        }
+        workspaceViewController.onSaveWorkspaceSessionGroup = { [weak self] name, definition in
+            guard let self else {
+                throw WorkspaceSessionGroupSaveError.persistenceUnavailable
+            }
+            _ = try self.saveWorkspaceSessionGroup(name: name, definition: definition)
         }
     }
 
@@ -2872,13 +2884,16 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func performExistingTerminalSplit(layout: TerminalSplitLayoutMode) {
-        let targets = workspaceViewController.splitTargets()
-        if targets.count < 2 {
+        let targetChoices = workspaceViewController.splitTargetChoices()
+        if targetChoices.count < 2 {
             guard (try? workspaceViewController.splitCurrentTerminal()) != nil else { return }
             workspaceViewController.setCurrentTerminalSplitLayout(layout)
             return
         }
-        guard let selection = multiExecSessionSelector.selectMultiExecTargets(targets: targets, parentWindow: window) else {
+        guard let selection = multiExecSessionSelector.selectMultiExecTargets(
+            targetChoices: targetChoices,
+            parentWindow: window
+        ) else {
             return
         }
         _ = try? workspaceViewController.splitExistingTerminals(targetIDs: selection.targetIDs, layout: layout)
@@ -3171,8 +3186,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         guard isLicensed(.multiExec) else {
             throw LicensedFeatureAccessError.licenseRequired(.multiExec)
         }
-        let targets = workspaceViewController.multiExecTargets()
-        guard targets.count >= 2 else {
+        let targetChoices = workspaceViewController.multiExecTargetChoices()
+        guard targetChoices.count >= 2 else {
             let error = WorkspaceTerminalError.multiExecRequiresMultipleTargets
             multiExecSessionSelector.presentMultiExecError(error, parentWindow: window)
             throw error
@@ -3182,7 +3197,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if currentSplitIDs.count >= 2 {
             selectedIDs = currentSplitIDs
         } else if let selection = multiExecSessionSelector.selectMultiExecTargets(
-            targets: targets,
+            targetChoices: targetChoices,
             parentWindow: window
         ) {
             selectedIDs = selection.targetIDs
@@ -3198,8 +3213,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     @discardableResult
     public func multiExecFromToolbar(_ sender: Any?) throws -> BroadcastAuditEvent? {
-        let targets = workspaceViewController.multiExecTargets()
-        guard let request = multiExecPromptPresenter.promptMultiExec(targets: targets, parentWindow: window) else {
+        let targetChoices = workspaceViewController.multiExecTargetChoices()
+        let targets = targetChoices.map(\.target)
+        guard let request = multiExecPromptPresenter.promptMultiExec(
+            targetChoices: targetChoices,
+            parentWindow: window
+        ) else {
             return nil
         }
 
@@ -3453,23 +3472,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             let databasePath = try databasePathProvider()
             return try CoreBridge.listAllSessionRecords(databasePath: databasePath)
                 .compactMap { session -> FileTransferRemoteDeviceOption? in
-                    let normalizedProtocol = session.protocol
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .lowercased()
-                    guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
-                        return nil
-                    }
-                    let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let host = session.host.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let username = session.username?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let hostAndPort = "\(host):\(session.port)"
-                    let endpoint = username.isEmpty ? hostAndPort : "\(username)@\(hostAndPort)"
-                    return FileTransferRemoteDeviceOption(
-                        sessionID: session.id,
-                        title: title.isEmpty ? host : title,
-                        protocolName: normalizedProtocol.uppercased(),
-                        endpoint: endpoint
+                    let configJSON = try CoreBridge.getSessionConfigJSON(
+                        databasePath: databasePath,
+                        id: session.id
+                    )
+                    return Self.makeFileTransferRemoteDeviceOption(
+                        session: session,
+                        configJSON: configJSON
                     )
                 }
                 .sorted {
@@ -3478,6 +3487,39 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         } catch {
             return []
         }
+    }
+
+    private static func makeFileTransferRemoteDeviceOption(
+        session: SessionRecord,
+        configJSON: String?
+    ) -> FileTransferRemoteDeviceOption? {
+        let normalizedProtocol = session.protocol
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
+            return nil
+        }
+        let summary = BastionSessionDisplaySummaryCodec.summary(
+            protocolName: session.protocol,
+            gatewayHost: session.host,
+            gatewayPort: session.port,
+            gatewayUsername: session.username,
+            configJSON: configJSON
+        )
+        let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return FileTransferRemoteDeviceOption(
+            sessionID: session.id,
+            title: title.isEmpty ? summary.primaryTarget : title,
+            protocolName: normalizedProtocol.uppercased(),
+            endpoint: summary.displayText
+        )
+    }
+
+    static func fileTransferRemoteDeviceOptionForTesting(
+        session: SessionRecord,
+        configJSON: String?
+    ) -> FileTransferRemoteDeviceOption? {
+        makeFileTransferRemoteDeviceOption(session: session, configJSON: configJSON)
     }
 
     private func connectFileTransferRemoteDevice(
@@ -3491,45 +3533,22 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             else {
                 throw WorkbenchSessionOpenError.savedSessionNotFound(sessionID)
             }
-            let normalizedProtocol = session.protocol
+            let selectedProtocol = session.protocol
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
-            guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
-                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol)
+            let workspaceProtocol = filesPane.fileTransferProtocolName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard selectedProtocol == workspaceProtocol else {
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol.uppercased())
             }
-
-            let config = try savedSessionSSHConfig(for: session)
-            let context = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
-                config: config,
-                databasePath: databasePath
-            )
-            let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "\(config.username)@\(config.host)"
-                : session.name
-            let paneBridge: RemoteFilesBridging
-            let paneScheduler: SCPTransferScheduling?
-            if normalizedProtocol == "sftp" {
-                paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
-                paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
-            } else {
-                paneBridge = remoteFilesBridge
-                paneScheduler = currentTransferScheduler()
-            }
-
-            let configuration = FileTransferRemotePaneConfiguration(
-                sourceRuntimeID: "saved:\(session.id)",
-                context: context,
-                title: title,
-                bridge: paneBridge,
-                transferScheduler: paneScheduler,
-                remoteProtocolName: normalizedProtocol.uppercased(),
-                initialRemotePath: "~",
-                remoteFilePathTerminalSender: { [weak workspace = workspaceViewController] path in
-                    _ = workspace?.sendTextToCurrentTerminal(path)
-                }
+            let configuration = try fileTransferRemotePaneConfiguration(
+                for: session,
+                databasePath: databasePath,
+                initialRemotePath: "~"
             )
             guard filesPane.attachFileTransferRemoteDevice(configuration) != nil else {
-                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(normalizedProtocol.uppercased())
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol.uppercased())
             }
             markSavedSessionOpened(session)
         } catch {
@@ -3537,13 +3556,428 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
     }
 
+    private func createFileTransferRemoteDevice(
+        protocolName: String,
+        in filesPane: RemoteFilesPaneViewController
+    ) {
+        let normalizedProtocol = protocolName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let workspaceProtocol = filesPane.fileTransferProtocolName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard (normalizedProtocol == "scp" || normalizedProtocol == "sftp"),
+              normalizedProtocol == workspaceProtocol
+        else {
+            quickConnectErrorPresenter.presentQuickConnectError(
+                WorkbenchSessionOpenError.protocolRuntimeUnavailable(protocolName.uppercased()),
+                parentWindow: window
+            )
+            return
+        }
+
+        let transientDraft: (draft: SessionDraft, cleanup: (() -> Void)?)?
+        if let fileTransferRemoteSessionDraftProvider,
+           let draft = fileTransferRemoteSessionDraftProvider(normalizedProtocol.uppercased(), window) {
+            transientDraft = (draft, nil)
+        } else if fileTransferRemoteSessionDraftProvider != nil {
+            transientDraft = nil
+        } else {
+            transientDraft = promptTransientFileTransferSessionDraft(protocolName: normalizedProtocol)
+        }
+        guard let transientDraft else { return }
+
+        do {
+            guard transientDraft.draft.protocol
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == normalizedProtocol
+            else {
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(
+                    transientDraft.draft.protocol.uppercased()
+                )
+            }
+            let databasePath = try databasePathProvider()
+            let configuration = try fileTransferRemotePaneConfiguration(
+                for: transientDraft.draft,
+                databasePath: databasePath,
+                onRuntimeClosed: transientDraft.cleanup
+            )
+            guard filesPane.attachFileTransferRemoteDevice(configuration) != nil else {
+                throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(protocolName.uppercased())
+            }
+        } catch {
+            transientDraft.cleanup?()
+            quickConnectErrorPresenter.presentQuickConnectError(error, parentWindow: window)
+        }
+    }
+
+    private func promptTransientFileTransferSessionDraft(
+        protocolName: String
+    ) -> (draft: SessionDraft, cleanup: (() -> Void)?)? {
+        guard let sessionProtocol = SessionSettingsProtocol(storageKey: protocolName),
+              sessionProtocol == .scp || sessionProtocol == .sftp
+        else { return nil }
+        let credentialManager = resolvedQuickConnectCredentialSaver()
+        let controller = SessionSettingsWindowController(
+            existingSession: nil,
+            selectedFolderID: nil,
+            draftFactory: SessionSidebarSessionDraftFactory(credentialSaver: credentialManager),
+            errorPresenter: AppKitSessionSidebarErrorPresenter(),
+            licenseAccess: licenseAccess,
+            initialProtocol: sessionProtocol,
+            selectableProtocols: [sessionProtocol],
+            parentWindowProvider: { [weak self] in self?.window }
+        )
+        guard let draft = controller.runModal(parentWindow: window) else { return nil }
+
+        let cleanup: (() -> Void)?
+        if let credentialID = optionalTrimmed(draft.credentialId),
+           let credentialManager {
+            cleanup = {
+                try? credentialManager.cleanupReplacedCredential(
+                    previousCredentialID: credentialID,
+                    replacementCredentialID: nil
+                )
+            }
+        } else {
+            cleanup = nil
+        }
+        return (draft, cleanup)
+    }
+
+    func saveWorkspaceSessionGroup(
+        name: String,
+        definition: WorkspaceSessionGroupDefinition
+    ) throws -> SessionRecord {
+        let databasePath = try databasePathProvider()
+        let configJSON = try WorkspaceSessionGroupCodec.encode(definition)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let record = try CoreBridge.createSessionRecord(
+            databasePath: databasePath,
+            draft: SessionDraft(
+                folderId: nil,
+                name: trimmedName.isEmpty ? definition.displayName : trimmedName,
+                protocol: definition.sessionProtocol,
+                host: definition.paneCountDescription,
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: configJSON
+            )
+        )
+        sessionSidebarViewController?.reloadSessions()
+        return record
+    }
+
+    private func fileTransferRemotePaneConfiguration(
+        for session: SessionRecord,
+        databasePath: String,
+        initialRemotePath: String
+    ) throws -> FileTransferRemotePaneConfiguration {
+        let normalizedProtocol = session.protocol
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol)
+        }
+        let config = try savedSessionSSHConfig(for: session)
+        let context = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
+            config: config,
+            databasePath: databasePath
+        )
+        let title = session.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(config.username)@\(config.host)"
+            : session.name
+        let paneBridge: RemoteFilesBridging
+        let paneScheduler: SCPTransferScheduling?
+        if normalizedProtocol == "sftp" {
+            paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
+            paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
+        } else {
+            paneBridge = remoteFilesBridge
+            paneScheduler = currentTransferScheduler()
+        }
+        return FileTransferRemotePaneConfiguration(
+            sourceRuntimeID: "saved:\(session.id)",
+            context: context,
+            title: title,
+            bridge: paneBridge,
+            transferScheduler: paneScheduler,
+            remoteProtocolName: normalizedProtocol.uppercased(),
+            initialRemotePath: initialRemotePath,
+            remoteFilePathTerminalSender: { [weak workspace = workspaceViewController] path in
+                _ = workspace?.sendTextToCurrentTerminal(path)
+            }
+        )
+    }
+
+    private func fileTransferRemotePaneConfiguration(
+        for draft: SessionDraft,
+        databasePath: String,
+        onRuntimeClosed: (() -> Void)?
+    ) throws -> FileTransferRemotePaneConfiguration {
+        let normalizedProtocol = draft.protocol
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedProtocol == "scp" || normalizedProtocol == "sftp" else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(draft.protocol)
+        }
+        guard draft.port > 0, draft.port <= UInt32(UInt16.max) else {
+            throw WorkbenchSessionOpenError.invalidSavedSessionPort(draft.protocol, draft.port)
+        }
+        let credentialID = optionalTrimmed(draft.credentialId)
+        let authMethod: SshAuthMethod
+        if let privateKeyPath = optionalTrimmed(draft.privateKeyPath) {
+            authMethod = .privateKey(keyPath: privateKeyPath, passphraseRef: credentialID)
+        } else if let credentialID {
+            authMethod = .password(credentialRef: credentialID)
+        } else {
+            authMethod = .agent
+        }
+        let automationPolicy = SessionAutomationPolicy.fromConfigJSON(draft.configJson)
+        let config = SshConnectionConfig(
+            host: draft.host,
+            port: UInt16(draft.port),
+            username: optionalTrimmed(draft.username) ?? NSUserName(),
+            authMethod: authMethod,
+            connectTimeoutMs: automationPolicy.connectTimeoutMs ?? SSHConnectionDefaults.fastConnectTimeoutMs
+        )
+        let context = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
+            config: config,
+            databasePath: databasePath
+        )
+        let title = draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(config.username)@\(config.host)"
+            : draft.name
+        let paneBridge: RemoteFilesBridging
+        let paneScheduler: SCPTransferScheduling?
+        if normalizedProtocol == "sftp" {
+            paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
+            paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
+        } else {
+            paneBridge = remoteFilesBridge
+            paneScheduler = currentTransferScheduler()
+        }
+        return FileTransferRemotePaneConfiguration(
+            sourceRuntimeID: "transient:\(normalizedProtocol)_\(UUID().uuidString.lowercased())",
+            context: context,
+            title: title,
+            bridge: paneBridge,
+            transferScheduler: paneScheduler,
+            remoteProtocolName: normalizedProtocol.uppercased(),
+            initialRemotePath: "~",
+            remoteFilePathTerminalSender: { [weak workspace = workspaceViewController] path in
+                _ = workspace?.sendTextToCurrentTerminal(path)
+            },
+            onRuntimeClosed: onRuntimeClosed
+        )
+    }
+
+    private func openWorkspaceSessionGroup(_ session: SessionRecord) throws -> LiveShellStatus {
+        let databasePath = try databasePathProvider()
+        guard let configJSON = try CoreBridge.getSessionConfigJSON(
+            databasePath: databasePath,
+            id: session.id
+        ) else {
+            throw WorkspaceSessionGroupCodecError.invalidConfiguration
+        }
+        let definition = try WorkspaceSessionGroupCodec.decode(configJSON)
+        guard definition.sessionProtocol.caseInsensitiveCompare(session.protocol) == .orderedSame else {
+            throw WorkspaceSessionGroupCodecError.invalidConfiguration
+        }
+        let sessions = try CoreBridge.listAllSessionRecords(databasePath: databasePath)
+        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        let status: LiveShellStatus
+        switch definition.kind {
+        case .scp, .sftp:
+            status = try openFileTransferWorkspaceGroup(
+                session: session,
+                definition: definition,
+                sessionsByID: sessionsByID,
+                databasePath: databasePath
+            )
+        case .terminalSplit, .terminalMultiExec:
+            status = try openTerminalWorkspaceGroup(
+                session: session,
+                definition: definition,
+                sessionsByID: sessionsByID
+            )
+        }
+        workspaceViewController.markCurrentWorkspaceSessionGroupRestored(definition)
+        markSavedSessionOpened(session)
+        return status
+    }
+
+    private func openFileTransferWorkspaceGroup(
+        session: SessionRecord,
+        definition: WorkspaceSessionGroupDefinition,
+        sessionsByID: [String: SessionRecord],
+        databasePath: String
+    ) throws -> LiveShellStatus {
+        let remoteDefinitions = definition.panes.filter { $0.kind == .remoteSession }
+        guard let primaryDefinition = remoteDefinitions.first,
+              let primarySessionID = primaryDefinition.sessionID,
+              let primarySession = sessionsByID[primarySessionID]
+        else {
+            throw WorkspaceSessionGroupCodecError.unrestorablePane
+        }
+        let expectedProtocol = definition.kind == .sftp ? "sftp" : "scp"
+        try validateFileTransferGroupMember(primarySession, expectedProtocol: expectedProtocol)
+        let primaryConfig = try savedSessionSSHConfig(for: primarySession)
+        let primaryContext = try resolvedSavedSessionContextBuilder().makeTunnelLiveSessionContext(
+            config: primaryConfig,
+            databasePath: databasePath
+        )
+        tunnelLiveSessionStore.replace(with: primaryContext)
+        let primaryTitle = primarySession.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(primaryConfig.username)@\(primaryConfig.host)"
+            : primarySession.name
+        let localPaths = definition.panes.compactMap { pane in
+            pane.kind == .localDirectory ? pane.path : nil
+        }
+        let primaryLocalPath = localPaths.first ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let runtimeID: String
+        if definition.kind == .sftp {
+            runtimeID = try workspaceViewController.openSFTPFilesSession(
+                context: primaryContext,
+                title: session.name.isEmpty ? primaryTitle : session.name,
+                bridge: remoteFilesBridge,
+                sftpTransferScheduler: currentSFTPTransferScheduler(),
+                initialRemotePath: primaryDefinition.path ?? "~",
+                initialLocalDirectory: primaryLocalPath
+            )
+        } else {
+            runtimeID = try workspaceViewController.openRemoteFilesSession(
+                context: primaryContext,
+                title: session.name.isEmpty ? primaryTitle : session.name,
+                bridge: remoteFilesBridge,
+                transferScheduler: currentTransferScheduler(),
+                initialRemotePath: primaryDefinition.path ?? "~",
+                initialLocalDirectory: primaryLocalPath
+            )
+        }
+        guard let filesPane = workspaceViewController.currentTerminalPane as? RemoteFilesPaneViewController else {
+            throw WorkspaceSessionGroupCodecError.invalidConfiguration
+        }
+        filesPane.markPrimaryFileTransferRemoteDevice(sessionID: primarySession.id)
+        for paneDefinition in remoteDefinitions.dropFirst() {
+            guard let sessionID = paneDefinition.sessionID,
+                  let member = sessionsByID[sessionID]
+            else {
+                throw WorkbenchSessionOpenError.savedSessionNotFound(paneDefinition.sessionID ?? "")
+            }
+            try validateFileTransferGroupMember(member)
+            let configuration = try fileTransferRemotePaneConfiguration(
+                for: member,
+                databasePath: databasePath,
+                initialRemotePath: paneDefinition.path ?? "~"
+            )
+            guard filesPane.attachFileTransferRemoteDevice(configuration) != nil else {
+                throw WorkspaceSessionGroupCodecError.invalidConfiguration
+            }
+        }
+        filesPane.restoreFileTransferWorkspace(
+            additionalLocalDirectoryPaths: Array(localPaths.dropFirst()),
+            layout: definition.layout == .grid ? .grid : .columns
+        )
+        return LiveShellStatus(
+            runtimeId: runtimeID,
+            status: "running",
+            diagnostic: "已恢复 \(definition.displayName)"
+        )
+    }
+
+    private func validateFileTransferGroupMember(
+        _ session: SessionRecord,
+        expectedProtocol: String? = nil
+    ) throws {
+        let memberProtocol = session.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard memberProtocol == "scp" || memberProtocol == "sftp" else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(session.protocol)
+        }
+        guard let expectedProtocol else { return }
+        guard memberProtocol == expectedProtocol else {
+            throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(
+                "\(session.protocol)（分组需要 \(expectedProtocol.uppercased())）"
+            )
+        }
+    }
+
+    private func openTerminalWorkspaceGroup(
+        session: SessionRecord,
+        definition: WorkspaceSessionGroupDefinition,
+        sessionsByID: [String: SessionRecord]
+    ) throws -> LiveShellStatus {
+        var runtimeIDs: [String] = []
+        for pane in definition.panes {
+            switch pane.kind {
+            case .localTerminal:
+                runtimeIDs.append(try workspaceViewController.openLocalShell(initialDirectory: pane.path))
+            case .terminalSession:
+                guard let sessionID = pane.sessionID,
+                      let member = sessionsByID[sessionID]
+                else {
+                    throw WorkbenchSessionOpenError.savedSessionNotFound(pane.sessionID ?? "")
+                }
+                let memberProtocol = member.protocol.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard ["ssh", "telnet", "serial"].contains(memberProtocol) else {
+                    throw WorkbenchSessionOpenError.protocolRuntimeUnavailable(member.protocol)
+                }
+                runtimeIDs.append(try openSavedSession(member).runtimeId)
+            case .localDirectory, .remoteSession:
+                throw WorkspaceSessionGroupCodecError.invalidConfiguration
+            }
+        }
+        guard runtimeIDs.count >= 2 else {
+            throw WorkspaceSessionGroupCodecError.invalidConfiguration
+        }
+        let layout = terminalSplitLayout(for: definition.layout)
+        let groupTitle = session.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? definition.displayName
+            : session.name
+        if definition.kind == .terminalMultiExec {
+            try workspaceViewController.startMultiExecSession(targetIDs: runtimeIDs, title: groupTitle)
+            workspaceViewController.setCurrentTerminalSplitLayout(layout)
+        } else {
+            try workspaceViewController.splitExistingTerminals(
+                targetIDs: runtimeIDs,
+                layout: layout,
+                title: groupTitle
+            )
+        }
+        return LiveShellStatus(
+            runtimeId: runtimeIDs[0],
+            status: "running",
+            diagnostic: "已恢复 \(definition.displayName)"
+        )
+    }
+
+    private func terminalSplitLayout(
+        for layout: WorkspaceSessionGroupLayout
+    ) -> TerminalSplitLayoutMode {
+        switch layout {
+        case .horizontal:
+            return .horizontal
+        case .grid:
+            return .grid
+        case .columns, .vertical:
+            return .vertical
+        }
+    }
+
     @discardableResult
     public func openSavedSession(_ session: SessionRecord) throws -> LiveShellStatus {
+        if WorkspaceSessionGroupKind(sessionProtocol: session.protocol) != nil {
+            return try openWorkspaceSessionGroup(session)
+        }
         let status = try openSavedSession(session, allowMissingCredentialRepair: true)
         workspaceViewController.setAIHistoryScopeID(
             "session:\(session.id)",
             runtimeID: status.runtimeId
         )
+        workspaceViewController.setSavedSessionID(session.id, runtimeID: status.runtimeId)
         return status
     }
 
@@ -3638,6 +4072,31 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             let status = try resolvedTelnetSessionStarter().openSessionTab(config: config, title: title)
             markSavedSessionOpened(session)
             return status
+        }
+        if normalizedProtocol == "console" {
+            guard let configJSON = try CoreBridge.getSessionConfigJSON(
+                databasePath: databasePathProvider(),
+                id: session.id
+            ) else {
+                throw BLEConsoleErrorCode.configInvalid
+            }
+            let config: ConsoleSessionConfig
+            do {
+                config = try CoreBridge.parseConsoleSessionConfig(json: configJSON)
+            } catch {
+                throw BLEConsoleErrorCode.configInvalid
+            }
+            guard optionalTrimmed(config.ble.platformBindings.macOsPeripheralUuid) != nil else {
+                throw BLEConsoleErrorCode.configInvalid
+            }
+            let title = session.name.isEmpty ? config.ble.deviceName : session.name
+            let runtime = try resolvedConsoleSessionStarter().openSessionTab(config: config, title: title)
+            markSavedSessionOpened(session)
+            return LiveShellStatus(
+                runtimeId: runtime.id,
+                status: runtime.status,
+                diagnostic: runtime.status
+            )
         }
         if normalizedProtocol == "serial" {
             let config = try savedSessionSerialConfig(for: session)
@@ -4071,6 +4530,15 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         let starter = SerialSessionCoordinator(workspace: workspaceViewController)
         serialSessionStarter = starter
+        return starter
+    }
+
+    private func resolvedConsoleSessionStarter() -> ConsoleSessionStarting {
+        if let consoleSessionStarter {
+            return consoleSessionStarter
+        }
+        let starter = ConsoleSessionCoordinator(workspace: workspaceViewController)
+        consoleSessionStarter = starter
         return starter
     }
 

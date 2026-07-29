@@ -69,21 +69,21 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
             }
         }
 
-        let importableCount = preview.sessions.filter { !$0.conflict }.count
-        let alert = NSAlert()
-        alert.messageText = L10n.Import.title
-        alert.informativeText = L10n.Import.previewMessage(
-            sourceName: sourceName,
-            sourceType: sourceType,
-            importableCount: importableCount,
-            conflictCount: preview.conflictCount
-        )
-        alert.addButton(withTitle: L10n.Import.action)
-        alert.addButton(withTitle: L10n.Common.cancel)
-        alert.buttons.first?.isEnabled = importableCount > 0
-        alert.accessoryView = makePreviewAccessory(preview)
-
-        return alert.runModal() == .alertFirstButtonReturn
+        return MainActor.assumeIsolated {
+            let importableCount = preview.sessions.filter { !$0.conflict }.count
+            let controller = SessionImportPreviewWindowController(
+                preview: preview,
+                title: L10n.Import.title,
+                message: L10n.Import.previewMessage(
+                    sourceName: sourceName,
+                    sourceType: sourceType,
+                    importableCount: importableCount,
+                    conflictCount: preview.conflictCount
+                ),
+                importEnabled: importableCount > 0
+            )
+            return controller.runModal(parentWindow: parentWindow)
+        }
     }
 
     public func showImportResult(_ result: ImportApplyResult, parentWindow: NSWindow?) {
@@ -121,55 +121,35 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
         _ = alert.runModal()
     }
 
-    private func makePreviewAccessory(_ preview: ImportPreview) -> NSView {
-        let rows = Self.previewRows(preview)
-        let dataSource = SessionImportPreviewTableDataSource(rows: rows)
-        let tableView = NSTableView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
-        tableView.usesAlternatingRowBackgroundColors = false
-        tableView.headerView = NSTableHeaderView()
-        tableView.rowHeight = 24
-        tableView.dataSource = dataSource
-        tableView.delegate = dataSource
-        tableView.allowsColumnReordering = false
-        tableView.allowsColumnResizing = true
-        tableView.allowsEmptySelection = true
-        tableView.allowsMultipleSelection = false
-        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
-        StacioDesignSystem.styleTable(tableView)
-
-        [
-            ("name", L10n.Import.nameColumn, 104),
-            ("folder", L10n.Import.folderColumn, 76),
-            ("protocol", L10n.Import.protocolColumn, 58),
-            ("target", L10n.Import.targetColumn, 144),
-            ("status", L10n.Import.statusColumn, 52),
-            ("warnings", L10n.Import.warningsColumn, 86)
-        ].forEach { identifier, title, width in
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
-            column.title = title
-            column.width = CGFloat(width)
-            column.minWidth = min(CGFloat(width), 52)
-            tableView.addTableColumn(column)
+    static func previewAccessoryForTesting(_ preview: ImportPreview) -> NSView {
+        MainActor.assumeIsolated {
+            SessionImportPreviewWindowController(
+                preview: preview,
+                title: L10n.Import.title,
+                message: "测试导入预览",
+                importEnabled: true
+            ).window?.contentView ?? NSView()
         }
-
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
-        scrollView.documentView = tableView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        scrollView.postsFrameChangedNotifications = true
-        objc_setAssociatedObject(
-            scrollView,
-            &Self.previewTableDataSourceAssociationKey,
-            dataSource,
-            .OBJC_ASSOCIATION_RETAIN_NONATOMIC
-        )
-        return scrollView
     }
 
-    static func previewAccessoryForTesting(_ preview: ImportPreview) -> NSView {
-        AppKitSessionImportPreviewPresenter().makePreviewAccessory(preview)
+    static func previewWindowControllerForTesting(
+        _ preview: ImportPreview,
+        message: String = "测试导入预览"
+    ) -> NSWindowController {
+        MainActor.assumeIsolated {
+            SessionImportPreviewWindowController(
+                preview: preview,
+                title: L10n.Import.title,
+                message: message,
+                importEnabled: preview.sessions.contains { $0.conflict == false }
+            )
+        }
+    }
+
+    static func previewContentSizeForTesting(availableSize: NSSize) -> NSSize {
+        MainActor.assumeIsolated {
+            SessionImportPreviewWindowController.contentSize(forAvailableSize: availableSize)
+        }
     }
 
     static func previewTextForTesting(_ preview: ImportPreview) -> String {
@@ -221,8 +201,7 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
         var lines = [L10n.Import.header]
         lines.append(contentsOf: preview.sessions.map { session in
             let folder = session.folder ?? ""
-            let username = session.username.map { "\($0)@" } ?? ""
-            let target = "\(username)\(session.host):\(session.port)"
+            let target = displaySummary(for: session).displayText
             let protocolName = protocolLabel(session.protocol)
             let status = session.conflict ? L10n.Import.conflict : L10n.Import.new
             return "\(session.name)\t\(folder)\t\(protocolName)\t\(target)\t\(status)"
@@ -252,19 +231,30 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
         }
     }
 
-    private static func previewRows(_ preview: ImportPreview) -> [SessionImportPreviewRow] {
+    fileprivate static func previewRows(_ preview: ImportPreview) -> [SessionImportPreviewRow] {
         let warnings = sanitizedWarnings(preview.warnings).joined(separator: "\n")
         return preview.sessions.enumerated().map { index, session in
-            let username = session.username.map { "\($0)@" } ?? ""
+            let summary = displaySummary(for: session)
             return SessionImportPreviewRow(
                 name: session.name,
                 folder: session.folder ?? "",
                 protocolName: protocolLabel(session.protocol),
-                target: "\(username)\(session.host):\(session.port)",
+                target: summary.primaryTarget,
+                gateway: summary.gatewayDetail,
                 status: session.conflict ? L10n.Import.conflict : L10n.Import.new,
                 warnings: index == 0 ? warnings : ""
             )
         }
+    }
+
+    private static func displaySummary(for session: ImportSessionPreview) -> BastionSessionDisplaySummary {
+        BastionSessionDisplaySummaryCodec.summary(
+            protocolName: session.protocol,
+            gatewayHost: session.host,
+            gatewayPort: UInt32(session.port),
+            gatewayUsername: session.username,
+            configJSON: session.configJson
+        )
     }
 
     private static func sanitizedWarnings(_ warnings: [String]) -> [String] {
@@ -281,17 +271,238 @@ public struct AppKitSessionImportPreviewPresenter: SessionImportPreviewPresentin
             return warning
         }
     }
-
-    private static var previewTableDataSourceAssociationKey: UInt8 = 0
 }
 
-private struct SessionImportPreviewRow {
+fileprivate struct SessionImportPreviewRow {
     let name: String
     let folder: String
     let protocolName: String
     let target: String
+    let gateway: String?
     let status: String
     let warnings: String
+}
+
+@MainActor
+private final class SessionImportPreviewWindowController: NSWindowController, NSWindowDelegate {
+    private enum Layout {
+        static let preferredSize = NSSize(width: 840, height: 520)
+        static let minimumSize = NSSize(width: 700, height: 420)
+        static let screenInset: CGFloat = 48
+    }
+
+    private let tableView = NSTableView()
+    private let dataSource: SessionImportPreviewTableDataSource
+    private let titleLabel: NSTextField
+    private let messageLabel: NSTextField
+    private let importButton = NSButton(title: L10n.Import.action, target: nil, action: nil)
+    private let cancelButton = NSButton(title: L10n.Common.cancel, target: nil, action: nil)
+    private var accepted = false
+
+    init(preview: ImportPreview, title: String, message: String, importEnabled: Bool) {
+        dataSource = SessionImportPreviewTableDataSource(
+            rows: AppKitSessionImportPreviewPresenter.previewRows(preview)
+        )
+        titleLabel = NSTextField(labelWithString: title)
+        messageLabel = NSTextField(wrappingLabelWithString: message)
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: Layout.preferredSize),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.titleVisibility = .visible
+        window.toolbarStyle = .automatic
+        window.backgroundColor = .windowBackgroundColor
+        window.contentMinSize = Layout.minimumSize
+        super.init(window: window)
+        window.delegate = self
+        configureContent(importEnabled: importEnabled)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func runModal(parentWindow: NSWindow?) -> Bool {
+        guard let window else { return false }
+        resizeToFit(screen: parentWindow?.screen ?? NSScreen.main)
+        if let parentWindow {
+            parentWindow.beginSheet(window)
+            let response = NSApplication.shared.runModal(for: window)
+            parentWindow.endSheet(window)
+            window.orderOut(nil)
+            return response == .OK && accepted
+        }
+        window.center()
+        let response = NSApplication.shared.runModal(for: window)
+        window.close()
+        return response == .OK && accepted
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApplication.shared.stopModal(withCode: .cancel)
+    }
+
+    private func configureContent(importEnabled: Bool) {
+        guard let window else { return }
+        let root = StacioAppearanceRefreshView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        StacioDesignSystem.applyWorkspaceSurface(root)
+
+        let appIcon = NSImageView(image: NSApplication.shared.applicationIconImage)
+        appIcon.imageScaling = .scaleProportionallyUpOrDown
+        appIcon.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+        titleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.setAccessibilityIdentifier("Stacio.ImportPreview.title")
+
+        messageLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        messageLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        messageLabel.maximumNumberOfLines = 3
+        messageLabel.translatesAutoresizingMaskIntoConstraints = false
+        messageLabel.setAccessibilityIdentifier("Stacio.ImportPreview.message")
+
+        configureTableView()
+        let scrollView = NSScrollView()
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+        scrollView.drawsBackground = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.setAccessibilityIdentifier("Stacio.ImportPreview.scroll")
+
+        let footerSeparator = NSBox()
+        footerSeparator.boxType = .separator
+        footerSeparator.translatesAutoresizingMaskIntoConstraints = false
+
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .large
+        cancelButton.keyEquivalent = "\u{1b}"
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelPressed(_:))
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.setAccessibilityIdentifier("Stacio.ImportPreview.cancel")
+
+        importButton.bezelStyle = .rounded
+        importButton.controlSize = .large
+        importButton.keyEquivalent = "\r"
+        importButton.isEnabled = importEnabled
+        importButton.target = self
+        importButton.action = #selector(importPressed(_:))
+        importButton.translatesAutoresizingMaskIntoConstraints = false
+        importButton.setAccessibilityIdentifier("Stacio.ImportPreview.import")
+
+        [appIcon, titleLabel, messageLabel, scrollView, footerSeparator, cancelButton, importButton]
+            .forEach(root.addSubview)
+        NSLayoutConstraint.activate([
+            appIcon.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            appIcon.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
+            appIcon.widthAnchor.constraint(equalToConstant: 48),
+            appIcon.heightAnchor.constraint(equalToConstant: 48),
+
+            titleLabel.leadingAnchor.constraint(equalTo: appIcon.trailingAnchor, constant: 16),
+            titleLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            titleLabel.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
+
+            messageLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            messageLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 7),
+
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            scrollView.topAnchor.constraint(equalTo: appIcon.bottomAnchor, constant: 18),
+            scrollView.bottomAnchor.constraint(equalTo: footerSeparator.topAnchor, constant: -16),
+
+            footerSeparator.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            footerSeparator.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            footerSeparator.bottomAnchor.constraint(equalTo: cancelButton.topAnchor, constant: -15),
+
+            importButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            importButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
+            importButton.widthAnchor.constraint(equalToConstant: 96),
+            importButton.heightAnchor.constraint(equalToConstant: 32),
+
+            cancelButton.trailingAnchor.constraint(equalTo: importButton.leadingAnchor, constant: -10),
+            cancelButton.centerYAnchor.constraint(equalTo: importButton.centerYAnchor),
+            cancelButton.widthAnchor.constraint(equalToConstant: 96),
+            cancelButton.heightAnchor.constraint(equalTo: importButton.heightAnchor)
+        ])
+        window.contentView = root
+        window.initialFirstResponder = tableView
+        window.defaultButtonCell = importButton.cell as? NSButtonCell
+        tableView.reloadData()
+        root.layoutSubtreeIfNeeded()
+    }
+
+    private func configureTableView() {
+        tableView.frame = NSRect(x: 0, y: 0, width: 796, height: 320)
+        tableView.usesAlternatingRowBackgroundColors = false
+        tableView.headerView = NSTableHeaderView()
+        tableView.rowHeight = 42
+        tableView.intercellSpacing = NSSize(width: 3, height: 1)
+        tableView.dataSource = dataSource
+        tableView.delegate = dataSource
+        tableView.allowsColumnReordering = false
+        tableView.allowsColumnResizing = true
+        tableView.allowsEmptySelection = true
+        tableView.allowsMultipleSelection = false
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.setAccessibilityIdentifier("Stacio.ImportPreview.table")
+        StacioDesignSystem.styleTable(tableView)
+
+        [
+            ("name", L10n.Import.nameColumn, 150, 110),
+            ("folder", L10n.Import.folderColumn, 105, 80),
+            ("protocol", L10n.Import.protocolColumn, 64, 58),
+            ("target", L10n.Import.targetColumn, 220, 170),
+            ("status", L10n.Import.statusColumn, 64, 58),
+            ("warnings", L10n.Import.warningsColumn, 150, 100)
+        ].forEach { identifier, title, width, minimumWidth in
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
+            column.title = title
+            column.width = CGFloat(width)
+            column.minWidth = CGFloat(minimumWidth)
+            tableView.addTableColumn(column)
+        }
+    }
+
+    private func resizeToFit(screen: NSScreen?) {
+        let availableSize = screen?.visibleFrame.size ?? Layout.preferredSize
+        let size = Self.contentSize(forAvailableSize: availableSize)
+        window?.contentMinSize = NSSize(
+            width: min(Layout.minimumSize.width, size.width),
+            height: min(Layout.minimumSize.height, size.height)
+        )
+        window?.setContentSize(size)
+    }
+
+    static func contentSize(forAvailableSize availableSize: NSSize) -> NSSize {
+        let availableWidth = max(1, availableSize.width - Layout.screenInset)
+        let availableHeight = max(1, availableSize.height - Layout.screenInset)
+        return NSSize(
+            width: min(Layout.preferredSize.width, availableWidth),
+            height: min(Layout.preferredSize.height, availableHeight)
+        )
+    }
+
+    @objc private func importPressed(_ sender: NSButton) {
+        accepted = true
+        NSApplication.shared.stopModal(withCode: .OK)
+    }
+
+    @objc private func cancelPressed(_ sender: NSButton) {
+        accepted = false
+        NSApplication.shared.stopModal(withCode: .cancel)
+    }
 }
 
 private final class SessionImportPreviewTableDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
@@ -317,8 +528,11 @@ private final class SessionImportPreviewTableDataSource: NSObject, NSTableViewDa
         let cell = NSTableCellView()
         let textField = NSTextField(labelWithString: value(for: tableColumn.identifier.rawValue, in: rows[rowIndex]))
         textField.lineBreakMode = .byTruncatingTail
-        textField.maximumNumberOfLines = 1
+        textField.maximumNumberOfLines = tableColumn.identifier.rawValue == "target"
+            || tableColumn.identifier.rawValue == "warnings" ? 2 : 1
         textField.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        textField.textColor = StacioDesignSystem.theme.primaryTextColor
+        textField.toolTip = textField.stringValue.isEmpty ? nil : textField.stringValue
         textField.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(textField)
         cell.textField = textField
@@ -339,7 +553,8 @@ private final class SessionImportPreviewTableDataSource: NSObject, NSTableViewDa
         case "protocol":
             return row.protocolName
         case "target":
-            return row.target
+            guard let gateway = row.gateway else { return row.target }
+            return "\(row.target)\n\(gateway)"
         case "status":
             return row.status
         case "warnings":
