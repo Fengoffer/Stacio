@@ -8,7 +8,14 @@ public enum TerminalLinkInteraction {
     }
 
     public static func handleEvent(in terminalView: TerminalView, event: NSEvent) -> NSEvent? {
-        guard isEventTargetingTerminalSurface(terminalView, event: event) else {
+        let targetsTerminalSurface = isEventTargetingTerminalSurface(terminalView, event: event)
+        if [.leftMouseDown, .leftMouseDragged].contains(event.type),
+           windowHitTargetsTerminal(terminalView, event: event),
+           targetsTerminalSurface == false
+        {
+            return nil
+        }
+        guard targetsTerminalSurface else {
             return event
         }
 
@@ -101,6 +108,13 @@ public enum TerminalLinkInteraction {
             coveredBranch = container
         }
         return true
+    }
+
+    private static func windowHitTargetsTerminal(_ terminalView: TerminalView, event: NSEvent) -> Bool {
+        guard let contentView = terminalView.window?.contentView else { return false }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let hit = contentView.hitTest(point) else { return false }
+        return hit === terminalView || hit.isDescendant(of: terminalView)
     }
 
     private static func linkAtCurrentMouseLocation(in terminalView: TerminalView) -> String? {

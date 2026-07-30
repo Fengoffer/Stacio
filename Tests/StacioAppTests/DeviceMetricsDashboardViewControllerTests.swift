@@ -67,6 +67,83 @@ final class DeviceMetricsDashboardViewControllerTests: XCTestCase {
         XCTAssertEqual(diskIO.writeBytesPerSecond, 4_096, accuracy: 0.001)
     }
 
+    func testDashboardBlankAreaOwnsMouseDragAboveTerminal() throws {
+        let controller = DeviceMetricsDashboardViewController(
+            runtimeID: "term_metrics_pointer_shield",
+            title: "root@pointer-shield",
+            provider: RecordingDeviceMetricsProvider(snapshot: .sample),
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+        controller.view.frame = NSRect(x: 420, y: 80, width: 300, height: 500)
+
+        let container = DeviceMetricsForcedHitContainerView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 640)
+        )
+        let terminal = StacioLocalTerminalView(frame: container.bounds)
+        container.addSubview(terminal)
+        container.addSubview(controller.view)
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = container
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        controller.view.layoutSubtreeIfNeeded()
+
+        let blankPoint = controller.view.convert(NSPoint(x: 5, y: 250), to: nil)
+        let draggedPoint = controller.view.convert(NSPoint(x: 40, y: 280), to: nil)
+        let mouseDown = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: blankPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let mouseDragged = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: draggedPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime + 0.01,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 1
+        ))
+
+        window.sendEvent(mouseDown)
+        window.sendEvent(mouseDragged)
+
+        let hit = try XCTUnwrap(container.hitTest(container.convert(blankPoint, from: nil)))
+        XCTAssertFalse(hit === terminal || hit.isDescendant(of: terminal))
+
+        container.forcedHit = terminal
+        XCTAssertNil(TerminalLinkInteraction.handleEvent(in: terminal, event: mouseDown))
+        XCTAssertNil(TerminalLinkInteraction.handleEvent(in: terminal, event: mouseDragged))
+        container.forcedHit = nil
+
+        let terminalMouseDown = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 120, y: 120),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime + 0.02,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 3,
+            clickCount: 1,
+            pressure: 1
+        ))
+        XCTAssertNotNil(TerminalLinkInteraction.handleEvent(in: terminal, event: terminalMouseDown))
+    }
+
     func testInspectorDoesNotExposeDeviceMetricsDashboardSection() throws {
         let inspector = InspectorViewController()
 
@@ -875,6 +952,14 @@ private final class SequenceDeviceMetricsProvider: DeviceMetricsProviding {
             return
         }
         completion(results.removeFirst())
+    }
+}
+
+private final class DeviceMetricsForcedHitContainerView: NSView {
+    weak var forcedHit: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        forcedHit ?? super.hitTest(point)
     }
 }
 

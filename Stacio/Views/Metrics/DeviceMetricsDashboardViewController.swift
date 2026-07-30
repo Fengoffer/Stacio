@@ -1621,6 +1621,19 @@ private class DeviceMetricsArrowCursorView: NSView {
         true
     }
 
+    override var mouseDownCanMoveWindow: Bool {
+        false
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isHidden == false, alphaValue > 0.01, frame.contains(point) else { return nil }
+        return super.hitTest(point) ?? self
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .arrow)

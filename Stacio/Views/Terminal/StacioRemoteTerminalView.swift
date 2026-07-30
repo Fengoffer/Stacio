@@ -160,7 +160,9 @@ import SwiftTerm
             self.linkInteractionMonitor = nil
         }
         guard window != nil else { return }
-        linkInteractionMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .mouseMoved, .flagsChanged]) { [weak self] event in
+        linkInteractionMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved, .flagsChanged]
+        ) { [weak self] event in
             guard let self,
                   event.window === self.window
             else {
