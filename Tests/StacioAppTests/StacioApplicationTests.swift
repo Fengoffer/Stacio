@@ -112,7 +112,7 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertTrue(joinedLogs.contains("app.started"))
         XCTAssertTrue(joinedLogs.contains("bundle="))
         XCTAssertTrue(joinedLogs.contains("executable="))
-        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.2"))
+        XCTAssertTrue(joinedLogs.contains("version=Stacio-0.14.3"))
     }
 
     func testApplicationDidFinishLaunchingRecordsSafeDiagnosticEvent() {
@@ -692,7 +692,7 @@ final class StacioApplicationTests: XCTestCase {
 
         let content = presenter.recordedContent
         XCTAssertEqual(content?.applicationName, "Stacio")
-        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.2")
+        XCTAssertEqual(content?.displayVersion, "Stacio-0.14.3")
         XCTAssertEqual(content?.websiteURL.absoluteString, "https://www.stacio.cn/")
         XCTAssertEqual(content?.websiteAccessibilityLabel, "Stacio 官网")
         XCTAssertEqual(content?.repositoryURL.absoluteString, "https://github.com/Fengoffer/Stacio")

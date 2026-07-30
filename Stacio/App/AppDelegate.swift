@@ -30,7 +30,7 @@ public protocol RunningTunnelReporting {
 public enum StacioAppMetadata {
     public static let applicationName = "Stacio"
     public static let bundleIdentifier = "com.stacio.Stacio"
-    private static let fallbackDisplayVersion = "Stacio-0.14.2"
+    private static let fallbackDisplayVersion = "Stacio-0.14.3"
     public static var displayVersion: String { displayVersion(in: .main) }
     public static let websiteURL = "https://www.stacio.cn/"
     public static let documentationURL = "https://www.stacio.cn/wiki/"
