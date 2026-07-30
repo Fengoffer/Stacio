@@ -5133,9 +5133,14 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         let continueButton = try XCTUnwrap(
             panel.view.firstSubview(withIdentifier: "Stacio.AI.taskControl.continue") as? NSButton
         )
+        let taskControl = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.taskControl")
+        )
         XCTAssertTrue(continueButton.isEnabled)
 
         continueButton.performClick(nil)
+
+        XCTAssertTrue(taskControl.isHidden)
 
         XCTAssertTrue(waitUntil {
             execution.commands == ["pwd", "ls"]

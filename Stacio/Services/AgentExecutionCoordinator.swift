@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import StacioAgentBridge
 import StacioCoreBindings
@@ -299,6 +300,22 @@ private final class VisibleTerminalObservationSession {
     private static let maximumObservedOutputByteCount = 64 * 1024
     private static let maximumSummaryCharacterCount = 8_000
     private static let outputUpdateInterval: TimeInterval = 0.1
+    private static let responsiveEventMask: NSEvent.EventTypeMask = [
+        .leftMouseDown,
+        .leftMouseUp,
+        .rightMouseDown,
+        .rightMouseUp,
+        .otherMouseDown,
+        .otherMouseUp,
+        .mouseMoved,
+        .leftMouseDragged,
+        .rightMouseDragged,
+        .otherMouseDragged,
+        .scrollWheel,
+        .keyDown,
+        .keyUp,
+        .flagsChanged
+    ]
 
     private let requestID: String
     private let runtimeID: String
@@ -390,7 +407,7 @@ private final class VisibleTerminalObservationSession {
                (lastOutputAt == nil || outputBytes.isEmpty) {
                 break
             }
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            runResponsiveMainLoopIteration()
             refreshTerminalOutputIfNeeded()
             if sawUserInput {
                 return VisibleTerminalObservationResult(
@@ -502,7 +519,7 @@ private final class VisibleTerminalObservationSession {
             min(completion.maximumDuration, max(completion.idleInterval * 2, 0.75))
         )
         while Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            runResponsiveMainLoopIteration()
             refreshTerminalOutputIfNeeded()
             if sawUserInput {
                 return VisibleTerminalObservationResult(
@@ -548,6 +565,24 @@ private final class VisibleTerminalObservationSession {
             outputHub.unsubscribe(runtimeID: runtimeID, subscription: subscription)
         }
         subscription = nil
+    }
+
+    private func runResponsiveMainLoopIteration() {
+        let application = NSApplication.shared
+        // The synchronous command contract uses a nested wait, so explicitly
+        // dispatch a bounded number of queued user events to keep controls live.
+        for _ in 0..<8 {
+            guard let event = application.nextEvent(
+                matching: Self.responsiveEventMask,
+                until: Date(),
+                inMode: .default,
+                dequeue: true
+            ) else {
+                break
+            }
+            application.sendEvent(event)
+        }
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
     }
 
     private func refreshTerminalOutputIfNeeded() {
@@ -1438,6 +1473,15 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
             )
             target.setAgentInteractionLocked(true)
             emit(.typing, "正在写入终端", decision: decision)
+            let isInteractiveConfirmationReply = Self.isInteractiveConfirmationReply(
+                commandRequest.command,
+                terminalText: [
+                    target.agentTerminalOutputTranscript,
+                    target.agentTerminalDisplaySnapshot
+                ].joined(separator: "\n")
+            )
+            let usesCompletionMarker = target.supportsAgentCompletionMarker
+                && isInteractiveConfirmationReply == false
             let visibleObservation = VisibleTerminalObservationSession(
                 requestID: request.id,
                 runtimeID: target.runtimeID,
@@ -1449,7 +1493,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 terminalOutputTranscript: { target.agentTerminalOutputTranscript },
                 terminalDisplaySnapshot: { target.agentTerminalDisplaySnapshot },
                 refreshTerminalOutput: { target.refreshAgentTerminalOutput() },
-                completionMarker: target.supportsAgentCompletionMarker
+                completionMarker: usesCompletionMarker
                     ? Self.agentCompletionMarker(requestID: request.id)
                     : nil,
                 onOutputUpdate: { update in
@@ -1466,7 +1510,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
             )
             visibleObservation.begin()
             visibleObservation.markCommandWriteStarted()
-            let terminalCommand = target.supportsAgentCompletionMarker
+            let terminalCommand = usesCompletionMarker
                 ? Self.commandWithCompletionMarker(commandRequest.command, requestID: request.id)
                 : commandRequest.command
             target.sendAgentInput(Array((terminalCommand + "\n").utf8))
@@ -1604,6 +1648,37 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
     private static func commandWithCompletionMarker(_ command: String, requestID: String) -> String {
         let markerID = sanitizedMarkerID(requestID)
         return "{ \(command)\n}; printf '\\033]777;stacio-agent-done=\(markerID)\\007'"
+    }
+
+    private static func isInteractiveConfirmationReply(_ command: String, terminalText: String) -> Bool {
+        let reply = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["y", "n", "yes", "no"].contains(reply) else { return false }
+
+        let recentLines = terminalText
+            .lowercased()
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .suffix(6)
+            .joined(separator: "\n")
+        let tail = String(recentLines.suffix(1_024))
+        let explicitOptionMarkers = [
+            "[y/n]",
+            "(y/n)",
+            "[yes/no]",
+            "(yes/no)",
+            "[y/yes/n/no]",
+            "(y/yes/n/no)"
+        ]
+        if explicitOptionMarkers.contains(where: tail.contains) {
+            return true
+        }
+
+        let namesBothReplies = (tail.contains("'y'") || tail.contains("\"y\""))
+            && (tail.contains("'n'") || tail.contains("\"n\""))
+        let describesConfirmation = tail.contains("proceed")
+            || tail.contains("continue")
+            || tail.contains("confirm")
+            || tail.contains("abort")
+        return namesBothReplies && describesConfirmation
     }
 
     private static func sanitizedMarkerID(_ requestID: String) -> String {

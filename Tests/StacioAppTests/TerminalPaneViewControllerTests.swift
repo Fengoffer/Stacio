@@ -172,6 +172,157 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(overlay.visibleControlTitlesForTesting, [])
     }
 
+    func testTerminalAgentTraceOverlayWaitingControlsAcceptRealButtonClicks() throws {
+        let overlay = TerminalAgentTraceOverlayView(
+            frame: NSRect(x: 0, y: 0, width: 520, height: 132)
+        )
+        var received: (requestID: String, action: TerminalAgentTaskControlAction)?
+        overlay.onControlAction = { requestID, action in
+            received = (requestID, action)
+        }
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-clickable-control",
+                state: .waitingForOutput,
+                message: "等待输出",
+                redactedCommand: "brew install iperf3"
+            )
+        ])
+        overlay.layoutSubtreeIfNeeded()
+
+        let cancelButton = try XCTUnwrap(
+            overlay.descendantButtonsForTesting.first { $0.title == L10n.AI.cancelTask }
+        )
+        let buttonCenter = overlay.convert(
+            NSPoint(x: cancelButton.bounds.midX, y: cancelButton.bounds.midY),
+            from: cancelButton
+        )
+
+        XCTAssertTrue(cancelButton.isEnabled)
+        XCTAssertTrue(overlay.hitTest(buttonCenter) === cancelButton)
+        cancelButton.performClick(nil)
+        XCTAssertEqual(received?.requestID, "req-clickable-control")
+        XCTAssertEqual(received?.action, .cancel)
+    }
+
+    func testTerminalPointerEventsDoNotPassThroughVisibleAgentTraceOverlay() throws {
+        let terminalView = StacioLocalTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        let overlay = TerminalAgentTraceOverlayView(
+            frame: NSRect(x: 8, y: 8, width: 520, height: 132)
+        )
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-pointer-occlusion",
+                state: .waitingForOutput,
+                message: "等待输出",
+                redactedCommand: "brew install iperf3"
+            )
+        ])
+        let container = NSView(frame: terminalView.frame)
+        container.addSubview(terminalView)
+        container.addSubview(overlay)
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = container
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        let coveredPoint = overlay.convert(
+            NSPoint(x: overlay.bounds.midX, y: overlay.bounds.midY),
+            to: nil
+        )
+        let uncoveredPoint = terminalView.convert(
+            NSPoint(x: terminalView.bounds.maxX - 16, y: terminalView.bounds.maxY - 16),
+            to: nil
+        )
+        let coveredEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: coveredPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 0,
+            pressure: 0
+        ))
+        let uncoveredEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: uncoveredPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 0,
+            pressure: 0
+        ))
+
+        XCTAssertFalse(
+            TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: coveredEvent)
+        )
+        XCTAssertTrue(
+            TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: uncoveredEvent)
+        )
+    }
+
+    func testAppKitDoesNotDeliverMouseMovedToTrackingAreaBehindAgentTraceOverlay() throws {
+        let probe = MouseMovedTrackingProbeView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        let overlay = TerminalAgentTraceOverlayView(
+            frame: NSRect(x: 8, y: 8, width: 520, height: 132)
+        )
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-tracking-occlusion",
+                state: .running,
+                message: "执行中",
+                redactedCommand: "uptime"
+            )
+        ])
+        let container = NSView(frame: probe.frame)
+        container.addSubview(probe)
+        container.addSubview(overlay)
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.acceptsMouseMovedEvents = true
+        window.contentView = container
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        probe.installTrackingAreaForTesting()
+
+        let coveredPoint = overlay.convert(
+            NSPoint(x: overlay.bounds.midX, y: overlay.bounds.midY),
+            to: nil
+        )
+        let event = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: coveredPoint,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 3,
+            clickCount: 0,
+            pressure: 0
+        ))
+
+        NSApp.sendEvent(event)
+
+        XCTAssertEqual(probe.mouseMovedCount, 0)
+    }
+
     func testLocalTerminalEnablesCommandClickImplicitLinks() {
         let terminalView = StacioLocalTerminalView(frame: .zero)
 
@@ -1983,4 +2134,28 @@ func assertShellAcceptsScriptIfPresent(
         file: file,
         line: line
     )
+}
+
+private extension NSView {
+    var descendantButtonsForTesting: [NSButton] {
+        let current = (self as? NSButton).map { [$0] } ?? []
+        return current + subviews.flatMap(\.descendantButtonsForTesting)
+    }
+}
+
+private final class MouseMovedTrackingProbeView: NSView {
+    private(set) var mouseMovedCount = 0
+
+    func installTrackingAreaForTesting() {
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        mouseMovedCount += 1
+    }
 }

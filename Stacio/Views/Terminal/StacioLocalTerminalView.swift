@@ -119,7 +119,7 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
                   StacioTerminalMouseBehavior.shouldApplyControlScrollZoom(settingsStore: self.fontZoomSettingsStore),
                   let window = self.window,
                   event.window === window,
-                  self.bounds.contains(self.convert(event.locationInWindow, from: nil))
+                  TerminalLinkInteraction.isEventTargetingTerminalSurface(self, event: event)
             else {
                 return event
             }

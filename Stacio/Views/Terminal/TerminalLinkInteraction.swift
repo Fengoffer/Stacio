@@ -8,7 +8,7 @@ public enum TerminalLinkInteraction {
     }
 
     public static func handleEvent(in terminalView: TerminalView, event: NSEvent) -> NSEvent? {
-        guard isEventInsideTerminal(terminalView, event: event) else {
+        guard isEventTargetingTerminalSurface(terminalView, event: event) else {
             return event
         }
 
@@ -73,8 +73,33 @@ public enum TerminalLinkInteraction {
         return bareLink(in: terminalView, at: position)
     }
 
-    private static func isEventInsideTerminal(_ terminalView: TerminalView, event: NSEvent) -> Bool {
-        terminalView.bounds.contains(terminalView.convert(event.locationInWindow, from: nil))
+    public static func isEventTargetingTerminalSurface(
+        _ terminalView: TerminalView,
+        event: NSEvent
+    ) -> Bool {
+        let pointInTerminal = terminalView.convert(event.locationInWindow, from: nil)
+        guard terminalView.bounds.contains(pointInTerminal),
+              let container = terminalView.superview,
+              let terminalIndex = container.subviews.firstIndex(where: { $0 === terminalView })
+        else {
+            return terminalView.bounds.contains(pointInTerminal)
+        }
+
+        for candidate in container.subviews.dropFirst(terminalIndex + 1).reversed() {
+            guard candidate.isHidden == false,
+                  candidate.alphaValue > 0.01
+            else {
+                continue
+            }
+            let pointInCandidate = candidate.convert(event.locationInWindow, from: nil)
+            guard candidate.bounds.contains(pointInCandidate),
+                  candidate.hitTest(pointInCandidate) != nil
+            else {
+                continue
+            }
+            return false
+        }
+        return true
     }
 
     private static func linkAtCurrentMouseLocation(in terminalView: TerminalView) -> String? {

@@ -1677,6 +1677,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         pendingTaskContinuation = nil
         taskContinueButton.isEnabled = false
         taskContinueButton.isHidden = true
+        taskControlContainer.isHidden = true
     }
 
     private func beginAutonomousRun() -> UUID {
@@ -2321,10 +2322,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let runID = beginAutonomousRun()
         isExecuting = true
         statusLabel.stringValue = "已继续，自主执行再放行 \(agentTaskLoopLimits.maxSteps) 步。"
-        taskControlLabel.stringValue = statusLabel.stringValue
-        taskControlText = statusLabel.stringValue
-        taskControlContainer.isHidden = false
-        taskControlDismissButton.isEnabled = true
         refreshHeaderStatus(context: continuation.context)
         updateQuestionControlState()
         appendSystemTranscript(statusLabel.stringValue)

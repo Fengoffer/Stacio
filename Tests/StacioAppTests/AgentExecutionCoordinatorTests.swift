@@ -1,3 +1,4 @@
+import AppKit
 import StacioAgentBridge
 import StacioCoreBindings
 import XCTest
@@ -87,6 +88,158 @@ final class AgentExecutionCoordinatorTests: XCTestCase {
         XCTAssertEqual(auditStore.events.first?.approvalMode, "inherit")
         XCTAssertEqual(auditStore.events.first?.policyDecision, "confirmed")
         XCTAssertEqual(auditStore.events.first?.redactionVersion, "stacio.agent-redaction.v1")
+    }
+
+    func testInteractiveConfirmationReplyBypassesShellCompletionWrapper() throws {
+        let terminal = RecordingAgentTerminalTarget(
+            runtimeID: "term_interactive",
+            agentTitle: "local",
+            terminalDisplaySnapshot: "Do you want to proceed with the installation? [y/n]",
+            supportsAgentCompletionMarker: true
+        )
+        let coordinator = makeVisibleCoordinator(
+            target: terminal,
+            authorizer: PolicyAllowedAgentActionAuthorizer()
+        )
+
+        _ = try coordinator.runCommand(
+            AgentBridgeRequest(
+                id: "req-interactive-confirmation",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_interactive"),
+                        command: "y",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        XCTAssertEqual(terminal.sentInput, ["y\n"])
+        XCTAssertFalse(terminal.sentInput.joined().contains("stacio-agent-done"))
+        XCTAssertFalse(terminal.sentInput.joined().contains("}; printf"))
+    }
+
+    func testShortCommandWithoutConfirmationPromptKeepsCompletionWrapper() throws {
+        let terminal = RecordingAgentTerminalTarget(
+            runtimeID: "term_shell",
+            agentTitle: "local",
+            terminalDisplaySnapshot: "mac@host / %",
+            supportsAgentCompletionMarker: true
+        )
+        let coordinator = makeVisibleCoordinator(
+            target: terminal,
+            authorizer: PolicyAllowedAgentActionAuthorizer()
+        )
+
+        _ = try coordinator.runCommand(
+            AgentBridgeRequest(
+                id: "req-short-shell-command",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_shell"),
+                        command: "y",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        XCTAssertTrue(terminal.sentInput.joined().contains("stacio-agent-done"))
+    }
+
+    func testStaleConfirmationPromptDoesNotTurnLaterShortCommandIntoInteractiveReply() throws {
+        let completedOutput = (1...8).map { "installation output line \($0)" }.joined(separator: "\n")
+        let terminal = RecordingAgentTerminalTarget(
+            runtimeID: "term_completed_prompt",
+            agentTitle: "local",
+            terminalDisplaySnapshot: "Do you want to proceed? [y/n]\n\(completedOutput)\nmac@host / %",
+            supportsAgentCompletionMarker: true
+        )
+        let coordinator = makeVisibleCoordinator(
+            target: terminal,
+            authorizer: PolicyAllowedAgentActionAuthorizer()
+        )
+
+        _ = try coordinator.runCommand(
+            AgentBridgeRequest(
+                id: "req-stale-confirmation",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_completed_prompt"),
+                        command: "y",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        XCTAssertTrue(terminal.sentInput.joined().contains("stacio-agent-done"))
+    }
+
+    func testVisibleTerminalObservationKeepsAppKitControlsResponsive() throws {
+        let clickTarget = RecordingButtonClickTarget()
+        let button = NSButton(title: "取消", target: clickTarget, action: #selector(RecordingButtonClickTarget.clicked(_:)))
+        button.frame = NSRect(x: 20, y: 20, width: 100, height: 32)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 120),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView?.addSubview(button)
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        let mouseLocation = NSPoint(x: button.frame.midX, y: button.frame.midY)
+        let mouseDown = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: mouseLocation,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let mouseUp = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseUp,
+            location: mouseLocation,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 1,
+            pressure: 0
+        ))
+        NSApp.postEvent(mouseDown, atStart: false)
+        NSApp.postEvent(mouseUp, atStart: false)
+
+        let terminal = RecordingAgentTerminalTarget(runtimeID: "term_responsive", agentTitle: "local")
+        let coordinator = makeVisibleCoordinator(
+            target: terminal,
+            authorizer: PolicyAllowedAgentActionAuthorizer()
+        )
+        _ = try coordinator.runCommand(
+            AgentBridgeRequest(
+                id: "req-responsive-wait",
+                actor: AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_responsive"),
+                        command: "sleep 1",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        XCTAssertEqual(clickTarget.clickCount, 1)
     }
 
     func testApprovedAgentCommandStreamsTraceEventsWhileWritingTerminalInput() throws {
@@ -1430,6 +1583,8 @@ private final class RecordingAgentTerminalTarget: AgentTerminalTarget {
     let agentTitle: String
     let agentLiveSessionContext: TunnelLiveSessionContext?
     let agentAutomationPolicy: SessionAutomationPolicy
+    let agentTerminalDisplaySnapshot: String
+    let supportsAgentCompletionMarker: Bool
     private(set) var sentInput: [String] = []
     private(set) var sentInputBytes: [[UInt8]] = []
     private var traceEvents: [AgentTraceEvent] = []
@@ -1438,12 +1593,16 @@ private final class RecordingAgentTerminalTarget: AgentTerminalTarget {
         runtimeID: String,
         agentTitle: String,
         agentLiveSessionContext: TunnelLiveSessionContext? = nil,
-        agentAutomationPolicy: SessionAutomationPolicy = .default
+        agentAutomationPolicy: SessionAutomationPolicy = .default,
+        terminalDisplaySnapshot: String = "",
+        supportsAgentCompletionMarker: Bool = false
     ) {
         self.runtimeID = runtimeID
         self.agentTitle = agentTitle
         self.agentLiveSessionContext = agentLiveSessionContext
         self.agentAutomationPolicy = agentAutomationPolicy
+        self.agentTerminalDisplaySnapshot = terminalDisplaySnapshot
+        self.supportsAgentCompletionMarker = supportsAgentCompletionMarker
     }
 
     func appendAgentTrace(_ event: AgentTraceEvent) {
@@ -1463,6 +1622,16 @@ private final class RecordingAgentTerminalTarget: AgentTerminalTarget {
 
     var traceEventsForTesting: [AgentTraceEvent] {
         traceEvents
+    }
+}
+
+@MainActor
+private final class RecordingButtonClickTarget: NSObject {
+    private(set) var clickCount = 0
+
+    @objc
+    func clicked(_ sender: Any?) {
+        clickCount += 1
     }
 }
 
