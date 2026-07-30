@@ -2605,7 +2605,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        var identifiers: [NSToolbarItem.Identifier] = [ToolbarItem.sidebar]
+        var identifiers: [NSToolbarItem.Identifier] = [
+            ToolbarItem.sidebar,
+            ToolbarItem.updatePrompt
+        ]
         identifiers.append(contentsOf: [
             .flexibleSpace,
             ToolbarItem.newSession,

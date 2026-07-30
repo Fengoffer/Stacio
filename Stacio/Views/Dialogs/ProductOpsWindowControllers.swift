@@ -492,6 +492,12 @@ public final class UpdatePromptWindowController: NSWindowController {
         }
     }
 
+    public func showDiscoveredSparkleUpdate(_ update: SparkleUpdatePromptInfo) {
+        renderManualState(.available(update))
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func checkPressed(_ sender: Any?) {
         if sparkleChecker != nil {
             beginManualCheck(sender)

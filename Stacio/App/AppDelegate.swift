@@ -285,6 +285,11 @@ public protocol SparkleUpdateButtonControlling: SparkleUpdateChecking {
 }
 
 @MainActor
+public protocol SparkleAvailableUpdateNotifying: AnyObject {
+    var onAvailableUpdate: ((SparkleUpdatePromptInfo) -> Void)? { get set }
+}
+
+@MainActor
 public protocol SparkleUpdateTerminationProtecting: AnyObject {
     func prepareForApplicationTermination() -> Bool
 }
@@ -780,7 +785,7 @@ final class StacioSparkleUserDriver: NSObject, SPUUserDriver {
 }
 
 @MainActor
-public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControlling, SparkleUpdateActionHandling, SparkleUpdateTerminationProtecting, SPUUpdaterDelegate {
+public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControlling, SparkleAvailableUpdateNotifying, SparkleUpdateActionHandling, SparkleUpdateTerminationProtecting, SPUUpdaterDelegate {
     public static let shared = SparkleUpdateController()
 
     private let configurationStore: ProductOpsConfigurationStore
@@ -808,6 +813,7 @@ public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControl
 
     public private(set) var buttonState: SparkleUpdateButtonState = .hidden
     public var onButtonStateChanged: ((SparkleUpdateButtonState) -> Void)?
+    public var onAvailableUpdate: ((SparkleUpdatePromptInfo) -> Void)?
 
     public init(
         configurationStore: ProductOpsConfigurationStore = ProductOpsConfigurationStore(),
@@ -1371,7 +1377,12 @@ public final class SparkleUpdateController: NSObject, SparkleUpdateButtonControl
             origin: .launch,
             now: nowProvider()
         )
-        publish(isSuppressed ? .hidden : .available(promptInfo))
+        guard isSuppressed == false else {
+            publish(.hidden)
+            return
+        }
+        publish(.available(promptInfo))
+        onAvailableUpdate?(promptInfo)
     }
 
     public func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
@@ -1738,6 +1749,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Stacio has no searchable Help Book. Leaving the system Help menu unset
         // avoids its oversized, non-functional search field while retaining support actions.
         NSApplication.shared.helpMenu = nil
+        bindAutomaticUpdatePresentationIfSupported()
         let controller = workbenchWindowControllerFactory()
         controller.showWindow(self)
         workbenchWindowController = controller
@@ -1747,6 +1759,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         scheduleWorkbenchVisibilityRepair()
         presentInstalledUpdateReleaseNotesIfNeeded()
         startLicenseRevalidation()
+    }
+
+    private func bindAutomaticUpdatePresentationIfSupported() {
+        (sparkleUpdateChecker as? SparkleAvailableUpdateNotifying)?.onAvailableUpdate = { [weak self] update in
+            self?.showAutomaticallyDiscoveredUpdate(update)
+        }
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
@@ -1964,6 +1982,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         updatePromptWindowController?.showWindow(sender)
         updatePromptWindowController?.window?.makeKeyAndOrderFront(sender)
         updatePromptWindowController?.beginManualCheck(sender)
+    }
+
+    private func showAutomaticallyDiscoveredUpdate(_ update: SparkleUpdatePromptInfo) {
+        if updatePromptWindowController == nil {
+            updatePromptWindowController = UpdatePromptWindowController(
+                sparkleChecker: sparkleUpdateChecker,
+                actionHandler: sparkleUpdateChecker as? SparkleUpdateActionHandling
+            )
+        }
+        updatePromptWindowController?.showDiscoveredSparkleUpdate(update)
     }
 
     public func presentInstalledUpdateReleaseNotesIfNeeded(bundle: Bundle = .main) {

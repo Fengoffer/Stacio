@@ -1701,6 +1701,52 @@ final class ProductOpsSecurityTests: XCTestCase {
     }
 
     @MainActor
+    func testLaunchProbePublishesUnsuppressedUpdateToPresentationObserver() throws {
+        let defaults = try makeProductOpsSecurityDefaults()
+        let updater = RecordingSparkleUpdaterDriver()
+        let bundleRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioAutomaticUpdateTests-\(UUID().uuidString).bundle", isDirectory: true)
+        let contents = bundleRoot.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let plistData = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "CFBundleIdentifier": "com.stacio.Stacio.AutomaticUpdateTests",
+                "CFBundlePackageType": "BNDL",
+                "CFBundleShortVersionString": "0.14.2",
+                "CFBundleVersion": "333"
+            ],
+            format: .xml,
+            options: 0
+        )
+        try plistData.write(to: contents.appendingPathComponent("Info.plist"))
+        defer { try? FileManager.default.removeItem(at: bundleRoot) }
+        let bundle = try XCTUnwrap(Bundle(url: bundleRoot))
+        let controller = SparkleUpdateController(
+            configurationStore: ProductOpsConfigurationStore(defaults: defaults, environment: [:], bundleInfo: [:]),
+            releaseNotesStore: InstalledUpdateReleaseNotesStore(defaults: defaults),
+            bundle: bundle,
+            updaterFactory: { _, _, _ in updater },
+            suppressionStore: SparkleUpdateSuppressionStore(defaults: defaults)
+        )
+        let update = SparkleUpdatePromptInfo(
+            version: "999.0.0",
+            build: "50",
+            releaseNotes: "Release notes",
+            packageSize: 12_000_000
+        )
+        var announcedUpdates: [SparkleUpdatePromptInfo] = []
+        controller.onAvailableUpdate = { announcedUpdates.append($0) }
+
+        controller.probeForAvailableUpdate()
+        controller.processDiscoveredUpdateForTesting(update)
+
+        XCTAssertEqual(controller.buttonState, .available(update))
+        XCTAssertEqual(announcedUpdates, [update])
+        XCTAssertEqual(updater.informationCheckCount, 1)
+        XCTAssertEqual(updater.installCheckCount, 0)
+    }
+
+    @MainActor
     func testLaunchProbeHonorsSuppressionWhileManualProbeStillReportsUpdate() throws {
         let defaults = try makeProductOpsSecurityDefaults()
         let updater = RecordingSparkleUpdaterDriver()

@@ -58,6 +58,16 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(controller.window?.minSize.height ?? .greatestFiniteMagnitude, 1)
     }
 
+    func testDefaultToolbarIncludesUpdatePromptFallback() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: "Stacio.Tests.Toolbar")
+
+        XCTAssertTrue(
+            controller.toolbarDefaultItemIdentifiers(toolbar)
+                .contains(NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt"))
+        )
+    }
+
     func testWorkbenchInspectorIncludesAIAssistantPanel() throws {
         let controller = WorkbenchWindowController(
             workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)

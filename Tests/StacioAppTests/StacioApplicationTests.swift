@@ -468,6 +468,37 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertEqual(checker.senderDescriptions, ["manual-check"])
     }
 
+    func testAutomaticallyDiscoveredUpdateShowsNativeWindowWithoutManualRecheck() throws {
+        let checker = RecordingSparkleUpdateChecker()
+        let delegate = AppDelegate(
+            factory: { FakeWorkbenchWindowController() },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(shouldTerminate: true),
+            sparkleUpdateChecker: checker
+        )
+        let update = SparkleUpdatePromptInfo(
+            version: "0.14.3",
+            build: "334",
+            releaseNotes: "- 自动更新提示",
+            packageSize: 12_000_000
+        )
+
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        checker.emitAvailableUpdate(update)
+
+        let window = try XCTUnwrap(NSApplication.shared.windows.last { $0.title == L10n.ProductOps.updateTitle })
+        defer { window.close() }
+        let status = try XCTUnwrap(
+            window.contentView?.firstSubview(withIdentifier: "Stacio.Update.status") as? NSTextField
+        )
+        let details = try XCTUnwrap(
+            window.contentView?.firstSubview(withIdentifier: "Stacio.Update.details") as? NSTextField
+        )
+        XCTAssertTrue(window.isVisible)
+        XCTAssertTrue(status.stringValue.contains("0.14.3"))
+        XCTAssertTrue(details.stringValue.contains("334"))
+        XCTAssertEqual(checker.senderDescriptions, [])
+    }
+
     func testUpdateMenuShowsNativeWindowWithVisibleLatestResult() throws {
         let workbench = FakeWorkbenchWindowController()
         let checker = RecordingSparkleUpdateChecker()
@@ -823,9 +854,10 @@ private extension NSView {
     }
 }
 
-private final class RecordingSparkleUpdateChecker: SparkleUpdateChecking {
+private final class RecordingSparkleUpdateChecker: SparkleUpdateChecking, SparkleAvailableUpdateNotifying {
     var senderDescriptions: [String] = []
     var manualStates: [SparkleManualUpdateCheckState] = []
+    var onAvailableUpdate: ((SparkleUpdatePromptInfo) -> Void)?
 
     func checkForUpdates(_ sender: Any?) {
         senderDescriptions.append((sender as? NSObject)?.description ?? "<nil>")
@@ -837,6 +869,10 @@ private final class RecordingSparkleUpdateChecker: SparkleUpdateChecking {
     ) {
         senderDescriptions.append((sender as? NSObject)?.description ?? "<nil>")
         manualStates.forEach(statusHandler)
+    }
+
+    func emitAvailableUpdate(_ update: SparkleUpdatePromptInfo) {
+        onAvailableUpdate?(update)
     }
 }
 
