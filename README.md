@@ -1,125 +1,262 @@
+<div align="center">
+
+<img src="assets/stacio-logo.png" width="128" alt="Stacio" />
+
 # Stacio
 
-Stacio 是原生 macOS SSH客户端与远程运维工作台，用于在一个桌面应用中管理远程会话、终端、文件传输、隧道、设备状态和经用户确认的 AI 辅助排查。
+**Native macOS SSH Client & Remote Operations Workbench**
 
-Stacio is a native macOS SSH client and remote operations workbench for managing terminal sessions, remote files, transfers, tunnels, device visibility, and user-confirmed AI-assisted troubleshooting.
+Terminal · SCP/SFTP · Remote Files · SSH Tunnels · Device Metrics · AI Agent
 
-**官方链接**
+[![Version](https://img.shields.io/badge/version-0.14.2%20Stable-2dd4bf)](https://www.stacio.cn/)
+[![macOS](https://img.shields.io/badge/macOS-14%2B-000000)](https://www.stacio.cn/)
+[![License](https://img.shields.io/badge/license-Source%20Available%20NC-blue)](LICENSE)
+[![Swift](https://img.shields.io/badge/Swift-5-F05138)](https://www.swift.org/)
+[![Rust](https://img.shields.io/badge/Rust-Core-CE422B)](https://www.rust-lang.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
-- 官网：[https://www.stacio.cn/](https://www.stacio.cn/)
-- 下载：[https://www.stacio.cn/#download](https://www.stacio.cn/#download)
-- GitHub：[https://github.com/Fengoffer/Stacio](https://github.com/Fengoffer/Stacio)
-- Gitee：[https://gitee.com/fengoffer/Stacio](https://gitee.com/fengoffer/Stacio)
-- LLM Context：[https://www.stacio.cn/llms.txt](https://www.stacio.cn/llms.txt)
-- Full Product Context：[https://www.stacio.cn/llms-full.txt](https://www.stacio.cn/llms-full.txt)
+[Website](https://www.stacio.cn/) · [Download](https://www.stacio.cn/#download) · [GitHub](https://github.com/Fengoffer/Stacio) · [Gitee](https://gitee.com/fengoffer/Stacio) · [Release Notes](https://www.stacio.cn/#releases)
 
-## 快速事实
+[中文](README.zh-CN.md) | **English**
 
-- **当前稳定版：** Stacio 0.14.0 Stable（构建号 282）
-- **系统要求：** macOS 14 及以上。
-- **安装包：** 下载页分别提供 Apple Silicon 与 Intel Mac 版本，请按设备芯片选择。
-- **首次打开：** 当前安装包尚未经过 Apple 公证。若 macOS 拦截首次启动，请在 Finder 中右键 `Stacio.app`，再选择“打开”。
-- **桌面平台：** 当前仅提供 macOS 客户端，Windows 和 Linux 桌面客户端暂未提供。
+</div>
 
-## Stacio 能做什么
+---
 
-- 管理 SSH、Telnet、串口和本地终端会话，并用会话分组整理常用主机。
-- 在终端标签页中分屏，并按需对选定终端进行同步执行。
-- 浏览和操作远程文件，使用 SCP 传输文件并查看传输任务状态。
-- 管理 SSH 隧道、查看设备指标，并通过内置浏览器访问所需网页。
-- 使用 AI 辅助排查和本地 Agent 集成。AI 生成的命令、更新下载、安装和重启均需用户确认，Stacio 不会静默执行这些操作。
+> Stacio is a native macOS SSH client and remote operations workbench. It combines terminal sessions, SCP/SFTP file transfers, remote file editing, SSH tunnels, device monitoring, and user-confirmed AI-assisted troubleshooting into one native Mac app. **Not Electron. Not a web wrapper.** Built with Swift + AppKit, powered by a shared Rust core.
 
-## 不做什么
+## Why Stacio
 
-- 当前不提供 Windows 或 Linux 桌面客户端。
-- 不提供数据库连接或相关管理功能。
-- 不会在用户未确认前执行 AI 生成的命令，也不会在未确认时下载更新、安装或重启。
+| Pain Point | Existing Tools | Stacio |
+|------------|---------------|--------|
+| Terminal + files + monitoring scattered across apps | iTerm2 + FileZilla + htop | One app, one window |
+| Electron tools drain battery and RAM | Termius 500MB+ RAM | Native Swift, ~50MB idle |
+| No Xshell for Mac | No good alternative | Session groups + split + bastion import |
+| AI ops tools execute commands silently | Fear of uncontrolled AI | Commands require explicit confirmation |
+| Subscription-locked SSH clients | Termius $120/yr, SecureCRT $99+ | Free core, local-first, no account required |
 
-## 适用场景
+### How Stacio Compares
 
-Stacio 面向希望在 Mac 上集中使用 SSH工具的开发者、运维人员和 Homelab 用户。作为 Mac SSH客户端和 Mac SSH工具，它适合将服务器远程管理工具、Shell 与 Terminal 工作流放进同一个原生工作台。对于正在寻找 Xshell for Mac 替代选择的用户，Stacio 适合需要会话分组、终端分屏、同步执行、远程文件、SCP 传输和 SSH 隧道的日常远程运维场景。
+| Feature | Stacio | iTerm2 | Termius | Tabby | Electerm | SecureCRT |
+|---------|--------|--------|---------|-------|----------|-----------|
+| Native Mac (not Electron) | Swift + AppKit | Native | Electron | Electron | Electron | Qt |
+| SSH / Telnet / Serial | SSH / Telnet / Serial / BLE | SSH only | SSH / Telnet | SSH / Telnet / Serial | SSH / Telnet / Serial | SSH / Telnet / Serial |
+| SCP / SFTP file transfer | Dual-pane + multi-panel + remote-to-remote | No | Yes | Yes | Yes | No |
+| Remote file editor | Syntax highlight + multi-encoding | No | No | No | Yes | No |
+| File preview (spacebar) | Image / video / audio / PDF / hex | No | No | No | No | No |
+| Session groups + split | Yes + sync execution | Split only | Groups only | Tabs only | Tabs only | Groups only |
+| Bastion host import | TOPSEC / Xshell / SecureCRT | No | No | No | No | No |
+| SSH tunnels | Local / remote / dynamic | No | Yes | No | No | No |
+| Device metrics dashboard | CPU / mem / disk / network + alerts | No | Yes (paid) | No | No | No |
+| AI troubleshooting | Command cards (user-confirmed) | No | No | No | No | No |
+| Local agent integration | Codex / Claude / OpenCode / Qwen | No | No | No | No | No |
+| SSH remote browser | Access remote web via SSH | No | No | No | No | No |
+| Pricing | Free core, local-first | Free | $120/yr | Free | Free | $99+ |
 
-## 下载与安装
+## Screenshots
 
-请通过 [Stacio 官方下载页](https://www.stacio.cn/#download) 获取当前安装包。下载页会分别提供 Apple Silicon 与 Intel Mac 版本。
+<p float="left">
+  <img src="assets/screenshots/terminal-dark-light.png" width="49%" alt="Terminal with session groups (dark/light)" />
+  <img src="assets/screenshots/terminal-split.png" width="49%" alt="Terminal split view" />
+</p>
+<p float="left">
+  <img src="assets/screenshots/scp-sftp-transfer.png" width="49%" alt="SCP/SFTP multi-panel transfer" />
+  <img src="assets/screenshots/device-dashboard.png" width="49%" alt="Device metrics dashboard" />
+</p>
+<p float="left">
+  <img src="assets/screenshots/ai-assistant.png" width="49%" alt="Built-in AI assistant" />
+  <img src="assets/screenshots/codex-integration.png" width="49%" alt="Codex local agent integration" />
+</p>
+<p float="left">
+  <img src="assets/screenshots/file-editor.png" width="49%" alt="Remote file editor" />
+  <img src="assets/screenshots/stacio-workbench.png" width="49%" alt="Main workbench" />
+</p>
 
-在 Mac 的“关于本机”中查看芯片信息：显示 Apple 芯片时选择 Apple Silicon 版本；显示 Intel 时选择 Intel Mac 版本。当前安装包未公证，首次被拦截时，请在 Finder 中右键 `Stacio.app`，选择“打开”。
+## Key Features
 
-## 常见问题
+### Terminal
 
-### Stacio 是 Mac SSH客户端吗？
+- **Multi-protocol**: SSH / Telnet / Serial / Bluetooth Console in one app
+- **Session groups**: Organize by project, environment, or team — save and restore split layouts
+- **Split views**: Horizontal / vertical splits with multi-terminal sync execution
+- **Semantic highlighting**: System info, status, and errors auto-colored
+- **Command completion**: Smart suggestions without phantom spaces or cursor jumps
+- **Command history**: Searchable history inspector per session
+- **Terminal macros**: Record and replay command sequences
 
-是。Stacio 是原生 macOS SSH客户端，提供远程会话、终端、远程文件、SCP 传输、SSH 隧道和设备指标等远程运维工作流。
+### File Transfer
 
-### Stacio 与 macOS Terminal 有何不同？
+- **SCP/SFTP workspace**: Dual-pane and multi-panel grid layouts (2×2)
+- **Drag-and-drop transfers**: Local→remote, remote→local, local→local, remote→-remote
+- **Transfer queue**: Pause / resume / cancel, concurrent queue with progress, speed, and ETA
+- **Integrity**: Resume broken transfers, integrity verification, automatic retry
+- **Conflict handling**: Replace / keep both / skip on transfer conflicts
+- **Remote file editor**: Syntax highlighting, multi-encoding, find & replace, safe save
+- **File preview**: Spacebar quick look for images, video, audio, PDF, and hex
 
-macOS Terminal 是系统自带的终端应用。Stacio 在终端基础上增加会话保存与分组、终端分屏、同步执行、远程文件、SCP 传输、SSH 隧道、设备指标和 AI 辅助排查等能力，便于长期管理多台主机。
+### Network & Tunnels
 
-### Stacio 能作为 Xshell for Mac 替代吗？
+- **SSH tunnel management**: Local / remote / dynamic port forwarding
+- **SSH remote browser**: Access remote internal web services through SSH
+- **ProxyJump**: Multi-hop jump host support
 
-可以。若你的需求是在 Mac 上管理多个远程会话，并需要会话分组、终端分屏、同步执行、远程文件、SCP 传输和 SSH 隧道，Stacio 可以作为 Xshell for Mac 的替代选择。
+### Device Monitoring
 
-### 如何选择 Apple Silicon 与 Intel 安装包？
+- **Real-time metrics**: CPU / memory / disk / network I/O
+- **Custom alerts**: Threshold-based notifications
+- **System overview**: Hostname, OS, kernel, uptime, network interfaces
 
-在 Mac 的“关于本机”中查看芯片信息。显示 Apple 芯片时选择 Apple Silicon 版本；显示 Intel 时选择 Intel Mac 版本。
+### AI Agent
 
-### Stacio 是否管理数据库？
+- **Context-aware**: Reads terminal context to generate troubleshooting suggestions
+- **Command cards**: Generates executable commands — **requires user confirmation before execution**
+- **Local agent integration**: Codex, Claude, OpenCode, Qwen Code
+- **Safety first**: AI never executes commands, downloads, or installs silently
 
-不管理。Stacio 不提供数据库连接或相关管理功能。
+### Professional
 
-## 截图
+- **Bastion host import**: TOPSEC / Xshell / SecureCRT config import with preview
+- **Session bulk import/export**: Batch operations with deduplication
+- **Session groups**: Save multi-panel layouts (terminal + file transfer) as restorable groups
 
-![Stacio 主工作台，左侧会话列表与新建连接入口](assets/screenshots/stacio-workbench.png)
+## Architecture
 
-![Stacio 会话设置界面，展示连接信息、标签和保存操作](assets/screenshots/stacio-session-settings.png)
+```
+┌─────────────────────────────────────┐
+│         macOS UI Layer              │
+│     Swift + AppKit (Native)         │
+├─────────────────────────────────────┤
+│         FFI Bridge                  │
+│    Swift ↔ Rust Bridge              │
+├─────────────────────────────────────┤
+│         Rust Core (StacioCore)      │
+│  · SSH Protocol (russh)             │
+│  · SCP/SFTP Transfer Engine         │
+│  · Session & Tunnel Management      │
+├─────────────────────────────────────┤
+│         Platform Layer              │
+│  macOS Keychain · Network · FS      │
+└─────────────────────────────────────┘
+```
 
-## 从源码构建
+Each platform uses its native UI (macOS: Swift/AppKit, Windows: WinUI 3, Linux: GTK4), while the core protocol layer is unified in Rust — three platforms share the same SSH/SCP engine.
 
-以下依赖和命令仅适用于从源码构建；使用官网安装包不需要安装 Xcode、Swift、Rust 或 Node 开发环境。
+## Security
 
-构建前需要准备 Xcode Command Line Tools、Swift Package Manager、Rust toolchain 和 Cargo，以及 Node.js 与 npm。
+- **Credentials**: macOS Keychain, never stored in plain text
+- **Local-first**: Session data stays local, not cloud-synced by default
+- **Log Redaction**: Diagnostics and logs redacted by default (hostnames, IPs, accounts, paths, commands stripped)
+- **AI Safety**: AI-generated commands, update downloads, installs, and restarts all require user confirmation — Stacio never executes these silently
+- **Offline Licensing**: Ed25519 signatures + X25519 key agreement, cross-platform license contract (v1.2)
 
-安装 JavaScript 依赖：
+## Roadmap
+
+| Platform | Status | Tech Stack |
+|----------|--------|------------|
+| macOS | Available now (0.14.2) | Swift + AppKit + Rust Core |
+| Windows | In development | WinUI 3 / .NET 8 + Rust Core |
+| Linux | Architecture baseline ready | GTK4 / libadwaita + Rust Core |
+| Domestic OS | Planned | UOS · Deepin · Kylin · openEuler · HarmonyOS |
+
+## Quick Facts
+
+- **Current Version:** Stacio 0.14.2 Stable (Build 333)
+- **System Requirements:** macOS 14 or later
+- **Installer:** Separate downloads for Apple Silicon and Intel Macs
+- **First Launch:** Installer is not yet notarized. If macOS blocks first launch, right-click `Stacio.app` in Finder → Open
+
+## FAQ
+
+<details>
+<summary><b>Is Stacio a Mac SSH client?</b></summary>
+
+Yes. Stacio is a native macOS SSH client providing remote sessions, terminal, remote files, SCP transfers, SSH tunnels, and device metrics for remote operations workflows.
+</details>
+
+<details>
+<summary><b>How is Stacio different from macOS Terminal?</b></summary>
+
+macOS Terminal is a basic system terminal. Stacio adds session persistence and grouping, split terminals, sync execution, remote files, SCP transfers, SSH tunnels, device metrics, and AI-assisted troubleshooting — for managing multiple hosts long-term.
+</details>
+
+<details>
+<summary><b>Can Stacio replace Xshell on Mac?</b></summary>
+
+Yes. If you need to manage multiple remote sessions on Mac with session groups, split terminals, sync execution, remote files, SCP transfers, and SSH tunnels, Stacio is a viable Xshell for Mac alternative. It also imports Xshell session configurations.
+</details>
+
+<details>
+<summary><b>Is there a Windows or Linux version?</b></summary>
+
+The Windows version is in development using WinUI 3 / .NET 8, sharing the same Rust core as the macOS version. The Linux version has a GTK4 / libadwaita architecture baseline. Long-term plans include native adaptation for domestic operating systems (UOS, Deepin, Kylin, openEuler, HarmonyOS).
+</details>
+
+<details>
+<summary><b>How does the AI assistant work? Is it safe?</b></summary>
+
+The AI assistant reads terminal context and generates troubleshooting suggestions as command cards. Each command card requires explicit user confirmation before execution — Stacio never runs AI-generated commands silently. You can also connect local agents (Codex, Claude, OpenCode, Qwen Code) for more advanced workflows.
+</details>
+
+<details>
+<summary><b>Does Stacio manage databases?</b></summary>
+
+No. Stacio does not provide database connection or management features.
+</details>
+
+<details>
+<summary><b>How to choose Apple Silicon vs Intel installer?</b></summary>
+
+Check your Mac's chip in "About This Mac". If it shows Apple chip, choose the Apple Silicon version. If it shows Intel, choose the Intel Mac version.
+</details>
+
+## Download & Install
+
+Download from the [official download page](https://www.stacio.cn/#download). Separate installers are provided for Apple Silicon and Intel Macs.
+
+## Build from Source
+
+These dependencies and commands are for building from source only. Using the official installer does not require Xcode, Swift, Rust, or Node.js.
+
+**Prerequisites:** Xcode Command Line Tools, Swift Package Manager, Rust toolchain + Cargo, Node.js + npm.
 
 ```bash
+# Install JavaScript dependencies
 npm ci
-```
 
-构建 Rust Core：
-
-```bash
+# Build Rust Core
 cargo build --manifest-path StacioCore/Cargo.toml --lib
-```
 
-运行 Swift 测试或构建应用目标：
-
-```bash
+# Run tests
 swift test
-swift build --product Stacio
-```
+cargo test --manifest-path StacioCore/Cargo.toml
 
-创建本地 `.app`：
-
-```bash
+# Create local .app bundle
 ./scripts/package-app.sh
 ```
 
-打包完成后应用位于：
+The built app will be at `dist/Stacio.app`.
 
-```text
-dist/Stacio.app
-```
+## Contributing & License
 
-## 测试、贡献与许可证
+Reproducible bug reports, improvement suggestions, and non-commercial contributions are welcome. Please read the [contributing guide](CONTRIBUTING.md) before submitting.
 
-常用本地检查：
+Stacio uses the [Stacio Source Available Non-Commercial License](LICENSE) 1.0. This license permits personal study, research, evaluation, and non-commercial derivative development. Commercial use and redistribution of official branded binaries, installers, or derivative versions require prior written authorization.
 
-```bash
-swift test
-cargo test --manifest-path StacioCore/Cargo.toml
-./scripts/smoke-local-app.sh dist/Stacio.app
-```
+## Links
 
-欢迎围绕可复现的问题、改进建议和非商业贡献参与项目；提交前请先阅读许可证要求。
+- **Website:** [https://www.stacio.cn/](https://www.stacio.cn/)
+- **Download:** [https://www.stacio.cn/#download](https://www.stacio.cn/#download)
+- **GitHub:** [https://github.com/Fengoffer/Stacio](https://github.com/Fengoffer/Stacio)
+- **Gitee:** [https://gitee.com/fengoffer/Stacio](https://gitee.com/fengoffer/Stacio)
+- **LLM Context:** [https://www.stacio.cn/llms.txt](https://www.stacio.cn/llms.txt)
+- **Full Product Context:** [https://www.stacio.cn/llms-full.txt](https://www.stacio.cn/llms-full.txt)
 
-Stacio 使用 [Stacio Source Available Non-Commercial License](LICENSE) 1.0。该许可证允许个人学习、研究、评估和非商业二次开发；商业使用以及官方品牌二进制、安装包或衍生版本的再分发，均需要事先获得书面授权。
+---
+
+<div align="center">
+
+If Stacio helps you, please consider giving it a Star
+
+**[GitHub](https://github.com/Fengoffer/Stacio)** · **[Gitee](https://gitee.com/fengoffer/Stacio)**
+
+</div>

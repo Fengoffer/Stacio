@@ -22,3 +22,10 @@ dist/
 /官网/
 /后台/
 /操作系统图标/
+
+# Internal working directories
+/stacio-promotion/
+/stacio-strategy/
+/stacio-doc-audit/
+/.trae-html-share-packages/
+/CLAUDE.md
