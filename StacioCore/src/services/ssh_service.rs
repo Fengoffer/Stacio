@@ -32,6 +32,12 @@ pub trait KnownHostStore {
     ) -> Result<Option<HostKeyRecord>, SshRuntimeError>;
 
     fn save_known_host(&self, record: HostKeyRecord) -> Result<(), SshRuntimeError>;
+
+    fn replace_known_host_if_matches(
+        &self,
+        record: HostKeyRecord,
+        previous_fingerprint_sha256: &str,
+    ) -> Result<bool, SshRuntimeError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,30 +151,48 @@ pub fn apply_host_key_decision<S: KnownHostStore>(
     store: &S,
 ) -> Result<HostKeyVerification, SshRuntimeError> {
     let fingerprint = fingerprint_sha256(host_key);
-    let known = store.find_known_host(host, port)?;
+    let record = HostKeyRecord {
+        host: host.to_string(),
+        port,
+        fingerprint_sha256: fingerprint.clone(),
+    };
 
-    if let Some(record) = known {
-        if record.fingerprint_sha256 == fingerprint {
-            return Ok(HostKeyVerification::Trusted);
+    match store.find_known_host(host, port)? {
+        Some(current) if current.fingerprint_sha256 == fingerprint => {
+            Ok(HostKeyVerification::Trusted)
         }
-        if decision != HostKeyTrustDecision::TrustAndSave {
-            return Err(SshRuntimeError::HostKeyChanged {
-                previous_fingerprint_sha256: record.fingerprint_sha256.clone(),
-            });
-        }
-    } else if decision == HostKeyTrustDecision::Reject {
-        return Err(SshRuntimeError::UnknownHostKey);
+        Some(current) => match decision {
+            HostKeyTrustDecision::TrustAndReplace {
+                previous_fingerprint_sha256,
+            } if previous_fingerprint_sha256 == current.fingerprint_sha256 => {
+                if store.replace_known_host_if_matches(record, &previous_fingerprint_sha256)? {
+                    return Ok(HostKeyVerification::Trusted);
+                }
+                match store.find_known_host(host, port)? {
+                    Some(latest) if latest.fingerprint_sha256 == fingerprint => {
+                        Ok(HostKeyVerification::Trusted)
+                    }
+                    Some(latest) => Err(SshRuntimeError::HostKeyChanged {
+                        previous_fingerprint_sha256: latest.fingerprint_sha256,
+                    }),
+                    None => Err(SshRuntimeError::UnknownHostKey),
+                }
+            }
+            _ => Err(SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: current.fingerprint_sha256,
+            }),
+        },
+        None => match decision {
+            HostKeyTrustDecision::Reject | HostKeyTrustDecision::TrustAndReplace { .. } => {
+                Err(SshRuntimeError::UnknownHostKey)
+            }
+            HostKeyTrustDecision::TrustAndSave => {
+                store.save_known_host(record)?;
+                Ok(HostKeyVerification::Trusted)
+            }
+            HostKeyTrustDecision::TrustOnce => Ok(HostKeyVerification::Trusted),
+        },
     }
-
-    if decision == HostKeyTrustDecision::TrustAndSave {
-        store.save_known_host(HostKeyRecord {
-            host: host.to_string(),
-            port,
-            fingerprint_sha256: fingerprint,
-        })?;
-    }
-
-    Ok(HostKeyVerification::Trusted)
 }
 
 #[cfg(test)]
@@ -210,6 +234,25 @@ mod host_key_decision_service_tests {
             records.retain(|current| current.host != record.host || current.port != record.port);
             records.push(record);
             Ok(())
+        }
+
+        fn replace_known_host_if_matches(
+            &self,
+            record: HostKeyRecord,
+            previous_fingerprint_sha256: &str,
+        ) -> Result<bool, SshRuntimeError> {
+            let mut records = self.records.borrow_mut();
+            let Some(current) = records
+                .iter_mut()
+                .find(|current| current.host == record.host && current.port == record.port)
+            else {
+                return Ok(false);
+            };
+            if current.fingerprint_sha256 != previous_fingerprint_sha256 {
+                return Ok(false);
+            }
+            *current = record;
+            Ok(true)
         }
     }
 
@@ -268,13 +311,14 @@ mod host_key_decision_service_tests {
     }
 
     #[test]
-    fn trust_and_save_replaces_changed_key() {
+    fn trust_and_replace_updates_matching_changed_key() {
         let store = MemoryKnownHostStore::default();
+        let old_fingerprint = fingerprint_sha256(b"old-key");
         store
             .save_known_host(HostKeyRecord {
                 host: "example.com".to_string(),
                 port: 22,
-                fingerprint_sha256: fingerprint_sha256(b"old-key"),
+                fingerprint_sha256: old_fingerprint.clone(),
             })
             .expect("seed old");
 
@@ -282,7 +326,9 @@ mod host_key_decision_service_tests {
             "example.com",
             22,
             b"new-key",
-            HostKeyTrustDecision::TrustAndSave,
+            HostKeyTrustDecision::TrustAndReplace {
+                previous_fingerprint_sha256: old_fingerprint,
+            },
             &store,
         )
         .expect("trust changed");
@@ -291,6 +337,42 @@ mod host_key_decision_service_tests {
         assert_eq!(
             store.records.borrow()[0].fingerprint_sha256,
             fingerprint_sha256(b"new-key")
+        );
+    }
+
+    #[test]
+    fn trust_and_replace_rejects_stale_previous_fingerprint() {
+        let store = MemoryKnownHostStore::default();
+        let stale_fingerprint = fingerprint_sha256(b"old-key");
+        let current_fingerprint = fingerprint_sha256(b"concurrent-key");
+        store
+            .save_known_host(HostKeyRecord {
+                host: "example.com".to_string(),
+                port: 22,
+                fingerprint_sha256: current_fingerprint.clone(),
+            })
+            .expect("seed concurrent key");
+
+        let error = apply_host_key_decision(
+            "example.com",
+            22,
+            b"new-key",
+            HostKeyTrustDecision::TrustAndReplace {
+                previous_fingerprint_sha256: stale_fingerprint,
+            },
+            &store,
+        )
+        .expect_err("reject stale confirmation");
+
+        assert_eq!(
+            error,
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: current_fingerprint.clone(),
+            }
+        );
+        assert_eq!(
+            store.records.borrow()[0].fingerprint_sha256,
+            current_fingerprint
         );
     }
 

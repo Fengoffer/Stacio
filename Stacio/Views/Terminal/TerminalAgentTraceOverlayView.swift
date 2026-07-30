@@ -112,6 +112,12 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
         )
     }
 
+    var textContentIsSelectableForTesting: Bool {
+        selectableTextLabels.allSatisfy { label in
+            label.isSelectable && label.isEditable == false
+        }
+    }
+
     func dragOffsetForTesting(from start: NSPoint, to end: NSPoint, superviewIsFlipped: Bool) -> NSPoint {
         Self.dragOffset(from: start, to: end, startingAt: .zero, superviewIsFlipped: superviewIsFlipped)
     }
@@ -160,6 +166,11 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
         detailLabel.cell?.wraps = true
         detailLabel.cell?.isScrollable = false
         detailLabel.setAccessibilityIdentifier("Stacio.Terminal.agentTraceOverlay.detail")
+        selectableTextLabels.forEach { label in
+            label.isEditable = false
+            label.isSelectable = true
+            label.focusRingType = .none
+        }
         [titleLabel, stateLabel, detailLabel, controlsStack].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
@@ -269,13 +280,33 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
         updateCloseButtonVisibility()
     }
 
+    private var selectableTextLabels: [NSTextField] {
+        [titleLabel, stateLabel, detailLabel]
+    }
+
+    private func isPointOverSelectableText(_ point: NSPoint) -> Bool {
+        selectableTextLabels.contains { label in
+            label.isHidden == false && convert(label.bounds, from: label).contains(point)
+        }
+    }
+
+    private func isSelectableTextHit(_ hit: NSView) -> Bool {
+        selectableTextLabels.contains { label in
+            hit === label || hit.isDescendant(of: label)
+        }
+    }
+
     public override func cursorUpdate(with event: NSEvent) {
-        NSCursor.arrow.set()
+        let point = convert(event.locationInWindow, from: nil)
+        (isPointOverSelectableText(point) ? NSCursor.iBeam : NSCursor.arrow).set()
     }
 
     public override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .arrow)
+        selectableTextLabels.forEach { label in
+            addCursorRect(convert(label.bounds, from: label), cursor: .iBeam)
+        }
     }
 
     public override func mouseDown(with event: NSEvent) {
@@ -449,9 +480,15 @@ public final class TerminalAgentTraceOverlayView: NSVisualEffectView {
     }
 
     public override func hitTest(_ point: NSPoint) -> NSView? {
-        guard isHidden == false, bounds.contains(point) else { return nil }
+        guard isHidden == false, frame.contains(point) else { return nil }
         guard let hit = super.hitTest(point) else { return self }
         let controls = [pauseButton, cancelButton, takeOverButton, confirmCompleteButton, closeButton]
-        return controls.contains(where: { hit === $0 || hit.isDescendant(of: $0) }) ? hit : self
+        if controls.contains(where: { hit === $0 || hit.isDescendant(of: $0) }) {
+            return hit
+        }
+        if isSelectableTextHit(hit) {
+            return hit
+        }
+        return self
     }
 }

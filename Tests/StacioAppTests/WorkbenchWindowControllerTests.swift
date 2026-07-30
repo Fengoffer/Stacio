@@ -2047,7 +2047,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let window = try XCTUnwrap(controller.window)
         let toolbarItems = try XCTUnwrap(window.toolbar?.items)
         XCTAssertEqual(toolbarItems.first?.itemIdentifier.rawValue, "Stacio.Toolbar.sidebar")
-        XCTAssertEqual(toolbarItems.dropFirst().first?.itemIdentifier, .flexibleSpace)
+        XCTAssertEqual(toolbarItems.dropFirst().first?.itemIdentifier.rawValue, "Stacio.Toolbar.updatePrompt")
+        XCTAssertEqual(toolbarItems.dropFirst(2).first?.itemIdentifier, .flexibleSpace)
 
         let sidebarButton = try sidebarToolbarButton(in: controller)
 
@@ -2112,7 +2113,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let identifiers = window.toolbar?.items.map(\.itemIdentifier.rawValue) ?? []
         XCTAssertEqual(identifiers.prefix(2), [
             "Stacio.Toolbar.sidebar",
-            NSToolbarItem.Identifier.flexibleSpace.rawValue
+            "Stacio.Toolbar.updatePrompt"
         ])
         XCTAssertEqual(updateController.probeCount, 1)
 
@@ -2196,10 +2197,10 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let commandItems = items.filter {
             $0.itemIdentifier != .flexibleSpace && $0.itemIdentifier != .space
         }
-        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
+        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "更新", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
         XCTAssertEqual(
             commandItems.map(\.toolTip),
-            ["显示或隐藏侧边栏", "新建会话", "从其他终端工具导入会话", "将输入同步执行到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
+            ["显示或隐藏侧边栏", "Stacio 更新", "新建会话", "从其他终端工具导入会话", "将输入同步执行到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
         )
         XCTAssertNil(items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.closeTerminal" })
         XCTAssertEqual(
@@ -2636,6 +2637,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             identifiers,
             [
                 "Stacio.Toolbar.sidebar",
+                "Stacio.Toolbar.updatePrompt",
                 NSToolbarItem.Identifier.flexibleSpace.rawValue,
                 "Stacio.Toolbar.newSession",
                 "Stacio.Toolbar.importSessions",
@@ -5046,11 +5048,12 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             pane.runtimeID == "graphics_vnc_password" && graphicsRuntime.requests.count == 1
         })
         XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [[
-            "--password",
-            "vnc-secret",
             "desktop.example.com:5900"
         ]])
-        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("<redacted>"))
+        XCTAssertEqual(
+            graphicsRuntime.requests.map(\.environment),
+            [["STACIO_VNC_PASSWORD": "vnc-secret"]]
+        )
         XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("vnc-secret"))
         XCTAssertTrue(starter.startedConfigs.isEmpty)
     }
@@ -5124,8 +5127,9 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             "prompted-vnc-secret"
         )
         XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
-        let arguments = try XCTUnwrap(graphicsRuntime.requests.first?.arguments)
-        XCTAssertEqual(Array(arguments.suffix(3)), ["--password", "prompted-vnc-secret", "desktop.example.com:5900"])
+        let request = try XCTUnwrap(graphicsRuntime.requests.first)
+        XCTAssertEqual(request.arguments, ["desktop.example.com:5900"])
+        XCTAssertEqual(request.environment, ["STACIO_VNC_PASSWORD": "prompted-vnc-secret"])
     }
 
     func testWorkbenchOpenSavedVNCSessionWithInvalidEndpointShowsEndpointDiagnostic() throws {

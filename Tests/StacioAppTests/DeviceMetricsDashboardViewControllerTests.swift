@@ -283,9 +283,9 @@ final class DeviceMetricsDashboardViewControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(cpuChart.superview?.frame.width ?? 0, 86)
         XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Metrics.diskPie./data"))
         XCTAssertEqual(metricsDashboardRootWidthConstraintCount(in: controller.view), 0)
-        XCTAssertTrue(controller.textFieldUsesArrowCursorForTesting(accessibilityIdentifier: "Stacio.Metrics.systemValue.operatingSystem"))
-        XCTAssertTrue(controller.textFieldUsesArrowCursorForTesting(accessibilityIdentifier: "Stacio.Metrics.section.overview.title"))
-        XCTAssertTrue(controller.textFieldUsesArrowCursorForTesting(accessibilityIdentifier: "Stacio.Metrics.networkRate.download.ens160"))
+        XCTAssertTrue(controller.textFieldSupportsSelectionForTesting(accessibilityIdentifier: "Stacio.Metrics.systemValue.operatingSystem"))
+        XCTAssertTrue(controller.textFieldSupportsSelectionForTesting(accessibilityIdentifier: "Stacio.Metrics.section.overview.title"))
+        XCTAssertTrue(controller.textFieldSupportsSelectionForTesting(accessibilityIdentifier: "Stacio.Metrics.networkRate.download.ens160"))
     }
 
     func testDashboardOffersFullOperatingSystemPopoverWhenNameIsTruncated() throws {

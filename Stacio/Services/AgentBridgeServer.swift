@@ -77,6 +77,7 @@ public final class AgentBridgeServer {
             startAcceptLoop(fd: fd, handler: handler)
         } catch {
             close(fd)
+            unlink(socketPath)
             throw error
         }
         #else
@@ -117,6 +118,17 @@ public final class AgentBridgeServer {
                 let clientFD = accept(fd, nil, nil)
                 guard clientFD >= 0 else {
                     break
+                }
+                var noSigPipe: Int32 = 1
+                guard setsockopt(
+                    clientFD,
+                    SOL_SOCKET,
+                    SO_NOSIGPIPE,
+                    &noSigPipe,
+                    socklen_t(MemoryLayout<Int32>.size)
+                ) == 0 else {
+                    close(clientFD)
+                    continue
                 }
                 let data = Self.readAll(from: clientFD)
                 Task { @MainActor in
@@ -160,9 +172,9 @@ public final class AgentBridgeServer {
         guard result == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        // 限制 socket 文件权限为 0600（仅属主可读写），防止同机其他用户连接。
-        // 使用 chmod 按路径操作，比 fchmod 在 socket fd 上更可靠跨平台。
-        chmod(socketPath, 0o600)
+        guard chmod(socketPath, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     private static func readAll(from fd: Int32) -> Data {

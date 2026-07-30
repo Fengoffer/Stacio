@@ -819,6 +819,8 @@ private extension HostKeyTrustDecision {
             "trustOnce"
         case .trustAndSave:
             "trustAndSave"
+        case let .trustAndReplace(previousFingerprintSha256):
+            "trustAndReplace:\(previousFingerprintSha256)"
         case .reject:
             "reject"
         }

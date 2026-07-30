@@ -8347,6 +8347,8 @@ public enum HostKeyTrustDecision {
 
     case trustOnce
     case trustAndSave
+    case trustAndReplace(previousFingerprintSha256: String
+    )
     case reject
 }
 
@@ -8369,7 +8371,10 @@ public struct FfiConverterTypeHostKeyTrustDecision: FfiConverterRustBuffer {
 
         case 2: return .trustAndSave
 
-        case 3: return .reject
+        case 3: return .trustAndReplace(previousFingerprintSha256: try FfiConverterString.read(from: &buf)
+        )
+
+        case 4: return .reject
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -8387,8 +8392,13 @@ public struct FfiConverterTypeHostKeyTrustDecision: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
 
 
-        case .reject:
+        case let .trustAndReplace(previousFingerprintSha256):
             writeInt(&buf, Int32(3))
+            FfiConverterString.write(previousFingerprintSha256, into: &buf)
+
+
+        case .reject:
+            writeInt(&buf, Int32(4))
 
         }
     }

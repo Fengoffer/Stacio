@@ -282,13 +282,32 @@ public final class SSHConnectionCoordinator {
         guard decision != .reject else {
             throw SSHConnectionCoordinatorError.hostKeyRejected
         }
-        return try connector.applyHostKeyDecision(
-            databasePath: databasePath,
-            host: config.host,
-            port: config.port,
-            hostKey: Array(hostKey.rawKey),
-            decision: decision
-        )
+        let appliedDecision: HostKeyTrustDecision
+        switch (reason, decision) {
+        case let (.changed(previousFingerprint), .trustAndSave):
+            appliedDecision = .trustAndReplace(
+                previousFingerprintSha256: previousFingerprint
+            )
+        default:
+            appliedDecision = decision
+        }
+        do {
+            return try connector.applyHostKeyDecision(
+                databasePath: databasePath,
+                host: config.host,
+                port: config.port,
+                hostKey: Array(hostKey.rawKey),
+                decision: appliedDecision
+            )
+        } catch SshRuntimeError.HostKeyChanged,
+                SshRuntimeError.UnknownHostKey
+        {
+            return try verifyOrConfirmHostKey(
+                config: config,
+                databasePath: databasePath,
+                hostKey: hostKey
+            )
+        }
     }
 
     private func makeAuthSecret(

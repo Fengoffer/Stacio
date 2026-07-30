@@ -124,12 +124,59 @@ final class SSHConnectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(connector.events, [
             "probe:example.com:22",
             "trust:example.com:22:reject",
-            "trust:example.com:22:trustAndSave",
+            "trust:example.com:22:trustAndReplace:SHA256:old-key",
             "connect"
         ])
         XCTAssertEqual(confirmer.confirmations.count, 1)
         XCTAssertEqual(confirmer.confirmations.first?.reason, .changed(previousFingerprintSHA256: "SHA256:old-key"))
         XCTAssertEqual(credentialResolver.resolveCount, 1)
+    }
+
+    func testChangedHostKeyRepromptsWhenStoredFingerprintChangesDuringConfirmation() throws {
+        let oldFingerprint = "SHA256:old-key"
+        let concurrentFingerprint = "SHA256:concurrent-key"
+        let connector = RecordingSSHLiveConnector(
+            probeResult: liveHostKey(raw: "new-key"),
+            trustResults: [.trusted],
+            trustErrors: [
+                SshRuntimeError.HostKeyChanged(previousFingerprintSha256: oldFingerprint),
+                SshRuntimeError.HostKeyChanged(previousFingerprintSha256: concurrentFingerprint),
+                SshRuntimeError.HostKeyChanged(previousFingerprintSha256: concurrentFingerprint),
+                nil
+            ],
+            connectStatus: connectedStatus()
+        )
+        let confirmer = RecordingHostKeyConfirming(decision: .trustAndSave)
+        let coordinator = SSHConnectionCoordinator(
+            connector: connector,
+            credentialResolver: RecordingSSHCredentialResolving(
+                credential: ResolvedSSHCredential(kind: .password, primarySecret: "super-secret")
+            ),
+            hostKeyConfirmer: confirmer,
+            privateKeyLoader: InMemoryPrivateKeyLoader(keys: [:])
+        )
+
+        let status = try coordinator.connect(
+            config: passwordConfig(),
+            databasePath: "/tmp/Stacio-test.sqlite"
+        )
+
+        XCTAssertTrue(status.connected)
+        XCTAssertEqual(
+            confirmer.confirmations.map(\.reason),
+            [
+                .changed(previousFingerprintSHA256: oldFingerprint),
+                .changed(previousFingerprintSHA256: concurrentFingerprint)
+            ]
+        )
+        XCTAssertEqual(connector.events, [
+            "probe:example.com:22",
+            "trust:example.com:22:reject",
+            "trust:example.com:22:trustAndReplace:\(oldFingerprint)",
+            "trust:example.com:22:reject",
+            "trust:example.com:22:trustAndReplace:\(concurrentFingerprint)",
+            "connect"
+        ])
     }
 
     func testPrivateKeyAuthLoadsKeyMaterialWithoutSystemCommand() throws {
@@ -414,6 +461,8 @@ private extension HostKeyTrustDecision {
             "trustOnce"
         case .trustAndSave:
             "trustAndSave"
+        case let .trustAndReplace(previousFingerprintSha256):
+            "trustAndReplace:\(previousFingerprintSha256)"
         case .reject:
             "reject"
         }

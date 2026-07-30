@@ -167,6 +167,7 @@ pub enum HostKeyVerification {
 pub enum HostKeyTrustDecision {
     TrustOnce,
     TrustAndSave,
+    TrustAndReplace { previous_fingerprint_sha256: String },
     Reject,
 }
 
@@ -175,6 +176,7 @@ impl HostKeyTrustDecision {
         match self {
             HostKeyTrustDecision::TrustOnce => "trust_once".to_string(),
             HostKeyTrustDecision::TrustAndSave => "trust_and_save".to_string(),
+            HostKeyTrustDecision::TrustAndReplace { .. } => "trust_and_replace".to_string(),
             HostKeyTrustDecision::Reject => "reject".to_string(),
         }
     }

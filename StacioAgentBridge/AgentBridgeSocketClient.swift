@@ -56,10 +56,26 @@ public struct AgentBridgeSocketClient {
         }
         defer { close(fd) }
 
-        // H15: 设置读取超时（30 秒），防止服务端无响应时 CLI 永久挂起
         var timeout = timeval(tv_sec: 30, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        guard setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0,
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0 else {
+            throw AgentBridgeSocketClientError.bridgeUnavailable(
+                socketPath: socketPath,
+                code: POSIXErrorCode(rawValue: errno) ?? .EIO
+            )
+        }
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -135,7 +151,12 @@ public struct AgentBridgeSocketClient {
                 code: POSIXErrorCode(rawValue: errno) ?? .ENOENT
             )
         }
-        // 属主必须为当前用户
+        guard (statBuffer.st_mode & S_IFMT) == S_IFSOCK else {
+            throw AgentBridgeSocketClientError.bridgeUnavailable(
+                socketPath: path,
+                code: .ENOTSOCK
+            )
+        }
         guard statBuffer.st_uid == getuid() else {
             throw AgentBridgeSocketClientError.bridgeUnavailable(
                 socketPath: path,

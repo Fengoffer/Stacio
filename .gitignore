@@ -11,6 +11,7 @@ worktrees/
 /Icon?
 dist/
 .superpowers/
+.ohmyagent/
 /竞品截图/
 
 # Internal product, research, planning, and deployment material.

@@ -23,27 +23,67 @@ public extension AgentBridgeRequest {
 
 public enum AgentProtocolRedaction {
     public static func redact(_ text: String) -> String {
-        var shouldRedactNextBearerValue = false
+        var redactNextToken = false
         let redactedTokens = text
             .split(whereSeparator: \.isWhitespace)
             .map { token -> String in
-                let lower = token.lowercased()
-                if shouldRedactNextBearerValue {
-                    shouldRedactNextBearerValue = false
+                let value = String(token)
+                let lower = value.lowercased()
+                if redactNextToken {
+                    if isAuthorizationSchemeToken(lower) {
+                        return value
+                    }
+                    redactNextToken = false
                     return "[redacted]"
                 }
-                if lower == "bearer" || lower == "basic" || lower.hasSuffix(":bearer") || lower.hasSuffix(":basic") {
-                    shouldRedactNextBearerValue = true
-                    return String(token)
+                if isAuthorizationSchemeToken(lower) {
+                    redactNextToken = true
+                    return value
+                }
+                if redactsFollowingToken(lower) {
+                    redactNextToken = true
+                    return "[redacted]"
                 }
                 if isSensitiveToken(lower) {
                     return "[redacted]"
                 }
-                return String(token)
+                return value
             }
             .joined(separator: " ")
-        // 脱敏 URL 内嵌凭据（如 postgres://user:password@host/db）
         return redactURLCredentials(in: redactedTokens)
+    }
+
+    private static func isAuthorizationSchemeToken(_ lower: String) -> Bool {
+        lower == "bearer"
+            || lower == "basic"
+            || lower.hasSuffix(":bearer")
+            || lower.hasSuffix(":basic")
+    }
+
+    private static func redactsFollowingToken(_ lower: String) -> Bool {
+        var key = lower.trimmingCharacters(in: CharacterSet(charactersIn: "-'\""))
+        while key.hasPrefix("-") {
+            key.removeFirst()
+        }
+        if key.hasSuffix(":") {
+            key.removeLast()
+        }
+        return [
+            "authorization",
+            "proxy-authorization",
+            "password",
+            "passphrase",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "api-key",
+            "access_key",
+            "access-key",
+            "private_key",
+            "private-key",
+            "credential"
+        ].contains(key)
     }
 
     private static func isSensitiveToken(_ lower: String) -> Bool {

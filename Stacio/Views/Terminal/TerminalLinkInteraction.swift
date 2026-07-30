@@ -78,26 +78,27 @@ public enum TerminalLinkInteraction {
         event: NSEvent
     ) -> Bool {
         let pointInTerminal = terminalView.convert(event.locationInWindow, from: nil)
-        guard terminalView.bounds.contains(pointInTerminal),
-              let container = terminalView.superview,
-              let terminalIndex = container.subviews.firstIndex(where: { $0 === terminalView })
-        else {
-            return terminalView.bounds.contains(pointInTerminal)
+        guard terminalView.bounds.contains(pointInTerminal) else {
+            return false
         }
 
-        for candidate in container.subviews.dropFirst(terminalIndex + 1).reversed() {
-            guard candidate.isHidden == false,
-                  candidate.alphaValue > 0.01
-            else {
-                continue
+        var coveredBranch: NSView = terminalView
+        // Workspace-level floating panels live above a terminal ancestor, not beside the terminal itself.
+        while let container = coveredBranch.superview {
+            guard let branchIndex = container.subviews.firstIndex(where: { $0 === coveredBranch }) else {
+                return false
             }
-            let pointInCandidate = candidate.convert(event.locationInWindow, from: nil)
-            guard candidate.bounds.contains(pointInCandidate),
-                  candidate.hitTest(pointInCandidate) != nil
-            else {
-                continue
+            let pointInContainer = container.convert(event.locationInWindow, from: nil)
+            for candidate in container.subviews.dropFirst(branchIndex + 1).reversed() {
+                guard candidate.isHidden == false,
+                      candidate.alphaValue > 0.01,
+                      candidate.hitTest(pointInContainer) != nil
+                else {
+                    continue
+                }
+                return false
             }
-            return false
+            coveredBranch = container
         }
         return true
     }

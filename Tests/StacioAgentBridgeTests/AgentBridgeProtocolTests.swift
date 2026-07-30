@@ -32,6 +32,23 @@ final class AgentBridgeProtocolTests: XCTestCase {
         XCTAssertEqual(redacted, "CPU 20%\n[redacted]\nMemory 40%")
     }
 
+    func testRedactionRemovesSeparatedSensitiveValues() {
+        for input in [
+            "Authorization: secret-value",
+            "curl --password secret-value example.com",
+            "api_key secret-value",
+            "Proxy-Authorization: Basic secret-value"
+        ] {
+            let redacted = AgentProtocolRedaction.redact(input)
+            XCTAssertFalse(redacted.contains("secret-value"), input)
+            XCTAssertTrue(redacted.contains("[redacted]"), input)
+        }
+        let opaqueToken = "eyJhbGciOiJIUzI1NiJ9.payload.signature"
+        let authorization = AgentProtocolRedaction.redact("Authorization: Bearer \(opaqueToken)")
+        XCTAssertFalse(authorization.contains(opaqueToken))
+        XCTAssertEqual(authorization, "[redacted] Bearer [redacted]")
+    }
+
     func testRiskClassifierMarksDestructiveCommands() {
         XCTAssertEqual(
             AgentActionClassifier.risk(forCommand: "rm -rf /tmp/build"),
@@ -91,6 +108,24 @@ final class AgentBridgeProtocolTests: XCTestCase {
             "find /var/log -type f 2>/dev/null | wc -l"
         ] {
             XCTAssertEqual(AgentActionClassifier.risk(forCommand: command), .readOnly, command)
+        }
+    }
+
+    func testRiskClassifierContinuesAfterCommentsOnEarlierLines() {
+        XCTAssertEqual(
+            AgentActionClassifier.risk(
+                forCommand: "printf ok # note\nprintf attacker-key > ~/.ssh/authorized_keys"
+            ),
+            .write
+        )
+    }
+
+    func testRiskClassifierTreatsStderrFileRedirectionAsWrite() {
+        for command in [
+            "uptime 2>/tmp/load-error.txt",
+            "journalctl -u sshd 2>>/tmp/sshd-error.log"
+        ] {
+            XCTAssertEqual(AgentActionClassifier.risk(forCommand: command), .write, command)
         }
     }
 
@@ -480,6 +515,26 @@ final class AgentBridgeProtocolTests: XCTestCase {
             XCTAssertTrue(message.contains("Stacio Agent Bridge"))
             XCTAssertTrue(message.contains(socketPath))
             XCTAssertTrue(message.contains("打开 Stacio"))
+        }
+    }
+
+    func testSocketClientRejectsRegularFileAtSocketPath() throws {
+        let socketPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-agent-\(UUID().uuidString).sock")
+        try Data().write(to: socketPath)
+        defer { try? FileManager.default.removeItem(at: socketPath) }
+        let client = AgentBridgeSocketClient(socketPath: socketPath.path)
+        let request = AgentBridgeRequest(
+            id: "req-regular-file",
+            actor: AgentActor(kind: .externalCLI, name: "codex", processID: 42),
+            action: .listSessions
+        )
+
+        XCTAssertThrowsError(try client.send(request: request, onLine: { _ in })) { error in
+            XCTAssertEqual(
+                error as? AgentBridgeSocketClientError,
+                .bridgeUnavailable(socketPath: socketPath.path, code: .ENOTSOCK)
+            )
         }
     }
 

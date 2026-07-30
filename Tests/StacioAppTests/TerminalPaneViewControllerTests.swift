@@ -65,8 +65,17 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(overlay.closeButtonVisibleForTesting)
     }
 
-    func testAgentTraceOverlayUsesArrowCursorAndConvertsDragToTopLeadingOffset() {
+    func testAgentTraceOverlayUsesContextualCursorsAndConvertsDragToTopLeadingOffset() throws {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = container
         let overlay = TerminalAgentTraceOverlayView(frame: NSRect(x: 8, y: 8, width: 520, height: 132))
+        container.addSubview(overlay)
         overlay.render([
             TerminalTraceEvent(
                 requestID: "req-drag",
@@ -75,9 +84,45 @@ final class TerminalPaneViewControllerTests: XCTestCase {
                 redactedCommand: "uptime"
             )
         ])
+        overlay.layoutSubtreeIfNeeded()
+        let detailLabel = try XCTUnwrap(
+            overlay.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay.detail") as? NSTextField
+        )
+        let detailPoint = overlay.convert(
+            NSPoint(x: detailLabel.bounds.midX, y: detailLabel.bounds.midY),
+            from: detailLabel
+        )
+        let dragPoint = NSPoint(x: 2, y: 2)
+        let textCursorEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: overlay.convert(detailPoint, to: nil),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 0,
+            pressure: 0
+        ))
+        let dragCursorEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: overlay.convert(dragPoint, to: nil),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            clickCount: 0,
+            pressure: 0
+        ))
 
         overlay.resetCursorRects()
-        XCTAssertTrue(overlay.hitTest(NSPoint(x: 1, y: 1)) === overlay)
+        XCTAssertTrue(overlay.hitTest(NSPoint(x: 9, y: 9)) === overlay)
+        XCTAssertTrue(overlay.textContentIsSelectableForTesting)
+        overlay.cursorUpdate(with: textCursorEvent)
+        XCTAssertEqual(NSCursor.current, .iBeam)
+        overlay.cursorUpdate(with: dragCursorEvent)
+        XCTAssertEqual(NSCursor.current, .arrow)
         XCTAssertEqual(
             overlay.dragOffsetForTesting(
                 from: NSPoint(x: 20, y: 20),
@@ -86,6 +131,43 @@ final class TerminalPaneViewControllerTests: XCTestCase {
             ),
             NSPoint(x: 50, y: 35)
         )
+    }
+
+    func testAgentTraceOverlayHitTestingUsesSuperviewCoordinatesAfterBeingMoved() throws {
+        let terminalView = StacioLocalTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 1_000, height: 700)
+        )
+        let overlay = TerminalAgentTraceOverlayView(
+            frame: NSRect(x: 240, y: 310, width: 520, height: 132)
+        )
+        overlay.render([
+            TerminalTraceEvent(
+                requestID: "req-moved-overlay",
+                state: .waitingForOutput,
+                message: "等待输出",
+                redactedCommand: "brew install iperf3"
+            )
+        ])
+        let container = NSView(frame: terminalView.frame)
+        container.addSubview(terminalView)
+        container.addSubview(overlay)
+        overlay.layoutSubtreeIfNeeded()
+
+        let coveredPoint = NSPoint(x: overlay.frame.midX, y: overlay.frame.midY)
+        let hitView = try XCTUnwrap(container.hitTest(coveredPoint))
+
+        XCTAssertTrue(hitView === overlay || hitView.isDescendant(of: overlay))
+        XCTAssertFalse(hitView === terminalView || hitView.isDescendant(of: terminalView))
+
+        let detailLabel = try XCTUnwrap(
+            overlay.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay.detail") as? NSTextField
+        )
+        let detailPoint = container.convert(
+            NSPoint(x: detailLabel.bounds.midX, y: detailLabel.bounds.midY),
+            from: detailLabel
+        )
+        XCTAssertTrue(container.hitTest(detailPoint) === detailLabel)
+        XCTAssertTrue(detailLabel.isSelectable)
     }
 
     func testTerminalPaneLoadsSwiftTermView() {
@@ -269,6 +351,63 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         )
         XCTAssertTrue(
             TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: uncoveredEvent)
+        )
+    }
+
+    func testTerminalPointerEventsRespectFloatingUIInAnAncestorContainer() throws {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 700))
+        let terminalContainer = NSView(frame: root.bounds)
+        let terminalView = StacioLocalTerminalView(frame: terminalContainer.bounds)
+        terminalContainer.addSubview(terminalView)
+        root.addSubview(terminalContainer)
+
+        let floatingPanel = NSView(frame: NSRect(x: 620, y: 220, width: 320, height: 360))
+        floatingPanel.setAccessibilityIdentifier("Stacio.Test.floatingPanel")
+        root.addSubview(floatingPanel, positioned: .above, relativeTo: terminalContainer)
+
+        let window = NSWindow(
+            contentRect: root.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = root
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+
+        let coveredEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: NSPoint(x: floatingPanel.frame.midX, y: floatingPanel.frame.midY),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 4,
+            clickCount: 0,
+            pressure: 0
+        ))
+        let uncoveredEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .mouseMoved,
+            location: NSPoint(x: 100, y: 100),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 5,
+            clickCount: 0,
+            pressure: 0
+        ))
+
+        XCTAssertFalse(
+            TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: coveredEvent)
+        )
+        XCTAssertTrue(
+            TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: uncoveredEvent)
+        )
+
+        floatingPanel.isHidden = true
+        XCTAssertTrue(
+            TerminalLinkInteraction.isEventTargetingTerminalSurface(terminalView, event: coveredEvent)
         )
     }
 
@@ -473,7 +612,9 @@ final class TerminalPaneViewControllerTests: XCTestCase {
                 as? TerminalAgentTraceOverlayView
         )
         XCTAssertTrue(overlay.superview === controller.view)
-        XCTAssertTrue(overlay.hitTest(NSPoint(x: 1, y: 1)) === overlay)
+        XCTAssertTrue(overlay.hitTest(
+            NSPoint(x: overlay.frame.minX + 1, y: overlay.frame.minY + 1)
+        ) === overlay)
         XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-hit-test"))
     }
 

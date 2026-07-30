@@ -34,6 +34,30 @@ impl KnownHostRepository {
         Ok(())
     }
 
+    pub fn replace_if_matches(
+        &self,
+        record: &HostKeyRecord,
+        previous_fingerprint_sha256: &str,
+    ) -> Result<bool, SshRuntimeError> {
+        let now = Utc::now().to_rfc3339();
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE known_hosts
+                 SET fingerprint_sha256 = ?1, updated_at = ?2
+                 WHERE host = ?3 AND port = ?4 AND fingerprint_sha256 = ?5",
+                params![
+                    record.fingerprint_sha256,
+                    now,
+                    record.host,
+                    i64::from(record.port),
+                    previous_fingerprint_sha256
+                ],
+            )
+            .map_err(map_db_error)?;
+        Ok(updated == 1)
+    }
+
     pub fn find(&self, host: &str, port: u16) -> Result<Option<HostKeyRecord>, SshRuntimeError> {
         self.connection
             .query_row(
@@ -84,6 +108,14 @@ impl KnownHostStore for KnownHostRepository {
 
     fn save_known_host(&self, record: HostKeyRecord) -> Result<(), SshRuntimeError> {
         self.upsert(&record)
+    }
+
+    fn replace_known_host_if_matches(
+        &self,
+        record: HostKeyRecord,
+        previous_fingerprint_sha256: &str,
+    ) -> Result<bool, SshRuntimeError> {
+        self.replace_if_matches(&record, previous_fingerprint_sha256)
     }
 }
 
@@ -170,6 +202,38 @@ mod known_host_repository_tests {
             .expect("known host");
 
         assert_eq!(found.fingerprint_sha256, "SHA256:new");
+    }
+
+    #[test]
+    fn conditionally_replaces_only_matching_fingerprint() {
+        let repository = KnownHostRepository::new(migrated_connection());
+        repository
+            .upsert(&HostKeyRecord {
+                host: "example.com".to_string(),
+                port: 22,
+                fingerprint_sha256: "SHA256:current".to_string(),
+            })
+            .expect("save current");
+        let replacement = HostKeyRecord {
+            host: "example.com".to_string(),
+            port: 22,
+            fingerprint_sha256: "SHA256:new".to_string(),
+        };
+
+        assert!(!repository
+            .replace_if_matches(&replacement, "SHA256:stale")
+            .expect("reject stale"));
+        assert!(repository
+            .replace_if_matches(&replacement, "SHA256:current")
+            .expect("replace current"));
+        assert_eq!(
+            repository
+                .find("example.com", 22)
+                .expect("find")
+                .expect("known host")
+                .fingerprint_sha256,
+            "SHA256:new"
+        );
     }
 
     #[test]

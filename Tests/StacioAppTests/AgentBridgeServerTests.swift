@@ -72,6 +72,20 @@ final class AgentBridgeServerTests: XCTestCase {
         XCTAssertTrue(responseLines[0].contains(#""runtimeID":"term_1""#))
     }
 
+    func testServerCreatesOwnerOnlyUnixSocket() throws {
+        let socketPath = "/tmp/stacio-agent-permissions-\(UUID().uuidString).sock"
+        let server = AgentBridgeServer(
+            handler: RecordingAgentBridgeRequestHandler(),
+            socketPath: socketPath
+        )
+        try server.start()
+        defer { server.stop() }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
     func testServerKeepsFollowSocketOpenUntilDeferredTerminalResultArrives() throws {
         let socketPath = "/tmp/stacio-agent-follow-\(UUID().uuidString).sock"
         let handler = DeferredAgentBridgeRequestHandler()

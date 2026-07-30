@@ -29,24 +29,26 @@ public enum AgentActionClassifier {
     }
 
     private static func containsWriteRedirection(in tokens: [ShellCommandToken]) -> Bool {
-        tokens.contains { token in
-            guard token.isQuoted == false else {
-                return false
-            }
+        for (index, token) in tokens.enumerated() where token.isQuoted == false {
             let value = token.text
-            // 仅 stdout 重定向（>、>>、1>、1>>、&>）视为写操作；
-            // stderr 重定向（2>、2>>）通常用于静默错误输出（如 2>/dev/null），不算写。
-            if [">", ">>", "1>", "1>>", "&>"].contains(value) {
+            if [">", ">>", "1>", "1>>", "&>"].contains(value)
+                || value.hasPrefix("1>")
+                || value.hasPrefix("&>")
+            {
                 return true
             }
-            if value.hasPrefix(">") || value.hasPrefix(">>") || value.hasPrefix("&>") {
-                return true
+            if value == "2>" || value == "2>>" {
+                guard tokens.indices.contains(index + 1), tokens[index + 1].text == "/dev/null" else {
+                    return true
+                }
+            } else if value.hasPrefix("2>") {
+                let target = value.drop(while: { $0 == "2" || $0 == ">" })
+                if target != "/dev/null" {
+                    return true
+                }
             }
-            if value.hasPrefix("1>") || value.hasPrefix("1>>") {
-                return true
-            }
-            return false
         }
+        return false
     }
 
     private static func riskForSegment(_ tokens: [ShellCommandToken]) -> AgentActionRisk {
@@ -130,7 +132,7 @@ public enum AgentActionClassifier {
         case "zypper":
             return riskForZypperPackageCommand(words)
         case "pacman":
-            return riskForPacmanPackageCommand(words)
+            return riskForPacmanPackageCommand(arguments)
         case "git":
             return riskForGit(words)
         case "tee", "chmod", "chown", "mv", "cp":
@@ -246,18 +248,22 @@ public enum AgentActionClassifier {
         return .readOnly
     }
 
-    private static func riskForPacmanPackageCommand(_ words: [String]) -> AgentActionRisk {
-        for word in words {
-            guard word.hasPrefix("-") else { continue }
-            let optionCharacters = Set(word.dropFirst())
-            if optionCharacters.contains("r") {
+    private static func riskForPacmanPackageCommand(_ arguments: [ShellCommandToken]) -> AgentActionRisk {
+        for argument in arguments where argument.isQuoted == false {
+            let value = argument.text
+            if value.hasPrefix("--") {
+                switch value.lowercased() {
+                case "--remove": return .destructive
+                case "--sync", "--upgrade": return .network
+                default: continue
+                }
+            }
+            guard value.hasPrefix("-") else { continue }
+            let optionCharacters = Set(value.dropFirst())
+            if optionCharacters.contains("R") {
                 return .destructive
             }
-            if optionCharacters.contains("s") {
-                // -s (sync) 触发网络安装；-q (quiet) 仅减少输出，不改变安装行为
-                return .network
-            }
-            if optionCharacters.contains("u") {
+            if optionCharacters.contains("S") || optionCharacters.contains("U") {
                 return .network
             }
         }
@@ -814,6 +820,7 @@ private enum ShellCommandTokenizer {
         var quote: Character?
         var currentIsQuoted = false
         var isEscaping = false
+        var isInComment = false
 
         func flush() {
             guard current.isEmpty == false else { return }
@@ -822,7 +829,21 @@ private enum ShellCommandTokenizer {
             currentIsQuoted = false
         }
 
+        func appendLineSeparator() {
+            flush()
+            if tokens.last?.text != ";" {
+                tokens.append(ShellCommandToken(text: ";", isQuoted: false))
+            }
+        }
+
         for character in command {
+            if isInComment {
+                if character == "\n" {
+                    isInComment = false
+                    appendLineSeparator()
+                }
+                continue
+            }
             if isEscaping {
                 current.append(character)
                 isEscaping = false
@@ -845,13 +866,16 @@ private enum ShellCommandTokenizer {
                 currentIsQuoted = true
                 continue
             }
-            if character == "#" && quote == nil && current.isEmpty {
-                // Shell 注释：非引号/非转义状态下，# 处于词起始位置时，
-                // 从 # 到行尾的内容均为注释，直接丢弃。
-                break
+            if character == "#" && current.isEmpty {
+                isInComment = true
+                continue
             }
             if character.isWhitespace {
-                flush()
+                if character == "\n" {
+                    appendLineSeparator()
+                } else {
+                    flush()
+                }
                 continue
             }
             if isOperatorCharacter(character) {

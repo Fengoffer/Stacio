@@ -286,11 +286,13 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
         (view as? DeviceMetricsArrowCursorView)?.usesArrowCursorForTesting == true
     }
 
-    public func textFieldUsesArrowCursorForTesting(accessibilityIdentifier: String) -> Bool {
+    public func textFieldSupportsSelectionForTesting(accessibilityIdentifier: String) -> Bool {
         guard let textField = firstSubview(withIdentifier: accessibilityIdentifier, in: view) as? NSTextField else {
             return false
         }
-        return (textField as? DeviceMetricStaticLabel)?.usesArrowCursorForTesting == true
+        return textField.isSelectable
+            && textField.isEditable == false
+            && (textField as? DeviceMetricStaticLabel)?.usesTextCursorForTesting == true
     }
 
     private func firstSubview(withIdentifier identifier: String, in root: NSView) -> NSView? {
@@ -1630,7 +1632,7 @@ private class DeviceMetricsArrowCursorView: NSView {
 }
 
 private class DeviceMetricStaticLabel: NSTextField {
-    var usesArrowCursorForTesting: Bool {
+    var usesTextCursorForTesting: Bool {
         true
     }
 
@@ -1638,10 +1640,11 @@ private class DeviceMetricStaticLabel: NSTextField {
         super.init(frame: .zero)
         stringValue = text
         isEditable = false
-        isSelectable = false
+        isSelectable = true
         isBordered = false
         drawsBackground = false
         backgroundColor = .clear
+        focusRingType = .none
         maximumNumberOfLines = wraps ? 0 : 1
         lineBreakMode = wraps ? .byWordWrapping : .byTruncatingTail
         cell?.wraps = wraps
@@ -1656,17 +1659,13 @@ private class DeviceMetricStaticLabel: NSTextField {
         nil
     }
 
-    override var acceptsFirstResponder: Bool {
-        false
-    }
-
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: .arrow)
+        addCursorRect(bounds, cursor: .iBeam)
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        NSCursor.arrow.set()
+        NSCursor.iBeam.set()
     }
 }
 
