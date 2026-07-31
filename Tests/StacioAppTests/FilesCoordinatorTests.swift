@@ -1854,6 +1854,42 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
     }
 
+    func testCoordinatorEndsSCPRemoteOpenOnNonterminalProgressAfterRuntimeDisappears() throws {
+        let cacheRoot = try makeTemporaryDirectory()
+        let scheduler = RecordingSCPTransferScheduler()
+        let opener = RecordingRemoteEditOpener()
+        let files = FilesViewController()
+        files.loadView()
+        var currentContext: TunnelLiveSessionContext? = liveContext()
+        var currentRuntimeID: String? = "runtime-alpha"
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { currentContext },
+            liveSessionRuntimeIDProvider: { currentRuntimeID },
+            transferScheduler: scheduler,
+            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener,
+            remoteEditSessionIDProvider: { "session-alpha" }
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil)
+        ])
+
+        files.performContextMenuActionForTesting(title: "使用默认程序打开...", row: 0)
+        let downloadJob = try XCTUnwrap(scheduler.jobs.first)
+
+        currentContext = nil
+        currentRuntimeID = nil
+        scheduler.report(jobID: downloadJob.id, status: "running")
+
+        XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
+        scheduler.complete(jobID: downloadJob.id)
+        XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
+        XCTAssertTrue(opener.localCopyRequestIDs.isEmpty)
+    }
+
     func testCoordinatorEndsSCPRemoteOpenOnEveryFailureTerminalStatusExactlyOnce() throws {
         for terminalStatus in ["failed", "canceled", "cancelled", "stopped"] {
             let cacheRoot = try makeTemporaryDirectory()
@@ -3294,6 +3330,40 @@ final class FilesCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(opener.openRequests.isEmpty)
         XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
+    }
+
+    func testCoordinatorEndsFTPRemoteOpenOnNonterminalProgressAfterContextDisappears() throws {
+        let scheduler = RecordingFTPTransferScheduler()
+        let cacheRoot = try makeTemporaryDirectory()
+        let opener = RecordingRemoteEditOpener()
+        let files = FilesViewController()
+        files.loadView()
+        var currentFTPContext: FTPLiveSessionContext? = ftpContext()
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            ftpSessionContextProvider: { currentFTPContext },
+            ftpTransferScheduler: scheduler,
+            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener,
+            remoteEditSessionIDProvider: { "ftp-session" }
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/pub/config.json", size: 18, linkTarget: nil)
+        ])
+
+        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        files.performOpenRemoteEditForTesting()
+        let downloadJob = try XCTUnwrap(scheduler.jobs.first)
+
+        currentFTPContext = nil
+        scheduler.report(jobID: downloadJob.id, status: "running")
+
+        XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
+        scheduler.complete(jobID: downloadJob.id)
+        XCTAssertEqual(opener.failedOpenRequestIDs, opener.preparedRequestIDs)
+        XCTAssertTrue(opener.localCopyRequestIDs.isEmpty)
     }
 
     func testCoordinatorEndsFTPRemoteOpenOnEveryFailureTerminalStatusExactlyOnce() throws {

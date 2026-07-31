@@ -4736,13 +4736,11 @@ public final class FilesCoordinator {
                     guard let self else {
                         return
                     }
-                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status),
-                          didFinishOpenRequest == false
-                    else {
+                    guard didFinishOpenRequest == false else {
                         return
                     }
-                    didFinishOpenRequest = true
                     guard self.isLiveSessionRuntimeCurrent(runtimeID) else {
+                        didFinishOpenRequest = true
                         let message = "runtime=\(runtimeID) status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
                             name: "file.open.download.stale",
@@ -4759,6 +4757,10 @@ public final class FilesCoordinator {
                         )
                         return
                     }
+                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status) else {
+                        return
+                    }
+                    didFinishOpenRequest = true
                     guard terminalStatus == "completed" else {
                         let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
@@ -4888,13 +4890,11 @@ public final class FilesCoordinator {
                     guard let self else {
                         return
                     }
-                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status),
-                          didFinishOpenRequest == false
-                    else {
+                    guard didFinishOpenRequest == false else {
                         return
                     }
-                    didFinishOpenRequest = true
                     guard self.isFTPSessionRuntimeCurrent(runtimeID) else {
+                        didFinishOpenRequest = true
                         let message = "runtime=\(runtimeID) status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
                             name: "file.open.ftp.download.stale",
@@ -4911,6 +4911,10 @@ public final class FilesCoordinator {
                         )
                         return
                     }
+                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status) else {
+                        return
+                    }
+                    didFinishOpenRequest = true
                     guard terminalStatus == "completed" else {
                         let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
