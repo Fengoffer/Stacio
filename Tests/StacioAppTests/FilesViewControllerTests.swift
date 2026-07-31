@@ -870,6 +870,31 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertEqual(editor.activeFileNameForTesting, "service.conf")
     }
 
+    func testRestoringCollapsedEditorForcesLayoutWhenItsSizeIsUnchanged() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
+
+        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
+        controller.view.layoutSubtreeIfNeeded()
+        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
+        editor.markEditorReadyForTesting()
+        editor.viewDidLayout()
+        XCTAssertTrue(waitUntil {
+            editor.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+        editor.resetEditorFunctionCallsForTesting()
+
+        controller.collapseEmbeddedCapabilityForTesting()
+        controller.expandEmbeddedCapabilityForTesting()
+        controller.view.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(waitUntil {
+            editor.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+    }
+
     func testCollapsedEmbeddedEditorRestoresUserAdjustedFileBrowserWidth() throws {
         let controller = FilesViewController()
         controller.loadView()

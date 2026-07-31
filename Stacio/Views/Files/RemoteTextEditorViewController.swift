@@ -142,6 +142,17 @@ public enum RemoteTextEditorCloseDecision: Equatable {
     case cancel
 }
 
+public enum RemoteTextEditorCloseDisposition: Equatable {
+    case ready
+    case pending
+    case cancelled
+}
+
+public enum RemoteTextEditorCloseResolution: Equatable {
+    case ready
+    case cancelled
+}
+
 public enum RemoteTextEditorSaveState: Equatable {
     case saved
     case dirty
@@ -250,23 +261,40 @@ public final class AppKitRemoteTextEditorCloseConfirmer: RemoteTextEditorCloseCo
 
 public final class RemoteTextEditorViewController: NSViewController, WKNavigationDelegate {
     private static let aiDocumentExcerptLimit = 12_000
+    private static let maximumMonacoReadinessRecoveryReloads = 1
+    private static let monacoReadinessGraceInterval: TimeInterval = 3
 
     public let localURL: URL
     public var onDirtyStateChanged: ((Bool) -> Void)?
     public var onActiveDocumentChanged: ((String, Bool) -> Void)?
     public var onCloseRequested: (() -> Void)?
     public var onWindowCloseReady: (() -> Void)?
+    public var onPendingCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
     public var onAIQuestionRequested: ((String) -> Void)?
 
     private let settingsStore: AppSettingsStore
     private let localTextIO: FileTransferLocalTextIO
     private var webView: WKWebView?
+    private var monacoNavigation: WKNavigation?
+    private let editorLoadingOverlay = NSView()
+    private let editorLoadingIndicator = NSProgressIndicator()
+    private let editorLoadingStatusLabel = NSTextField(labelWithString: "")
+    private let editorLoadingRetryButton = NSButton(
+        title: "重新加载",
+        target: nil,
+        action: nil
+    )
     private var scriptMessageHandler: RemoteTextEditorScriptMessageHandler?
     private var settingsObserver: NSObjectProtocol?
+    private var liveResizeEndObserver: NSObjectProtocol?
     private var documents: [RemoteTextEditorDocument]
     private var activeDocumentID: String
     private var currentThemeIdentifier = "vs-dark"
+    private var isMonacoRuntimeReady = false
     private var isEditorReady = false
+    private var lastRequestedEditorLayoutSize = NSSize.zero
+    private var isEditorLayoutRequestPending = false
+    private var forcePendingEditorLayoutRequest = false
     private var cursorLine = 1
     private var cursorColumn = 1
     private let editorOptionsDefaults: UserDefaults
@@ -276,12 +304,23 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private weak var minimapButton: NSButton?
     private var editorFunctionCallsForTestingStorage: [String] = []
     private var editorFunctionScriptsForTestingStorage: [String] = []
+    private var monacoPageLoadCountForTestingStorage = 0
+    private var monacoReadinessRecoveryReloadCount = 0
+    private var monacoInitializationWasInterruptedByLiveResize = false
+    private var isEditorLiveResizeActive = false
+    private var hasEditorBeenAttachedToWindow = false
+    private var isEditorDetachedFromWindow = false
+    private var isMonacoReadinessRecoveryScheduled = false
+    private var monacoPageLoadGeneration = 0
+    private var monacoReadinessWatchdogSequence = 0
+    private var monacoReadinessWatchdog: DispatchWorkItem?
     private var pendingTabCloseDocumentIDs = Set<String>()
     private var pendingWindowCloseDocumentIDs = Set<String>()
     private var pendingSavedCloseHandshakes: [String: PendingSavedCloseHandshake] = [:]
     private var pendingLocalDocumentLoadIDs = Set<String>()
     private var hasPendingWindowClose = false
     private var isEvaluatingWindowClose = false
+    private var pendingCloseResolutionExpected = false
 
     public init(
         localURL: URL,
@@ -364,13 +403,25 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         root.onKeyEquivalent = { [weak self] event in
             self?.handleKeyEquivalent(event) ?? false
         }
+        root.onLiveResizeStarted = { [weak self] in
+            self?.editorLiveResizeDidStart()
+        }
+        root.onLiveResizeEnded = { [weak self] in
+            self?.editorLiveResizeDidEnd()
+        }
+        root.onWindowChanged = { [weak self] window in
+            self?.editorDidMoveToWindow(window)
+        }
         root.wantsLayer = true
         root.setAccessibilityIdentifier("Stacio.Editor.root")
 
         let toolbar = makeToolbar()
         let editorWebView = makeWebView()
+        let loadingOverlay = makeEditorLoadingOverlay()
         root.addSubview(toolbar)
         root.addSubview(editorWebView)
+        root.addSubview(loadingOverlay)
+
         NSLayoutConstraint.activate([
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -379,20 +430,231 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             editorWebView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             editorWebView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             editorWebView.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
-            editorWebView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+            editorWebView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            loadingOverlay.leadingAnchor.constraint(equalTo: editorWebView.leadingAnchor),
+            loadingOverlay.trailingAnchor.constraint(equalTo: editorWebView.trailingAnchor),
+            loadingOverlay.topAnchor.constraint(equalTo: editorWebView.topAnchor),
+            loadingOverlay.bottomAnchor.constraint(equalTo: editorWebView.bottomAnchor)
         ])
 
         webView = editorWebView
         view = root
         observeSettingsChanges()
+        observeWindowLiveResizeEnd()
         applyCurrentTheme()
-        loadMonacoEditorHTML()
+        loadMonacoEditorHTML(resetReadinessRecoveryBudget: true)
         markDirtyIfNeeded()
+    }
+
+    public override func viewDidLayout() {
+        super.viewDidLayout()
+        scheduleEditorLayoutIfNeeded()
     }
 
     public override func viewDidAppear() {
         super.viewDidAppear()
         view.window?.makeFirstResponder(webView)
+        scheduleEditorLayoutIfNeeded(force: true)
+    }
+
+    func synchronizeLayoutAfterContainerChange() {
+        scheduleEditorLayoutIfNeeded(force: true)
+    }
+
+    private func editorLiveResizeDidStart() {
+        isEditorLiveResizeActive = true
+        if isEditorReady == false {
+            monacoInitializationWasInterruptedByLiveResize = true
+        }
+    }
+
+    private func editorLiveResizeDidEnd() {
+        isEditorLiveResizeActive = false
+        if isEditorReady {
+            monacoInitializationWasInterruptedByLiveResize = false
+            scheduleEditorLayoutIfNeeded(force: true)
+            return
+        }
+        guard monacoInitializationWasInterruptedByLiveResize else { return }
+        scheduleMonacoReadinessRecovery()
+    }
+
+    private func editorDidMoveToWindow(_ window: NSWindow?) {
+        guard let window else {
+            if hasEditorBeenAttachedToWindow {
+                isEditorDetachedFromWindow = true
+            }
+            if isEditorLiveResizeActive, isEditorReady == false {
+                monacoInitializationWasInterruptedByLiveResize = true
+            }
+            isEditorLiveResizeActive = false
+            return
+        }
+
+        hasEditorBeenAttachedToWindow = true
+        isEditorDetachedFromWindow = false
+        if window.inLiveResize {
+            editorLiveResizeDidStart()
+        } else if monacoInitializationWasInterruptedByLiveResize {
+            editorLiveResizeDidEnd()
+        } else if isEditorReady {
+            scheduleEditorLayoutIfNeeded(force: true)
+        }
+    }
+
+    private func scheduleMonacoReadinessRecovery() {
+        guard isMonacoReadinessRecoveryScheduled == false else { return }
+        let pageLoadGeneration = monacoPageLoadGeneration
+        isMonacoReadinessRecoveryScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isMonacoReadinessRecoveryScheduled = false
+            guard self.monacoPageLoadGeneration == pageLoadGeneration else { return }
+            self.recoverMonacoReadinessIfNeeded()
+        }
+    }
+
+    private func recoverMonacoReadinessIfNeeded() {
+        if isEditorReady {
+            monacoInitializationWasInterruptedByLiveResize = false
+            scheduleEditorLayoutIfNeeded(force: true)
+            return
+        }
+        if isEditorDetachedFromWindow {
+            monacoInitializationWasInterruptedByLiveResize = true
+            return
+        }
+        if isEditorLiveResizeActive || view.window?.inLiveResize == true {
+            monacoInitializationWasInterruptedByLiveResize = true
+            return
+        }
+        guard monacoReadinessRecoveryReloadCount < Self.maximumMonacoReadinessRecoveryReloads else {
+            showMonacoLoadFailure()
+            return
+        }
+
+        monacoReadinessRecoveryReloadCount += 1
+        monacoInitializationWasInterruptedByLiveResize = false
+        loadMonacoEditorHTML()
+    }
+
+    private func scheduleMonacoReadinessWatchdog() {
+        cancelMonacoReadinessWatchdog()
+        let watchdogSequence = monacoReadinessWatchdogSequence
+        let pageLoadGeneration = monacoPageLoadGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.monacoReadinessWatchdogSequence == watchdogSequence,
+                  self.monacoPageLoadGeneration == pageLoadGeneration
+            else { return }
+            self.monacoReadinessWatchdog = nil
+            guard self.isEditorReady == false else { return }
+
+            if self.isEditorDetachedFromWindow {
+                self.monacoInitializationWasInterruptedByLiveResize = true
+                return
+            }
+            if self.isEditorLiveResizeActive || self.view.window?.inLiveResize == true {
+                self.monacoInitializationWasInterruptedByLiveResize = true
+                return
+            }
+            self.scheduleMonacoReadinessRecovery()
+        }
+        monacoReadinessWatchdog = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.monacoReadinessGraceInterval,
+            execute: workItem
+        )
+    }
+
+    private func cancelMonacoReadinessWatchdog() {
+        monacoReadinessWatchdogSequence += 1
+        monacoReadinessWatchdog?.cancel()
+        monacoReadinessWatchdog = nil
+    }
+
+    /// 编辑器就绪前给 WKWebView 的 layer 设置不透明背景色，
+    /// 遮盖 WebContent 进程启动期间的默认黑色；
+    /// 就绪后清除 layer 背景色让 Monaco 接管渲染。
+    private func updateWebViewVisibilityForEditorReadiness() {
+        if isEditorReady {
+            webView?.layer?.backgroundColor = nil
+        } else {
+            webView?.layer?.backgroundColor = (currentThemeIdentifier == "vs-dark"
+                ? NSColor(calibratedRed: 0.055, green: 0.063, blue: 0.078, alpha: 1)
+                : NSColor.textBackgroundColor
+            ).cgColor
+        }
+    }
+
+    private func showMonacoLoading() {
+        editorLoadingOverlay.isHidden = false
+        editorLoadingStatusLabel.stringValue = "正在加载编辑器..."
+        editorLoadingRetryButton.isHidden = true
+        editorLoadingIndicator.isHidden = false
+        editorLoadingIndicator.startAnimation(nil)
+    }
+
+    private func showMonacoLoadFailure() {
+        cancelMonacoReadinessWatchdog()
+        isMonacoRuntimeReady = false
+        isEditorReady = false
+        updateWebViewVisibilityForEditorReadiness()
+        editorLoadingOverlay.isHidden = false
+        editorLoadingStatusLabel.stringValue = "编辑器加载失败"
+        editorLoadingIndicator.stopAnimation(nil)
+        editorLoadingIndicator.isHidden = true
+        editorLoadingRetryButton.isHidden = false
+    }
+
+    private func hideMonacoLoading() {
+        editorLoadingIndicator.stopAnimation(nil)
+        editorLoadingOverlay.isHidden = true
+    }
+
+    @objc private func retryMonacoLoading(_ sender: NSButton) {
+        loadMonacoEditorHTML(resetReadinessRecoveryBudget: true)
+    }
+
+    private func scheduleEditorLayoutIfNeeded(force: Bool = false) {
+        forcePendingEditorLayoutRequest = forcePendingEditorLayoutRequest || force
+        guard isEditorReady,
+              let webView
+        else { return }
+        guard webView.bounds.width > 0,
+              webView.bounds.height > 0
+        else {
+            forcePendingEditorLayoutRequest = true
+            return
+        }
+
+        let currentSize = webView.bounds.size
+        guard forcePendingEditorLayoutRequest || currentSize != lastRequestedEditorLayoutSize else {
+            return
+        }
+        guard isEditorLayoutRequestPending == false else { return }
+
+        isEditorLayoutRequestPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isEditorLayoutRequestPending = false
+            guard self.isEditorReady,
+                  let webView = self.webView
+            else { return }
+            guard webView.bounds.width > 0,
+                  webView.bounds.height > 0
+            else {
+                self.forcePendingEditorLayoutRequest = true
+                return
+            }
+
+            let latestSize = webView.bounds.size
+            let shouldForce = self.forcePendingEditorLayoutRequest
+            self.forcePendingEditorLayoutRequest = false
+            guard shouldForce || latestSize != self.lastRequestedEditorLayoutSize else { return }
+            self.lastRequestedEditorLayoutSize = latestSize
+            self.callEditorFunction("layout", payload: EmptyEditorPayload())
+        }
     }
 
     public var hasUnsavedChanges: Bool {
@@ -501,7 +763,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     public var editorHTMLForTesting: String {
-        Self.editorHTML
+        Self.editorHTML(pageLoadGeneration: monacoPageLoadGeneration)
+    }
+
+    public var monacoPageLoadCountForTesting: Int {
+        monacoPageLoadCountForTestingStorage
     }
 
     public var editorFunctionCallsForTesting: [String] {
@@ -553,7 +819,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     public func markEditorReadyForTesting() {
+        isMonacoRuntimeReady = true
         isEditorReady = true
+        monacoInitializationWasInterruptedByLiveResize = false
+        cancelMonacoReadinessWatchdog()
+        updateWebViewVisibilityForEditorReadiness()
+        hideMonacoLoading()
     }
 
     public func resetEditorFunctionCallsForTesting() {
@@ -685,18 +956,20 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     @discardableResult
-    public func canClose(
+    public func requestClose(
         parentWindow: NSWindow?,
         closeConfirmer: RemoteTextEditorCloseConfirming
-    ) -> Bool {
-        guard hasPendingWindowClose == false,
-              pendingTabCloseDocumentIDs.isEmpty
-        else {
-            return false
+    ) -> RemoteTextEditorCloseDisposition {
+        if hasPendingWindowClose {
+            return .pending
         }
+        guard pendingTabCloseDocumentIDs.isEmpty else {
+            return .cancelled
+        }
+        pendingCloseResolutionExpected = false
         let dirtyDocumentIDs = documents.filter(\.isDirty).map(\.id)
         guard dirtyDocumentIDs.isEmpty == false else {
-            return true
+            return .ready
         }
         var decisions: [(documentID: String, decision: RemoteTextEditorCloseDecision)] = []
         for documentID in dirtyDocumentIDs {
@@ -705,7 +978,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             }
             let decision = closeConfirmer.confirmClose(fileName: document.fileName, parentWindow: parentWindow)
             guard decision != .cancel else {
-                return false
+                return .cancelled
             }
             decisions.append((documentID, decision))
         }
@@ -726,7 +999,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
                 cancelPendingWindowClose()
                 isEvaluatingWindowClose = false
                 presentSaveError(error, parentWindow: parentWindow)
-                return false
+                return .cancelled
             }
         }
         isEvaluatingWindowClose = false
@@ -737,20 +1010,36 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
         if asyncSaveFailedOrChanged {
             cancelPendingWindowClose()
-            return false
+            return .cancelled
         }
         if hasPendingWindowClose, pendingWindowCloseDocumentIDs.isEmpty {
             hasPendingWindowClose = false
         }
-        return hasPendingWindowClose == false
+        guard hasPendingWindowClose else {
+            return .ready
+        }
+        pendingCloseResolutionExpected = true
+        return .pending
+    }
+
+    @discardableResult
+    public func canClose(
+        parentWindow: NSWindow?,
+        closeConfirmer: RemoteTextEditorCloseConfirming
+    ) -> Bool {
+        requestClose(parentWindow: parentWindow, closeConfirmer: closeConfirmer) == .ready
     }
 
     deinit {
+        monacoReadinessWatchdog?.cancel()
         for document in documents {
             Self.unregisterRemotePreviewSource(document.previewSource)
         }
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
+        }
+        if let liveResizeEndObserver {
+            NotificationCenter.default.removeObserver(liveResizeEndObserver)
         }
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "stacioEditor")
     }
@@ -1097,10 +1386,49 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
         let editorWebView = WKWebView(frame: .zero, configuration: configuration)
         editorWebView.translatesAutoresizingMaskIntoConstraints = false
+        editorWebView.wantsLayer = true
         editorWebView.navigationDelegate = self
         editorWebView.setAccessibilityIdentifier("Stacio.Editor.webView")
         editorWebView.setValue(false, forKey: "drawsBackground")
         return editorWebView
+    }
+
+    private func makeEditorLoadingOverlay() -> NSView {
+        editorLoadingOverlay.translatesAutoresizingMaskIntoConstraints = false
+        editorLoadingOverlay.wantsLayer = true
+        editorLoadingOverlay.setAccessibilityIdentifier("Stacio.Editor.loadingOverlay")
+
+        editorLoadingIndicator.style = .spinning
+        editorLoadingIndicator.controlSize = .small
+        editorLoadingIndicator.isDisplayedWhenStopped = false
+
+        editorLoadingStatusLabel.alignment = .center
+        editorLoadingStatusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        editorLoadingStatusLabel.setAccessibilityIdentifier("Stacio.Editor.loadingStatus")
+
+        editorLoadingRetryButton.target = self
+        editorLoadingRetryButton.action = #selector(retryMonacoLoading(_:))
+        editorLoadingRetryButton.bezelStyle = .rounded
+        editorLoadingRetryButton.controlSize = .small
+        editorLoadingRetryButton.setAccessibilityIdentifier("Stacio.Editor.retryLoading")
+
+        let content = NSStackView(views: [
+            editorLoadingIndicator,
+            editorLoadingStatusLabel,
+            editorLoadingRetryButton
+        ])
+        content.orientation = .vertical
+        content.alignment = .centerX
+        content.spacing = 8
+        content.translatesAutoresizingMaskIntoConstraints = false
+        editorLoadingOverlay.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.centerXAnchor.constraint(equalTo: editorLoadingOverlay.centerXAnchor),
+            content.centerYAnchor.constraint(equalTo: editorLoadingOverlay.centerYAnchor),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: editorLoadingOverlay.leadingAnchor, constant: 16),
+            content.trailingAnchor.constraint(lessThanOrEqualTo: editorLoadingOverlay.trailingAnchor, constant: -16)
+        ])
+        return editorLoadingOverlay
     }
 
     private func makeToolbar() -> NSView {
@@ -1296,6 +1624,22 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
     }
 
+    private func observeWindowLiveResizeEnd() {
+        guard liveResizeEndObserver == nil else { return }
+        liveResizeEndObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didEndLiveResizeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let resizedWindow = notification.object as? NSWindow,
+                  self.isViewLoaded,
+                  self.view.window === resizedWindow
+            else { return }
+            self.editorLiveResizeDidEnd()
+        }
+    }
+
     private func applyCurrentTheme() {
         let appearance = isViewLoaded ? view.effectiveAppearance : NSApp.effectiveAppearance
         let settings = settingsStore.snapshot()
@@ -1307,12 +1651,84 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             ? NSColor(calibratedRed: 0.055, green: 0.063, blue: 0.078, alpha: 1)
             : NSColor.textBackgroundColor
         ).cgColor
+        editorLoadingOverlay.layer?.backgroundColor = view.layer?.backgroundColor
+        editorLoadingStatusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        if isEditorReady == false {
+            webView?.layer?.backgroundColor = view.layer?.backgroundColor
+        }
         callEditorFunction("setTheme", payload: ThemePayload(settings: settings, theme: currentThemeIdentifier))
     }
 
-    private func loadMonacoEditorHTML() {
+    private func loadMonacoEditorHTML(resetReadinessRecoveryBudget: Bool = false) {
+        cancelMonacoReadinessWatchdog()
+        if resetReadinessRecoveryBudget {
+            monacoReadinessRecoveryReloadCount = 0
+        }
+        monacoPageLoadGeneration += 1
+        monacoPageLoadCountForTestingStorage += 1
+        isMonacoRuntimeReady = false
+        isEditorReady = false
+        lastRequestedEditorLayoutSize = .zero
+        forcePendingEditorLayoutRequest = false
+        updateWebViewVisibilityForEditorReadiness()
+        showMonacoLoading()
         let baseURL = MonacoEditorResourceLocator.monacoBaseURL()
-        webView?.loadHTMLString(Self.editorHTML, baseURL: baseURL)
+        monacoNavigation = webView?.loadHTMLString(
+            Self.editorHTML(pageLoadGeneration: monacoPageLoadGeneration),
+            baseURL: baseURL
+        )
+        scheduleMonacoReadinessWatchdog()
+    }
+
+    // MARK: - WKNavigationDelegate
+
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView === self.webView,
+              navigation == nil || navigation === monacoNavigation
+        else { return }
+        scheduleMonacoReadinessWatchdog()
+    }
+
+    public func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleMonacoNavigationFailure(webView: webView, navigation: navigation, error: error)
+    }
+
+    public func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleMonacoNavigationFailure(webView: webView, navigation: navigation, error: error)
+    }
+
+    private func handleMonacoNavigationFailure(
+        webView: WKWebView,
+        navigation: WKNavigation?,
+        error: Error
+    ) {
+        guard webView === self.webView,
+              navigation == nil || navigation === monacoNavigation
+        else { return }
+        let navigationError = error as NSError
+        guard navigationError.domain != NSURLErrorDomain
+                || navigationError.code != NSURLErrorCancelled
+        else { return }
+        cancelMonacoReadinessWatchdog()
+        scheduleMonacoReadinessRecovery()
+    }
+
+    public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard webView === self.webView else { return }
+        cancelMonacoReadinessWatchdog()
+        isMonacoRuntimeReady = false
+        isEditorReady = false
+        updateWebViewVisibilityForEditorReadiness()
+        showMonacoLoading()
+        recoverMonacoReadinessIfNeeded()
     }
 
     private func presentSaveError(_ error: Error, parentWindow: NSWindow?) {
@@ -1330,15 +1746,31 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     fileprivate func handleScriptMessage(_ message: WKScriptMessage) {
         guard let body = message.body as? [String: Any],
-              let name = body["name"] as? String
+              let name = body["name"] as? String,
+              let messagePageLoadGeneration = (body["pageLoadGeneration"] as? NSNumber)?.intValue,
+              messagePageLoadGeneration == monacoPageLoadGeneration
         else {
             return
         }
         let payload = body["payload"] as? [String: Any]
         switch name {
         case "ready":
-            isEditorReady = true
+            guard isMonacoRuntimeReady == false else { return }
+            isMonacoRuntimeReady = true
+            monacoInitializationWasInterruptedByLiveResize = false
+            scheduleMonacoReadinessWatchdog()
             syncWorkspaceToWebView()
+        case "workspaceReady":
+            guard isMonacoRuntimeReady,
+                  payload?["activeDocumentID"] as? String == activeDocumentID,
+                  (payload?["documentCount"] as? NSNumber)?.intValue == documents.count
+            else { return }
+            isEditorReady = true
+            monacoReadinessRecoveryReloadCount = 0
+            cancelMonacoReadinessWatchdog()
+            updateWebViewVisibilityForEditorReadiness()
+            hideMonacoLoading()
+            scheduleEditorLayoutIfNeeded(force: true)
         case "changed":
             guard let id = payload?["id"] as? String,
                   let content = payload?["content"] as? String
@@ -1693,16 +2125,27 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
            isEvaluatingWindowClose == false
         {
             hasPendingWindowClose = false
+            resolvePendingClose(.ready)
             onWindowCloseReady?()
         }
     }
 
     private func cancelPendingWindowClose() {
+        let shouldResolve = hasPendingWindowClose && pendingCloseResolutionExpected
         hasPendingWindowClose = false
         pendingWindowCloseDocumentIDs.removeAll()
         pendingSavedCloseHandshakes = pendingSavedCloseHandshakes.filter {
             pendingTabCloseDocumentIDs.contains($0.key)
         }
+        if shouldResolve {
+            resolvePendingClose(.cancelled)
+        }
+    }
+
+    private func resolvePendingClose(_ resolution: RemoteTextEditorCloseResolution) {
+        guard pendingCloseResolutionExpected else { return }
+        pendingCloseResolutionExpected = false
+        onPendingCloseResolved?(resolution)
     }
 
     private func aiQuestionForActiveDocument() -> String? {
@@ -1745,7 +2188,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     private func syncWorkspaceToWebView() {
-        guard isEditorReady else { return }
+        guard isMonacoRuntimeReady else { return }
+        let pageLoadGeneration = monacoPageLoadGeneration
         callEditorFunction(
             "loadWorkspace",
             payload: EditorWorkspacePayload(
@@ -1754,7 +2198,15 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
                 displayOptions: editorDisplayOptions,
                 theme: ThemePayload(settings: settingsStore.snapshot(), theme: currentThemeIdentifier)
             )
-        )
+        ) { [weak self] error in
+            guard let self,
+                  self.monacoPageLoadGeneration == pageLoadGeneration,
+                  self.isEditorReady == false,
+                  error != nil
+            else { return }
+            self.cancelMonacoReadinessWatchdog()
+            self.scheduleMonacoReadinessRecovery()
+        }
     }
 
     private func syncActiveDocumentToWebView() {
@@ -1773,7 +2225,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         )
     }
 
-    private func callEditorFunction<Payload: Encodable>(_ functionName: String, payload: Payload) {
+    private func callEditorFunction<Payload: Encodable>(
+        _ functionName: String,
+        payload: Payload,
+        completion: ((Error?) -> Void)? = nil
+    ) {
         guard isViewLoaded,
               let webView,
               let data = try? JSONEncoder().encode(payload),
@@ -1784,7 +2240,13 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         editorFunctionCallsForTestingStorage.append(functionName)
         let script = "window.StacioEditor && window.StacioEditor.\(functionName)(\(json));"
         editorFunctionScriptsForTestingStorage.append(script)
-        webView.evaluateJavaScript(script, completionHandler: nil)
+        if let completion {
+            webView.evaluateJavaScript(script) { _, error in
+                completion(error)
+            }
+        } else {
+            webView.evaluateJavaScript(script)
+        }
     }
 
     private func document(id: String) -> RemoteTextEditorDocument? {
@@ -1804,7 +2266,16 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         return max(1, components.count)
     }
 
-    private static let editorHTML = #"""
+    private static let editorPageLoadGenerationPlaceholder = "__STACIO_MONACO_PAGE_LOAD_GENERATION__"
+
+    private static func editorHTML(pageLoadGeneration: Int) -> String {
+        editorHTMLTemplate.replacingOccurrences(
+            of: editorPageLoadGenerationPlaceholder,
+            with: String(pageLoadGeneration)
+        )
+    }
+
+    private static let editorHTMLTemplate = #"""
 <!doctype html>
 <html>
 <head>
@@ -1888,9 +2359,10 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
   </script>
   <script src="vs/loader.js"></script>
   <script>
+    const pageLoadGeneration = __STACIO_MONACO_PAGE_LOAD_GENERATION__;
     const post = (name, payload = {}) => {
       if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.stacioEditor) {
-        window.webkit.messageHandlers.stacioEditor.postMessage({ name, payload });
+        window.webkit.messageHandlers.stacioEditor.postMessage({ pageLoadGeneration, name, payload });
       }
     };
 
@@ -1906,6 +2378,9 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     let editorActionIDs = new Set([findActionID, replaceActionID]);
     let displayOptions = Object.assign({}, defaultDisplayOptions);
     let statusTimers = { saveState: null };
+    let pendingEditorLayoutFrame = null;
+    let pendingEditorLayoutFallbackTimer = null;
+    const editorLayoutFallbackDelay = 200;
 
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
@@ -1920,6 +2395,39 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         if (lhs === 'plaintext') { return -1; }
         if (rhs === 'plaintext') { return 1; }
         return lhs.localeCompare(rhs);
+      });
+    }
+
+    function performMeasuredEditorLayout() {
+      if (!editor) { return; }
+      const editorElement = window.document.getElementById('editor');
+      const width = editorElement.clientWidth;
+      const height = editorElement.clientHeight;
+      if (width <= 0 || height <= 0) { return; }
+      editor.layout({ width, height });
+    }
+
+    function scheduleEditorLayout() {
+      if (pendingEditorLayoutFallbackTimer !== null) {
+        window.clearTimeout(pendingEditorLayoutFallbackTimer);
+      }
+      pendingEditorLayoutFallbackTimer = window.setTimeout(() => {
+        pendingEditorLayoutFallbackTimer = null;
+        if (pendingEditorLayoutFrame !== null) {
+          cancelAnimationFrame(pendingEditorLayoutFrame);
+          pendingEditorLayoutFrame = null;
+        }
+        performMeasuredEditorLayout();
+      }, editorLayoutFallbackDelay);
+
+      if (pendingEditorLayoutFrame !== null) { return; }
+      pendingEditorLayoutFrame = requestAnimationFrame(() => {
+        pendingEditorLayoutFrame = null;
+        if (pendingEditorLayoutFallbackTimer !== null) {
+          window.clearTimeout(pendingEditorLayoutFallbackTimer);
+          pendingEditorLayoutFallbackTimer = null;
+        }
+        performMeasuredEditorLayout();
       });
     }
 
@@ -2427,11 +2935,19 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       preview.style.display = 'none';
       preview.innerHTML = '';
       const uri = monaco.Uri.parse(document.monacoURI || `stacio-document:untitled/${encodeURIComponent(document.fileName || 'untitled')}`);
-      const model = monaco.editor.createModel(document.content || '', language, uri);
-      monaco.editor.setModelLanguage(model, language);
+      const nextContent = document.content || '';
       const oldModel = editor.getModel();
-      editor.setModel(model);
-      if (oldModel) { oldModel.dispose(); }
+      let model = monaco.editor.getModel(uri);
+      if (!model) {
+        model = monaco.editor.createModel(nextContent, language, uri);
+      } else if (model.getValue() !== nextContent) {
+        model.setValue(nextContent);
+      }
+      monaco.editor.setModelLanguage(model, language);
+      if (oldModel !== model) {
+        editor.setModel(model);
+        if (oldModel) { oldModel.dispose(); }
+      }
       editor.updateOptions({ readOnly: !document.canEdit });
       editorWrap.style.display = document.canEdit ? 'block' : 'none';
       error.style.display = document.canEdit ? 'none' : 'flex';
@@ -2443,6 +2959,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         updateTabs(documents, activeDocumentID);
       }
       updateStatus();
+      scheduleEditorLayout();
       editor.focus();
     }
 
@@ -2454,6 +2971,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       populateLanguageOptions();
       setEditorDocument(activeDocument());
       updateTabs(documents, activeDocumentID);
+      post('workspaceReady', { activeDocumentID, documentCount: documents.length });
     }
 
     function activateDocument(document) {
@@ -2474,7 +2992,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       applyDisplayOptions,
       runEditorAction,
       saveActiveDocument,
-      confirmSavedContentBeforeClose
+      confirmSavedContentBeforeClose,
+      layout: scheduleEditorLayout
     };
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabsPointerDown, { capture: true });
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);
@@ -2484,6 +3003,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     window.document.getElementById('tab-scroll-left').addEventListener('click', () => scrollTabsBy(-1));
     window.document.getElementById('tab-scroll-right').addEventListener('click', () => scrollTabsBy(1));
     window.addEventListener('resize', updateTabScrollButtons);
+    window.addEventListener('resize', scheduleEditorLayout);
 
     require.config({
       paths: { vs: 'vs' },
@@ -2494,7 +3014,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       editor = monaco.editor.create(window.document.getElementById('editor'), {
         value: '',
         language: 'plaintext',
-        automaticLayout: true,
+        automaticLayout: false,
         lineNumbers: 'on',
         wordWrap: 'off',
         folding: true,
@@ -2538,6 +3058,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyF, () => runEditorAction({ actionID: findActionID }));
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => runEditorAction({ actionID: replaceActionID }));
       editor.addCommand(monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyH, () => runEditorAction({ actionID: replaceActionID }));
+      scheduleEditorLayout();
       post('ready');
     });
   </script>
@@ -2801,6 +3322,24 @@ private enum MonacoEditorResourceLocator {
 private final class RemoteTextEditorRootView: NSView, StacioEffectiveAppearanceRefreshHandling {
     var onEffectiveAppearanceDidChange: (() -> Void)?
     var onKeyEquivalent: ((NSEvent) -> Bool)?
+    var onLiveResizeStarted: (() -> Void)?
+    var onLiveResizeEnded: (() -> Void)?
+    var onWindowChanged: ((NSWindow?) -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindowChanged?(window)
+    }
+
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        onLiveResizeStarted?()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        onLiveResizeEnded?()
+    }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()

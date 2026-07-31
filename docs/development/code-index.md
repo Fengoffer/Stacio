@@ -1,8 +1,8 @@
 # Stacio 代码索引文档
 
-版本：v0.4
-日期：2026-07-29
-状态：BLE Console v1、macOS CoreBluetooth adapter、保存会话路由与 Windows BLE-first contract 已进入实现
+版本：v0.5
+日期：2026-07-31
+状态：BLE Console v1、macOS CoreBluetooth adapter、保存会话路由、Windows BLE-first contract 与 Remote Text Editor UI 稳定性基线已进入实现
 
 ## 1. 顶层目录
 
@@ -41,7 +41,7 @@
 | `Stacio/Views/Dialogs/` | host key、危险操作、导入预览 sheets。 |
 | `Stacio/Services/FilesCoordinator.swift` | Swift Files coordinator；调用 remote listing bridge 并更新 `FilesViewController`，可通过当前 `TunnelLiveSessionContext` 加载 SCP/SSH remote directory，也可通过 `FTPLiveSessionContext` 加载 FTP directory；SCP 上传/下载进入 SCP queue，FTP 上传/下载进入内置 FTP queue，目录浏览、新建、重命名、删除走内置 FTP control channel；Remote Edit 本地副本丢失时阻止上传并显示重新打开远程文件的恢复提示；FTP Remote Edit 通过内置 FTP 队列下载缓存副本并保存回原远端路径。 |
 | `Stacio/Services/RemoteEditCache.swift` | Remote Edit 本地缓存；按 runtime/session/remote path 隔离缓存文件，生成回传原路径的 SCP upload job，检测本地副本是否晚于远端 modifiedAt，批量列出全部或指定 runtime/session 的已变化本地副本；同一路径重新打开时只保留当前 tracked item，并在缓存路径逃逸或本地副本丢失时抛 typed error。 |
-| `Stacio/Views/Files/RemoteTextEditorViewController.swift` | Monaco-backed Remote Edit 文本编辑器；跟随终端主题/字体设置，维护多文档 dirty 状态，并可把当前文件名、远端路径、语言和 12,000 字符以内内容摘要发送给右侧 AI 助手；该入口只生成问题，不直接修改远端文件。 |
+| `Stacio/Views/Files/RemoteTextEditorViewController.swift` | Monaco-backed Remote Edit 文本编辑器；以 Swift 文档状态为 source of truth，使用 page generation、`ready -> workspaceReady` 两阶段握手、原生加载遮罩、有限自动恢复和合并布局处理 WebKit/Monaco 生命周期；跟随终端主题/字体设置，维护多文档 dirty 状态，并可把当前文件名、远端路径、语言和 12,000 字符以内内容摘要发送给右侧 AI 助手；该入口只生成问题，不直接修改远端文件。 |
 | `Stacio/Services/QuickConnectCoordinator.swift` | Quick Connect 编排：调用 Rust parser，将目标转换为 agent-auth `SshConnectionConfig`，再进入 Workbench 远程 SSH session starter。 |
 | `Stacio/Services/RemoteSSHSessionCoordinator.swift` | 远程 SSH 会话启动编排：构建受信任 `TunnelLiveSessionContext`、启动 embedded live shell runtime、写入 `TunnelLiveSessionStore`、打开 Workspace 远程终端 pane。 |
 | `Stacio/Services/TelnetSessionCoordinator.swift` | 远程 Telnet 会话启动编排：调用 Rust embedded Telnet runtime，打开 Workspace 远程终端 pane，不调用系统 `telnet`。 |
@@ -163,6 +163,8 @@
 | SSH 连接失败 | `Stacio/Security/SSHConnectionCoordinator.swift` -> `StacioCore/src/lib.rs` live SSH exports -> `infrastructure/ssh/` -> diagnostics。 |
 | 终端黑屏 | `TerminalView.swift` -> shell channel events。 |
 | Files 不显示 | `files_service.rs` -> `infrastructure/ssh/` -> remote capability check。 |
+| Remote Edit 打开黑屏、长时间加载或拖一下 Files 分栏才显示 | [Remote Text Editor 与 Files UI 稳定性 Runbook](./remote-text-editor-ui-runbook.md) -> `RemoteTextEditorViewController.loadMonacoEditorHTML` / `handleScriptMessage` / `scheduleEditorLayoutIfNeeded`。先区分 workspace readiness 与 layout，不要先改 SSH/下载链路。 |
+| Remote Edit 在窗口 resize、折叠恢复或离屏重挂后空白 | [Remote Text Editor 与 Files UI 稳定性 Runbook](./remote-text-editor-ui-runbook.md) -> `editorLiveResizeDidStart/End` -> `editorDidMoveToWindow` -> `FilesViewController.restoreEmbeddedCapability()`。 |
 | 上传下载失败 | `files_service.rs` -> SCP adapter -> `transfer_jobs`。 |
 | 隧道无法启动 | `tunnel_service.rs` -> embedded tunnel worker；local/dynamic 看本地 listener 和 direct TCP/IP，remote 看 libssh2 remote listener 和本地 target connector。 |
 | 凭据读取失败 | `Stacio/Security/KeychainCredentialStore.swift` -> `SSHCredentialResolver.swift` -> `CredentialRepository`。 |
@@ -328,7 +330,8 @@
 | `Stacio/Views/Transfers/TransferQueueViewController.swift` | AppKit 原生 transfer queue 表格，按 SCP job 汇总最新 progress，显示 Progress/Status/Speed/ETA/Detail 和 Embedded SCP engine，并用 macOS symbol icon 暴露 Retry/Cancel action，不使用 SFTP/rsync 文案或本机命令。 |
 | `Stacio/Views/Tunnels/TunnelsViewController.swift` | AppKit 原生 tunnel 表格，显示 Kind/Local/Remote/Status/Detail，使用 macOS symbol icon 暴露 Add/Edit/Delete 和 Start/Stop action；有 live session context 时调用 embedded live tunnel runtime（local forward / remote forward / dynamic SOCKS），缺少 context 时显示 `missing_live_session_context`。 |
 | `Stacio/Views/Tunnels/TunnelProfileManagement.swift` | Swift profile 管理 adapter：`CoreBridgeTunnelProfileStore` 调用 `save/list/deleteTunnelProfile`，默认 editor 使用 AppKit alert accessory view 和 `NSSegmentedControl` 选择 Local/Remote/Dynamic。 |
-| `Tests/StacioAppTests/FilesViewControllerTests.swift` | Swift UI 层 Files 表格渲染、empty state 和 Inspector 接线测试。 |
+| `Tests/StacioAppTests/FilesViewControllerTests.swift` | Swift UI 层 Files 表格渲染、empty state、Inspector 接线、内嵌编辑器分栏、折叠恢复和强制 Monaco 布局同步测试。 |
+| `Tests/StacioAppTests/RemoteTextEditorViewControllerTests.swift` | Remote Text Editor 的 page generation、两阶段 workspace handshake、真实 Monaco、`0 x 0`/resize/重挂布局、WebContent/导航/JS 有限恢复、同 URI model 复用和 async save/close revision 回归。 |
 | `Tests/StacioAppTests/FilesCoordinatorTests.swift` | Swift coordinator 层 remote listing parse、Files UI 更新和 parse failure 保持 empty state 测试。 |
 | `Tests/StacioAppTests/TransferBridgeTests.swift` | Swift bridge 层 remote listing parser、conflict policy、SCP transfer、live preflight、progress polling 和 transfer history/failure message persistence 测试。 |
 | `Tests/StacioAppTests/TransferQueueViewControllerTests.swift` | Swift UI 层 transfer queue 渲染、empty state、progress coalescing、Speed/ETA、failure Detail、传输日志、Retry/Cancel action 和 Inspector 接线测试。 |

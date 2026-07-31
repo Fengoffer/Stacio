@@ -1593,6 +1593,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         } else {
             applyInitialEditorSplitPositionIfNeeded()
         }
+        embeddedEditorViewController?.synchronizeLayoutAfterContainerChange()
     }
 
     private func embeddedCapabilityView() -> NSView? {

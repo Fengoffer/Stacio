@@ -754,6 +754,659 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertTrue(html.contains("vs/nls.messages.zh-cn.js"))
     }
 
+    func testReadyEditorCoalescesLayoutRequestsAndSkipsUnchangedSize() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        controller.markEditorReadyForTesting()
+        controller.resetEditorFunctionCallsForTesting()
+
+        for _ in 0..<100 {
+            controller.viewDidLayout()
+        }
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+
+        for _ in 0..<100 {
+            controller.viewDidLayout()
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count,
+            1
+        )
+
+        controller.view.frame.size.width = 1_080
+        controller.view.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 2
+        })
+    }
+
+    func testForcedLayoutSurvivesTemporaryZeroSizedContainer() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.markEditorReadyForTesting()
+        controller.viewDidLayout()
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+        controller.resetEditorFunctionCallsForTesting()
+
+        controller.view.frame.size = .zero
+        controller.view.layoutSubtreeIfNeeded()
+        controller.viewDidLayout()
+
+        controller.view.frame.size = NSSize(width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        controller.viewDidLayout()
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+    }
+
+    func testMonacoLayoutUsesMeasuredSizeAndOneAnimationFramePerRenderCycle() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+
+        let html = controller.editorHTMLForTesting
+        XCTAssertTrue(html.contains("let pendingEditorLayoutFrame = null;"))
+        XCTAssertTrue(html.contains("let pendingEditorLayoutFallbackTimer = null;"))
+        XCTAssertTrue(html.contains("function performMeasuredEditorLayout()"))
+        XCTAssertTrue(html.contains("function scheduleEditorLayout()"))
+        XCTAssertTrue(html.contains("if (pendingEditorLayoutFrame !== null) { return; }"))
+        XCTAssertTrue(html.contains("pendingEditorLayoutFrame = requestAnimationFrame(() =>"))
+        XCTAssertTrue(html.contains("pendingEditorLayoutFallbackTimer = window.setTimeout(() =>"))
+        XCTAssertTrue(html.contains("cancelAnimationFrame(pendingEditorLayoutFrame);"))
+        XCTAssertTrue(html.contains("const width = editorElement.clientWidth;"))
+        XCTAssertTrue(html.contains("const height = editorElement.clientHeight;"))
+        XCTAssertTrue(html.contains("editor.layout({ width, height });"))
+        XCTAssertTrue(html.contains("layout: scheduleEditorLayout"))
+        XCTAssertTrue(html.contains("window.addEventListener('resize', scheduleEditorLayout)"))
+        XCTAssertFalse(html.contains("automaticLayout: true"))
+    }
+
+    func testRepeatedWorkspaceLoadReusesExistingMonacoModelURI() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+
+        let html = controller.editorHTMLForTesting
+        XCTAssertTrue(html.contains("let model = monaco.editor.getModel(uri);"))
+        XCTAssertTrue(html.contains("model = monaco.editor.createModel(nextContent, language, uri);"))
+        XCTAssertTrue(html.contains("if (model.getValue() !== nextContent)"))
+        XCTAssertTrue(html.contains("if (oldModel !== model)"))
+        XCTAssertFalse(html.contains("const model = monaco.editor.createModel(document.content || '', language, uri);"))
+    }
+
+    func testEditorBridgeIgnoresReadyFromPreviousPageGeneration() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.resetEditorFunctionCallsForTesting()
+
+        webView.loadHTMLString(
+            """
+            <!doctype html>
+            <html><body><script>
+              const bridge = window.webkit.messageHandlers.stacioEditor;
+              bridge.postMessage({ pageLoadGeneration: 0, name: 'ready', payload: {} });
+              bridge.postMessage({ pageLoadGeneration: 1, name: 'ready', payload: {} });
+            </script></body></html>
+            """,
+            baseURL: nil
+        )
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "loadWorkspace" }.count >= 1
+        })
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(
+            controller.editorFunctionCallsForTesting.filter { $0 == "loadWorkspace" }.count,
+            1
+        )
+    }
+
+    func testEditorRemainsLoadingUntilCurrentWorkspaceAcknowledges() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.resetEditorFunctionCallsForTesting()
+        XCTAssertTrue(controller.editorHTMLForTesting.contains("post('workspaceReady'"))
+
+        webView.loadHTMLString(
+            """
+            <!doctype html>
+            <html><body><script>
+              const bridge = window.webkit.messageHandlers.stacioEditor;
+              window.StacioEditor = {
+                loadWorkspace(payload) {
+                  window.setTimeout(() => {
+                    bridge.postMessage({
+                      pageLoadGeneration: 1,
+                      name: 'workspaceReady',
+                      payload: {
+                        activeDocumentID: payload.activeDocumentID,
+                        documentCount: payload.documents.length
+                      }
+                    });
+                  }, 400);
+                }
+              };
+              bridge.postMessage({ pageLoadGeneration: 1, name: 'ready', payload: {} });
+            </script></body></html>
+            """,
+            baseURL: nil
+        )
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.contains("loadWorkspace")
+        })
+        XCTAssertNotNil(webView.layer?.backgroundColor)
+        XCTAssertFalse(controller.editorFunctionCallsForTesting.contains("layout"))
+
+        XCTAssertTrue(waitUntil(timeout: 1) {
+            webView.layer?.backgroundColor == nil
+        })
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.contains("layout")
+        })
+    }
+
+    func testActualMonacoRuntimeCompletesWorkspaceHandshakeBeforeBecomingVisible() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/remote.js",
+            fileName: "remote.js",
+            content: "const value = 1\n"
+        )
+        let controller = RemoteTextEditorViewController(document: descriptor)
+        let windowController = RemoteTextEditorWindowController(editorViewController: controller)
+        windowController.showWindow(nil)
+        defer { windowController.close() }
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        let repositoryURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let monacoBaseURL = repositoryURL
+            .appendingPathComponent("node_modules/monaco-editor/min", isDirectory: true)
+        guard FileManager.default.fileExists(
+            atPath: monacoBaseURL.appendingPathComponent("vs/loader.js").path
+        ) else {
+            throw XCTSkip("Monaco runtime is not installed in this source checkout")
+        }
+        let testPageDirectory = repositoryURL
+            .appendingPathComponent(".build/stacio-monaco-tests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: testPageDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: testPageDirectory) }
+        let html = controller.editorHTMLForTesting.replacingOccurrences(
+            of: "<head>",
+            with: "<head><base href=\"\(monacoBaseURL.absoluteString)\">"
+        )
+        let htmlURL = testPageDirectory.appendingPathComponent("editor.html")
+        try html.write(to: htmlURL, atomically: true, encoding: .utf8)
+        webView.loadFileURL(htmlURL, allowingReadAccessTo: repositoryURL)
+
+        XCTAssertTrue(
+            waitUntil(timeout: 5) {
+                webView.layer?.backgroundColor == nil
+            },
+            "The real Monaco runtime never completed its workspace handshake"
+        )
+        XCTAssertTrue(controller.editorFunctionCallsForTesting.contains("loadWorkspace"))
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.contains("layout")
+        })
+        let retryButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.retryLoading") as? NSButton
+        )
+        XCTAssertTrue(retryButton.isHidden)
+    }
+
+    func testWorkspaceJavaScriptFailureImmediatelyTriggersBoundedRecovery() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        webView.loadHTMLString(
+            """
+            <!doctype html>
+            <html><body><script>
+              window.StacioEditor = {
+                loadWorkspace() { throw new Error('workspace sync failed'); }
+              };
+              window.webkit.messageHandlers.stacioEditor.postMessage({
+                pageLoadGeneration: 1,
+                name: 'ready',
+                payload: {}
+              });
+            </script></body></html>
+            """,
+            baseURL: nil
+        )
+
+        XCTAssertTrue(waitUntil(timeout: 0.5) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testLayoutChangesNeverReloadMonacoAndProcessTerminationReloadsExactlyOnce() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.markEditorReadyForTesting()
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+
+        for index in 0..<100 {
+            controller.view.frame.size = NSSize(width: 900 + index, height: 600 + (index % 7))
+            controller.view.layoutSubtreeIfNeeded()
+            controller.viewDidLayout()
+        }
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+
+        controller.webViewWebContentProcessDidTerminate(webView)
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+    }
+
+    func testRepeatedWebContentProcessTerminationUsesBoundedAutomaticRecovery() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.markEditorReadyForTesting()
+
+        controller.webViewWebContentProcessDidTerminate(webView)
+        XCTAssertTrue(waitUntil(timeout: 0.5) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+
+        controller.webViewWebContentProcessDidTerminate(webView)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+        let retryButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.retryLoading") as? NSButton
+        )
+        XCTAssertFalse(retryButton.isHidden)
+    }
+
+    func testSuccessfulWorkspaceAfterRecoveryRestoresProcessTerminationBudget() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/remote.js",
+            fileName: "remote.js",
+            content: "const value = 1\n"
+        )
+        let controller = RemoteTextEditorViewController(document: descriptor)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.markEditorReadyForTesting()
+
+        controller.webViewWebContentProcessDidTerminate(webView)
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+        webView.stopLoading()
+        webView.loadHTMLString(
+            """
+            <!doctype html>
+            <html><body><script>
+              const bridge = window.webkit.messageHandlers.stacioEditor;
+              window.StacioEditor = {
+                loadWorkspace(payload) {
+                  bridge.postMessage({
+                    pageLoadGeneration: 2,
+                    name: 'workspaceReady',
+                    payload: {
+                      activeDocumentID: payload.activeDocumentID,
+                      documentCount: payload.documents.length
+                    }
+                  });
+                }
+              };
+              bridge.postMessage({ pageLoadGeneration: 2, name: 'ready', payload: {} });
+            </script></body></html>
+            """,
+            baseURL: nil
+        )
+        XCTAssertTrue(waitUntil(timeout: 1) {
+            webView.layer?.backgroundColor == nil
+        })
+
+        controller.webViewWebContentProcessDidTerminate(webView)
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 3)
+    }
+
+    func testUnreadyEditorReloadsOnceWhenLiveResizeEnds() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+
+        controller.view.viewWillStartLiveResize()
+        controller.view.viewDidEndLiveResize()
+
+        XCTAssertTrue(waitUntil {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+
+        controller.view.viewDidEndLiveResize()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+    }
+
+    func testReadyEditorEndingLiveResizeRequestsLayoutWithoutReloading() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        controller.markEditorReadyForTesting()
+        controller.resetEditorFunctionCallsForTesting()
+
+        controller.view.viewWillStartLiveResize()
+        controller.view.viewDidEndLiveResize()
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+    }
+
+    func testEditorBecomingReadyDuringLiveResizeAvoidsRecoveryReload() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        controller.view.viewWillStartLiveResize()
+        controller.markEditorReadyForTesting()
+        controller.resetEditorFunctionCallsForTesting()
+        controller.view.viewDidEndLiveResize()
+
+        XCTAssertTrue(waitUntil {
+            controller.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
+        })
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+    }
+
+    func testFinishedNavigationWithoutReadyTriggersOneBoundedRecoveryReload() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        webView.loadHTMLString("<html><body></body></html>", baseURL: nil)
+
+        (controller as WKNavigationDelegate).webView?(webView, didFinish: nil)
+
+        XCTAssertTrue(waitUntil(timeout: 4) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+
+        (controller as WKNavigationDelegate).webView?(webView, didFinish: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(1.6))
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+    }
+
+    func testNavigationWithoutAnyDelegateCallbackStillTriggersBoundedRecovery() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.navigationDelegate = nil
+        webView.stopLoading()
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+        XCTAssertTrue(waitUntil(timeout: 4) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testCurrentNavigationFailureImmediatelyTriggersBoundedRecovery() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        let error = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorCannotOpenFile,
+            userInfo: nil
+        )
+        (controller as WKNavigationDelegate).webView?(
+            webView,
+            didFailProvisionalNavigation: nil,
+            withError: error
+        )
+
+        XCTAssertTrue(waitUntil(timeout: 0.5) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testExhaustedAutomaticRecoveryShowsManualRetryWithoutReloadLoop() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
+        controller.view.layoutSubtreeIfNeeded()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.navigationDelegate = nil
+        webView.stopLoading()
+
+        XCTAssertTrue(waitUntil(timeout: 4) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+        RunLoop.main.run(until: Date().addingTimeInterval(3.4))
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 2)
+
+        let retryButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.retryLoading") as? NSButton
+        )
+        XCTAssertFalse(retryButton.isHidden)
+
+        retryButton.performClick(nil as Any?)
+
+        XCTAssertTrue(waitUntil(timeout: 0.5) {
+            controller.monacoPageLoadCountForTesting == 3
+        })
+        XCTAssertTrue(retryButton.isHidden)
+    }
+
+    func testReadinessWatchdogDefersRecoveryUntilLiveResizeEnds() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        controller.loadView()
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        webView.loadHTMLString("<html><body></body></html>", baseURL: nil)
+
+        controller.view.viewWillStartLiveResize()
+        (controller as WKNavigationDelegate).webView?(webView, didFinish: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(3.2))
+
+        XCTAssertEqual(controller.monacoPageLoadCountForTesting, 1)
+
+        controller.view.viewDidEndLiveResize()
+        XCTAssertTrue(waitUntil {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testWindowLiveResizeEndNotificationRecoversWhenViewCallbackIsMissed() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        let windowController = RemoteTextEditorWindowController(editorViewController: controller)
+        defer { windowController.close() }
+        let window = try XCTUnwrap(windowController.window)
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+
+        controller.view.viewWillStartLiveResize()
+        NotificationCenter.default.post(name: NSWindow.didEndLiveResizeNotification, object: window)
+
+        XCTAssertTrue(waitUntil {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testEditorAttachedWhileWindowIsLiveResizingRecoversAtResizeEnd() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        let window = SimulatedLiveResizeWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 640),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.simulatesLiveResize = true
+        let windowController = NSWindowController(window: window)
+        defer {
+            window.contentViewController = nil
+            windowController.close()
+        }
+        window.contentViewController = controller
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        webView.loadHTMLString("<html><body></body></html>", baseURL: nil)
+
+        window.simulatesLiveResize = false
+        NotificationCenter.default.post(name: NSWindow.didEndLiveResizeNotification, object: window)
+
+        XCTAssertTrue(waitUntil(timeout: 0.5) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
+    func testEditorDetachedDuringLiveResizeRecoversWhenReattachedAfterResize() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "remote.js", contents: "const value = 1\n")
+        let controller = RemoteTextEditorViewController(localURL: fileURL)
+        let window = SimulatedLiveResizeWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 640),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.simulatesLiveResize = true
+        let windowController = NSWindowController(window: window)
+        defer {
+            window.contentViewController = nil
+            windowController.close()
+        }
+        window.contentViewController = controller
+        let webView = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.navigationDelegate = nil
+        webView.stopLoading()
+
+        window.contentViewController = nil
+        window.simulatesLiveResize = false
+        window.contentViewController = controller
+
+        XCTAssertTrue(waitUntil(timeout: 2.5) {
+            controller.monacoPageLoadCountForTesting == 2
+        })
+    }
+
     func testDirtyEditorPromptsToSaveBeforeClosing() throws {
         let fileURL = try makeTemporaryEditorFile(name: "app.toml", contents: "debug = false\n")
         let confirmer = RecordingRemoteTextEditorCloseConfirmer(decision: .save)
@@ -778,6 +1431,85 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(savedURLs, [fileURL])
         XCTAssertEqual(try String(contentsOf: fileURL), "debug = true\n")
         XCTAssertFalse(controller.hasUnsavedChangesForTesting)
+    }
+
+    func testCloseRequestDistinguishesReadyPendingAndCancelled() {
+        let clean = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/clean.conf",
+                fileName: "clean.conf",
+                content: "enabled=true\n"
+            )
+        )
+        XCTAssertEqual(
+            clean.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .discard)
+            ),
+            .ready
+        )
+
+        let cancelled = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/cancel.conf",
+                fileName: "cancel.conf",
+                content: "enabled=true\n"
+            )
+        )
+        cancelled.replaceTextForTesting("enabled=false\n")
+        XCTAssertEqual(
+            cancelled.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .cancel)
+            ),
+            .cancelled
+        )
+
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let pending = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/pending.conf",
+                fileName: "pending.conf",
+                content: "enabled=true\n"
+            ),
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        pending.replaceTextForTesting("enabled=false\n")
+        XCTAssertEqual(
+            pending.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+            ),
+            .pending
+        )
+        saveCompletion?(.failure(CocoaError(.fileWriteUnknown)))
+    }
+
+    func testPendingClosePublishesExactlyOneFinalResolution() {
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/remote.conf",
+                fileName: "remote.conf",
+                content: "enabled=true\n"
+            ),
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        var resolutions: [RemoteTextEditorCloseResolution] = []
+        editor.onPendingCloseResolved = { resolutions.append($0) }
+        editor.replaceTextForTesting("enabled=false\n")
+
+        XCTAssertEqual(
+            editor.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+            ),
+            .pending
+        )
+        saveCompletion?(.success(()))
+        saveCompletion?(.success(()))
+
+        XCTAssertEqual(resolutions, [.ready])
     }
 
     func testWindowCloseWaitsForAsyncSaveSuccessBeforeClosing() throws {
@@ -839,14 +1571,17 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             String(data: JSONEncoder().encode(editor.documentIDsForTesting[0]), encoding: .utf8)
         )
         let pageLoaded = expectation(description: "handshake test page loaded")
+        editor.markEditorReadyForTesting()
         webView.loadHTMLString(
             """
             <script>
+              window.handshakeTestPageReady = true;
               window.monacoContent = 'debug = newest\\n';
               window.monacoRevision = 2;
               window.StacioEditor = {
                 confirmSavedContentBeforeClose(payload) {
                   window.webkit.messageHandlers.stacioEditor.postMessage({
+                    pageLoadGeneration: 1,
                     name: 'closeHandshake',
                     payload: {
                       id: payload.documentID,
@@ -862,8 +1597,8 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             baseURL: nil
         )
         func waitForPage() {
-            webView.evaluateJavaScript("document.readyState") { value, _ in
-                if value as? String == "complete" {
+            webView.evaluateJavaScript("window.handshakeTestPageReady === true") { value, _ in
+                if value as? Bool == true {
                     pageLoaded.fulfill()
                 } else {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: waitForPage)
@@ -872,7 +1607,6 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         }
         waitForPage()
         wait(for: [pageLoaded], timeout: 2)
-        editor.markEditorReadyForTesting()
 
         XCTAssertFalse(windowController.windowShouldClose(try XCTUnwrap(windowController.window)))
         XCTAssertEqual(editor.activeSaveStateForTesting, .saving)
@@ -882,6 +1616,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             """
             window.setTimeout(() => {
               window.webkit.messageHandlers.stacioEditor.postMessage({
+                pageLoadGeneration: 1,
                 name: 'changed',
                 payload: {
                   id: \(documentIDJSON),
@@ -1005,6 +1740,14 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
     }
 }
 
+private final class SimulatedLiveResizeWindow: NSWindow {
+    var simulatesLiveResize = false
+
+    override var inLiveResize: Bool {
+        simulatesLiveResize
+    }
+}
+
 private final class EditorMediaInvalidationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = 0
@@ -1058,7 +1801,7 @@ private func commandKeyEvent(_ characters: String, keyCode: UInt16) -> NSEvent {
     )!
 }
 
-private final class RecordingRemoteTextEditorCloseConfirmer: RemoteTextEditorCloseConfirming {
+final class RecordingRemoteTextEditorCloseConfirmer: RemoteTextEditorCloseConfirming {
     let decision: RemoteTextEditorCloseDecision
     private(set) var promptedFileNames: [String] = []
 
