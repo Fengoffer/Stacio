@@ -9,6 +9,7 @@ public enum StacioLicenseEntitlement {
     public static let fileSync = "file_sync"
     public static let proxyJump = "proxy_jump"
     public static let sessionBulkIO = "session_bulk_io"
+    public static let detachedFileEditor = "detached_file_editor"
 }
 
 public enum LicensedFeatureAccessError: LocalizedError, Equatable {

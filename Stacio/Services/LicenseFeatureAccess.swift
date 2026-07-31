@@ -9,6 +9,7 @@ public enum StacioLicensedFeature: CaseIterable, Sendable {
     case fileSync
     case proxyJump
     case sessionBulkIO
+    case detachedFileEditor
 
     public var entitlement: String {
         switch self {
@@ -20,6 +21,7 @@ public enum StacioLicensedFeature: CaseIterable, Sendable {
         case .fileSync: StacioLicenseEntitlement.fileSync
         case .proxyJump: StacioLicenseEntitlement.proxyJump
         case .sessionBulkIO: StacioLicenseEntitlement.sessionBulkIO
+        case .detachedFileEditor: StacioLicenseEntitlement.detachedFileEditor
         }
     }
 }

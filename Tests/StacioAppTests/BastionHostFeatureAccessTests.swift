@@ -11,7 +11,8 @@ final class BastionHostFeatureAccessTests: XCTestCase {
             .advancedMetrics: "advanced_metrics",
             .fileSync: "file_sync",
             .proxyJump: "proxy_jump",
-            .sessionBulkIO: "session_bulk_io"
+            .sessionBulkIO: "session_bulk_io",
+            .detachedFileEditor: "detached_file_editor"
         ]
 
         XCTAssertEqual(StacioLicensedFeature.allCases.count, expected.count)
@@ -42,6 +43,22 @@ final class BastionHostFeatureAccessTests: XCTestCase {
         XCTAssertFalse(state.enables(.fileSync))
         XCTAssertFalse(state.enables(.proxyJump))
         XCTAssertFalse(state.enables(.sessionBulkIO))
+        XCTAssertFalse(state.enables(.detachedFileEditor))
+    }
+
+    func testDetachedEditorEntitlementDoesNotUnlockOtherLicensedFeatures() {
+        let state = makeState(
+            plan: "custom",
+            status: .offlineActive,
+            permissions: [StacioLicenseEntitlement.detachedFileEditor],
+            expiresAt: .distantFuture
+        )
+
+        XCTAssertTrue(state.enables(.detachedFileEditor))
+        XCTAssertFalse(state.enables(.multiExec))
+        XCTAssertFalse(state.enables(.aiAgent))
+        XCTAssertFalse(state.enables(.bastionHost))
+        XCTAssertFalse(state.enables(.sshTunnel))
     }
 
     func testInvalidExpiredAndRevokedStatesDisableEveryLicensedFeature() {
