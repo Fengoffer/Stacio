@@ -751,6 +751,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         {
             view.frame = superview.bounds
         }
+        // spec: fix-workbench-window-resize — standalone 模式下用 frame+autoresizingMask 同步尺寸。
+        // ensureEditorSplitViewAttached 在切换到 split 模式时会重置 translatesAutoresizingMaskIntoConstraints。
         if contentSplitView.superview == nil,
            fileBrowserPaneView.superview === view,
            fileBrowserPaneView.frame != view.bounds
@@ -1476,6 +1478,11 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             return
         }
         NSLayoutConstraint.deactivate(fileBrowserStandaloneConstraints)
+        // spec: fix-workbench-window-resize — 重置 translatesAutoresizingMaskIntoConstraints，
+        // 因为 synchronizeStandaloneFileBrowserFrameIfNeeded 在拖拽窗口时可能将其设为 true，
+        // 若不重置，fileBrowserPaneView 进入 contentSplitView 后 Auto Layout 约束失效，
+        // editorView 被挤压到 0，Monaco 编辑器无法渲染。
+        fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = false
         fileBrowserPaneView.removeFromSuperview()
         view.addSubview(contentSplitView)
         contentSplitConstraints = [
@@ -1509,6 +1516,9 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         contentSplitConstraints = []
         contentSplitView.removeFromSuperview()
         view.addSubview(fileBrowserPaneView)
+        // spec: fix-workbench-window-resize — 确保 standalone 约束模式下
+        // translatesAutoresizingMaskIntoConstraints = false，Auto Layout 约束才能生效
+        fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate(fileBrowserStandaloneConstraints)
         view.layoutSubtreeIfNeeded()
     }
@@ -1724,9 +1734,10 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         else {
             return
         }
-
+        // spec: fix-workbench-window-resize — standalone 模式下用 frame+autoresizingMask 同步尺寸。
+        // 注意：此处设置 translatesAutoresizingMaskIntoConstraints = true 是 standalone 模式的正常状态。
+        // ensureEditorSplitViewAttached 在切换到 split 模式时会重置为 false。
         if fileBrowserPaneView.frame != view.bounds {
-            NSLayoutConstraint.deactivate(fileBrowserStandaloneConstraints)
             fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = true
             fileBrowserPaneView.autoresizingMask = [.width, .height]
             fileBrowserPaneView.frame = view.bounds

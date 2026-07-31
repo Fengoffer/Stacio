@@ -95,7 +95,13 @@ public final class UpdatePromptTitlebarButton: NSButton {
 
 private final class WorkbenchRootView: NSView, StacioEffectiveAppearanceRefreshHandling {
     override var fittingSize: NSSize {
-        bounds.size
+        // spec: fix-workbench-window-resize — flag=true 时使用默认 fittingSize，
+        // 让 AppKit 正确计算 zoom 的 standardFrame/userFrame 切换；
+        // flag=false 时保留修复前的 bounds.size 覆写（回滚通道）
+        if WorkbenchWindowController.workbenchResizeFixEnabled {
+            return super.fittingSize
+        }
+        return bounds.size
     }
 
     override var intrinsicContentSize: NSSize {
@@ -103,7 +109,15 @@ private final class WorkbenchRootView: NSView, StacioEffectiveAppearanceRefreshH
     }
 
     override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(constrainedContentSize(newSize))
+        // spec: fix-workbench-window-resize — flag=true 时移除 constrainedContentSize 钳制，
+        // 让 contentView 自由适配 window resize（原先的钳制在 window.frame 未更新时
+        // 会把 contentView 锁回旧尺寸，导致初始状态无法拖大窗口）；
+        // flag=false 时保留修复前行为（回滚通道）
+        if WorkbenchWindowController.workbenchResizeFixEnabled {
+            super.setFrameSize(newSize)
+        } else {
+            super.setFrameSize(constrainedContentSize(newSize))
+        }
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -300,6 +314,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var workbenchContentWidthStayConstraint: NSLayoutConstraint?
     private var workbenchContentHeightStayConstraint: NSLayoutConstraint?
     private var isSystemZoomingWindow = false
+    /// 运行时即时回滚开关：false 时恢复修复前的 live-resize 行为（spec: fix-workbench-window-resize）
+    fileprivate static let workbenchResizeFixEnabled = true
     private var aiAssistantOverlayViewController: AIAssistantPanelViewController?
     private var agentExecutionCoordinator: AgentExecutionCoordinator?
     private var splitResizeObserver: NSObjectProtocol?
@@ -625,6 +641,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     public func windowDidEndLiveResize(_ notification: Notification) {
         isUserLiveResizingWindow = false
         if let window = notification.object as? NSWindow {
+            // === SPEC: fix-workbench-window-resize ===
+            // 不再升回 999，stay 约束保持 .defaultLow，避免阻挡后续 resize
+            if Self.workbenchResizeFixEnabled {
+                updateWorkbenchContentSizeStayConstraints(forFrameSize: window.frame.size, in: window)
+            }
             layoutWorkbenchContent(in: window)
             saveWorkbenchWindowFrame(window)
         }
@@ -722,12 +743,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let widthConstraint = contentView.widthAnchor.constraint(
             equalToConstant: contentView.bounds.width
         )
-        widthConstraint.priority = NSLayoutConstraint.Priority(999)
+        // spec: fix-workbench-window-resize — 默认 .defaultLow，避免阻挡窗口 live resize
+        widthConstraint.priority = Self.workbenchResizeFixEnabled ? .defaultLow : NSLayoutConstraint.Priority(999)
         widthConstraint.identifier = "Stacio.Workbench.contentWidthStay"
         let heightConstraint = contentView.heightAnchor.constraint(
             equalToConstant: contentView.bounds.height
         )
-        heightConstraint.priority = NSLayoutConstraint.Priority(999)
+        heightConstraint.priority = Self.workbenchResizeFixEnabled ? .defaultLow : NSLayoutConstraint.Priority(999)
         heightConstraint.identifier = "Stacio.Workbench.contentHeightStay"
         NSLayoutConstraint.activate([widthConstraint, heightConstraint])
         workbenchContentWidthStayConstraint = widthConstraint
@@ -758,8 +780,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     private func finishWorkbenchSystemResizeIfNeeded() {
         guard isSystemZoomingWindow else { return }
-        workbenchContentWidthStayConstraint?.priority = NSLayoutConstraint.Priority(999)
-        workbenchContentHeightStayConstraint?.priority = NSLayoutConstraint.Priority(999)
+        // spec: fix-workbench-window-resize — flag=true 时保持 .defaultLow 不升回（与 live resize 一致）；
+        // flag=false 时恢复修复前行为（升回 999）
+        if Self.workbenchResizeFixEnabled == false {
+            workbenchContentWidthStayConstraint?.priority = NSLayoutConstraint.Priority(999)
+            workbenchContentHeightStayConstraint?.priority = NSLayoutConstraint.Priority(999)
+        }
         isSystemZoomingWindow = false
     }
 
