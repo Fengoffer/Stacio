@@ -36,13 +36,11 @@ final class WorkbenchCenterContainerViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             controller.editorSidecarWidthForTesting,
-            WorkbenchCenterContainerViewController.defaultEditorTargetWidth,
+            680,
             accuracy: 1
         )
-        XCTAssertEqual(
-            controller.editorTargetWidthForTesting,
-            WorkbenchCenterContainerViewController.defaultEditorTargetWidth
-        )
+        XCTAssertEqual(controller.editorTargetWidthForTesting, 680)
+        XCTAssertEqual(WorkbenchCenterContainerViewController.defaultEditorTargetWidth, 680)
         XCTAssertEqual(store.savedSidecarWidths, [])
     }
 
@@ -137,6 +135,27 @@ final class WorkbenchCenterContainerViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.editorContentViewControllerForTesting === first)
         XCTAssertTrue(first.parent === controller)
         XCTAssertNil(second.parent)
+    }
+
+    func testInstallRejectsContentOwnedByAnotherParentWithoutReparentingIt() throws {
+        let controller = makeCenter(
+            width: 1_400,
+            store: RecordingRemoteEditorPresentationStore()
+        )
+        let foreignParent = PlainCenterChildViewController()
+        let editor = PlainCenterChildViewController()
+        foreignParent.loadView()
+        foreignParent.addChild(editor)
+        foreignParent.view.addSubview(editor.view)
+
+        XCTAssertThrowsError(try controller.installEditorContent(editor)) {
+            XCTAssertEqual($0 as? RemoteEditorDockHostError, .invalidContainment)
+        }
+
+        XCTAssertTrue(editor.parent === foreignParent)
+        XCTAssertTrue(editor.view.superview === foreignParent.view)
+        XCTAssertNil(controller.editorContentViewControllerForTesting)
+        XCTAssertTrue(controller.isEditorSidecarCollapsedForTesting)
     }
 
     func testInstallingSameContentIsIdempotent() throws {

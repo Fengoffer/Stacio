@@ -3,6 +3,7 @@ import AppKit
 public enum RemoteEditorDockHostError: Error, Equatable {
     case occupied
     case contentMismatch
+    case invalidContainment
 }
 
 @MainActor
@@ -158,6 +159,12 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             }
             setEditorSidecarCollapsed(false)
             return
+        }
+        guard controller.parent == nil else {
+            throw RemoteEditorDockHostError.invalidContainment
+        }
+        if controller.isViewLoaded, controller.view.superview != nil {
+            throw RemoteEditorDockHostError.invalidContainment
         }
 
         performProgrammaticLayout {
