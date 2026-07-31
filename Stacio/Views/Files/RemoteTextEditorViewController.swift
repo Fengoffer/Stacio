@@ -263,6 +263,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private static let aiDocumentExcerptLimit = 12_000
     private static let maximumMonacoReadinessRecoveryReloads = 1
     private static let monacoReadinessGraceInterval: TimeInterval = 3
+    private static let savedCloseHandshakeTimeout: TimeInterval = 2
 
     public let localURL: URL
     public var onDirtyStateChanged: ((Bool) -> Void)?
@@ -271,6 +272,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     public var onWindowCloseReady: (() -> Void)?
     public var onPendingCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
     public var onAIQuestionRequested: ((String) -> Void)?
+    var onWindowPresentationChanged: ((String, Bool) -> Void)?
 
     private let settingsStore: AppSettingsStore
     private let localTextIO: FileTransferLocalTextIO
@@ -317,6 +319,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private var pendingTabCloseDocumentIDs = Set<String>()
     private var pendingWindowCloseDocumentIDs = Set<String>()
     private var pendingSavedCloseHandshakes: [String: PendingSavedCloseHandshake] = [:]
+    private var savedCloseHandshakeTimeouts: [String: DispatchWorkItem] = [:]
     private var pendingLocalDocumentLoadIDs = Set<String>()
     private var hasPendingWindowClose = false
     private var isEvaluatingWindowClose = false
@@ -1032,6 +1035,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     deinit {
         monacoReadinessWatchdog?.cancel()
+        savedCloseHandshakeTimeouts.values.forEach { $0.cancel() }
         for document in documents {
             Self.unregisterRemotePreviewSource(document.previewSource)
         }
@@ -1660,6 +1664,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     private func loadMonacoEditorHTML(resetReadinessRecoveryBudget: Bool = false) {
+        cancelAllSavedCloseHandshakes()
         cancelMonacoReadinessWatchdog()
         if resetReadinessRecoveryBudget {
             monacoReadinessRecoveryReloadCount = 0
@@ -1717,12 +1722,14 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard navigationError.domain != NSURLErrorDomain
                 || navigationError.code != NSURLErrorCancelled
         else { return }
+        cancelAllSavedCloseHandshakes()
         cancelMonacoReadinessWatchdog()
         scheduleMonacoReadinessRecovery()
     }
 
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard webView === self.webView else { return }
+        cancelAllSavedCloseHandshakes()
         cancelMonacoReadinessWatchdog()
         isMonacoRuntimeReady = false
         isEditorReady = false
@@ -1851,6 +1858,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         if textChanged || revisionAdvanced {
             pendingTabCloseDocumentIDs.remove(id)
             pendingSavedCloseHandshakes.removeValue(forKey: id)
+            cancelSavedCloseHandshakeTimeout(documentID: id)
             cancelPendingWindowClose()
         }
         documents[index].text = text
@@ -2051,6 +2059,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         case .failure(let error):
             pendingTabCloseDocumentIDs.remove(documentID)
             pendingSavedCloseHandshakes.removeValue(forKey: documentID)
+            cancelSavedCloseHandshakeTimeout(documentID: documentID)
             documents[index].saveState = .failed
             documents[index].saveFailureMessage = RuntimeDiagnosticFormatter.userMessage(for: error)
             cancelPendingWindowClose()
@@ -2074,13 +2083,18 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             savedText: savedText,
             savedRevision: savedRevision
         )
+        scheduleSavedCloseHandshakeTimeout(documentID: documentID, requestID: requestID)
         callEditorFunction(
             "confirmSavedContentBeforeClose",
             payload: EditorCloseHandshakeRequestPayload(
                 documentID: documentID,
                 requestID: requestID
-            )
-        )
+            ),
+            requiresFunction: true
+        ) { [weak self] error in
+            guard error != nil else { return }
+            self?.cancelSavedCloseHandshake(documentID: documentID, requestID: requestID)
+        }
     }
 
     private func handleSavedCloseHandshake(_ payload: [String: Any]?) {
@@ -2093,6 +2107,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
               let index = documents.firstIndex(where: { $0.id == documentID })
         else { return }
         pendingSavedCloseHandshakes.removeValue(forKey: documentID)
+        cancelSavedCloseHandshakeTimeout(documentID: documentID)
 
         guard content == pending.savedText,
               revision == pending.savedRevision,
@@ -2113,6 +2128,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     private func finishSavedClose(documentID: String) {
+        cancelSavedCloseHandshakeTimeout(documentID: documentID)
         let shouldRemoveTab = pendingTabCloseDocumentIDs.remove(documentID) != nil
         if hasPendingWindowClose, pendingWindowCloseDocumentIDs.contains(documentID) {
             pendingWindowCloseDocumentIDs.remove(documentID)
@@ -2134,6 +2150,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         let shouldResolve = hasPendingWindowClose && pendingCloseResolutionExpected
         hasPendingWindowClose = false
         pendingWindowCloseDocumentIDs.removeAll()
+        for documentID in pendingSavedCloseHandshakes.keys
+            where pendingTabCloseDocumentIDs.contains(documentID) == false
+        {
+            cancelSavedCloseHandshakeTimeout(documentID: documentID)
+        }
         pendingSavedCloseHandshakes = pendingSavedCloseHandshakes.filter {
             pendingTabCloseDocumentIDs.contains($0.key)
         }
@@ -2146,6 +2167,45 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard pendingCloseResolutionExpected else { return }
         pendingCloseResolutionExpected = false
         onPendingCloseResolved?(resolution)
+    }
+
+    private func scheduleSavedCloseHandshakeTimeout(documentID: String, requestID: String) {
+        cancelSavedCloseHandshakeTimeout(documentID: documentID)
+        let timeout = DispatchWorkItem { [weak self] in
+            self?.cancelSavedCloseHandshake(documentID: documentID, requestID: requestID)
+        }
+        savedCloseHandshakeTimeouts[documentID] = timeout
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.savedCloseHandshakeTimeout,
+            execute: timeout
+        )
+    }
+
+    private func cancelSavedCloseHandshakeTimeout(documentID: String) {
+        savedCloseHandshakeTimeouts.removeValue(forKey: documentID)?.cancel()
+    }
+
+    private func cancelSavedCloseHandshake(documentID: String, requestID: String) {
+        guard pendingSavedCloseHandshakes[documentID]?.requestID == requestID else { return }
+        pendingSavedCloseHandshakes.removeValue(forKey: documentID)
+        cancelSavedCloseHandshakeTimeout(documentID: documentID)
+        pendingTabCloseDocumentIDs.remove(documentID)
+        if hasPendingWindowClose, pendingWindowCloseDocumentIDs.contains(documentID) {
+            cancelPendingWindowClose()
+        }
+    }
+
+    private func cancelAllSavedCloseHandshakes() {
+        guard pendingSavedCloseHandshakes.isEmpty == false else { return }
+        let documentIDs = Set(pendingSavedCloseHandshakes.keys)
+        pendingSavedCloseHandshakes.removeAll()
+        for documentID in documentIDs {
+            cancelSavedCloseHandshakeTimeout(documentID: documentID)
+            pendingTabCloseDocumentIDs.remove(documentID)
+        }
+        if hasPendingWindowClose {
+            cancelPendingWindowClose()
+        }
     }
 
     private func aiQuestionForActiveDocument() -> String? {
@@ -2185,6 +2245,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard let activeDocument else { return }
         onDirtyStateChanged?(hasUnsavedChanges)
         onActiveDocumentChanged?(activeDocument.fileName, hasUnsavedChanges)
+        onWindowPresentationChanged?(activeDocument.fileName, hasUnsavedChanges)
     }
 
     private func syncWorkspaceToWebView() {
@@ -2228,17 +2289,34 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private func callEditorFunction<Payload: Encodable>(
         _ functionName: String,
         payload: Payload,
+        requiresFunction: Bool = false,
         completion: ((Error?) -> Void)? = nil
     ) {
-        guard isViewLoaded,
-              let webView,
-              let data = try? JSONEncoder().encode(payload),
+        guard isViewLoaded, let webView else {
+            completion?(RemoteTextEditorJavaScriptError.bridgeUnavailable)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(payload),
               let json = String(data: data, encoding: .utf8)
         else {
+            completion?(RemoteTextEditorJavaScriptError.invalidPayload)
             return
         }
         editorFunctionCallsForTestingStorage.append(functionName)
-        let script = "window.StacioEditor && window.StacioEditor.\(functionName)(\(json));"
+        let script: String
+        if requiresFunction {
+            script = """
+            (() => {
+              const editor = window.StacioEditor;
+              if (!editor || typeof editor.\(functionName) !== 'function') {
+                throw new Error('StacioEditor.\(functionName) is unavailable');
+              }
+              return editor.\(functionName)(\(json));
+            })();
+            """
+        } else {
+            script = "window.StacioEditor && window.StacioEditor.\(functionName)(\(json));"
+        }
         editorFunctionScriptsForTestingStorage.append(script)
         if let completion {
             webView.evaluateJavaScript(script) { _, error in
@@ -3096,12 +3174,7 @@ public final class RemoteTextEditorWindowController: NSWindowController, NSWindo
         window.center()
         super.init(window: window)
         window.delegate = self
-        editorViewController.onDirtyStateChanged = { [weak window, weak editorViewController] isDirty in
-            let fileName = editorViewController?.activeFileNameForTesting ?? ""
-            window?.title = Self.windowTitle(fileName: fileName, isDirty: isDirty)
-            window?.isDocumentEdited = isDirty
-        }
-        editorViewController.onActiveDocumentChanged = { [weak window] fileName, isDirty in
+        editorViewController.onWindowPresentationChanged = { [weak window] fileName, isDirty in
             window?.title = Self.windowTitle(fileName: fileName, isDirty: isDirty)
             window?.isDocumentEdited = isDirty
         }
@@ -3258,6 +3331,11 @@ private struct PendingSavedCloseHandshake {
     let requestID: String
     let savedText: String
     let savedRevision: Int
+}
+
+private enum RemoteTextEditorJavaScriptError: Error {
+    case bridgeUnavailable
+    case invalidPayload
 }
 
 private struct EditorActionPayload: Encodable {

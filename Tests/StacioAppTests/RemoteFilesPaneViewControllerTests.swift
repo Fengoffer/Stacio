@@ -837,6 +837,54 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         XCTAssertEqual(pane.textEditorViewControllerForTesting?.currentTextForTesting, "second=true\n")
     }
 
+    func testRightWorkspaceCloseThenReopenSamePathIgnoresOlderReadGeneration() throws {
+        let remotePath = "/srv/app/reused.conf"
+        let bridge = SequencedDelayedRemoteFilesPaneReadBridge(
+            entries: [
+                RemoteFileEntry(kind: .file, path: remotePath, size: 13, linkTarget: nil)
+            ],
+            remotePath: remotePath,
+            readData: [
+                Data("stale=true\n".utf8),
+                Data("fresh=true\n".utf8)
+            ]
+        )
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "scp_open_progress_same_path_generation",
+            context: Self.liveContext(),
+            title: "远端文件",
+            bridge: bridge,
+            transferScheduler: nil,
+            initialRemotePath: "/srv/app",
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+        pane.loadView()
+
+        pane.filesViewControllerForTesting.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        pane.filesViewControllerForTesting.openSelectedEntryForTesting()
+        XCTAssertTrue(bridge.waitUntilReadStarted(at: 0))
+        XCTAssertTrue(pane.closeRightWorkspaceForTesting())
+
+        pane.filesViewControllerForTesting.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        pane.filesViewControllerForTesting.openSelectedEntryForTesting()
+        XCTAssertTrue(bridge.waitUntilReadStarted(at: 1))
+
+        bridge.releaseRead(at: 0)
+
+        let staleGenerationOpened = waitUntil(timeout: 0.5) {
+            pane.textEditorViewControllerForTesting?.currentTextForTesting == "stale=true\n"
+        }
+        XCTAssertFalse(staleGenerationOpened)
+        XCTAssertNil(pane.textEditorViewControllerForTesting)
+        XCTAssertNotNil(pane.openProgressViewControllerForTesting)
+
+        bridge.releaseRead(at: 1)
+
+        XCTAssertTrue(waitUntil {
+            pane.textEditorViewControllerForTesting?.currentTextForTesting == "fresh=true\n"
+        })
+    }
+
     private static func liveContext() -> TunnelLiveSessionContext {
         TunnelLiveSessionContext(
             config: SshConnectionConfig(
@@ -1249,6 +1297,105 @@ private final class MultiDelayedRemoteFilesPaneReadBridge: RemoteFilesBridging {
         lock.lock()
         defer { lock.unlock() }
         return semaphores[remotePath]
+    }
+}
+
+private final class SequencedDelayedRemoteFilesPaneReadBridge: RemoteFilesBridging {
+    private let entries: [RemoteFileEntry]
+    private let remotePath: String
+    private let readData: [Data]
+    private let started: [DispatchSemaphore]
+    private let releases: [DispatchSemaphore]
+    private let lock = NSLock()
+    private var nextReadIndex = 0
+
+    init(entries: [RemoteFileEntry], remotePath: String, readData: [Data]) {
+        self.entries = entries
+        self.remotePath = remotePath
+        self.readData = readData
+        started = readData.map { _ in DispatchSemaphore(value: 0) }
+        releases = readData.map { _ in DispatchSemaphore(value: 0) }
+    }
+
+    func waitUntilReadStarted(at index: Int, timeout: TimeInterval = 1) -> Bool {
+        guard started.indices.contains(index) else { return false }
+        return started[index].wait(timeout: .now() + timeout) == .success
+    }
+
+    func releaseRead(at index: Int) {
+        guard releases.indices.contains(index) else { return }
+        releases[index].signal()
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        entries
+    }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        entries
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {}
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {}
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {}
+
+    func readLiveRemoteFile(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        offset: UInt64,
+        length: UInt64?
+    ) throws -> Data {
+        guard remotePath == self.remotePath else {
+            throw MissingRemoteFilesPaneReadDataError(path: remotePath)
+        }
+
+        lock.lock()
+        let readIndex = nextReadIndex
+        nextReadIndex += 1
+        lock.unlock()
+
+        guard readData.indices.contains(readIndex) else {
+            throw MissingRemoteFilesPaneReadDataError(path: remotePath)
+        }
+        started[readIndex].signal()
+        guard releases[readIndex].wait(timeout: .now() + 2) == .success else {
+            throw MissingRemoteFilesPaneReadDataError(path: remotePath)
+        }
+        return readData[readIndex]
     }
 }
 

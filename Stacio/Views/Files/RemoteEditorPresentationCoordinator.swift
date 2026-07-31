@@ -67,6 +67,11 @@ public typealias RemoteEditorOpenProgressFactory = @MainActor (
     _ mode: RemoteFileOpenMode
 ) -> RemoteFileOpenProgressViewController
 
+public typealias RemoteLocalEditorFactory = @MainActor (
+    _ localURL: URL,
+    _ saveHandler: RemoteEditSaveHandler?
+) -> RemoteTextEditorViewController
+
 @MainActor
 public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentationRouting {
     private enum State {
@@ -105,10 +110,12 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
     private let closeConfirmer: any RemoteTextEditorCloseConfirming
     private let fallbackOpener: any RemoteEditOpening
     private let editorFactory: RemoteEditorFactory
+    private let localEditorFactory: RemoteLocalEditorFactory
     private let progressFactory: RemoteEditorOpenProgressFactory
 
     private var state: State = .closed
     private var activeOpenRequestIDs: [OpenRequestKey: UUID] = [:]
+    private var activeOpenRequestKeysByID: [UUID: OpenRequestKey] = [:]
     private var isTransitioning = false
     private weak var pendingCloseEditor: RemoteTextEditorViewController?
     private var pendingCloseCompletions: [(RemoteTextEditorCloseResolution) -> Void] = []
@@ -124,6 +131,12 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         editorFactory: @escaping RemoteEditorFactory = { document, saveHandler in
             RemoteTextEditorViewController(document: document, onSaveText: saveHandler)
         },
+        localEditorFactory: @escaping RemoteLocalEditorFactory = { localURL, saveHandler in
+            RemoteTextEditorViewController(
+                localURL: localURL,
+                onSave: { _ in try saveHandler?() }
+            )
+        },
         progressFactory: @escaping RemoteEditorOpenProgressFactory = { selection, mode in
             RemoteFileOpenProgressViewController(selection: selection, mode: mode)
         }
@@ -136,6 +149,7 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         self.closeConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
         self.fallbackOpener = fallbackOpener ?? AppKitRemoteEditOpener()
         self.editorFactory = editorFactory
+        self.localEditorFactory = localEditorFactory
         self.progressFactory = progressFactory
     }
 
@@ -167,40 +181,48 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         selection: RemoteFileSelection,
         mode: RemoteFileOpenMode
     ) -> Bool {
-        guard handlesInWorkspace(mode) else {
-            return fallbackOpener.prepareToOpenRemote(selection: selection, mode: mode)
-        }
-        guard isTransitioning == false else { return false }
-        let key = requestKey(remotePath: selection.path, mode: mode)
-        guard activeOpenRequestIDs[key] == nil else { return false }
+        prepareRemoteOpen(selection: selection, mode: mode) != nil
+    }
 
-        let requestID = UUID()
-        activeOpenRequestIDs[key] = requestID
+    public func prepareRemoteOpen(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest? {
+        guard handlesInWorkspace(mode) else {
+            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
+        }
+        guard isTransitioning == false, pendingCloseEditor == nil else { return nil }
+        let key = requestKey(remotePath: selection.path, mode: mode)
+        guard activeOpenRequestIDs[key] == nil else { return nil }
+
+        let request = RemoteEditOpenRequest()
+        activeOpenRequestIDs[key] = request.id
+        activeOpenRequestKeysByID[request.id] = key
         if currentEditor != nil {
             if case .dockedHidden = state {
                 expandDockedEditor()
             }
-            return true
+            return request
         }
 
         guard case .closed = state, let dockHost else {
-            activeOpenRequestIDs[key] = nil
-            return false
+            invalidateOpenRequest(request.id)
+            return nil
         }
         let progress = progressFactory(selection, mode)
         progress.onCloseRequested = { [weak self, weak progress] in
             guard let self, let progress else { return }
-            self.closeOpeningPlaceholder(requestID: requestID, progress: progress)
+            self.closeOpeningPlaceholder(requestID: request.id, progress: progress)
         }
         do {
             onWillPresentDockedEditor?(targetSidecarWidth)
             try dockHost.installEditorContent(progress)
-            state = .opening(requestID: requestID, progress: progress)
+            state = .opening(requestID: request.id, progress: progress)
             publishSnapshot()
-            return true
+            return request
         } catch {
-            activeOpenRequestIDs[key] = nil
-            return false
+            invalidateOpenRequest(request.id)
+            return nil
         }
     }
 
@@ -219,11 +241,76 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             )
             return
         }
+        guard pendingCloseEditor == nil else { return }
+        if case .opening(let requestID, _) = state,
+           activeOpenRequestKeysByID[requestID] != nil
+        {
+            openLocalCopy(
+                at: url,
+                mode: mode,
+                applicationURL: applicationURL,
+                saveHandler: saveHandler,
+                request: RemoteEditOpenRequest(id: requestID)
+            )
+            return
+        }
+        openLocalCopyWithoutPreparedRequest(
+            at: url,
+            mode: mode,
+            applicationURL: applicationURL,
+            saveHandler: saveHandler
+        )
+    }
+
+    public func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard handlesInWorkspace(mode) else {
+            fallbackOpener.openLocalCopy(
+                at: url,
+                mode: mode,
+                applicationURL: applicationURL,
+                saveHandler: saveHandler,
+                request: request
+            )
+            return
+        }
+        guard let requestID = consumeActiveRequest(request, mode: mode) else { return }
+        guard pendingCloseEditor == nil else { return }
         if let editor = currentEditor {
             editor.openDocument(localURL: url) { _ in try saveHandler?() }
             if case .dockedHidden = state {
                 expandDockedEditor()
             }
+            publishSnapshot()
+            return
+        }
+        guard case .opening(let activeID, let progress) = state,
+              activeID == requestID,
+              dockHost != nil
+        else { return }
+        let editor = localEditorFactory(url, saveHandler)
+        wireEditorCallbacks(editor)
+        replaceOpeningProgress(progress, requestID: requestID, with: editor)
+    }
+
+    private func openLocalCopyWithoutPreparedRequest(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?
+    ) {
+        guard pendingCloseEditor == nil else { return }
+        if let editor = currentEditor {
+            editor.openDocument(localURL: url) { _ in try saveHandler?() }
+            if case .dockedHidden = state {
+                expandDockedEditor()
+            }
+            publishSnapshot()
             return
         }
         guard case .closed = state, let dockHost else {
@@ -235,10 +322,7 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             )
             return
         }
-        let editor = RemoteTextEditorViewController(
-            localURL: url,
-            onSave: { _ in try saveHandler?() }
-        )
+        let editor = localEditorFactory(url, saveHandler)
         wireEditorCallbacks(editor)
         do {
             onWillPresentDockedEditor?(targetSidecarWidth)
@@ -264,9 +348,30 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             fallbackOpener.openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
             return
         }
-        guard let requestID = consumeActiveRequest(remotePath: document.remotePath, mode: mode) else {
+        guard let request = activeRequest(remotePath: document.remotePath, mode: mode) else { return }
+        openRemoteDocument(document, mode: mode, saveHandler: saveHandler, request: request)
+    }
+
+    public func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard handlesInWorkspace(mode) else {
+            fallbackOpener.openRemoteDocument(
+                document,
+                mode: mode,
+                saveHandler: saveHandler,
+                request: request
+            )
             return
         }
+        guard let requestID = consumeActiveRequest(
+            request,
+            expectedKey: requestKey(remotePath: document.remotePath, mode: mode)
+        ) else { return }
+        guard pendingCloseEditor == nil else { return }
         if let editor = currentEditor {
             editor.openDocument(document, onSaveText: saveHandler)
             if case .dockedHidden = state {
@@ -276,33 +381,12 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             return
         }
         guard case .opening(let activeID, let progress) = state,
-              activeID == requestID,
-              let dockHost
+              activeID == requestID
         else { return }
 
         let editor = editorFactory(document, saveHandler)
         wireEditorCallbacks(editor)
-        do {
-            try dockHost.removeEditorContent(progress)
-            do {
-                try dockHost.installEditorContent(editor)
-            } catch {
-                do {
-                    try dockHost.installEditorContent(progress)
-                    progress.showFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
-                    state = .opening(requestID: requestID, progress: progress)
-                } catch {
-                    state = .closed
-                }
-                publishSnapshot()
-                return
-            }
-            state = .docked(editor)
-            publishSnapshot()
-        } catch {
-            state = .opening(requestID: requestID, progress: progress)
-            publishSnapshot()
-        }
+        replaceOpeningProgress(progress, requestID: requestID, with: editor)
     }
 
     public func remoteOpenDidFail(
@@ -314,9 +398,30 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             fallbackOpener.remoteOpenDidFail(selection: selection, mode: mode, message: message)
             return
         }
-        guard let requestID = consumeActiveRequest(remotePath: selection.path, mode: mode) else {
+        guard let request = activeRequest(remotePath: selection.path, mode: mode) else { return }
+        remoteOpenDidFail(selection: selection, mode: mode, message: message, request: request)
+    }
+
+    public func remoteOpenDidFail(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        message: String,
+        request: RemoteEditOpenRequest
+    ) {
+        guard handlesInWorkspace(mode) else {
+            fallbackOpener.remoteOpenDidFail(
+                selection: selection,
+                mode: mode,
+                message: message,
+                request: request
+            )
             return
         }
+        guard let requestID = consumeActiveRequest(
+            request,
+            expectedKey: requestKey(remotePath: selection.path, mode: mode)
+        ) else { return }
+        guard pendingCloseEditor == nil else { return }
         if let editor = currentEditor {
             editor.openFailedDocument(
                 remotePath: selection.path,
@@ -367,6 +472,10 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         parentWindow: NSWindow?,
         completion: ((RemoteTextEditorCloseResolution) -> Void)?
     ) -> RemoteTextEditorCloseDisposition {
+        guard isTransitioning == false else {
+            completion?(.cancelled)
+            return .cancelled
+        }
         if let completion {
             pendingCloseCompletions.append(completion)
         }
@@ -375,6 +484,7 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         }
         switch state {
         case .closed:
+            invalidateAllOpenRequests()
             finishCloseCompletions(.ready)
             return .ready
         case .opening(_, let progress):
@@ -440,20 +550,83 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         OpenRequestKey(remotePath: remotePath, modeLogName: mode.logName)
     }
 
-    private func consumeActiveRequest(
+    private func activeRequest(
         remotePath: String,
         mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest? {
+        let key = requestKey(remotePath: remotePath, mode: mode)
+        guard let requestID = activeOpenRequestIDs[key] else { return nil }
+        return RemoteEditOpenRequest(id: requestID)
+    }
+
+    private func consumeActiveRequest(
+        _ request: RemoteEditOpenRequest,
+        mode: RemoteFileOpenMode
     ) -> UUID? {
-        activeOpenRequestIDs.removeValue(
-            forKey: requestKey(remotePath: remotePath, mode: mode)
-        )
+        guard let key = activeOpenRequestKeysByID[request.id], key.modeLogName == mode.logName else {
+            return nil
+        }
+        return consumeActiveRequest(request, expectedKey: key)
+    }
+
+    private func consumeActiveRequest(
+        _ request: RemoteEditOpenRequest,
+        expectedKey: OpenRequestKey
+    ) -> UUID? {
+        guard activeOpenRequestKeysByID[request.id] == expectedKey,
+              activeOpenRequestIDs[expectedKey] == request.id
+        else { return nil }
+        activeOpenRequestKeysByID[request.id] = nil
+        activeOpenRequestIDs[expectedKey] = nil
+        return request.id
+    }
+
+    private func invalidateOpenRequest(_ requestID: UUID) {
+        guard let key = activeOpenRequestKeysByID.removeValue(forKey: requestID) else { return }
+        if activeOpenRequestIDs[key] == requestID {
+            activeOpenRequestIDs[key] = nil
+        }
+    }
+
+    private func invalidateAllOpenRequests() {
+        activeOpenRequestIDs.removeAll()
+        activeOpenRequestKeysByID.removeAll()
     }
 
     private func invalidateOpenRequests(for progress: RemoteFileOpenProgressViewController) {
         guard case .opening(let requestID, let currentProgress) = state,
               currentProgress === progress
         else { return }
-        activeOpenRequestIDs = activeOpenRequestIDs.filter { $0.value != requestID }
+        invalidateOpenRequest(requestID)
+    }
+
+    private func replaceOpeningProgress(
+        _ progress: RemoteFileOpenProgressViewController,
+        requestID: UUID,
+        with editor: RemoteTextEditorViewController
+    ) {
+        guard let dockHost else { return }
+        do {
+            try dockHost.removeEditorContent(progress)
+            do {
+                try dockHost.installEditorContent(editor)
+            } catch {
+                do {
+                    try dockHost.installEditorContent(progress)
+                    progress.showFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
+                    state = .opening(requestID: requestID, progress: progress)
+                } catch {
+                    state = .closed
+                }
+                publishSnapshot()
+                return
+            }
+            state = .docked(editor)
+            publishSnapshot()
+        } catch {
+            state = .opening(requestID: requestID, progress: progress)
+            publishSnapshot()
+        }
     }
 
     private func closeOpeningPlaceholder(
@@ -513,6 +686,7 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
             return false
         }
         pendingCloseEditor = nil
+        invalidateAllOpenRequests()
         state = .closed
         publishSnapshot()
         finishCloseCompletions(.ready)

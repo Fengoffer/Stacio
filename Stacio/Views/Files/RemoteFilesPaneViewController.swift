@@ -607,11 +607,14 @@ public final class RemoteFilesPaneViewController: NSViewController {
         _ = closeRightWorkspaceIfNeeded()
     }
 
-    func beginRightWorkspaceOpenRequest(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> UUID? {
+    func beginRightWorkspaceOpenRequest(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        requestID: UUID = UUID()
+    ) -> UUID? {
         guard presentOpenProgress(selection: selection, mode: mode) else {
             return nil
         }
-        let requestID = UUID()
         rightWorkspaceOpenRequestIDs.insert(requestID)
         return requestID
     }
@@ -990,6 +993,7 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
     private weak var filesPane: RemoteFilesPaneViewController?
     private let fallbackOpener: RemoteEditOpening
     private var rightOpenRequestIDsByKey: [String: UUID] = [:]
+    private var rightOpenRequestKeysByID: [UUID: String] = [:]
 
     init(
         filesPane: RemoteFilesPaneViewController,
@@ -1016,6 +1020,28 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
         }
     }
 
+    func prepareRemoteOpen(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest? {
+        guard let filesPane else {
+            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
+        }
+        let request = RemoteEditOpenRequest()
+        guard filesPane.beginRightWorkspaceOpenRequest(
+            selection: selection,
+            mode: mode,
+            requestID: request.id
+        ) != nil else {
+            return nil
+        }
+        rightOpenRequestKeysByID[request.id] = rightOpenRequestKey(
+            remotePath: selection.path,
+            mode: mode
+        )
+        return request
+    }
+
     func openLocalCopy(
         at url: URL,
         mode: RemoteFileOpenMode,
@@ -1036,6 +1062,35 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
                 saveHandler: saveHandler
             )
         }
+    }
+
+    func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard let filesPane,
+              consumeRightOpenRequest(request, mode: mode, filesPane: filesPane) != nil
+        else { return }
+
+        switch mode {
+        case .textEditor:
+            filesPane.presentTextEditor(localURL: url, saveHandler: saveHandler)
+        case .mediaPreview:
+            filesPane.presentMediaPreview(localURL: url)
+        case .chooseApplication, .defaultApplication:
+            filesPane.clearTransientOpenProgress()
+            fallbackOpener.openLocalCopy(
+                at: url,
+                mode: mode,
+                applicationURL: applicationURL,
+                saveHandler: saveHandler,
+                request: request
+            )
+        }
+        filesPane.finishRightWorkspaceOpenRequest(request.id)
     }
 
     func openRemoteDocument(
@@ -1059,6 +1114,34 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
         }
     }
 
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard let filesPane,
+              consumeRightOpenRequest(
+                request,
+                expectedKey: rightOpenRequestKey(remotePath: document.remotePath, mode: mode),
+                filesPane: filesPane
+              ) != nil
+        else { return }
+
+        switch mode {
+        case .textEditor, .mediaPreview:
+            filesPane.presentRemoteDocument(document, onSaveText: saveHandler)
+        case .chooseApplication, .defaultApplication:
+            fallbackOpener.openRemoteDocument(
+                document,
+                mode: mode,
+                saveHandler: saveHandler,
+                request: request
+            )
+        }
+        filesPane.finishRightWorkspaceOpenRequest(request.id)
+    }
+
     func remoteOpenDidFail(selection: RemoteFileSelection, mode: RemoteFileOpenMode, message: String) {
         switch mode {
         case .textEditor, .mediaPreview:
@@ -1076,12 +1159,56 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
         }
     }
 
+    func remoteOpenDidFail(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        message: String,
+        request: RemoteEditOpenRequest
+    ) {
+        guard let filesPane,
+              consumeRightOpenRequest(
+                request,
+                expectedKey: rightOpenRequestKey(remotePath: selection.path, mode: mode),
+                filesPane: filesPane
+              ) != nil
+        else { return }
+
+        filesPane.presentOpenFailure(selection: selection, mode: mode, message: message)
+        filesPane.finishRightWorkspaceOpenRequest(request.id)
+    }
+
     func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws {
         try fallbackOpener.compareLocalCopies(urls, parentWindow: parentWindow)
     }
 
     private func rightOpenRequestKey(remotePath: String, mode: RemoteFileOpenMode) -> String {
         "\(mode.logName):\(remotePath)"
+    }
+
+    private func consumeRightOpenRequest(
+        _ request: RemoteEditOpenRequest,
+        mode: RemoteFileOpenMode,
+        filesPane: RemoteFilesPaneViewController
+    ) -> UUID? {
+        guard let expectedKey = rightOpenRequestKeysByID[request.id],
+              expectedKey.hasPrefix("\(mode.logName):")
+        else { return nil }
+        return consumeRightOpenRequest(
+            request,
+            expectedKey: expectedKey,
+            filesPane: filesPane
+        )
+    }
+
+    private func consumeRightOpenRequest(
+        _ request: RemoteEditOpenRequest,
+        expectedKey: String,
+        filesPane: RemoteFilesPaneViewController
+    ) -> UUID? {
+        guard rightOpenRequestKeysByID[request.id] == expectedKey else { return nil }
+        rightOpenRequestKeysByID[request.id] = nil
+        guard filesPane.isRightWorkspaceOpenRequestActive(request.id) else { return nil }
+        return request.id
     }
 }
 

@@ -2078,6 +2078,14 @@ public enum RemoteBrowserDownloadSchedulingResult: Equatable {
     case rejected
 }
 
+public struct RemoteEditOpenRequest: Hashable, Sendable {
+    public let id: UUID
+
+    public init(id: UUID = UUID()) {
+        self.id = id
+    }
+}
+
 public protocol RemoteEditOpening: AnyObject {
     @MainActor
     func prepareToOpenRemote(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> Bool
@@ -2098,12 +2106,49 @@ public protocol RemoteEditOpening: AnyObject {
     func remoteOpenDidFail(selection: RemoteFileSelection, mode: RemoteFileOpenMode, message: String)
     @MainActor
     func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws
+
+    @MainActor
+    func prepareRemoteOpen(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest?
+    @MainActor
+    func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?,
+        request: RemoteEditOpenRequest
+    )
+    @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    )
+    @MainActor
+    func remoteOpenDidFail(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        message: String,
+        request: RemoteEditOpenRequest
+    )
 }
 
 public extension RemoteEditOpening {
     @MainActor
     func prepareToOpenRemote(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> Bool {
         true
+    }
+
+    @MainActor
+    func prepareRemoteOpen(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest? {
+        guard prepareToOpenRemote(selection: selection, mode: mode) else { return nil }
+        return RemoteEditOpenRequest()
     }
 
     @MainActor
@@ -2122,6 +2167,42 @@ public extension RemoteEditOpening {
             applicationURL: nil,
             saveHandler: nil
         )
+    }
+
+    @MainActor
+    func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?,
+        request: RemoteEditOpenRequest
+    ) {
+        openLocalCopy(
+            at: url,
+            mode: mode,
+            applicationURL: applicationURL,
+            saveHandler: saveHandler
+        )
+    }
+
+    @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    ) {
+        openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
+    }
+
+    @MainActor
+    func remoteOpenDidFail(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        message: String,
+        request: RemoteEditOpenRequest
+    ) {
+        remoteOpenDidFail(selection: selection, mode: mode, message: message)
     }
 }
 
@@ -2240,6 +2321,7 @@ public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
     private weak var filesViewController: FilesViewController?
     private let fallbackOpener: RemoteEditOpening
     private var embeddedOpenRequestIDsByKey: [String: UUID] = [:]
+    private var embeddedOpenRequestKeysByID: [UUID: String] = [:]
 
     public init(
         filesViewController: FilesViewController,
@@ -2263,6 +2345,34 @@ public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
             return true
         case .chooseApplication, .defaultApplication:
             return fallbackOpener.prepareToOpenRemote(selection: selection, mode: mode)
+        }
+    }
+
+    public func prepareRemoteOpen(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode
+    ) -> RemoteEditOpenRequest? {
+        guard let filesViewController else {
+            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
+        }
+
+        switch mode {
+        case .textEditor, .mediaPreview:
+            let request = RemoteEditOpenRequest()
+            guard filesViewController.beginEmbeddedOpenRequest(
+                selection: selection,
+                mode: mode,
+                requestID: request.id
+            ) != nil else {
+                return nil
+            }
+            embeddedOpenRequestKeysByID[request.id] = embeddedOpenRequestKey(
+                remotePath: selection.path,
+                mode: mode
+            )
+            return request
+        case .chooseApplication, .defaultApplication:
+            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
         }
     }
 
@@ -2300,6 +2410,38 @@ public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
         }
     }
 
+    public func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard mode == .textEditor || mode == .mediaPreview else {
+            fallbackOpener.openLocalCopy(
+                at: url,
+                mode: mode,
+                applicationURL: applicationURL,
+                saveHandler: saveHandler,
+                request: request
+            )
+            return
+        }
+        guard let filesViewController,
+              consumeEmbeddedRequest(request, mode: mode, filesViewController: filesViewController) != nil
+        else { return }
+
+        switch mode {
+        case .textEditor:
+            filesViewController.presentEmbeddedEditor(localURL: url, saveHandler: saveHandler)
+        case .mediaPreview:
+            filesViewController.presentEmbeddedMediaPreview(localURL: url)
+        case .chooseApplication, .defaultApplication:
+            break
+        }
+        filesViewController.finishEmbeddedOpenRequest(request.id)
+    }
+
     public func openRemoteDocument(
         _ document: RemoteTextEditorDocumentDescriptor,
         mode: RemoteFileOpenMode,
@@ -2324,6 +2466,33 @@ public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
         case .chooseApplication, .defaultApplication:
             fallbackOpener.openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
         }
+    }
+
+    public func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    ) {
+        guard mode == .textEditor || mode == .mediaPreview else {
+            fallbackOpener.openRemoteDocument(
+                document,
+                mode: mode,
+                saveHandler: saveHandler,
+                request: request
+            )
+            return
+        }
+        guard let filesViewController,
+              consumeEmbeddedRequest(
+                request,
+                expectedKey: embeddedOpenRequestKey(remotePath: document.remotePath, mode: mode),
+                filesViewController: filesViewController
+              ) != nil
+        else { return }
+
+        filesViewController.presentEmbeddedRemoteDocument(document, onSaveText: saveHandler)
+        filesViewController.finishEmbeddedOpenRequest(request.id)
     }
 
     public func remoteOpenDidFail(selection: RemoteFileSelection, mode: RemoteFileOpenMode, message: String) {
@@ -2359,12 +2528,78 @@ public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
         }
     }
 
+    public func remoteOpenDidFail(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        message: String,
+        request: RemoteEditOpenRequest
+    ) {
+        guard mode == .textEditor || mode == .mediaPreview else {
+            fallbackOpener.remoteOpenDidFail(
+                selection: selection,
+                mode: mode,
+                message: message,
+                request: request
+            )
+            return
+        }
+        guard let filesViewController,
+              consumeEmbeddedRequest(
+                request,
+                expectedKey: embeddedOpenRequestKey(remotePath: selection.path, mode: mode),
+                filesViewController: filesViewController
+              ) != nil
+        else { return }
+
+        if let editor = filesViewController.embeddedEditorViewControllerForTesting {
+            editor.openFailedDocument(
+                remotePath: selection.path,
+                fileName: (selection.path as NSString).lastPathComponent,
+                message: message,
+                byteCount: selection.size
+            )
+        } else {
+            filesViewController.presentEmbeddedOpenFailure(
+                selection: selection,
+                mode: mode,
+                message: message
+            )
+        }
+        filesViewController.finishEmbeddedOpenRequest(request.id)
+    }
+
     public func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws {
         try fallbackOpener.compareLocalCopies(urls, parentWindow: parentWindow)
     }
 
     private func embeddedOpenRequestKey(remotePath: String, mode: RemoteFileOpenMode) -> String {
         "\(mode.logName):\(remotePath)"
+    }
+
+    private func consumeEmbeddedRequest(
+        _ request: RemoteEditOpenRequest,
+        mode: RemoteFileOpenMode,
+        filesViewController: FilesViewController
+    ) -> UUID? {
+        guard let expectedKey = embeddedOpenRequestKeysByID[request.id],
+              expectedKey.hasPrefix("\(mode.logName):")
+        else { return nil }
+        return consumeEmbeddedRequest(
+            request,
+            expectedKey: expectedKey,
+            filesViewController: filesViewController
+        )
+    }
+
+    private func consumeEmbeddedRequest(
+        _ request: RemoteEditOpenRequest,
+        expectedKey: String,
+        filesViewController: FilesViewController
+    ) -> UUID? {
+        guard embeddedOpenRequestKeysByID[request.id] == expectedKey else { return nil }
+        embeddedOpenRequestKeysByID[request.id] = nil
+        guard filesViewController.isEmbeddedOpenRequestActive(request.id) else { return nil }
+        return request.id
     }
 }
 
@@ -2534,6 +2769,12 @@ public final class FilesCoordinator {
     private var liveDirectoryDisconnectedMessage: String?
     private var pendingUploadCompletionRefreshDirectories: [String] = []
     private var hasScheduledUploadCompletionRefresh = false
+    private static let remoteOpenFailureTerminalStatuses = Set([
+        "failed",
+        "canceled",
+        "cancelled",
+        "stopped"
+    ])
 
     public init(
         bridge: RemoteFilesBridging = CoreBridgeRemoteFilesBridge(),
@@ -4331,7 +4572,7 @@ public final class FilesCoordinator {
             return
         }
 
-        guard remoteEditOpener.prepareToOpenRemote(selection: selection, mode: mode) else {
+        guard let openRequest = remoteEditOpener.prepareRemoteOpen(selection: selection, mode: mode) else {
             logFileOpenEvent(
                 name: "file.open.cancelled",
                 selection: selection,
@@ -4353,7 +4594,12 @@ public final class FilesCoordinator {
                 level: .warning,
                 extra: "bytes=\(selection.size)"
             )
-            remoteEditOpener.remoteOpenDidFail(selection: selection, mode: mode, message: message)
+            remoteEditOpener.remoteOpenDidFail(
+                selection: selection,
+                mode: mode,
+                message: message,
+                request: openRequest
+            )
             return
         }
         let bridgeBox = UncheckedSendableBox(bridge)
@@ -4394,7 +4640,8 @@ public final class FilesCoordinator {
                         mode: mode,
                         saveHandler: { [weak self] updatedText in
                             try self?.writeRemoteEditText(updatedText, selection: selection, context: context)
-                        }
+                        },
+                        request: openRequest
                     )
                     self?.logFileOpenEvent(
                         name: "file.open.online.text",
@@ -4411,7 +4658,12 @@ public final class FilesCoordinator {
                         level: .error,
                         extra: message
                     )
-                    openerBox.value.remoteOpenDidFail(selection: selection, mode: mode, message: message)
+                    openerBox.value.remoteOpenDidFail(
+                        selection: selection,
+                        mode: mode,
+                        message: message,
+                        request: openRequest
+                    )
                 }
             }
         }
@@ -4448,7 +4700,7 @@ public final class FilesCoordinator {
             return
         }
 
-        guard remoteEditOpener.prepareToOpenRemote(selection: selection, mode: mode) else {
+        guard let openRequest = remoteEditOpener.prepareRemoteOpen(selection: selection, mode: mode) else {
             logFileOpenEvent(
                 name: "file.open.cancelled",
                 selection: selection,
@@ -4473,6 +4725,7 @@ public final class FilesCoordinator {
                 destinationPath: cacheItem.localURL.path,
                 bytesTotal: selection.size
             )
+            var didFinishOpenRequest = false
             transferScheduler.scheduleLiveTransfer(
                 runtimeID: runtimeID,
                 config: context.config,
@@ -4483,32 +4736,44 @@ public final class FilesCoordinator {
                     guard let self else {
                         return
                     }
+                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status),
+                          didFinishOpenRequest == false
+                    else {
+                        return
+                    }
+                    didFinishOpenRequest = true
                     guard self.isLiveSessionRuntimeCurrent(runtimeID) else {
+                        let message = "runtime=\(runtimeID) status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
                             name: "file.open.download.stale",
                             selection: selection,
                             mode: mode,
                             level: .warning,
-                            extra: "runtime=\(runtimeID) status=\(progress.status)"
+                            extra: message
+                        )
+                        self.remoteEditOpener.remoteOpenDidFail(
+                            selection: selection,
+                            mode: mode,
+                            message: message,
+                            request: openRequest
                         )
                         return
                     }
-                    guard progress.status == "completed" else {
-                        if progress.status == "failed" {
-                            let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
-                            self.logFileOpenEvent(
-                                name: "file.open.download.failed",
-                                selection: selection,
-                                mode: mode,
-                                level: .error,
-                                extra: message
-                            )
-                            self.remoteEditOpener.remoteOpenDidFail(
-                                selection: selection,
-                                mode: mode,
-                                message: message
-                            )
-                        }
+                    guard terminalStatus == "completed" else {
+                        let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
+                        self.logFileOpenEvent(
+                            name: "file.open.download.failed",
+                            selection: selection,
+                            mode: mode,
+                            level: .error,
+                            extra: message
+                        )
+                        self.remoteEditOpener.remoteOpenDidFail(
+                            selection: selection,
+                            mode: mode,
+                            message: message,
+                            request: openRequest
+                        )
                         return
                     }
                     self.logFileOpenEvent(
@@ -4534,7 +4799,8 @@ public final class FilesCoordinator {
                         applicationURL: applicationURL,
                         saveHandler: { [weak self] in
                             self?.saveRemoteEdit(selection)
-                        }
+                        },
+                        request: openRequest
                     )
                 }
             )
@@ -4545,6 +4811,12 @@ public final class FilesCoordinator {
                 mode: mode,
                 level: .error,
                 extra: RuntimeDiagnosticFormatter.userMessage(for: error)
+            )
+            remoteEditOpener.remoteOpenDidFail(
+                selection: selection,
+                mode: mode,
+                message: RuntimeDiagnosticFormatter.userMessage(for: error),
+                request: openRequest
             )
             present(error, context: .openRemoteEdit)
         }
@@ -4581,7 +4853,7 @@ public final class FilesCoordinator {
             return
         }
 
-        guard remoteEditOpener.prepareToOpenRemote(selection: selection, mode: mode) else {
+        guard let openRequest = remoteEditOpener.prepareRemoteOpen(selection: selection, mode: mode) else {
             logFileOpenEvent(
                 name: "file.open.ftp.cancelled",
                 selection: selection,
@@ -4606,6 +4878,7 @@ public final class FilesCoordinator {
                 destinationPath: cacheItem.localURL.path,
                 bytesTotal: selection.size
             )
+            var didFinishOpenRequest = false
             transferScheduler.scheduleLiveFTPTransfer(
                 runtimeID: runtimeID,
                 config: context.config,
@@ -4615,32 +4888,44 @@ public final class FilesCoordinator {
                     guard let self else {
                         return
                     }
+                    guard let terminalStatus = Self.remoteOpenTerminalStatus(progress.status),
+                          didFinishOpenRequest == false
+                    else {
+                        return
+                    }
+                    didFinishOpenRequest = true
                     guard self.isFTPSessionRuntimeCurrent(runtimeID) else {
+                        let message = "runtime=\(runtimeID) status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
                         self.logFileOpenEvent(
                             name: "file.open.ftp.download.stale",
                             selection: selection,
                             mode: mode,
                             level: .warning,
-                            extra: "runtime=\(runtimeID) status=\(progress.status)"
+                            extra: message
+                        )
+                        self.remoteEditOpener.remoteOpenDidFail(
+                            selection: selection,
+                            mode: mode,
+                            message: message,
+                            request: openRequest
                         )
                         return
                     }
-                    guard progress.status == "completed" else {
-                        if progress.status == "failed" {
-                            let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
-                            self.logFileOpenEvent(
-                                name: "file.open.ftp.download.failed",
-                                selection: selection,
-                                mode: mode,
-                                level: .error,
-                                extra: message
-                            )
-                            self.remoteEditOpener.remoteOpenDidFail(
-                                selection: selection,
-                                mode: mode,
-                                message: message
-                            )
-                        }
+                    guard terminalStatus == "completed" else {
+                        let message = "status=\(progress.status) bytes=\(progress.bytesDone)/\(progress.bytesTotal)"
+                        self.logFileOpenEvent(
+                            name: "file.open.ftp.download.failed",
+                            selection: selection,
+                            mode: mode,
+                            level: .error,
+                            extra: message
+                        )
+                        self.remoteEditOpener.remoteOpenDidFail(
+                            selection: selection,
+                            mode: mode,
+                            message: message,
+                            request: openRequest
+                        )
                         return
                     }
                     self.logFileOpenEvent(
@@ -4666,7 +4951,8 @@ public final class FilesCoordinator {
                         applicationURL: applicationURL,
                         saveHandler: { [weak self] in
                             self?.saveFTPRemoteEdit(selection, context: context, transferScheduler: transferScheduler)
-                        }
+                        },
+                        request: openRequest
                     )
                 }
             )
@@ -4678,8 +4964,26 @@ public final class FilesCoordinator {
                 level: .error,
                 extra: RuntimeDiagnosticFormatter.userMessage(for: error)
             )
+            remoteEditOpener.remoteOpenDidFail(
+                selection: selection,
+                mode: mode,
+                message: RuntimeDiagnosticFormatter.userMessage(for: error),
+                request: openRequest
+            )
             present(error, context: .openRemoteEdit)
         }
+    }
+
+    private static func remoteOpenTerminalStatus(_ status: String) -> String? {
+        let normalizedStatus = status
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedStatus == "completed"
+                || remoteOpenFailureTerminalStatuses.contains(normalizedStatus)
+        else {
+            return nil
+        }
+        return normalizedStatus
     }
 
     private func writeRemoteEditText(

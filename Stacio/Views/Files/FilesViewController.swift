@@ -1248,11 +1248,14 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         embeddedEditorViewController?.requestAIForActiveDocument()
     }
 
-    func beginEmbeddedOpenRequest(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> UUID? {
+    func beginEmbeddedOpenRequest(
+        selection: RemoteFileSelection,
+        mode: RemoteFileOpenMode,
+        requestID: UUID = UUID()
+    ) -> UUID? {
         guard presentEmbeddedOpenProgress(selection: selection, mode: mode) else {
             return nil
         }
-        let requestID = UUID()
         embeddedOpenRequestIDs.insert(requestID)
         return requestID
     }
@@ -1397,6 +1400,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         progress.view.removeFromSuperview()
         progress.removeFromParent()
         embeddedOpenProgressViewController = nil
+        embeddedOpenRequestIDs.removeAll()
     }
 
     private func fileBrowserWidthForRestoredStandaloneMode() -> CGFloat {

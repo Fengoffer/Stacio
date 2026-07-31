@@ -1512,6 +1512,110 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(resolutions, [.ready])
     }
 
+    func testMissingMonacoCloseHandshakeCancelsPendingCloseExactlyOnce() throws {
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/missing-handshake.conf",
+                fileName: "missing-handshake.conf",
+                content: "enabled=true\n"
+            ),
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        editor.loadView()
+        let webView = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        webView.loadHTMLString(
+            "<script>window.StacioEditor = {}; window.handshakePageReady = true;</script>",
+            baseURL: nil
+        )
+        XCTAssertTrue(waitUntil {
+            var ready = false
+            webView.evaluateJavaScript("window.handshakePageReady === true") { value, _ in
+                ready = value as? Bool == true
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            return ready
+        })
+        editor.markEditorReadyForTesting()
+        editor.replaceTextForTesting("enabled=false\n")
+        var resolutions: [RemoteTextEditorCloseResolution] = []
+        editor.onPendingCloseResolved = { resolutions.append($0) }
+
+        XCTAssertEqual(
+            editor.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+            ),
+            .pending
+        )
+        saveCompletion?(.success(()))
+
+        XCTAssertTrue(waitUntil { resolutions == [.cancelled] })
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(resolutions, [.cancelled])
+    }
+
+    func testWebContentTerminationCancelsUnansweredMonacoCloseHandshakeExactlyOnce() throws {
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/unanswered-handshake.conf",
+                fileName: "unanswered-handshake.conf",
+                content: "enabled=true\n"
+            ),
+            onSaveTextAsync: { _, completion in saveCompletion = completion }
+        )
+        editor.loadView()
+        let webView = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.webView") as? WKWebView
+        )
+        defer { webView.stopLoading() }
+        webView.stopLoading()
+        webView.loadHTMLString(
+            """
+            <script>
+              window.StacioEditor = { confirmSavedContentBeforeClose() {} };
+              window.handshakePageReady = true;
+            </script>
+            """,
+            baseURL: nil
+        )
+        XCTAssertTrue(waitUntil {
+            var ready = false
+            webView.evaluateJavaScript("window.handshakePageReady === true") { value, _ in
+                ready = value as? Bool == true
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            return ready
+        })
+        editor.markEditorReadyForTesting()
+        editor.replaceTextForTesting("enabled=false\n")
+        var resolutions: [RemoteTextEditorCloseResolution] = []
+        editor.onPendingCloseResolved = { resolutions.append($0) }
+
+        XCTAssertEqual(
+            editor.requestClose(
+                parentWindow: nil,
+                closeConfirmer: RecordingRemoteTextEditorCloseConfirmer(decision: .save)
+            ),
+            .pending
+        )
+        saveCompletion?(.success(()))
+        XCTAssertTrue(waitUntil {
+            editor.editorFunctionCallsForTesting.contains("confirmSavedContentBeforeClose")
+        })
+
+        editor.webViewWebContentProcessDidTerminate(webView)
+
+        XCTAssertEqual(resolutions, [.cancelled])
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(resolutions, [.cancelled])
+    }
+
     func testWindowCloseWaitsForAsyncSaveSuccessBeforeClosing() throws {
         let descriptor = RemoteTextEditorDocumentDescriptor(
             remotePath: "/etc/app.toml",

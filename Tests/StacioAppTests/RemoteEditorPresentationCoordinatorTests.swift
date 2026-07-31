@@ -194,6 +194,80 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         )
     }
 
+    func testPendingCloseRejectsNewOpenAndDropsOutstandingCompletion() throws {
+        var saveCompletion: ((Result<Void, Error>) -> Void)?
+        let harness = makeHarness(
+            closeDecision: .save,
+            asyncSaveInstaller: { completion in saveCompletion = completion }
+        )
+        openDocument(path: "/etc/first.conf", in: harness)
+        let pendingSelection = makeSelection(path: "/etc/pending.conf")
+        let pendingRequest = try XCTUnwrap(
+            harness.coordinator.prepareRemoteOpen(
+                selection: pendingSelection,
+                mode: .textEditor
+            )
+        )
+        harness.coordinator.currentEditor?.replaceTextForTesting("changed=true\n")
+
+        XCTAssertEqual(
+            harness.coordinator.requestClose(parentWindow: nil, completion: nil),
+            .pending
+        )
+        XCTAssertNil(
+            harness.coordinator.prepareRemoteOpen(
+                selection: makeSelection(path: "/etc/rejected.conf"),
+                mode: .textEditor
+            )
+        )
+
+        harness.coordinator.openRemoteDocument(
+            makeDescriptor(path: pendingSelection.path, content: "pending=true\n"),
+            mode: .textEditor,
+            saveHandler: nil,
+            request: pendingRequest
+        )
+
+        XCTAssertEqual(
+            harness.coordinator.currentEditor?.tabTitlesForTesting,
+            ["first.conf"]
+        )
+        saveCompletion?(.success(()))
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .closed)
+    }
+
+    func testSuccessfulCloseInvalidatesOutstandingOpenRequests() throws {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/first.conf")
+        let pendingSelection = makeSelection(path: "/etc/pending.conf")
+        let pendingRequest = try XCTUnwrap(
+            harness.coordinator.prepareRemoteOpen(
+                selection: pendingSelection,
+                mode: .textEditor
+            )
+        )
+
+        XCTAssertEqual(
+            harness.coordinator.requestClose(parentWindow: nil, completion: nil),
+            .ready
+        )
+        XCTAssertNotNil(
+            harness.coordinator.prepareRemoteOpen(
+                selection: pendingSelection,
+                mode: .textEditor
+            )
+        )
+
+        harness.coordinator.openRemoteDocument(
+            makeDescriptor(path: pendingSelection.path, content: "stale=true\n"),
+            mode: .textEditor,
+            saveHandler: nil,
+            request: pendingRequest
+        )
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .opening)
+        XCTAssertNil(harness.coordinator.currentEditor)
+    }
+
     func testSynchronousAsyncSaveFinishesCloseWithoutStrandingPendingState() {
         let harness = makeHarness(
             closeDecision: .save,
@@ -302,6 +376,110 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.coordinator.snapshot.mode, .dockedHidden)
         XCTAssertTrue(harness.host.isEditorSidecarCollapsed)
         XCTAssertFalse(harness.coordinator.snapshot.isTransitioning)
+    }
+
+    func testStaleSamePathCompletionCannotConsumeNewerRequestGeneration() {
+        let harness = makeHarness()
+        let selection = makeSelection(path: "/etc/reused.conf")
+        let firstRequest = try? XCTUnwrap(
+            harness.coordinator.prepareRemoteOpen(selection: selection, mode: .textEditor)
+        )
+        XCTAssertNotNil(firstRequest)
+        XCTAssertEqual(
+            harness.coordinator.requestClose(parentWindow: nil, completion: nil),
+            .ready
+        )
+        let secondRequest = try? XCTUnwrap(
+            harness.coordinator.prepareRemoteOpen(selection: selection, mode: .textEditor)
+        )
+        XCTAssertNotNil(secondRequest)
+
+        if let firstRequest {
+            harness.coordinator.openRemoteDocument(
+                makeDescriptor(path: selection.path, content: "stale=true\n"),
+                mode: .textEditor,
+                saveHandler: nil,
+                request: firstRequest
+            )
+        }
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .opening)
+        XCTAssertNil(harness.coordinator.currentEditor)
+
+        if let secondRequest {
+            harness.coordinator.openRemoteDocument(
+                makeDescriptor(path: selection.path, content: "fresh=true\n"),
+                mode: .textEditor,
+                saveHandler: nil,
+                request: secondRequest
+            )
+        }
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
+        XCTAssertEqual(harness.coordinator.currentEditor?.currentTextForTesting, "fresh=true\n")
+    }
+
+    func testPreparedLocalCopyReplacesOpeningPlaceholderAndConsumesRequest() throws {
+        let harness = makeHarness()
+        let selection = makeSelection(path: "/srv/app/config.yml")
+        let request = try XCTUnwrap(
+            harness.coordinator.prepareRemoteOpen(selection: selection, mode: .textEditor)
+        )
+        let progress = try XCTUnwrap(harness.host.editorContentViewController)
+        let localURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-coordinator-\(UUID().uuidString).yml")
+        try "enabled: true\n".write(to: localURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: localURL) }
+
+        harness.coordinator.openLocalCopy(
+            at: localURL,
+            mode: .textEditor,
+            applicationURL: nil,
+            saveHandler: nil,
+            request: request
+        )
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
+        XCTAssertNotNil(harness.coordinator.currentEditor)
+        XCTAssertFalse(harness.host.editorContentViewController === progress)
+        XCTAssertTrue(harness.host.editorContentViewController === harness.coordinator.currentEditor)
+        XCTAssertNil(harness.fallback.lastLocalCopyURL)
+        XCTAssertNotNil(
+            harness.coordinator.prepareRemoteOpen(selection: selection, mode: .textEditor),
+            "Consuming the local-copy completion must unblock the next generation"
+        )
+    }
+
+    func testCloseRequestedFromTransitionSnapshotCannotCorruptDockHostState() {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/app.conf")
+        let editor = harness.coordinator.currentEditor
+        var closeDisposition: RemoteTextEditorCloseDisposition?
+        harness.coordinator.onSnapshotChanged = { [weak coordinator = harness.coordinator] snapshot in
+            guard snapshot.isTransitioning, closeDisposition == nil else { return }
+            closeDisposition = coordinator?.requestClose(parentWindow: nil, completion: nil)
+        }
+
+        harness.coordinator.collapseDockedEditor()
+
+        XCTAssertEqual(closeDisposition, .cancelled)
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .dockedHidden)
+        XCTAssertTrue(harness.coordinator.currentEditor === editor)
+        XCTAssertTrue(harness.host.editorContentViewController === editor)
+        XCTAssertTrue(harness.host.isEditorSidecarCollapsed)
+    }
+
+    func testWindowPresentationDoesNotReplaceCoordinatorOwnedEditorCallbacks() throws {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/app.conf")
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        var snapshotPublicationCount = 0
+        harness.coordinator.onSnapshotChanged = { _ in snapshotPublicationCount += 1 }
+        let windowController = RemoteTextEditorWindowController(editorViewController: editor)
+        defer { windowController.close() }
+
+        editor.replaceTextForTesting("enabled=false\n")
+
+        XCTAssertGreaterThan(snapshotPublicationCount, 0)
+        XCTAssertEqual(windowController.window?.isDocumentEdited, true)
     }
 
     func testUnsupportedOpenModesStayOnInjectedFallbackBoundary() {
@@ -499,6 +677,7 @@ private struct AllowingCoordinatorAuthorizer: LicensedFeatureAuthorizing {
 private final class RecordingCoordinatorFallbackOpener: RemoteEditOpening {
     private(set) var prepareRequests: [String] = []
     private(set) var failureRequests: [String] = []
+    private(set) var lastLocalCopyURL: URL?
 
     func prepareToOpenRemote(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> Bool {
         prepareRequests.append(selection.path)
@@ -510,7 +689,9 @@ private final class RecordingCoordinatorFallbackOpener: RemoteEditOpening {
         mode: RemoteFileOpenMode,
         applicationURL: URL?,
         saveHandler: RemoteEditSaveHandler?
-    ) {}
+    ) {
+        lastLocalCopyURL = url
+    }
 
     func openRemoteDocument(
         _ document: RemoteTextEditorDocumentDescriptor,
