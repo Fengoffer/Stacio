@@ -1102,7 +1102,9 @@ public final class MountViewController: NSViewController {
                 self.mountStore.appendEntry(entry)
 
                 DispatchQueue.main.async {
-                    self.updateStatusLabel("挂载成功")
+                    // 远端→本地已通过 statfs 验证；本地→远端是 fire-and-forget，仅确认命令已下发
+                    let message = entry.status == .pending ? "挂载命令已发送，等待远端确认" : "挂载成功"
+                    self.updateStatusLabel(message)
                     self.refreshEntries()
                     self.mountButton.isEnabled = true
                     self.remotePathField.stringValue = ""
