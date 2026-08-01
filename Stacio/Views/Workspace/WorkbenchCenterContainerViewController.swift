@@ -264,6 +264,42 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
         return min(max(0, proposedPosition), usableWidth)
     }
 
+    public func splitView(
+        _ splitView: NSSplitView,
+        constrainMinCoordinate proposedMinimumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView === self.splitView,
+              dividerIndex == 0,
+              splitView.arrangedSubviews.count == 2
+        else {
+            return proposedMinimumPosition
+        }
+        let usableWidth = max(0, splitView.bounds.width - splitView.dividerThickness)
+        guard usableWidth >= Self.minimumReadableWorkspaceWidth + Self.minimumEditorWidth else {
+            return 0
+        }
+        return min(Self.minimumReadableWorkspaceWidth, usableWidth)
+    }
+
+    public func splitView(
+        _ splitView: NSSplitView,
+        constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard splitView === self.splitView,
+              dividerIndex == 0,
+              splitView.arrangedSubviews.count == 2
+        else {
+            return proposedMaximumPosition
+        }
+        let usableWidth = max(0, splitView.bounds.width - splitView.dividerThickness)
+        guard usableWidth >= Self.minimumReadableWorkspaceWidth + Self.minimumEditorWidth else {
+            return usableWidth
+        }
+        return max(0, usableWidth - Self.minimumEditorWidth)
+    }
+
     public func splitViewDidResizeSubviews(_ notification: Notification) {
         guard notification.object as? NSSplitView === splitView else { return }
         scheduleEditorLayoutSynchronization()

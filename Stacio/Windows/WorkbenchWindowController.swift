@@ -306,6 +306,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let graphicsRuntimeManager: GraphicsRuntimeManaging
     private let sparkleUpdateController: SparkleUpdateButtonControlling?
     private let frameAutosaveName: NSWindow.FrameAutosaveName
+    private let remoteEditorPresentationStore: any RemoteEditorPresentationStoring
+    private let remoteEditorScreenProvider: any RemoteEditorScreenProviding
+    private let remoteEditorCloseConfirmer: any RemoteTextEditorCloseConfirming
+    public private(set) var centerContainerViewController: WorkbenchCenterContainerViewController?
+    public private(set) var remoteEditorPresentationCoordinator: RemoteEditorPresentationCoordinator?
     private weak var sidebarSplitViewItem: NSSplitViewItem?
     private weak var inspectorSplitViewItem: NSSplitViewItem?
     private weak var updatePromptToolbarItem: NSToolbarItem?
@@ -341,7 +346,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let minimumWorkspaceWidthWhenOpeningInspector: CGFloat = 248
     private let defaultInspectorPanelWidth: CGFloat = 320
     private let minimumInspectorWidthBeforeDeferredUncollapse: CGFloat = 420
-    private let preferredFilesCapabilityInspectorWidth: CGFloat = 960
     private let unrestrictedInspectorPanelWidth: CGFloat = 100_000
     private let splitResizeSettleInterval: TimeInterval = 0.08
 
@@ -427,7 +431,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 .appendingPathComponent(protocolName.lowercased(), isDirectory: false)
             return FileManager.default.isExecutableFile(atPath: adapterURL.path) ? adapterURL.path : nil
         },
-        frameAutosaveName: NSWindow.FrameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.v4")
+        frameAutosaveName: NSWindow.FrameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.v4"),
+        remoteEditorPresentationStore: (any RemoteEditorPresentationStoring)? = nil,
+        remoteEditorScreenProvider: (any RemoteEditorScreenProviding)? = nil,
+        remoteEditorCloseConfirmer: (any RemoteTextEditorCloseConfirming)? = nil
     ) {
         self.workspaceViewController = workspaceViewController
         self.tunnelLiveSessionStore = tunnelLiveSessionStore
@@ -481,6 +488,15 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         self.sparkleUpdateController = sparkleUpdateController
         self.graphicsAdapterPathProvider = graphicsAdapterPathProvider
         self.frameAutosaveName = frameAutosaveName
+        self.remoteEditorPresentationStore = remoteEditorPresentationStore
+            ?? UserDefaultsRemoteEditorPresentationStore(
+                defaults: .standard,
+                frameAutosaveName: frameAutosaveName
+            )
+        self.remoteEditorScreenProvider = remoteEditorScreenProvider
+            ?? AppKitRemoteEditorScreenProvider()
+        self.remoteEditorCloseConfirmer = remoteEditorCloseConfirmer
+            ?? AppKitRemoteTextEditorCloseConfirmer()
         super.init(window: nil)
         licensedFeatureMenuDelegate.controller = self
         licenseAuthorizationObserver = NotificationCenter.default.addObserver(
@@ -489,6 +505,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.remoteEditorPresentationCoordinator?.refreshLicenseState()
                 self?.refreshToolbarItemAvailability()
             }
         }
@@ -737,6 +754,75 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         contentSplitViewController.portDeskRefreshPinnedSplitViewLayout()
         contentSplitViewController.view.layoutSubtreeIfNeeded()
         applyInitialSplitColumnWidthsIfNeeded(in: window)
+        centerContainerViewController?.synchronizeEditorLayout()
+    }
+
+    private func prepareWorkbenchForDockedEditor(targetWidth: CGFloat) {
+        guard targetWidth.isFinite,
+              targetWidth > 0,
+              let window,
+              let centerContainerViewController
+        else {
+            return
+        }
+        guard let visibleFrame = remoteEditorScreenProvider.descriptor(containing: window)?.visibleFrame
+            ?? (window.screen ?? NSScreen.main)?.visibleFrame
+        else { return }
+
+        _ = centerContainerViewController.view
+        layoutWorkbenchContent(in: window)
+
+        let requiredCenterWidth = WorkbenchCenterContainerViewController.minimumReadableWorkspaceWidth
+            + centerContainerViewController.editorSidecarDividerThickness
+            + targetWidth
+        let missingWidth = max(0, requiredCenterWidth - centerContainerViewController.view.bounds.width)
+        let growth = min(missingWidth, max(0, visibleFrame.width - window.frame.width))
+        guard growth > 0 else {
+            centerContainerViewController.synchronizeEditorLayout()
+            return
+        }
+
+        let splitView = contentSplitViewController.splitView
+        splitView.layoutSubtreeIfNeeded()
+        let subviews = splitView.arrangedSubviews
+        let sidebarWidth = subviews.first?.isHidden == false ? subviews.first?.frame.width : nil
+        let inspectorWidth = currentInspectorPanelWidth()
+        var frame = window.frame
+        frame.size.width += growth
+        frame.origin.x = min(
+            max(frame.origin.x, visibleFrame.minX),
+            max(visibleFrame.minX, visibleFrame.maxX - frame.width)
+        )
+
+        pendingProgrammaticWindowFrameRestore = nil
+        performProgrammaticSplitLayout {
+            isRestoringWindowFrame = true
+            updateWorkbenchContentSizeStayConstraints(forFrameSize: frame.size, in: window)
+            window.setFrame(frame, display: true)
+            isRestoringWindowFrame = false
+            layoutWorkbenchContent(in: window)
+
+            let expandedSplitView = contentSplitViewController.splitView
+            splitPositionOverrideDepth += 1
+            defer { splitPositionOverrideDepth -= 1 }
+            if let sidebarWidth, sidebarWidth > 0 {
+                expandedSplitView.setPosition(sidebarWidth, ofDividerAt: 0)
+            }
+            if let inspectorWidth, inspectorWidth > 0 {
+                let dividerPosition = expandedSplitView.bounds.width
+                    - inspectorWidth
+                    - expandedSplitView.dividerThickness
+                expandedSplitView.setPosition(dividerPosition, ofDividerAt: 1)
+                applyPinnedWorkbenchSplitFrames(
+                    targetInspectorWidth: inspectorWidth,
+                    in: expandedSplitView,
+                    targetSidebarWidth: sidebarWidth
+                )
+            }
+            expandedSplitView.layoutSubtreeIfNeeded()
+            centerContainerViewController.synchronizeEditorLayout()
+        }
+        saveWorkbenchWindowFrame(window)
     }
 
     private func installWorkbenchContentSizeStayConstraints(on contentView: NSView) {
@@ -1512,124 +1598,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         )
     }
 
-    private func restoreInspectorWidthAfterFilesCapabilityClosed(fileBrowserWidth: CGFloat) {
-        let windowFrame = window?.frame
-        defer {
-            restoreProgrammaticFrameIfNeeded(windowFrame)
-        }
-        guard contentSplitViewController.splitViewItems.count >= 3,
-              let inspectorSplitViewItem,
-              inspectorSplitViewItem.isCollapsed == false
-        else { return }
-
-        let splitView = contentSplitViewController.splitView
-        splitView.layoutSubtreeIfNeeded()
-        let subviews = splitView.arrangedSubviews
-        guard subviews.count >= 3,
-              subviews[2].isHidden == false
-        else { return }
-
-        let targetWidth = clampedInspectorWidth(
-            max(fileBrowserWidth, defaultInspectorPanelWidth),
-            splitWidth: splitView.bounds.width
-        )
-        guard targetWidth > 0 else { return }
-
-        let storedSidebarWidth = storedSplitWidth(column: "sidebar")
-        let pinnedSidebarWidth = storedSidebarWidth.map {
-            clampedSidebarWidth($0, availableWidth: splitView.bounds.width)
-        }
-        inspectorSplitViewItem.holdingPriority = .defaultLow
-        updatePreferredInspectorFraction(targetWidth, splitWidth: splitView.bounds.width)
-        pendingInspectorWidth = targetWidth
-        performProgrammaticSplitLayout {
-            if let storedSidebarWidth {
-                splitView.setPosition(
-                    pinnedSidebarWidth ?? clampedSidebarWidth(storedSidebarWidth, availableWidth: splitView.bounds.width),
-                    ofDividerAt: 0
-                )
-            }
-            applyInspectorWidth(
-                targetWidth,
-                in: splitView,
-                preservingWindowFrame: windowFrame,
-                pinsInspectorWidthDuringLayout: true,
-                pinnedSidebarWidth: pinnedSidebarWidth
-            )
-            splitView.layoutSubtreeIfNeeded()
-        }
-        inspectorSplitViewItem.holdingPriority = .defaultHigh
-        keepSidebarReadableWithoutResizingWindow()
-    }
-
-    private func prepareInspectorWidthForFilesCapabilityOpen(
-        restoringCollapsedInspector: Bool = false
-    ) {
-        let windowFrame = window?.frame
-        defer {
-            restoreProgrammaticFrameIfNeeded(windowFrame)
-        }
-        guard contentSplitViewController.splitViewItems.count >= 3,
-              let inspectorSplitViewItem,
-              inspectorSplitViewItem.isCollapsed == false
-        else { return }
-
-        let splitView = contentSplitViewController.splitView
-        splitView.layoutSubtreeIfNeeded()
-        let subviews = splitView.arrangedSubviews
-        guard subviews.count >= 3,
-              subviews[2].isHidden == false
-        else { return }
-
-        let targetWidth: CGFloat
-        if restoringCollapsedInspector,
-           let pendingInspectorWidth,
-           pendingInspectorWidth > 0
-        {
-            targetWidth = clampedInspectorWidth(
-                pendingInspectorWidth,
-                splitWidth: splitView.bounds.width
-            )
-        } else {
-            let defaultWidth = defaultInspectorWidth(
-                for: splitView.bounds.width,
-                preferredWidth: defaultInspectorPanelWidth
-            )
-            let storedWidth = storedSplitWidth(column: "inspector") ?? 0
-            targetWidth = clampedInspectorWidth(
-                max(defaultWidth, storedWidth, preferredFilesCapabilityInspectorWidth),
-                splitWidth: splitView.bounds.width
-            )
-        }
-        guard targetWidth > 0 else { return }
-
-        let storedSidebarWidth = storedSplitWidth(column: "sidebar")
-        let pinnedSidebarWidth = storedSidebarWidth.map {
-            clampedSidebarWidth($0, availableWidth: splitView.bounds.width)
-        }
-        inspectorSplitViewItem.holdingPriority = .defaultLow
-        updatePreferredInspectorFraction(targetWidth, splitWidth: splitView.bounds.width)
-        pendingInspectorWidth = targetWidth
-        performProgrammaticSplitLayout {
-            if let storedSidebarWidth {
-                splitView.setPosition(
-                    pinnedSidebarWidth ?? clampedSidebarWidth(storedSidebarWidth, availableWidth: splitView.bounds.width),
-                    ofDividerAt: 0
-                )
-            }
-            applyInspectorWidth(
-                targetWidth,
-                in: splitView,
-                preservingWindowFrame: windowFrame,
-                pinsInspectorWidthDuringLayout: true,
-                pinnedSidebarWidth: pinnedSidebarWidth
-            )
-            splitView.layoutSubtreeIfNeeded()
-        }
-        inspectorSplitViewItem.holdingPriority = .defaultHigh
-        keepSidebarReadableWithoutResizingWindow()
-    }
-
     private var isApplyingProgrammaticSplitLayout: Bool {
         programmaticSplitLayoutDepth > 0
     }
@@ -1908,10 +1876,28 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         sidebar.holdingPriority = .defaultLow
         sidebarSplitViewItem = sidebar
 
-        let workspace = NSSplitViewItem(viewController: workspaceViewController)
-        workspace.minimumThickness = 0
-        workspace.preferredThicknessFraction = 0.57
-        workspace.holdingPriority = .defaultLow
+        let centerController = WorkbenchCenterContainerViewController(
+            workspaceViewController: workspaceViewController,
+            presentationStore: remoteEditorPresentationStore
+        )
+        let presentation = RemoteEditorPresentationCoordinator(
+            dockHost: centerController,
+            presentationStore: remoteEditorPresentationStore,
+            screenProvider: remoteEditorScreenProvider,
+            licenseAccess: licenseAccess,
+            authorizer: LicenseFeatureAuthorizer(accessProvider: licenseAccess),
+            closeConfirmer: remoteEditorCloseConfirmer
+        )
+        presentation.onWillPresentDockedEditor = { [weak self] targetWidth in
+            self?.prepareWorkbenchForDockedEditor(targetWidth: targetWidth)
+        }
+        centerContainerViewController = centerController
+        remoteEditorPresentationCoordinator = presentation
+
+        let center = NSSplitViewItem(viewController: centerController)
+        center.minimumThickness = 0
+        center.preferredThicknessFraction = 0.57
+        center.holdingPriority = .defaultLow
         workspaceViewController.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         workspaceViewController.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
@@ -1932,12 +1918,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             tunnelLiveSessionContextProvider: tunnelLiveSessionContextProvider,
             remoteFilePathTerminalSender: { [weak workspaceViewController] path in
                 _ = workspaceViewController?.sendTextToCurrentTerminal(path)
-            },
-            filesEmbeddedCapabilityOpenHandler: { [weak self] in
-                self?.prepareInspectorWidthForFilesCapabilityOpen()
-            },
-            filesEmbeddedCapabilityCloseHandler: { [weak self] fileBrowserWidth in
-                self?.restoreInspectorWidthAfterFilesCapabilityClosed(fileBrowserWidth: fileBrowserWidth)
             },
             tunnelLiveBridge: tunnelLiveBridge,
             remoteFilesBridge: remoteFilesBridge,
@@ -2000,7 +1980,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             settingsStore: settingsStore,
             licenseAccess: licenseAccess,
             transferCompletionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
-            transferQueueCoordinatorFactory: transferQueueCoordinatorFactory
+            transferQueueCoordinatorFactory: transferQueueCoordinatorFactory,
+            remoteEditorPresentation: presentation
         )
         _ = inspectorController.view
         workspaceViewController.onRemoteTerminalDirectoryChanged = { [weak inspectorController] pane, directory in
@@ -2087,7 +2068,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         inspectorSplitViewItem = inspector
 
         split.addSplitViewItem(sidebar)
-        split.addSplitViewItem(workspace)
+        split.addSplitViewItem(center)
         split.addSplitViewItem(inspector)
         return split
     }
@@ -2955,17 +2936,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             _ = try? workspaceViewController.openFileSession(path: localPath, title: L10n.Workspace.localFiles)
             return
         }
-        let hasExpandedFilesCapability = inspectorViewController?.filesViewController?
-            .isEmbeddedCapabilityExpandedForInspectorControls == true
-        let wasInspectorCollapsed = inspectorSplitViewItem?.isCollapsed == true
         revealInspector()
-        if hasExpandedFilesCapability {
-            prepareInspectorWidthForFilesCapabilityOpen(
-                restoringCollapsedInspector: wasInspectorCollapsed
-            )
-        } else {
-            applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
-        }
+        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
         keepSidebarReadableWithoutResizingWindow()
         do {
             if let binding = currentRemoteFilesBinding {
@@ -2979,10 +2951,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         scheduleInspectorReadabilityRepair(
             preserving: windowFrame,
-            preferredDefaultWidth: hasExpandedFilesCapability
-                ? preferredFilesCapabilityInspectorWidth
-                : defaultInspectorPanelWidth,
-            force: hasExpandedFilesCapability == false
+            preferredDefaultWidth: defaultInspectorPanelWidth,
+            force: true
         )
         scheduleSidebarReadabilityRepair(preserving: windowFrame)
     }
@@ -3143,11 +3113,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let willRevealInspector = inspectorSplitViewItem.isCollapsed
         if willRevealInspector {
             revealInspector()
-            if inspectorViewController?.filesViewController?.isEmbeddedCapabilityExpandedForInspectorControls == true {
-                prepareInspectorWidthForFilesCapabilityOpen(restoringCollapsedInspector: true)
-            } else {
-                applyDefaultInspectorWidthIfNeeded()
-            }
+            applyDefaultInspectorWidthIfNeeded()
             scheduleInspectorReadabilityRepair(preserving: windowFrame)
         } else {
             if let inspectorWidth = currentInspectorPanelWidth() {
@@ -3158,6 +3124,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             }
         }
         keepSidebarReadableWithoutResizingWindow()
+        layoutWorkbenchContent(in: window)
+        centerContainerViewController?.synchronizeEditorLayout()
         scheduleSidebarReadabilityRepair(preserving: windowFrame)
     }
 
@@ -3170,9 +3138,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if isSidebarTemporarilyExpanded {
             isSidebarTemporarilyExpanded = false
             sidebar.isCollapsed = false
+            layoutWorkbenchContent(in: window)
+            centerContainerViewController?.synchronizeEditorLayout()
             return
         }
         sidebar.isCollapsed.toggle()
+        layoutWorkbenchContent(in: window)
+        centerContainerViewController?.synchronizeEditorLayout()
     }
 
     private func temporarilyRevealSidebarFromTitlebarHover() {
@@ -4676,6 +4648,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             inspectorSplitViewItem.isCollapsed = true
         }
         keepSidebarReadableWithoutResizingWindow()
+        layoutWorkbenchContent(in: window)
+        centerContainerViewController?.synchronizeEditorLayout()
         scheduleSidebarReadabilityRepair(preserving: windowFrame)
         return true
     }
