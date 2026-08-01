@@ -1345,7 +1345,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(opener.failedOpenRequestIDs, [opener.preparedRequestIDs[1]])
     }
 
-    func testCoordinatorOpensTextThroughInjectedOpenerAndRemoteMediaInIndependentWindowWithoutCacheDownloads() throws {
+    func testCoordinatorKeepsTextOnlineAndRoutesRemoteMediaThroughPresentationCacheDownload() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1377,25 +1377,20 @@ final class FilesCoordinatorTests: XCTestCase {
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
-        XCTAssertTrue(waitUntil {
-            NSApp.windows.contains {
-                $0.title == "screenshot.png"
-                    && $0.contentViewController is FileWorkspaceMediaViewController
-            }
-        })
-        defer {
-            NSApp.windows
-                .filter { $0.title == "screenshot.png" }
-                .forEach { $0.close() }
-        }
-        XCTAssertTrue(
-            scheduler.jobs.filter { $0.id.hasPrefix("remote_edit_download_") }.isEmpty,
-            "内置编辑器和独立媒体窗口必须在线打开，不能先下载到 StacioRemoteEditCache"
+        let mediaDownload = try XCTUnwrap(
+            scheduler.jobs.first { $0.id.hasPrefix("remote_edit_download_") }
         )
+        XCTAssertEqual(mediaDownload.sourcePath, "/srv/app/screenshot.png")
+        scheduler.complete(jobID: mediaDownload.id)
+
         XCTAssertEqual(bridge.readRequests.map(\.path), ["/srv/app/config.json"])
-        let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
-        XCTAssertEqual(request.document.content, #"{"enabled":true}"#)
-        try request.saveHandler?(#"{"enabled":false}"#)
+        let textRequest = try XCTUnwrap(opener.remoteDocumentRequests.first)
+        XCTAssertEqual(textRequest.document.content, #"{"enabled":true}"#)
+        try textRequest.saveHandler?(#"{"enabled":false}"#)
+        let mediaRequest = try XCTUnwrap(opener.openRequests.first)
+        XCTAssertEqual(mediaRequest.mode, .mediaPreview)
+        XCTAssertEqual(mediaRequest.url.path, mediaDownload.destinationPath)
+        XCTAssertEqual(opener.localCopyRequestIDs.last, opener.preparedRequestIDs.last)
 
         XCTAssertEqual(bridge.writeRequests.count, 1)
         XCTAssertEqual(bridge.writeRequests.first?.path, "/srv/app/config.json")
@@ -1486,7 +1481,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
-    func testCoordinatorOpensRemoteImageVideoAndAudioInIndependentMediaWindows() throws {
+    func testCoordinatorRoutesRemoteImageVideoAndAudioThroughInjectedPresentationOpener() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let opener = RecordingRemoteEditOpener()
@@ -1514,24 +1509,23 @@ final class FilesCoordinatorTests: XCTestCase {
             files.openSelectedEntryForTesting()
         }
 
-        let expectedNames = Set([
-            "files-panel-photo.png",
-            "files-panel-demo.mp4",
-            "files-panel-audio.mp3"
-        ])
-        XCTAssertTrue(waitUntil {
-            Set(NSApp.windows.compactMap { window -> String? in
-                guard window.contentViewController is FileWorkspaceMediaViewController else { return nil }
-                return expectedNames.contains(window.title) ? window.title : nil
-            }) == expectedNames
-        })
-        defer {
-            NSApp.windows
-                .filter { expectedNames.contains($0.title) }
-                .forEach { $0.close() }
-        }
-        XCTAssertTrue(scheduler.jobs.isEmpty)
+        XCTAssertEqual(scheduler.jobs.count, 3)
+        XCTAssertEqual(Set(scheduler.jobs.map(\.sourcePath)), Set([
+            "/srv/app/files-panel-photo.png",
+            "/srv/app/files-panel-demo.mp4",
+            "/srv/app/files-panel-audio.mp3"
+        ]))
+        XCTAssertEqual(opener.preparedRequestIDs.count, 3)
         XCTAssertTrue(opener.remoteDocumentRequests.isEmpty)
+
+        for job in scheduler.jobs {
+            scheduler.complete(jobID: job.id)
+        }
+
+        XCTAssertEqual(opener.openRequests.count, 3)
+        XCTAssertTrue(opener.openRequests.allSatisfy { $0.mode == .mediaPreview })
+        XCTAssertEqual(Set(opener.openRequests.map { $0.url.path }), Set(scheduler.jobs.map(\.destinationPath)))
+        XCTAssertEqual(opener.localCopyRequestIDs, opener.preparedRequestIDs)
         XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
