@@ -273,6 +273,9 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     public var onPendingCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
     public var onAIQuestionRequested: ((String) -> Void)?
     var onWindowPresentationChanged: ((String, Bool) -> Void)?
+    fileprivate var onStandaloneWindowCloseRequested: (() -> Void)?
+    fileprivate var onStandaloneWindowCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
+    fileprivate var onStandaloneWindowPresentationChanged: ((String, Bool) -> Void)?
 
     private let settingsStore: AppSettingsStore
     private let localTextIO: FileTransferLocalTextIO
@@ -771,6 +774,10 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     public var monacoPageLoadCountForTesting: Int {
         monacoPageLoadCountForTestingStorage
+    }
+
+    public var editorWebViewForTesting: WKWebView? {
+        webView
     }
 
     public var editorFunctionCallsForTesting: [String] {
@@ -1921,7 +1928,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard documents.count > 1,
               let index = documents.firstIndex(where: { $0.id == id })
         else {
-            onCloseRequested?()
+            if let onCloseRequested {
+                onCloseRequested()
+            } else {
+                onStandaloneWindowCloseRequested?()
+            }
             return
         }
         guard pendingTabCloseDocumentIDs.contains(id) == false else {
@@ -2167,6 +2178,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         guard pendingCloseResolutionExpected else { return }
         pendingCloseResolutionExpected = false
         onPendingCloseResolved?(resolution)
+        onStandaloneWindowCloseResolved?(resolution)
     }
 
     private func scheduleSavedCloseHandshakeTimeout(documentID: String, requestID: String) {
@@ -2246,6 +2258,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         onDirtyStateChanged?(hasUnsavedChanges)
         onActiveDocumentChanged?(activeDocument.fileName, hasUnsavedChanges)
         onWindowPresentationChanged?(activeDocument.fileName, hasUnsavedChanges)
+        onStandaloneWindowPresentationChanged?(activeDocument.fileName, hasUnsavedChanges)
     }
 
     private func syncWorkspaceToWebView() {
@@ -2792,8 +2805,8 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       const target = event.target instanceof Element ? event.target : event.target && event.target.parentElement;
       if (!target) { return; }
       const tabs = window.document.getElementById('tabs');
-      const closeButton = target.closest('[data-close]');
-      if (closeButton && tabs.contains(closeButton)) {
+      const excludedControl = target.closest('[data-close], .close, .tab-scroll');
+      if (excludedControl) {
         return false;
       }
       const tab = target.closest('.tab');
@@ -3146,41 +3159,112 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 }
 
 @MainActor
+public protocol RemoteTextEditorWindowControllerDelegate: AnyObject {
+    func remoteTextEditorWindowShouldClose(
+        _ controller: RemoteTextEditorWindowController
+    ) -> Bool
+    func remoteTextEditorWindowDidClose(
+        _ controller: RemoteTextEditorWindowController,
+        forRedock: Bool
+    )
+    func remoteTextEditorWindowDidChangeFrame(
+        _ controller: RemoteTextEditorWindowController,
+        frame: NSRect,
+        userInitiated: Bool
+    )
+    func remoteTextEditorWindowWillEnterFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    )
+    func remoteTextEditorWindowDidExitFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    )
+}
+
+public enum RemoteTextEditorWindowMigrationError: Error, Equatable {
+    case occupied
+    case contentMismatch
+    case invalidContainment
+    case windowUnavailable
+}
+
+@MainActor
 public final class RemoteTextEditorWindowController: NSWindowController, NSWindowDelegate {
-    private static let initialContentSize = NSSize(width: 980, height: 720)
-    private static let minimumContentSize = NSSize(width: 720, height: 480)
+    public static let initialContentSize = NSSize(width: 980, height: 720)
+    public static let minimumContentSize = NSSize(width: 720, height: 480)
+    private static let windowStyleMask: NSWindow.StyleMask = [
+        .titled,
+        .closable,
+        .miniaturizable,
+        .resizable,
+    ]
 
-    public let editorViewController: RemoteTextEditorViewController
+    public static func frameSize(forContentSize contentSize: NSSize) -> NSSize {
+        NSWindow.frameRect(
+            forContentRect: NSRect(origin: .zero, size: contentSize),
+            styleMask: windowStyleMask
+        ).size
+    }
+
+    public static var initialFrameSize: NSSize {
+        frameSize(forContentSize: initialContentSize)
+    }
+
+    public static var minimumFrameSize: NSSize {
+        frameSize(forContentSize: minimumContentSize)
+    }
+
+    public weak var presentationDelegate: RemoteTextEditorWindowControllerDelegate?
+    public var editorViewController: RemoteTextEditorViewController {
+        guard let installedEditorViewController else {
+            preconditionFailure("The editor window shell does not currently host an editor")
+        }
+        return installedEditorViewController
+    }
+    public private(set) var installedEditorViewController: RemoteTextEditorViewController?
     public var onClose: (@MainActor (RemoteTextEditorWindowController) -> Void)?
+    public private(set) var isInNativeFullScreen = false
+    public var nativeFullscreenToggleCountForTesting: Int {
+        (window as? RemoteEditorWindow)?.toggleFullScreenCallCount ?? 0
+    }
 
-    private let closeConfirmer: RemoteTextEditorCloseConfirming
+    private var standaloneLifecycleAdapter: RemoteTextEditorStandaloneWindowLifecycleAdapter?
+    private var isClosingForRedock = false
+    private var allowsDeferredClose = false
+    private var programmaticFrameDepth = 0
+    private var programmaticFrameGeneration = 0
+    private var lastProgrammaticFrame: NSRect?
 
-    public init(
-        editorViewController: RemoteTextEditorViewController,
-        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
-    ) {
-        self.editorViewController = editorViewController
-        self.closeConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
-        let window = NSWindow(
+    public init() {
+        let window = RemoteEditorWindow(
             contentRect: NSRect(origin: .zero, size: Self.initialContentSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: Self.windowStyleMask,
             backing: .buffered,
             defer: false
         )
-        window.title = Self.windowTitle(fileName: editorViewController.activeFileNameForTesting, isDirty: false)
-        window.contentViewController = editorViewController
         window.contentMinSize = Self.minimumContentSize
         window.setContentSize(Self.initialContentSize)
         window.center()
         super.init(window: window)
         window.delegate = self
-        editorViewController.onWindowPresentationChanged = { [weak window] fileName, isDirty in
-            window?.title = Self.windowTitle(fileName: fileName, isDirty: isDirty)
-            window?.isDocumentEdited = isDirty
+    }
+
+    public convenience init(
+        editorViewController: RemoteTextEditorViewController,
+        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
+    ) {
+        self.init()
+        do {
+            try installEditor(editorViewController)
+        } catch {
+            preconditionFailure("A fresh editor window must accept its initial editor: \(error)")
         }
-        editorViewController.onWindowCloseReady = { [weak self] in
-            self?.close()
-        }
+        let adapter = RemoteTextEditorStandaloneWindowLifecycleAdapter(
+            controller: self,
+            editor: editorViewController,
+            closeConfirmer: closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
+        )
+        standaloneLifecycleAdapter = adapter
+        presentationDelegate = adapter
     }
 
     @available(*, unavailable)
@@ -3188,16 +3272,289 @@ public final class RemoteTextEditorWindowController: NSWindowController, NSWindo
         nil
     }
 
+    func validateEmptyShellForMigration() throws {
+        guard let window else {
+            throw RemoteTextEditorWindowMigrationError.windowUnavailable
+        }
+        guard installedEditorViewController == nil,
+              window.contentViewController == nil
+        else {
+            throw RemoteTextEditorWindowMigrationError.occupied
+        }
+    }
+
+    public func installEditor(_ editor: RemoteTextEditorViewController) throws {
+        guard let window else {
+            throw RemoteTextEditorWindowMigrationError.windowUnavailable
+        }
+        if let current = installedEditorViewController {
+            guard current === editor else {
+                throw RemoteTextEditorWindowMigrationError.occupied
+            }
+            return
+        }
+        guard editor.parent == nil,
+              editor.isViewLoaded == false || editor.view.superview == nil
+        else {
+            throw RemoteTextEditorWindowMigrationError.invalidContainment
+        }
+        guard window.contentViewController == nil else {
+            throw RemoteTextEditorWindowMigrationError.occupied
+        }
+
+        let preservedContentSize = window.contentLayoutRect.size
+        installedEditorViewController = editor
+        window.contentViewController = editor
+        window.contentMinSize = Self.minimumContentSize
+        window.setContentSize(preservedContentSize)
+        updateDocumentPresentation(
+            fileName: editor.activeFileNameForTesting,
+            isDirty: editor.hasUnsavedChangesForTesting
+        )
+    }
+
+    public func removeEditorForMigration(_ editor: RemoteTextEditorViewController) throws {
+        guard let current = installedEditorViewController, current === editor else {
+            throw RemoteTextEditorWindowMigrationError.contentMismatch
+        }
+        guard let window, window.contentViewController === editor else {
+            throw RemoteTextEditorWindowMigrationError.contentMismatch
+        }
+        window.contentViewController = nil
+        installedEditorViewController = nil
+    }
+
+    public func closeShellForRedock() {
+        if let editor = installedEditorViewController {
+            try? removeEditorForMigration(editor)
+        }
+        if installedEditorViewController != nil || window?.contentViewController != nil {
+            window?.contentViewController = nil
+            installedEditorViewController = nil
+        }
+        isClosingForRedock = true
+        window?.close()
+    }
+
+    public func completeDeferredUserClose() {
+        allowsDeferredClose = true
+        if window?.isVisible == true {
+            window?.performClose(nil)
+        } else {
+            window?.close()
+        }
+    }
+
+    public func applyProgrammaticFrame(_ frame: NSRect, display: Bool) {
+        guard let window else { return }
+        programmaticFrameGeneration += 1
+        let generation = programmaticFrameGeneration
+        programmaticFrameDepth += 1
+        defer { programmaticFrameDepth -= 1 }
+        if let remoteEditorWindow = window as? RemoteEditorWindow {
+            remoteEditorWindow.setFrameWithoutScreenConstraint(frame, display: display)
+        } else {
+            window.setFrame(frame, display: display)
+        }
+        lastProgrammaticFrame = window.frame
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.programmaticFrameGeneration == generation else {
+                return
+            }
+            (window as? RemoteEditorWindow)?.finishProgrammaticFramePlacement()
+            guard self.lastProgrammaticFrame.map({
+                      Self.framesApproximatelyEqual(window.frame, $0)
+                  }) == true
+            else {
+                return
+            }
+            self.lastProgrammaticFrame = nil
+        }
+    }
+
+    public func updateDocumentPresentation(fileName: String, isDirty: Bool) {
+        window?.title = Self.windowTitle(fileName: fileName, isDirty: isDirty)
+        window?.isDocumentEdited = isDirty
+    }
+
     public func windowShouldClose(_ sender: NSWindow) -> Bool {
-        editorViewController.canClose(parentWindow: sender, closeConfirmer: closeConfirmer)
+        if allowsDeferredClose {
+            allowsDeferredClose = false
+            return true
+        }
+        return presentationDelegate?.remoteTextEditorWindowShouldClose(self) ?? true
     }
 
     public func windowWillClose(_ notification: Notification) {
+        let delegate = presentationDelegate
+        let closedForRedock = isClosingForRedock
+        presentationDelegate = nil
+        window?.delegate = nil
+        standaloneLifecycleAdapter?.detach()
+        standaloneLifecycleAdapter = nil
         onClose?(self)
+        delegate?.remoteTextEditorWindowDidClose(self, forRedock: closedForRedock)
+    }
+
+    public func windowDidMove(_ notification: Notification) {
+        reportFrameChange()
+    }
+
+    public func windowDidResize(_ notification: Notification) {
+        reportFrameChange()
+    }
+
+    public func windowWillEnterFullScreen(_ notification: Notification) {
+        isInNativeFullScreen = true
+        presentationDelegate?.remoteTextEditorWindowWillEnterFullScreen(self)
+    }
+
+    public func windowDidExitFullScreen(_ notification: Notification) {
+        isInNativeFullScreen = false
+        presentationDelegate?.remoteTextEditorWindowDidExitFullScreen(self)
+    }
+
+    public func simulateUserFrameChangeForTesting(_ frame: NSRect) {
+        window?.setFrame(frame, display: false)
+        presentationDelegate?.remoteTextEditorWindowDidChangeFrame(
+            self,
+            frame: frame,
+            userInitiated: true
+        )
+    }
+
+    public func simulateWillEnterFullScreenForTesting() {
+        windowWillEnterFullScreen(Notification(name: NSWindow.willEnterFullScreenNotification))
+    }
+
+    public func simulateDidExitFullScreenForTesting() {
+        windowDidExitFullScreen(Notification(name: NSWindow.didExitFullScreenNotification))
+    }
+
+    private func reportFrameChange() {
+        guard let frame = window?.frame else { return }
+        let matchesProgrammaticFrame = lastProgrammaticFrame.map {
+            Self.framesApproximatelyEqual($0, frame)
+        } ?? false
+        presentationDelegate?.remoteTextEditorWindowDidChangeFrame(
+            self,
+            frame: frame,
+            userInitiated: programmaticFrameDepth == 0 && matchesProgrammaticFrame == false
+        )
+    }
+
+    private static func framesApproximatelyEqual(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 0.5
+            && abs(lhs.minY - rhs.minY) <= 0.5
+            && abs(lhs.width - rhs.width) <= 0.5
+            && abs(lhs.height - rhs.height) <= 0.5
     }
 
     private static func windowTitle(fileName: String, isDirty: Bool) -> String {
         isDirty ? "● \(fileName)" : fileName
+    }
+}
+
+private final class RemoteEditorWindow: NSWindow {
+    private var bypassesScreenConstraint = false
+    private(set) var toggleFullScreenCallCount = 0
+
+    func setFrameWithoutScreenConstraint(_ frame: NSRect, display: Bool) {
+        bypassesScreenConstraint = true
+        setFrame(frame, display: display)
+    }
+
+    func finishProgrammaticFramePlacement() {
+        bypassesScreenConstraint = false
+    }
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        bypassesScreenConstraint ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
+
+    override func toggleFullScreen(_ sender: Any?) {
+        toggleFullScreenCallCount += 1
+        super.toggleFullScreen(sender)
+    }
+}
+
+@MainActor
+private final class RemoteTextEditorStandaloneWindowLifecycleAdapter:
+    RemoteTextEditorWindowControllerDelegate
+{
+    private weak var controller: RemoteTextEditorWindowController?
+    private weak var editor: RemoteTextEditorViewController?
+    private let closeConfirmer: RemoteTextEditorCloseConfirming
+    private var isWaitingForCloseResolution = false
+
+    init(
+        controller: RemoteTextEditorWindowController,
+        editor: RemoteTextEditorViewController,
+        closeConfirmer: RemoteTextEditorCloseConfirming
+    ) {
+        self.controller = controller
+        self.editor = editor
+        self.closeConfirmer = closeConfirmer
+        editor.onStandaloneWindowPresentationChanged = { [weak controller] fileName, isDirty in
+            controller?.updateDocumentPresentation(fileName: fileName, isDirty: isDirty)
+        }
+        editor.onStandaloneWindowCloseRequested = { [weak controller] in
+            controller?.window?.performClose(nil)
+        }
+        editor.onStandaloneWindowCloseResolved = { [weak self] resolution in
+            self?.closeDidResolve(resolution)
+        }
+    }
+
+    func detach() {
+        editor?.onStandaloneWindowPresentationChanged = nil
+        editor?.onStandaloneWindowCloseRequested = nil
+        editor?.onStandaloneWindowCloseResolved = nil
+        isWaitingForCloseResolution = false
+    }
+
+    func remoteTextEditorWindowShouldClose(
+        _ controller: RemoteTextEditorWindowController
+    ) -> Bool {
+        guard isWaitingForCloseResolution == false, let editor else { return false }
+        switch editor.requestClose(parentWindow: controller.window, closeConfirmer: closeConfirmer) {
+        case .ready:
+            return true
+        case .cancelled:
+            return false
+        case .pending:
+            isWaitingForCloseResolution = true
+            return false
+        }
+    }
+
+    func remoteTextEditorWindowDidClose(
+        _ controller: RemoteTextEditorWindowController,
+        forRedock: Bool
+    ) {
+        detach()
+    }
+
+    func remoteTextEditorWindowDidChangeFrame(
+        _ controller: RemoteTextEditorWindowController,
+        frame: NSRect,
+        userInitiated: Bool
+    ) {}
+
+    func remoteTextEditorWindowWillEnterFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {}
+
+    func remoteTextEditorWindowDidExitFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {}
+
+    private func closeDidResolve(_ resolution: RemoteTextEditorCloseResolution) {
+        guard isWaitingForCloseResolution else { return }
+        isWaitingForCloseResolution = false
+        if resolution == .ready {
+            controller?.completeDeferredUserClose()
+        }
     }
 }
 

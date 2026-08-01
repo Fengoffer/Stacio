@@ -90,4 +90,28 @@ final class RemoteEditorScreenProviderTests: XCTestCase {
 
         XCTAssertEqual(result, visibleFrame)
     }
+
+    func testClampKeepsPartiallyOffscreenFrameInsideRightDisplayVisibleFrame() {
+        let visibleFrame = NSRect(x: 1_440, y: 0, width: 2_560, height: 1_415)
+
+        let result = RemoteEditorScreenResolver.clamp(
+            NSRect(x: 3_700, y: -80, width: 980, height: 720),
+            to: visibleFrame,
+            minimumSize: NSSize(width: 720, height: 480)
+        )
+
+        XCTAssertEqual(result, NSRect(x: 3_020, y: 0, width: 980, height: 720))
+    }
+
+    func testClampKeepsFrameInsideDisplayPositionedAbovePrimary() {
+        let visibleFrame = NSRect(x: 0, y: 900, width: 1_440, height: 876)
+
+        let result = RemoteEditorScreenResolver.clamp(
+            NSRect(x: -200, y: 1_500, width: 980, height: 720),
+            to: visibleFrame,
+            minimumSize: NSSize(width: 720, height: 480)
+        )
+
+        XCTAssertEqual(result, NSRect(x: 0, y: 1_056, width: 980, height: 720))
+    }
 }

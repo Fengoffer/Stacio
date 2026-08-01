@@ -49,6 +49,10 @@ public protocol RemoteEditorPresentationRouting: RemoteEditOpening, AnyObject {
 
     func collapseDockedEditor()
     func expandDockedEditor()
+    func detachEditor() throws
+    func redockEditor() throws
+    func presentEditor(on screen: RemoteEditorScreenIdentity) throws
+    func availableScreensDidChange()
     func requestAIForActiveDocument()
     @discardableResult
     func requestClose(
@@ -72,8 +76,13 @@ public typealias RemoteLocalEditorFactory = @MainActor (
     _ saveHandler: RemoteEditSaveHandler?
 ) -> RemoteTextEditorViewController
 
+public typealias RemoteEditorWindowFactory = @MainActor () throws -> RemoteTextEditorWindowController
+
 @MainActor
-public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentationRouting {
+public final class RemoteEditorPresentationCoordinator:
+    RemoteEditorPresentationRouting,
+    RemoteTextEditorWindowControllerDelegate
+{
     private enum State {
         case closed
         case opening(requestID: UUID, progress: RemoteFileOpenProgressViewController)
@@ -109,9 +118,11 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
     private let authorizer: any LicensedFeatureAuthorizing
     private let closeConfirmer: any RemoteTextEditorCloseConfirming
     private let fallbackOpener: any RemoteEditOpening
+    private let windowFactory: RemoteEditorWindowFactory
     private let editorFactory: RemoteEditorFactory
     private let localEditorFactory: RemoteLocalEditorFactory
     private let progressFactory: RemoteEditorOpenProgressFactory
+    private let notificationCenter: NotificationCenter
 
     private var state: State = .closed
     private var activeOpenRequestIDs: [OpenRequestKey: UUID] = [:]
@@ -119,6 +130,8 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
     private var isTransitioning = false
     private weak var pendingCloseEditor: RemoteTextEditorViewController?
     private var pendingCloseCompletions: [(RemoteTextEditorCloseResolution) -> Void] = []
+    private weak var windowHandlingCloseRequest: RemoteTextEditorWindowController?
+    private var screenChangeObserver: NSObjectProtocol?
 
     public init(
         dockHost: any RemoteEditorDockHosting,
@@ -128,6 +141,9 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         authorizer: any LicensedFeatureAuthorizing = LicenseFeatureAuthorizer(),
         closeConfirmer: (any RemoteTextEditorCloseConfirming)? = nil,
         fallbackOpener: (any RemoteEditOpening)? = nil,
+        windowFactory: @escaping RemoteEditorWindowFactory = {
+            RemoteTextEditorWindowController()
+        },
         editorFactory: @escaping RemoteEditorFactory = { document, saveHandler in
             RemoteTextEditorViewController(document: document, onSaveText: saveHandler)
         },
@@ -139,7 +155,8 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         },
         progressFactory: @escaping RemoteEditorOpenProgressFactory = { selection, mode in
             RemoteFileOpenProgressViewController(selection: selection, mode: mode)
-        }
+        },
+        notificationCenter: NotificationCenter = .default
     ) {
         self.dockHost = dockHost
         self.presentationStore = presentationStore
@@ -148,9 +165,26 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         self.authorizer = authorizer
         self.closeConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
         self.fallbackOpener = fallbackOpener ?? AppKitRemoteEditOpener()
+        self.windowFactory = windowFactory
         self.editorFactory = editorFactory
         self.localEditorFactory = localEditorFactory
         self.progressFactory = progressFactory
+        self.notificationCenter = notificationCenter
+        screenChangeObserver = notificationCenter.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.availableScreensDidChange()
+            }
+        }
+    }
+
+    deinit {
+        if let screenChangeObserver {
+            notificationCenter.removeObserver(screenChangeObserver)
+        }
     }
 
     public var currentEditor: RemoteTextEditorViewController? {
@@ -463,6 +497,216 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         }
     }
 
+    public func detachEditor() throws {
+        guard isTransitioning == false else {
+            throw RemoteEditorPresentationError.transitionInProgress
+        }
+        switch state {
+        case .docked, .dockedHidden:
+            break
+        case .closed, .opening, .floating, .displayMaximized:
+            throw RemoteEditorPresentationError.invalidTransition
+        }
+
+        try authorizer.authorize(.detachedFileEditor)
+        try performThrowingTransition {
+            let editor: RemoteTextEditorViewController
+            let sourceState = state
+            switch sourceState {
+            case .docked(let current), .dockedHidden(let current):
+                editor = current
+            case .closed, .opening, .floating, .displayMaximized:
+                throw RemoteEditorPresentationError.invalidTransition
+            }
+            let screens = screenProvider.availableScreens()
+            guard let screen = preferredFloatingScreen(from: screens) else {
+                throw RemoteEditorPresentationError.screenUnavailable
+            }
+            let frame = resolvedFloatingFrame(on: screen)
+            let windowController = try makeEditorWindow()
+            try moveDockedEditorToWindow(
+                editor: editor,
+                sourceState: sourceState,
+                windowController: windowController,
+                frame: frame,
+                floatingScreen: screen,
+                displayScreen: nil,
+                restoreFrame: nil
+            )
+        }
+    }
+
+    public func redockEditor() throws {
+        guard isTransitioning == false else {
+            throw RemoteEditorPresentationError.transitionInProgress
+        }
+        guard let dockHost else {
+            throw RemoteEditorPresentationError.dockHostUnavailable
+        }
+
+        let editor: RemoteTextEditorViewController
+        let windowController: RemoteTextEditorWindowController
+        let sourceState = state
+        let sourceFrame: NSRect
+        switch sourceState {
+        case .floating(let currentEditor, let currentWindow, let frame, _):
+            editor = currentEditor
+            windowController = currentWindow
+            sourceFrame = currentWindow.window?.frame ?? frame
+        case .displayMaximized(let currentEditor, let currentWindow, _, _):
+            editor = currentEditor
+            windowController = currentWindow
+            sourceFrame = currentWindow.window?.frame ?? .zero
+        case .closed, .opening, .docked, .dockedHidden:
+            throw RemoteEditorPresentationError.invalidTransition
+        }
+
+        let wasVisible = windowController.window?.isVisible == true
+        try performThrowingTransition {
+            do {
+                onWillPresentDockedEditor?(targetSidecarWidth)
+                try windowController.removeEditorForMigration(editor)
+                do {
+                    try dockHost.installEditorContent(editor)
+                } catch {
+                    try windowController.installEditor(editor)
+                    windowController.presentationDelegate = self
+                    windowController.applyProgrammaticFrame(sourceFrame, display: false)
+                    if wasVisible {
+                        windowController.showWindow(nil)
+                        windowController.window?.makeKeyAndOrderFront(nil)
+                    }
+                    state = sourceState
+                    throw error
+                }
+                dockHost.setEditorSidecarCollapsed(false)
+                if case .floating = sourceState {
+                    presentationStore.saveFloatingFrame(sourceFrame)
+                }
+                state = .docked(editor)
+                windowController.presentationDelegate = nil
+                windowController.closeShellForRedock()
+                dockHost.synchronizeEditorLayout()
+                editor.synchronizeLayoutAfterContainerChange()
+            } catch {
+                state = sourceState
+                throw error
+            }
+        }
+    }
+
+    public func presentEditor(on screenIdentity: RemoteEditorScreenIdentity) throws {
+        guard isTransitioning == false else {
+            throw RemoteEditorPresentationError.transitionInProgress
+        }
+        switch state {
+        case .docked, .dockedHidden, .floating, .displayMaximized:
+            break
+        case .closed, .opening:
+            throw RemoteEditorPresentationError.invalidTransition
+        }
+
+        try authorizer.authorize(.detachedFileEditor)
+        try performThrowingTransition {
+            let screens = screenProvider.availableScreens()
+            guard let target = RemoteEditorScreenResolver.resolve(screenIdentity, screens: screens) else {
+                throw RemoteEditorPresentationError.screenUnavailable
+            }
+
+            switch state {
+            case .docked(let editor), .dockedHidden(let editor):
+                let sourceState = state
+                let restoreFrame = presentationStore.floatingFrame()
+                    ?? resolvedFloatingFrame(on: preferredFloatingScreen(from: screens) ?? target)
+                let windowController = try makeEditorWindow()
+                try moveDockedEditorToWindow(
+                    editor: editor,
+                    sourceState: sourceState,
+                    windowController: windowController,
+                    frame: target.visibleFrame,
+                    floatingScreen: nil,
+                    displayScreen: target,
+                    restoreFrame: restoreFrame
+                )
+            case .floating(let editor, let windowController, let normalFrame, _):
+                presentationStore.saveFloatingFrame(normalFrame)
+                windowController.applyProgrammaticFrame(target.visibleFrame, display: true)
+                state = .displayMaximized(
+                    editor,
+                    windowController,
+                    target.identity,
+                    normalFrame
+                )
+                presentationStore.saveScreenIdentity(target.identity)
+                editor.synchronizeLayoutAfterContainerChange()
+            case .displayMaximized(let editor, let windowController, _, let restoreFrame):
+                windowController.applyProgrammaticFrame(target.visibleFrame, display: true)
+                state = .displayMaximized(
+                    editor,
+                    windowController,
+                    target.identity,
+                    restoreFrame
+                )
+                presentationStore.saveScreenIdentity(target.identity)
+                editor.synchronizeLayoutAfterContainerChange()
+            case .closed, .opening:
+                throw RemoteEditorPresentationError.invalidTransition
+            }
+        }
+    }
+
+    public func availableScreensDidChange() {
+        guard isTransitioning == false else { return }
+        let screens = screenProvider.availableScreens()
+        guard screens.isEmpty == false else { return }
+
+        switch state {
+        case .floating(let editor, let windowController, let frame, let identity):
+            guard windowController.isInNativeFullScreen == false else { return }
+            guard screens.contains(where: { intersects(frame, $0.visibleFrame) }) == false else {
+                return
+            }
+            guard let fallback = resolvedScreen(identity, from: screens)
+                ?? workbenchScreen(from: screens)
+                ?? screens.first
+            else { return }
+            let clamped = RemoteEditorScreenResolver.clamp(
+                frame,
+                to: fallback.visibleFrame,
+                minimumSize: RemoteTextEditorWindowController.minimumFrameSize
+            )
+            windowController.applyProgrammaticFrame(clamped, display: true)
+            state = .floating(editor, windowController, clamped, fallback.identity)
+            presentationStore.saveFloatingFrame(clamped)
+            presentationStore.saveScreenIdentity(fallback.identity)
+            editor.synchronizeLayoutAfterContainerChange()
+            publishSnapshot()
+        case .displayMaximized(
+            let editor,
+            let windowController,
+            let identity,
+            let restoreFrame
+        ):
+            guard windowController.isInNativeFullScreen == false else { return }
+            guard let target = resolvedScreen(identity, from: screens)
+                ?? workbenchScreen(from: screens)
+                ?? screens.first
+            else { return }
+            windowController.applyProgrammaticFrame(target.visibleFrame, display: true)
+            state = .displayMaximized(
+                editor,
+                windowController,
+                target.identity,
+                restoreFrame
+            )
+            presentationStore.saveScreenIdentity(target.identity)
+            editor.synchronizeLayoutAfterContainerChange()
+            publishSnapshot()
+        case .closed, .opening, .docked, .dockedHidden:
+            break
+        }
+    }
+
     public func requestAIForActiveDocument() {
         currentEditor?.requestAIForActiveDocument()
     }
@@ -523,6 +767,123 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         }
     }
 
+    public func remoteTextEditorWindowShouldClose(
+        _ controller: RemoteTextEditorWindowController
+    ) -> Bool {
+        windowHandlingCloseRequest = controller
+        defer { windowHandlingCloseRequest = nil }
+        return requestClose(parentWindow: controller.window, completion: nil) == .ready
+    }
+
+    public func remoteTextEditorWindowDidClose(
+        _ controller: RemoteTextEditorWindowController,
+        forRedock: Bool
+    ) {
+        guard forRedock == false else { return }
+        let editor: RemoteTextEditorViewController
+        switch state {
+        case .floating(let currentEditor, let currentWindow, _, _),
+             .displayMaximized(let currentEditor, let currentWindow, _, _):
+            guard currentWindow === controller else { return }
+            editor = currentEditor
+        case .closed, .opening, .docked, .dockedHidden:
+            return
+        }
+        if controller.installedEditorViewController === editor {
+            try? controller.removeEditorForMigration(editor)
+        }
+        pendingCloseEditor = nil
+        invalidateAllOpenRequests()
+        state = .closed
+        publishSnapshot()
+        finishCloseCompletions(.ready)
+    }
+
+    public func remoteTextEditorWindowDidChangeFrame(
+        _ controller: RemoteTextEditorWindowController,
+        frame: NSRect,
+        userInitiated: Bool
+    ) {
+        guard userInitiated,
+              isTransitioning == false,
+              controller.isInNativeFullScreen == false
+        else { return }
+        let screens = screenProvider.availableScreens()
+        let screen = screen(containing: frame, in: screens)
+            ?? workbenchScreen(from: screens)
+            ?? screens.first
+
+        switch state {
+        case .floating(let editor, let currentWindow, _, _):
+            guard currentWindow === controller else { return }
+            state = .floating(editor, controller, frame, screen?.identity)
+            presentationStore.saveFloatingFrame(frame)
+            presentationStore.saveScreenIdentity(screen?.identity)
+            publishSnapshot()
+        case .displayMaximized(let editor, let currentWindow, _, _):
+            guard currentWindow === controller else { return }
+            state = .floating(editor, controller, frame, screen?.identity)
+            presentationStore.saveFloatingFrame(frame)
+            presentationStore.saveScreenIdentity(screen?.identity)
+            publishSnapshot()
+        case .closed, .opening, .docked, .dockedHidden:
+            break
+        }
+    }
+
+    public func remoteTextEditorWindowWillEnterFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {}
+
+    public func remoteTextEditorWindowDidExitFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {
+        guard isTransitioning == false else { return }
+        let screens = screenProvider.availableScreens()
+        switch state {
+        case .floating(let editor, let currentWindow, let frame, let identity):
+            guard currentWindow === controller else { return }
+            guard let target = resolvedScreen(identity, from: screens)
+                ?? workbenchScreen(from: screens)
+                ?? screens.first
+            else { return }
+            let clamped = RemoteEditorScreenResolver.clamp(
+                frame,
+                to: target.visibleFrame,
+                minimumSize: RemoteTextEditorWindowController.minimumFrameSize
+            )
+            controller.applyProgrammaticFrame(clamped, display: true)
+            state = .floating(editor, controller, clamped, target.identity)
+            presentationStore.saveFloatingFrame(clamped)
+            presentationStore.saveScreenIdentity(target.identity)
+            editor.synchronizeLayoutAfterContainerChange()
+            publishSnapshot()
+        case .displayMaximized(
+            let editor,
+            let currentWindow,
+            let identity,
+            let restoreFrame
+        ):
+            guard currentWindow === controller else { return }
+            guard let target = resolvedScreen(identity, from: screens)
+                ?? workbenchScreen(from: screens)
+                ?? screens.first
+            else { return }
+            controller.applyProgrammaticFrame(target.visibleFrame, display: true)
+            state = .displayMaximized(
+                editor,
+                controller,
+                target.identity,
+                restoreFrame
+            )
+            presentationStore.saveScreenIdentity(target.identity)
+            editor.synchronizeLayoutAfterContainerChange()
+            publishSnapshot()
+        case .closed, .opening, .docked, .dockedHidden:
+            break
+        }
+    }
+
     private var presentationMode: RemoteEditorPresentationMode {
         switch state {
         case .closed: .closed
@@ -537,6 +898,169 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
     private var targetSidecarWidth: CGFloat {
         presentationStore.sidecarTargetWidth()
             ?? WorkbenchCenterContainerViewController.defaultEditorTargetWidth
+    }
+
+    private func makeEditorWindow() throws -> RemoteTextEditorWindowController {
+        do {
+            return try windowFactory()
+        } catch {
+            throw RemoteEditorPresentationError.windowCreationFailed
+        }
+    }
+
+    private func moveDockedEditorToWindow(
+        editor: RemoteTextEditorViewController,
+        sourceState: State,
+        windowController: RemoteTextEditorWindowController,
+        frame: NSRect,
+        floatingScreen: RemoteEditorScreenDescriptor?,
+        displayScreen: RemoteEditorScreenDescriptor?,
+        restoreFrame: NSRect?
+    ) throws {
+        guard let dockHost else {
+            throw RemoteEditorPresentationError.dockHostUnavailable
+        }
+        let sourceWasHidden = dockHost.isEditorSidecarCollapsed
+        var removedFromDock = false
+
+        func destinationState() -> State {
+            if let displayScreen {
+                return .displayMaximized(
+                    editor,
+                    windowController,
+                    displayScreen.identity,
+                    restoreFrame
+                )
+            }
+            return .floating(
+                editor,
+                windowController,
+                frame,
+                floatingScreen?.identity
+            )
+        }
+
+        do {
+            try windowController.validateEmptyShellForMigration()
+            try dockHost.removeEditorContent(editor)
+            removedFromDock = true
+            try windowController.installEditor(editor)
+            windowController.presentationDelegate = self
+            windowController.applyProgrammaticFrame(frame, display: displayScreen != nil)
+            windowController.showWindow(nil)
+            windowController.window?.makeKeyAndOrderFront(nil)
+            dockHost.setEditorSidecarCollapsed(true)
+            state = destinationState()
+            if let displayScreen {
+                if let restoreFrame {
+                    presentationStore.saveFloatingFrame(restoreFrame)
+                }
+                presentationStore.saveScreenIdentity(displayScreen.identity)
+            } else {
+                presentationStore.saveFloatingFrame(frame)
+                presentationStore.saveScreenIdentity(floatingScreen?.identity)
+            }
+            updateWindowPresentation(for: editor)
+            editor.synchronizeLayoutAfterContainerChange()
+        } catch let transitionError {
+            if windowController.installedEditorViewController === editor {
+                try? windowController.removeEditorForMigration(editor)
+            }
+            guard removedFromDock else {
+                state = sourceState
+                windowController.presentationDelegate = nil
+                windowController.closeShellForRedock()
+                throw transitionError
+            }
+            do {
+                try dockHost.installEditorContent(editor)
+                dockHost.setEditorSidecarCollapsed(sourceWasHidden)
+                state = sourceState
+                windowController.presentationDelegate = nil
+                windowController.closeShellForRedock()
+            } catch {
+                if let occupant = windowController.installedEditorViewController,
+                   occupant !== editor
+                {
+                    try? windowController.removeEditorForMigration(occupant)
+                }
+                try? windowController.installEditor(editor)
+                windowController.presentationDelegate = self
+                windowController.applyProgrammaticFrame(frame, display: false)
+                windowController.showWindow(nil)
+                windowController.window?.makeKeyAndOrderFront(nil)
+                state = destinationState()
+            }
+            throw transitionError
+        }
+    }
+
+    private func resolvedFloatingFrame(on screen: RemoteEditorScreenDescriptor) -> NSRect {
+        let requested: NSRect
+        if let saved = presentationStore.floatingFrame() {
+            requested = saved
+        } else {
+            let frameSize = RemoteTextEditorWindowController.initialFrameSize
+            requested = NSRect(
+                x: screen.visibleFrame.midX - (frameSize.width / 2),
+                y: screen.visibleFrame.midY - (frameSize.height / 2),
+                width: frameSize.width,
+                height: frameSize.height
+            )
+        }
+        return RemoteEditorScreenResolver.clamp(
+            requested,
+            to: screen.visibleFrame,
+            minimumSize: RemoteTextEditorWindowController.minimumFrameSize
+        )
+    }
+
+    private func preferredFloatingScreen(
+        from screens: [RemoteEditorScreenDescriptor]
+    ) -> RemoteEditorScreenDescriptor? {
+        resolvedScreen(presentationStore.screenIdentity(), from: screens)
+            ?? workbenchScreen(from: screens)
+            ?? screens.first
+    }
+
+    private func workbenchScreen(
+        from screens: [RemoteEditorScreenDescriptor]
+    ) -> RemoteEditorScreenDescriptor? {
+        guard let descriptor = screenProvider.descriptor(containing: dockHost?.parentWindow) else {
+            return nil
+        }
+        return resolvedScreen(descriptor.identity, from: screens)
+            ?? screens.first(where: { $0 == descriptor })
+    }
+
+    private func resolvedScreen(
+        _ identity: RemoteEditorScreenIdentity?,
+        from screens: [RemoteEditorScreenDescriptor]
+    ) -> RemoteEditorScreenDescriptor? {
+        RemoteEditorScreenResolver.resolve(identity, screens: screens)
+    }
+
+    private func screen(
+        containing frame: NSRect,
+        in screens: [RemoteEditorScreenDescriptor]
+    ) -> RemoteEditorScreenDescriptor? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        if let containing = screens.first(where: { $0.frame.contains(center) }) {
+            return containing
+        }
+        return screens.max { lhs, rhs in
+            intersectionArea(frame, lhs.visibleFrame) < intersectionArea(frame, rhs.visibleFrame)
+        }
+    }
+
+    private func intersects(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        intersectionArea(lhs, rhs) > 0
+    }
+
+    private func intersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard intersection.isNull == false else { return 0 }
+        return max(0, intersection.width) * max(0, intersection.height)
     }
 
     private func handlesInWorkspace(_ mode: RemoteFileOpenMode) -> Bool {
@@ -643,7 +1167,10 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
     private func wireEditorCallbacks(_ editor: RemoteTextEditorViewController) {
         editor.onCloseRequested = { [weak self] in
             guard let self else { return }
-            _ = self.requestClose(parentWindow: self.dockHost?.parentWindow, completion: nil)
+            _ = self.requestClose(
+                parentWindow: self.parentWindow(for: editor),
+                completion: nil
+            )
         }
         editor.onPendingCloseResolved = { [weak self, weak editor] resolution in
             guard let self, let editor, self.pendingCloseEditor === editor else { return }
@@ -657,10 +1184,16 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         }
         editor.onDirtyStateChanged = { [weak self, weak editor] _ in
             guard let self, self.currentEditor === editor else { return }
+            if let editor {
+                self.updateWindowPresentation(for: editor)
+            }
             self.publishSnapshot()
         }
         editor.onActiveDocumentChanged = { [weak self, weak editor] _, _ in
             guard let self, self.currentEditor === editor else { return }
+            if let editor {
+                self.updateWindowPresentation(for: editor)
+            }
             self.publishSnapshot()
         }
         editor.onAIQuestionRequested = { [weak self] question in
@@ -670,6 +1203,7 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
 
     private func finishEditorClose(_ editor: RemoteTextEditorViewController) -> Bool {
         guard pendingCloseEditor === editor || currentEditor === editor else { return false }
+        var detachedWindow: RemoteTextEditorWindowController?
         do {
             switch state {
             case .docked, .dockedHidden:
@@ -677,7 +1211,11 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
                     throw RemoteEditorPresentationError.dockHostUnavailable
                 }
                 try dockHost.removeEditorContent(editor)
-            case .closed, .opening, .floating, .displayMaximized:
+            case .floating(_, let windowController, _, _),
+                 .displayMaximized(_, let windowController, _, _):
+                try windowController.removeEditorForMigration(editor)
+                detachedWindow = windowController
+            case .closed, .opening:
                 break
             }
         } catch {
@@ -690,7 +1228,39 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         state = .closed
         publishSnapshot()
         finishCloseCompletions(.ready)
+        if let detachedWindow,
+           windowHandlingCloseRequest !== detachedWindow
+        {
+            detachedWindow.completeDeferredUserClose()
+        }
         return true
+    }
+
+    private func parentWindow(for editor: RemoteTextEditorViewController) -> NSWindow? {
+        switch state {
+        case .floating(let current, let windowController, _, _):
+            return current === editor ? windowController.window : dockHost?.parentWindow
+        case .displayMaximized(let current, let windowController, _, _):
+            return current === editor ? windowController.window : dockHost?.parentWindow
+        case .closed, .opening, .docked, .dockedHidden:
+            return dockHost?.parentWindow
+        }
+    }
+
+    private func updateWindowPresentation(for editor: RemoteTextEditorViewController) {
+        let windowController: RemoteTextEditorWindowController?
+        switch state {
+        case .floating(let current, let window, _, _):
+            windowController = current === editor ? window : nil
+        case .displayMaximized(let current, let window, _, _):
+            windowController = current === editor ? window : nil
+        case .closed, .opening, .docked, .dockedHidden:
+            windowController = nil
+        }
+        windowController?.updateDocumentPresentation(
+            fileName: editor.activeFileNameForTesting,
+            isDirty: editor.hasUnsavedChangesForTesting
+        )
     }
 
     private func finishCloseCompletions(_ resolution: RemoteTextEditorCloseResolution) {
@@ -706,6 +1276,19 @@ public final class RemoteEditorPresentationCoordinator: RemoteEditorPresentation
         action()
         isTransitioning = false
         publishSnapshot()
+    }
+
+    private func performThrowingTransition(_ action: () throws -> Void) throws {
+        guard isTransitioning == false else {
+            throw RemoteEditorPresentationError.transitionInProgress
+        }
+        isTransitioning = true
+        publishSnapshot()
+        defer {
+            isTransitioning = false
+            publishSnapshot()
+        }
+        try action()
     }
 
     private func publishSnapshot() {

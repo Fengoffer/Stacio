@@ -609,10 +609,78 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         let window = try XCTUnwrap(windowController.window)
         window.layoutIfNeeded()
 
-        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.width, 900)
-        XCTAssertGreaterThanOrEqual(window.contentLayoutRect.height, 620)
-        XCTAssertGreaterThanOrEqual(window.contentMinSize.width, 720)
-        XCTAssertGreaterThanOrEqual(window.contentMinSize.height, 480)
+        XCTAssertEqual(window.contentLayoutRect.size, RemoteTextEditorWindowController.initialContentSize)
+        XCTAssertEqual(window.frame.size, RemoteTextEditorWindowController.initialFrameSize)
+        XCTAssertEqual(window.contentMinSize, RemoteTextEditorWindowController.minimumContentSize)
+    }
+
+    func testEmptyWindowShellInstallsAndRemovesEditorWithoutChangingWebViewIdentity() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "migration.conf", contents: "enabled=true\n")
+        let editor = RemoteTextEditorViewController(localURL: fileURL)
+        editor.loadView()
+        let webView = try XCTUnwrap(editor.editorWebViewForTesting)
+        let windowController = RemoteTextEditorWindowController()
+        defer { windowController.closeShellForRedock() }
+
+        try windowController.installEditor(editor)
+
+        XCTAssertTrue(windowController.editorViewController === editor)
+        XCTAssertTrue(windowController.window?.contentViewController === editor)
+        XCTAssertTrue(editor.editorWebViewForTesting === webView)
+
+        try windowController.removeEditorForMigration(editor)
+
+        XCTAssertNil(windowController.installedEditorViewController)
+        XCTAssertNil(windowController.window?.contentViewController)
+        XCTAssertTrue(editor.editorWebViewForTesting === webView)
+    }
+
+    func testStandaloneWindowAdapterPreservesExistingPresentationCallback() throws {
+        let fileURL = try makeTemporaryEditorFile(name: "callbacks.conf", contents: "enabled=true\n")
+        let editor = RemoteTextEditorViewController(localURL: fileURL)
+        var existingPresentationEvents: [(String, Bool)] = []
+        editor.onWindowPresentationChanged = {
+            existingPresentationEvents.append(($0, $1))
+        }
+        let windowController = RemoteTextEditorWindowController(editorViewController: editor)
+        defer { windowController.close() }
+        editor.loadView()
+        waitForLocalDocumentLoads(editor)
+
+        editor.replaceTextForTesting("enabled=false\n")
+
+        XCTAssertEqual(existingPresentationEvents.last?.0, "callbacks.conf")
+        XCTAssertEqual(existingPresentationEvents.last?.1, true)
+        XCTAssertEqual(windowController.window?.title, "● callbacks.conf")
+        XCTAssertEqual(windowController.window?.isDocumentEdited, true)
+    }
+
+    func testRedockShellCloseDoesNotAskEditorToCloseAndClearsDelegates() throws {
+        let descriptor = RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/redock.conf",
+            fileName: "redock.conf",
+            content: "enabled=true\n"
+        )
+        let editor = RemoteTextEditorViewController(document: descriptor)
+        editor.replaceTextForTesting("enabled=false\n")
+        let confirmer = RecordingRemoteTextEditorCloseConfirmer(decision: .cancel)
+        let windowController = RemoteTextEditorWindowController(
+            editorViewController: editor,
+            closeConfirmer: confirmer
+        )
+        let delegate = RecordingRemoteTextEditorWindowDelegate()
+        windowController.presentationDelegate = delegate
+        windowController.showWindow(nil)
+
+        windowController.closeShellForRedock()
+
+        XCTAssertEqual(confirmer.promptedFileNames, [])
+        XCTAssertFalse(windowController.window?.isVisible ?? true)
+        XCTAssertNil(windowController.installedEditorViewController)
+        XCTAssertNil(windowController.window?.contentViewController)
+        XCTAssertNil(windowController.window?.delegate)
+        XCTAssertNil(windowController.presentationDelegate)
+        XCTAssertEqual(delegate.closeReasons, [true])
     }
 
     func testEditorBuildsAIQuestionForActiveRemoteTextDocument() throws {
@@ -660,6 +728,9 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertTrue(html.contains(
             #"<span class="close" data-close="${escapeHTML(document.id)}" aria-label="关闭选项卡"></span><span class="dirty"></span><span class="tab-title">"#
         ))
+        XCTAssertTrue(html.contains("target.closest('[data-close], .close, .tab-scroll')"))
+        XCTAssertTrue(html.contains(".close {"))
+        XCTAssertFalse(html.contains("target.closest('.tab-close')"))
     }
 
     func testMonacoTabsSwitchThroughRobustContainerClickHandling() throws {
@@ -686,7 +757,9 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertTrue(html.contains("addEventListener('mousedown', handleTabsMouseDown)"))
         XCTAssertTrue(html.contains("function handleTabsMouseDown(event)"))
         XCTAssertTrue(html.contains("return activateTabFromEvent(event)"))
-        XCTAssertTrue(html.contains("const closeButton = target.closest('[data-close]')"))
+        XCTAssertTrue(html.contains(
+            "const excludedControl = target.closest('[data-close], .close, .tab-scroll')"
+        ))
     }
 
     func testWebSwitchTabMessageDoesNotPushStaleActiveTabBeforeActivatingTarget() throws {
@@ -1917,6 +1990,40 @@ final class RecordingRemoteTextEditorCloseConfirmer: RemoteTextEditorCloseConfir
         promptedFileNames.append(fileName)
         return decision
     }
+}
+
+@MainActor
+private final class RecordingRemoteTextEditorWindowDelegate:
+    RemoteTextEditorWindowControllerDelegate
+{
+    private(set) var closeReasons: [Bool] = []
+
+    func remoteTextEditorWindowShouldClose(
+        _ controller: RemoteTextEditorWindowController
+    ) -> Bool {
+        true
+    }
+
+    func remoteTextEditorWindowDidClose(
+        _ controller: RemoteTextEditorWindowController,
+        forRedock: Bool
+    ) {
+        closeReasons.append(forRedock)
+    }
+
+    func remoteTextEditorWindowDidChangeFrame(
+        _ controller: RemoteTextEditorWindowController,
+        frame: NSRect,
+        userInitiated: Bool
+    ) {}
+
+    func remoteTextEditorWindowWillEnterFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {}
+
+    func remoteTextEditorWindowDidExitFullScreen(
+        _ controller: RemoteTextEditorWindowController
+    ) {}
 }
 
 private extension NSView {
