@@ -15,7 +15,9 @@ import StacioCoreBindings
 
 struct SshfsDependencyChecker {
     static func checkMacFUSE() -> Bool {
-        FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs")
+        // 兼容新版 macFUSE 与旧版 OSXFUSE
+        return FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs")
+            || FileManager.default.fileExists(atPath: "/Library/Filesystems/osxfuse.fs")
     }
 
     static func checkSshfs() -> Bool {
@@ -57,6 +59,16 @@ public struct MountEntry: Equatable, Codable {
         }
     }
 
+    /// 挂载运行时状态。
+    /// - mounted: 已确认挂载成功（远端→本地通过 statfs 验证）
+    /// - pending: 命令已下发但未确认结果（本地→远端，因为远端终端是 fire-and-forget）
+    /// - unmounting: 卸载命令已下发但未确认结果
+    public enum Status: String, Codable {
+        case mounted
+        case pending
+        case unmounting
+    }
+
     public let id: String
     public let direction: Direction
     public let remotePath: String
@@ -66,6 +78,12 @@ public struct MountEntry: Equatable, Codable {
     public let createdAt: Date
     /// 远端主机信息（用于持久化展示，不含敏感凭据）。
     public let hostLabel: String
+    public var status: Status
+
+    private enum CodingKeys: String, CodingKey {
+        case id, direction, remotePath, localMountPoint, permission
+        case autoReconnect, createdAt, hostLabel, status
+    }
 
     public init(
         id: String = UUID().uuidString,
@@ -75,7 +93,8 @@ public struct MountEntry: Equatable, Codable {
         permission: Permission,
         autoReconnect: Bool,
         createdAt: Date = Date(),
-        hostLabel: String
+        hostLabel: String,
+        status: Status = .mounted
     ) {
         self.id = id
         self.direction = direction
@@ -85,23 +104,42 @@ public struct MountEntry: Equatable, Codable {
         self.autoReconnect = autoReconnect
         self.createdAt = createdAt
         self.hostLabel = hostLabel
+        self.status = status
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        direction = try c.decode(Direction.self, forKey: .direction)
+        remotePath = try c.decode(String.self, forKey: .remotePath)
+        localMountPoint = try c.decode(String.self, forKey: .localMountPoint)
+        permission = try c.decode(Permission.self, forKey: .permission)
+        autoReconnect = try c.decode(Bool.self, forKey: .autoReconnect)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        hostLabel = try c.decode(String.self, forKey: .hostLabel)
+        // 向后兼容：旧数据没有 status 字段，默认视为已挂载
+        status = try c.decodeIfPresent(Status.self, forKey: .status) ?? .mounted
     }
 }
 
-/// 运行时挂载句柄，持有 sshfs 进程和临时私钥文件路径，用于卸载时清理。
+/// 运行时挂载句柄，持有 sshfs 进程、临时私钥文件和 askpass 辅助脚本路径，
+/// 在卸载或句柄释放时统一清理，避免敏感凭据残留。
 public final class MountHandle {
     fileprivate let process: Process
     fileprivate let tempKeyFileURL: URL?
-    fileprivate let entry: MountEntry
+    fileprivate let askpassHelperURL: URL?
 
-    fileprivate init(process: Process, tempKeyFileURL: URL?, entry: MountEntry) {
+    fileprivate init(process: Process, tempKeyFileURL: URL?, askpassHelperURL: URL?) {
         self.process = process
         self.tempKeyFileURL = tempKeyFileURL
-        self.entry = entry
+        self.askpassHelperURL = askpassHelperURL
     }
 
     deinit {
         if let url = tempKeyFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let url = askpassHelperURL {
             try? FileManager.default.removeItem(at: url)
         }
     }
@@ -154,6 +192,18 @@ public final class MountStore {
         defer { lock.unlock() }
         var entries = (try? JSONDecoder().decode([MountEntry].self, from: defaults.data(forKey: sessionKey) ?? Data())) ?? []
         entries.removeAll { $0.id == id }
+        if let data = try? JSONEncoder().encode(entries) {
+            defaults.set(data, forKey: sessionKey)
+        }
+    }
+
+    /// 更新指定 entry 的状态（用于 pending → mounted / unmounting → 移除 的状态机推进）。
+    public func updateStatus(id: String, status: MountEntry.Status) {
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = (try? JSONDecoder().decode([MountEntry].self, from: defaults.data(forKey: sessionKey) ?? Data())) ?? []
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        entries[index].status = status
         if let data = try? JSONEncoder().encode(entries) {
             defaults.set(data, forKey: sessionKey)
         }
@@ -213,6 +263,10 @@ public final class MountOperationRunner {
     /// 运行时挂载句柄表（entryID → handle），用于卸载时清理 sshfs 进程和临时私钥文件。
     private var handles: [String: MountHandle] = [:]
     private let handlesLock = NSLock()
+
+    /// 缓存 sshfs 可执行路径，避免每次挂载都 fork `which` 进程。
+    private var cachedSshfsPath: String?
+    private let sshfsPathLock = NSLock()
 
     public init(
         sessionContext: TunnelLiveSessionContext?,
@@ -369,7 +423,7 @@ public final class MountOperationRunner {
                 autoReconnect: autoReconnect,
                 hostLabel: "\(user)@\(host):\(port)"
             )
-            let handle = MountHandle(process: process, tempKeyFileURL: tempKeyFileURL, entry: entry)
+            let handle = MountHandle(process: process, tempKeyFileURL: tempKeyFileURL, askpassHelperURL: askpassHelperURL)
             storeHandle(handle, for: entry.id)
             appLog?.append(level: .info, category: "mount", message: "sshfs.started host=\(host) port=\(port)")
             return entry
@@ -425,13 +479,16 @@ public final class MountOperationRunner {
 
         appLog?.append(level: .info, category: "mount", message: "local-to-remote dispatched")
 
+        // 本地→远端通过远端终端 fire-and-forget 发送，无法立即确认结果，
+        // 标记为 pending，由调用方在后续刷新时核对（满足"不立即假设成功"约束）。
         return MountEntry(
             direction: .localToRemote,
             remotePath: remoteMountPoint,
             localMountPoint: localPath,
             permission: .readWrite,
             autoReconnect: autoReconnect,
-            hostLabel: "\(context.config.username)@\(context.config.host):\(context.config.port)"
+            hostLabel: "\(context.config.username)@\(context.config.host):\(context.config.port)",
+            status: .pending
         )
     }
 
@@ -444,7 +501,9 @@ public final class MountOperationRunner {
             // 卸载后清理 sshfs 进程和临时私钥文件
             removeHandle(for: entry.id)
         case .localToRemote:
-            // 通过远端终端执行 umount
+            // 通过远端终端执行 umount。
+            // 远端终端是 fire-and-forget，无法立即确认卸载成功，
+            // 调用方应将 entry 标记为 .unmounting 并延迟移除，直到下次刷新核对。
             remoteTerminalSender("umount \(shellEscape(entry.remotePath))\n")
             appLog?.append(level: .info, category: "mount", message: "unmount.local-to-remote dispatched")
         }
@@ -470,6 +529,11 @@ public final class MountOperationRunner {
             // 回退到 diskutil
         }
 
+        // 排空 umount 的 stderr（即使失败），避免 pipe 资源泄漏，并可用于错误信息
+        let umountStderrData = umountPipe.fileHandleForReading.readDataToEndOfFile()
+        let umountStderrText = String(data: umountStderrData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
         // 回退到 diskutil unmount force
         let diskutil = Process()
         diskutil.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
@@ -484,9 +548,11 @@ public final class MountOperationRunner {
         } else {
             let stderrData = diskutilPipe.fileHandleForReading.readDataToEndOfFile()
             let stderrText = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let safeError = RuntimeDiagnosticFormatter.userMessage(for: MountError.unmountFailed(stderrText))
+            // 优先使用 diskutil 错误，其次 umount 错误
+            let combinedError = stderrText.isEmpty ? umountStderrText : stderrText
+            let safeError = RuntimeDiagnosticFormatter.userMessage(for: MountError.unmountFailed(combinedError))
             appLog?.append(level: .error, category: "mount", message: "unmount.failed status=\(diskutil.terminationStatus)")
-            throw MountError.unmountFailed(stderrText.isEmpty ? "退出码 \(diskutil.terminationStatus)" : safeError)
+            throw MountError.unmountFailed(combinedError.isEmpty ? "退出码 \(diskutil.terminationStatus)" : safeError)
         }
     }
 
@@ -551,6 +617,14 @@ public final class MountOperationRunner {
     }
 
     private func resolveSshfsPath() -> String? {
+        // 先读缓存，命中则直接返回，避免每次挂载都 fork `which`
+        sshfsPathLock.lock()
+        let cached = cachedSshfsPath
+        sshfsPathLock.unlock()
+        if let cached, FileManager.default.isExecutableFile(atPath: cached) {
+            return cached
+        }
+
         // 优先使用 which 解析
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
@@ -563,7 +637,10 @@ public final class MountOperationRunner {
             if process.terminationStatus == 0 {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let path, !path.isEmpty {
+                if let path, !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) {
+                    sshfsPathLock.lock()
+                    cachedSshfsPath = path
+                    sshfsPathLock.unlock()
                     return path
                 }
             }
@@ -575,7 +652,13 @@ public final class MountOperationRunner {
             "/opt/homebrew/bin/sshfs",
             "/usr/local/bin/sshfs"
         ]
-        return fallbackPaths.first { FileManager.default.isExecutableFile(atPath: $0) }
+        if let resolved = fallbackPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            sshfsPathLock.lock()
+            cachedSshfsPath = resolved
+            sshfsPathLock.unlock()
+            return resolved
+        }
+        return nil
     }
 
     private func writeTemporaryPrivateKey(pem: String) throws -> URL {
@@ -665,10 +748,10 @@ public final class MountViewController: NSViewController {
     }
 
     public override func loadView() {
-        // Liquid Glass 容器：使用 NSVisualEffectView hudWindow 材质
+        // macOS 27：sheet 内容视图使用 .windowBackground 材质（.hudWindow 仅用于浮动 HUD 小浮层）
         let container = NSVisualEffectView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.material = .hudWindow
+        container.material = .windowBackground
         container.blendingMode = .behindWindow
         container.state = .active
         container.wantsLayer = true
@@ -711,14 +794,14 @@ public final class MountViewController: NSViewController {
 
         mountButton.target = self
         mountButton.action = #selector(mountPressed)
-        // macOS 27：主操作使用 .prominent bezel，让系统玻璃自动渲染
+        // macOS 27：AppKit 无 .prominent bezel，主操作通过 keyEquivalent="\r" 让系统作 default 按钮渲染，
+        // 保留 .rounded bezel + .large controlSize，不覆盖系统 tint，让 Liquid Glass 自动适配。
         mountButton.bezelStyle = .rounded
         mountButton.controlSize = .large
         mountButton.keyEquivalent = "\r"
         mountButton.translatesAutoresizingMaskIntoConstraints = false
         mountButton.image = NSImage(systemSymbolName: "externaldrive.badge.plus", accessibilityDescription: "挂载")
         mountButton.imagePosition = .imageLeading
-        mountButton.contentTintColor = .white
 
         dependencyHintLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         dependencyHintLabel.textColor = .systemOrange
@@ -787,7 +870,7 @@ public final class MountViewController: NSViewController {
     // MARK: - 布局
 
     private func layoutViews() {
-        let titleIcon = NSImageView(image: NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: nil)!)
+        let titleIcon = NSImageView(image: NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: nil) ?? NSImage())
         titleIcon.contentTintColor = .controlAccentColor
         titleIcon.translatesAutoresizingMaskIntoConstraints = false
         titleIcon.symbolConfiguration = .init(pointSize: 20, weight: .semibold)
@@ -830,8 +913,10 @@ public final class MountViewController: NSViewController {
         dependencyRow.spacing = 8
         dependencyRow.translatesAutoresizingMaskIntoConstraints = false
 
+        let mountsTitleIcon = NSImageView(image: NSImage(systemSymbolName: "list.bullet", accessibilityDescription: nil) ?? NSImage())
+        mountsTitleIcon.contentTintColor = .secondaryLabelColor
         let mountsTitleRow = NSStackView(views: [
-            NSImageView(image: NSImage(systemSymbolName: "list.bullet", accessibilityDescription: nil)!),
+            mountsTitleIcon,
             NSTextField(labelWithString: "当前挂载").also {
                 $0.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
                 $0.textColor = .labelColor
@@ -1055,15 +1140,34 @@ public final class MountViewController: NSViewController {
             guard let self else { return }
             do {
                 try self.operationRunner.unmount(entry: entry)
-                self.mountStore.removeEntry(id: entry.id)
+                if entry.direction == .remoteToLocal {
+                    // 远端→本地：statfs 验证 umount 成功后才移除
+                    self.mountStore.removeEntry(id: entry.id)
+                } else {
+                    // 本地→远端：fire-and-forget，标记为卸载中，延迟移除
+                    self.mountStore.updateStatus(id: entry.id, status: .unmounting)
+                    self.schedulePendingUnmountRemoval(entryID: entry.id)
+                }
                 DispatchQueue.main.async {
-                    self.updateStatusLabel("已卸载")
+                    self.updateStatusLabel(entry.direction == .remoteToLocal ? "已卸载" : "卸载命令已发送")
                     self.refreshEntries()
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.updateStatusLabel(error.localizedDescription, isError: true)
                 }
+            }
+        }
+    }
+
+    /// 本地→远端卸载命令发出后，给远端 umount 一些执行时间再移除条目。
+    /// 这是对 fire-and-forget 终端的折中处理：不阻塞 UI，但也不立即假设成功。
+    private func schedulePendingUnmountRemoval(entryID: String) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self else { return }
+            self.mountStore.removeEntry(id: entryID)
+            DispatchQueue.main.async {
+                self.refreshEntries()
             }
         }
     }
@@ -1088,8 +1192,9 @@ extension MountViewController: NSTableViewDataSource, NSTableViewDelegate {
         let entry = entries[row]
 
         let cellIdentifier = NSUserInterfaceItemIdentifier("MountCell")
-        let cell = tableView.makeView(withIdentifier: cellIdentifier, owner: self) as? MountTableCellView
-            ?? MountTableCellView()
+        // 标准 NSTableView 复用模式：makeView 返回可复用 cell，否则新建并设置 identifier
+        let cell = (tableView.makeView(withIdentifier: cellIdentifier, owner: self) as? MountTableCellView)
+            ?? MountTableCellView(identifier: cellIdentifier)
 
         cell.configure(with: entry)
         cell.onUnmount = { [weak self] in
@@ -1108,6 +1213,7 @@ extension MountViewController: NSTableViewDataSource, NSTableViewDelegate {
 
 private final class MountTableCellView: NSTableCellView {
     private let directionIcon = NSImageView()
+    private let statusIcon = NSImageView()
     private let infoLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
     private let revealButton = NSButton(title: "Finder", target: nil, action: nil)
@@ -1115,6 +1221,13 @@ private final class MountTableCellView: NSTableCellView {
 
     var onUnmount: (() -> Void)?
     var onRevealInFinder: (() -> Void)?
+
+    /// 便捷初始化：传入 identifier 以支持 NSTableView 复用。
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        setup()
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1129,6 +1242,9 @@ private final class MountTableCellView: NSTableCellView {
     private func setup() {
         directionIcon.translatesAutoresizingMaskIntoConstraints = false
         directionIcon.symbolConfiguration = .init(pointSize: 14, weight: .regular)
+
+        statusIcon.translatesAutoresizingMaskIntoConstraints = false
+        statusIcon.symbolConfiguration = .init(pointSize: 10, weight: .regular)
 
         infoLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         infoLabel.textColor = .labelColor
@@ -1158,7 +1274,13 @@ private final class MountTableCellView: NSTableCellView {
         unmountButton.action = #selector(unmountPressed)
         unmountButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let textStack = NSStackView(views: [infoLabel, detailLabel])
+        let infoRow = NSStackView(views: [infoLabel, statusIcon])
+        infoRow.orientation = .horizontal
+        infoRow.alignment = .centerY
+        infoRow.spacing = 4
+        infoRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let textStack = NSStackView(views: [infoRow, detailLabel])
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 2
@@ -1201,6 +1323,26 @@ private final class MountTableCellView: NSTableCellView {
         directionIcon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: directionText)
         infoLabel.stringValue = "\(directionText) · \(entry.hostLabel)"
         detailLabel.stringValue = "\(entry.remotePath) → \(entry.localMountPoint)"
+
+        // 状态图标：mounted=checkmark.circle / pending=clock / unmounting=arrow.2.circlepath
+        let statusSymbol: String
+        let statusTint: NSColor
+        switch entry.status {
+        case .mounted:
+            statusSymbol = "checkmark.circle.fill"
+            statusTint = .systemGreen
+        case .pending:
+            statusSymbol = "clock.fill"
+            statusTint = .systemOrange
+        case .unmounting:
+            statusSymbol = "arrow.2.circlepath.circle.fill"
+            statusTint = .systemBlue
+        }
+        statusIcon.image = NSImage(systemSymbolName: statusSymbol, accessibilityDescription: entry.status.rawValue)
+        statusIcon.contentTintColor = statusTint
+
+        // 卸载中状态禁用卸载按钮，避免重复点击
+        unmountButton.isEnabled = entry.status != .unmounting
     }
 
     @objc private func revealPressed() {
@@ -1225,6 +1367,8 @@ private extension NSTextField {
 
 public extension MountViewController {
     /// 以 sheet 方式弹出挂载管理界面。
+    /// 通过 `contentViewController` 让 NSWindow 强持有 controller，避免函数返回后 controller 被释放。
+    /// 标题栏可见 + 标准关闭按钮，用户可通过关闭按钮结束 sheet。
     @MainActor
     static func present(
         on window: NSWindow,
@@ -1247,9 +1391,11 @@ public extension MountViewController {
             defer: false
         )
         sheet.title = "SSHFS 目录挂载"
-        sheet.titlebarAppearsTransparent = true
-        sheet.titleVisibility = .hidden
-        sheet.contentView = controller.view
+        // 可见标题栏 + 标准关闭按钮，确保用户能关闭 sheet
+        sheet.titleVisibility = .visible
+        sheet.titlebarAppearsTransparent = false
+        // contentViewController 让 window 强持有 controller，避免 target/action 失效
+        sheet.contentViewController = controller
         sheet.isReleasedWhenClosed = false
         sheet.minSize = NSSize(width: 500, height: 600)
 
