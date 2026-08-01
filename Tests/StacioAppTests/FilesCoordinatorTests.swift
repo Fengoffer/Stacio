@@ -582,7 +582,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(bridge.eventsSnapshot, ["live:~", "live:/home/deploy"])
     }
 
-    func testCoordinatorBuiltInEditorIgnoresStaleLocalCacheAndReadsRemoteOnline() throws {
+    func testCoordinatorInjectedOpenerIgnoresStaleLocalCacheAndReadsRemoteOnline() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let cache = RemoteEditCache(rootDirectory: cacheRoot)
         let scheduler = RecordingSCPTransferScheduler()
@@ -625,7 +625,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(request.mode, .textEditor)
         XCTAssertTrue(opener.openRequests.isEmpty)
         XCTAssertTrue(scheduler.jobs.isEmpty)
-        XCTAssertNil(files.embeddedOpenProgressViewControllerForTesting)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
     func testCoordinatorBuildsAIContextAttachmentFromSelectedRemoteTextFile() throws {
@@ -1345,7 +1345,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(opener.failedOpenRequestIDs, [opener.preparedRequestIDs[1]])
     }
 
-    func testCoordinatorOpensTextInEditorAndRemoteMediaInIndependentWindowWithoutCacheDownloads() throws {
+    func testCoordinatorOpensTextThroughInjectedOpenerAndRemoteMediaInIndependentWindowWithoutCacheDownloads() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1355,12 +1355,14 @@ final class FilesCoordinatorTests: XCTestCase {
         )
         let files = FilesViewController()
         files.loadView()
+        let opener = RecordingRemoteEditOpener()
         let coordinator = FilesCoordinator(
             bridge: bridge,
             filesViewController: files,
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -1371,9 +1373,7 @@ final class FilesCoordinatorTests: XCTestCase {
 
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.performOpenRemoteEditForTesting()
-        XCTAssertTrue(waitUntil {
-            files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting == ["config.json"]
-        })
+        XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
@@ -1393,25 +1393,24 @@ final class FilesCoordinatorTests: XCTestCase {
             "内置编辑器和独立媒体窗口必须在线打开，不能先下载到 StacioRemoteEditCache"
         )
         XCTAssertEqual(bridge.readRequests.map(\.path), ["/srv/app/config.json"])
-        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
-        XCTAssertEqual(editor.tabTitlesForTesting, ["config.json"])
-        XCTAssertEqual(editor.currentTextForTesting, #"{"enabled":true}"#)
-        editor.replaceTextForTesting(#"{"enabled":false}"#)
-        try editor.performSaveForTesting()
+        let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
+        XCTAssertEqual(request.document.content, #"{"enabled":true}"#)
+        try request.saveHandler?(#"{"enabled":false}"#)
 
         XCTAssertEqual(bridge.writeRequests.count, 1)
         XCTAssertEqual(bridge.writeRequests.first?.path, "/srv/app/config.json")
         XCTAssertEqual(String(data: try XCTUnwrap(bridge.writeRequests.first?.contents), encoding: .utf8), #"{"enabled":false}"#)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
-    func testCoordinatorShowsEmbeddedOpenProgressImmediatelyWhenOpeningRemoteFile() throws {
+    func testCoordinatorPreparesInjectedOpenerBeforeRemoteReadCompletes() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
-        let bridge = RecordingRemoteFilesBridge(
-            remoteFileData: [
-                "/srv/app/config.json": Data("{}".utf8)
-            ]
+        let bridge = DelayedRemoteFileReadBridge(
+            remotePath: "/srv/app/config.json",
+            data: Data("{}".utf8)
         )
+        let opener = RecordingRemoteEditOpener()
         let files = FilesViewController()
         files.loadView()
         let coordinator = FilesCoordinator(
@@ -1420,6 +1419,7 @@ final class FilesCoordinatorTests: XCTestCase {
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -1430,59 +1430,25 @@ final class FilesCoordinatorTests: XCTestCase {
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.performOpenRemoteEditForTesting()
 
-        XCTAssertNotNil(files.embeddedOpenProgressViewControllerForTesting)
-        XCTAssertNotNil(files.view.firstSubview(withIdentifier: "Stacio.RemoteFileOpenProgress.root"))
+        XCTAssertTrue(bridge.waitUntilReadStarted())
+        XCTAssertEqual(opener.preparedRequestIDs.count, 1)
+        XCTAssertTrue(opener.remoteDocumentRequests.isEmpty)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
 
-        XCTAssertTrue(waitUntil { files.embeddedOpenProgressViewControllerForTesting == nil })
+        bridge.releaseRead()
+
+        XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
         XCTAssertTrue(scheduler.jobs.isEmpty)
-        XCTAssertNil(files.embeddedOpenProgressViewControllerForTesting)
-        XCTAssertNotNil(files.embeddedEditorViewControllerForTesting)
     }
 
-    func testEmbeddedOpenProgressReplacementInvalidatesOlderRequestGeneration() throws {
-        let files = FilesViewController()
-        files.loadView()
-        let firstRequestID = UUID()
-        let secondRequestID = UUID()
-        let firstSelection = RemoteFileSelection(
-            path: "/srv/app/first.conf",
-            size: 11,
-            kind: .file
-        )
-        let secondSelection = RemoteFileSelection(
-            path: "/srv/app/second.conf",
-            size: 12,
-            kind: .file
-        )
-
-        XCTAssertEqual(
-            files.beginEmbeddedOpenRequest(
-                selection: firstSelection,
-                mode: .textEditor,
-                requestID: firstRequestID
-            ),
-            firstRequestID
-        )
-        XCTAssertEqual(
-            files.beginEmbeddedOpenRequest(
-                selection: secondSelection,
-                mode: .textEditor,
-                requestID: secondRequestID
-            ),
-            secondRequestID
-        )
-
-        XCTAssertFalse(files.isEmbeddedOpenRequestActive(firstRequestID))
-        XCTAssertTrue(files.isEmbeddedOpenRequestActive(secondRequestID))
-    }
-
-    func testCoordinatorIgnoresRemoteOpenReadCompletionAfterProgressIsClosed() throws {
+    func testCoordinatorIgnoresRemoteOpenReadCompletionAfterPresentationIsClosed() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = DelayedRemoteFileReadBridge(
             remotePath: "/srv/app/config.json",
             data: Data(#"{"enabled":true}"#.utf8)
         )
+        let presentationHarness = makeFilesCoordinatorPresentationHarness(testName: #function)
         let files = FilesViewController()
         files.loadView()
         let coordinator = FilesCoordinator(
@@ -1491,6 +1457,7 @@ final class FilesCoordinatorTests: XCTestCase {
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: presentationHarness.presentation,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -1502,17 +1469,21 @@ final class FilesCoordinatorTests: XCTestCase {
         files.performOpenRemoteEditForTesting()
 
         XCTAssertTrue(bridge.waitUntilReadStarted())
-        XCTAssertNotNil(files.embeddedOpenProgressViewControllerForTesting)
-        XCTAssertTrue(files.closeEmbeddedEditorIfNeeded())
-        XCTAssertNil(files.embeddedOpenProgressViewControllerForTesting)
+        XCTAssertEqual(presentationHarness.presentation.snapshot.mode, .opening)
+        XCTAssertEqual(
+            presentationHarness.presentation.requestClose(parentWindow: nil, completion: nil),
+            .ready
+        )
+        XCTAssertEqual(presentationHarness.presentation.snapshot.mode, .closed)
 
         bridge.releaseRead()
 
         let reopened = waitUntil(timeout: 0.5) {
-            files.embeddedEditorViewControllerForTesting != nil
+            presentationHarness.presentation.currentEditor != nil
         }
         XCTAssertFalse(reopened)
-        XCTAssertNil(files.embeddedEditorViewControllerForTesting)
+        XCTAssertNil(presentationHarness.presentation.currentEditor)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
     func testCoordinatorOpensRemoteImageVideoAndAudioInIndependentMediaWindows() throws {
@@ -1561,70 +1532,10 @@ final class FilesCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(scheduler.jobs.isEmpty)
         XCTAssertTrue(opener.remoteDocumentRequests.isEmpty)
-        XCTAssertNil(files.embeddedEditorViewControllerForTesting)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
-    func testCoordinatorDefaultOpenerKeepsRemoteMediaOutOfEditorTabs() throws {
-        let cacheRoot = try makeTemporaryDirectory()
-        let scheduler = RecordingSCPTransferScheduler()
-        let bridge = RecordingRemoteFilesBridge(
-            remoteFileData: [
-                "/srv/app/config.json": Data(#"{"enabled":true}"#.utf8)
-            ]
-        )
-        let files = FilesViewController()
-        files.loadView()
-        let coordinator = FilesCoordinator(
-            bridge: bridge,
-            filesViewController: files,
-            liveSessionContextProvider: { self.liveContext() },
-            transferScheduler: scheduler,
-            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
-            remoteEditSessionIDProvider: { "session-alpha" }
-        )
-        XCTAssertNotNil(coordinator)
-        files.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        files.setRemoteEntries([
-            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil),
-            RemoteFileEntry(kind: .file, path: "/srv/app/screenshot.png", size: 1_024, linkTarget: nil)
-        ])
-
-        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        files.performOpenRemoteEditForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting != nil })
-        files.view.layoutSubtreeIfNeeded()
-
-        XCTAssertNotNil(files.embeddedEditorViewControllerForTesting)
-        XCTAssertNotNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
-        XCTAssertNil(files.view.window)
-
-        files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        files.openSelectedEntryForTesting()
-        XCTAssertTrue(waitUntil {
-            NSApp.windows.contains {
-                $0.title == "screenshot.png"
-                    && $0.contentViewController is FileWorkspaceMediaViewController
-            }
-        })
-        defer {
-            NSApp.windows
-                .filter { $0.title == "screenshot.png" }
-                .forEach { $0.close() }
-        }
-        files.view.layoutSubtreeIfNeeded()
-
-        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
-        XCTAssertNil(files.embeddedMediaPreviewViewControllerForTesting)
-        XCTAssertNotNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
-        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.MediaPreview.root"))
-        XCTAssertEqual(editor.tabTitlesForTesting, ["config.json"])
-        XCTAssertEqual(editor.activeFileNameForTesting, "config.json")
-        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "text")
-        XCTAssertTrue(scheduler.jobs.isEmpty)
-        XCTAssertNil(files.view.window)
-    }
-
-    func testCoordinatorDefaultOpenerAddsMultipleRemoteTextFilesAsEditorTabs() throws {
+    func testCoordinatorPresentationOpenerAddsMultipleRemoteTextFilesAsEditorTabsOutsideFiles() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1635,12 +1546,14 @@ final class FilesCoordinatorTests: XCTestCase {
         )
         let files = FilesViewController()
         files.loadView()
+        let presentationHarness = makeFilesCoordinatorPresentationHarness(testName: #function)
         let coordinator = FilesCoordinator(
             bridge: bridge,
             filesViewController: files,
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: presentationHarness.presentation,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -1651,17 +1564,20 @@ final class FilesCoordinatorTests: XCTestCase {
 
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting == ["first.conf"] })
+        XCTAssertTrue(waitUntil {
+            presentationHarness.presentation.currentEditor?.tabTitlesForTesting == ["first.conf"]
+        })
 
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting.count == 2 })
-        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { presentationHarness.presentation.currentEditor?.tabTitlesForTesting.count == 2 })
+        let editor = try XCTUnwrap(presentationHarness.presentation.currentEditor)
         XCTAssertEqual(editor.tabTitlesForTesting, ["first.conf", "second.log"])
         XCTAssertEqual(editor.activeFileNameForTesting, "second.log")
         XCTAssertEqual(editor.currentTextForTesting, "service started\n")
         XCTAssertEqual(bridge.readRequests.map(\.path), ["/srv/app/first.conf", "/srv/app/second.log"])
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
     func testCoordinatorShowsFailureWhenOpeningAnotherRemoteTextFileFails() throws {
@@ -1674,12 +1590,14 @@ final class FilesCoordinatorTests: XCTestCase {
         )
         let files = FilesViewController()
         files.loadView()
+        let presentationHarness = makeFilesCoordinatorPresentationHarness(testName: #function)
         let coordinator = FilesCoordinator(
             bridge: bridge,
             filesViewController: files,
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: presentationHarness.presentation,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -1690,17 +1608,20 @@ final class FilesCoordinatorTests: XCTestCase {
 
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting == ["first.conf"] })
+        XCTAssertTrue(waitUntil {
+            presentationHarness.presentation.currentEditor?.tabTitlesForTesting == ["first.conf"]
+        })
 
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting?.tabTitlesForTesting.count == 2 })
-        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { presentationHarness.presentation.currentEditor?.tabTitlesForTesting.count == 2 })
+        let editor = try XCTUnwrap(presentationHarness.presentation.currentEditor)
         XCTAssertEqual(editor.tabTitlesForTesting, ["first.conf", "missing.log"])
         XCTAssertEqual(editor.activeFileNameForTesting, "missing.log")
         XCTAssertFalse(editor.canEditTextForTesting)
         XCTAssertTrue(editor.editorErrorTextForTesting?.contains("没有找到远端文件") ?? false)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
     func testCoordinatorDoubleClickUnknownRemoteFileOpensInsideStacioEditorOnline() throws {
@@ -2173,42 +2094,6 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(errorPresenter.messages, ["无法比较远端文件"])
     }
 
-    func testCoordinatorSaveRemoteEditWritesTextBackOnline() throws {
-        let cacheRoot = try makeTemporaryDirectory()
-        let scheduler = RecordingSCPTransferScheduler()
-        let bridge = RecordingRemoteFilesBridge(
-            remoteFileData: [
-                "/srv/app/config.json": Data(#"{"enabled":true}"#.utf8)
-            ]
-        )
-        let files = FilesViewController()
-        files.loadView()
-        let coordinator = FilesCoordinator(
-            bridge: bridge,
-            filesViewController: files,
-            liveSessionContextProvider: { self.liveContext() },
-            transferScheduler: scheduler,
-            remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
-            remoteEditSessionIDProvider: { "session-alpha" }
-        )
-        XCTAssertNotNil(coordinator)
-        files.setRemoteEntries([
-            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil)
-        ])
-
-        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        files.performOpenRemoteEditForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting != nil })
-        let editor = try XCTUnwrap(files.embeddedEditorViewControllerForTesting)
-        editor.replaceTextForTesting(#"{"enabled":false}"#)
-        try editor.performSaveForTesting()
-
-        XCTAssertTrue(scheduler.jobs.isEmpty)
-        XCTAssertEqual(bridge.writeRequests.count, 1)
-        XCTAssertEqual(bridge.writeRequests.first?.path, "/srv/app/config.json")
-        XCTAssertEqual(String(data: try XCTUnwrap(bridge.writeRequests.first?.contents), encoding: .utf8), #"{"enabled":false}"#)
-    }
-
     func testCoordinatorRemoteDocumentSaveHandlerWritesBackToOriginalPath() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
@@ -2465,9 +2350,10 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertTrue(bridge.writeRequests.isEmpty)
     }
 
-    func testCoordinatorShowsInlineFailureWhenRemoteTextReadFails() throws {
+    func testCoordinatorReportsRemoteTextReadFailureThroughInjectedOpener() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
+        let opener = RecordingRemoteEditOpener()
         let files = FilesViewController()
         files.loadView()
         let coordinator = FilesCoordinator(
@@ -2476,6 +2362,7 @@ final class FilesCoordinatorTests: XCTestCase {
             liveSessionContextProvider: { self.liveContext() },
             transferScheduler: scheduler,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: opener,
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
@@ -2486,11 +2373,11 @@ final class FilesCoordinatorTests: XCTestCase {
         files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         files.performOpenRemoteEditForTesting()
 
-        XCTAssertTrue(waitUntil {
-            files.embeddedOpenProgressViewControllerForTesting?.visibleTextSnapshotForTesting
-                .contains("远程路径不安全") == true
-        })
+        XCTAssertTrue(waitUntil { opener.failedOpenRequests.count == 1 })
+        XCTAssertEqual(opener.failedOpenRequests.first?.selection.path, "/srv/app/config.json")
+        XCTAssertTrue(opener.failedOpenRequests.first?.message.contains("远程路径不安全") == true)
         XCTAssertTrue(scheduler.jobs.isEmpty)
+        XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
     func testSaveRemoteEditMissingLocalCopyShowsActionableInformativeTextWithoutPath() {
@@ -2702,10 +2589,14 @@ final class FilesCoordinatorTests: XCTestCase {
     func testCoordinatorBacksUpActiveEditorTabToRemoteDirectoryWithTimestampedBakName() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler(completesImmediately: true)
-        let bridge = RecordingRemoteFilesBridge(
-            remoteFileData: [
-                "/srv/app/config.txt": Data("enabled=true\n".utf8)
-            ]
+        let bridge = RecordingRemoteFilesBridge()
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/srv/app/config.txt",
+                fileName: "config.txt",
+                content: "enabled=true\n",
+                byteCount: 128
+            )
         )
         let prompt = RecordingRemoteFileOperationPrompt(backupDestination: .remoteDirectory)
         let files = FilesViewController()
@@ -2717,15 +2608,12 @@ final class FilesCoordinatorTests: XCTestCase {
             transferScheduler: scheduler,
             operationPrompt: prompt,
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: RecordingRemoteEditOpener(),
+            currentEditorProvider: { editor },
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
-        files.setRemoteEntries([
-            RemoteFileEntry(kind: .file, path: "/srv/app/config.txt", size: 128, linkTarget: nil)
-        ])
-        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        files.performOpenRemoteEditForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting != nil })
+        files.setCurrentRemotePath("/srv/app")
 
         coordinator.performBackupFromInspector(date: fixedBackupDate(), timeZone: fixedBackupTimeZone())
 
@@ -2736,16 +2624,45 @@ final class FilesCoordinatorTests: XCTestCase {
         ] })
     }
 
+    func testBackupCandidatesComeFromInjectedCurrentEditorProvider() {
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/app.conf",
+                fileName: "app.conf",
+                content: "enabled=true\n"
+            )
+        )
+        let prompt = RecordingRemoteFileOperationPrompt(backupDestination: .remoteDirectory)
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: RecordingRemoteFilesBridge(),
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            operationPrompt: prompt,
+            remoteEditOpener: RecordingRemoteEditOpener(),
+            currentEditorProvider: { editor }
+        )
+
+        coordinator.performBackupFromInspector(date: fixedBackupDate(), timeZone: fixedBackupTimeZone())
+
+        XCTAssertEqual(prompt.backupCandidatePrompts.first?.map(\.remotePath), ["/etc/app.conf"])
+    }
+
     func testCoordinatorSchedulesLocalBackupDownloadWithTimestampedBakName() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler(completesImmediately: true)
         let destinationPicker = RecordingDownloadDestinationPicker(
             destinationPath: "/Users/alice/Downloads/config.txt-202606040912.bak"
         )
-        let bridge = RecordingRemoteFilesBridge(
-            remoteFileData: [
-                "/srv/app/config.txt": Data("enabled=true\n".utf8)
-            ]
+        let bridge = RecordingRemoteFilesBridge()
+        let editor = RemoteTextEditorViewController(
+            document: RemoteTextEditorDocumentDescriptor(
+                remotePath: "/srv/app/config.txt",
+                fileName: "config.txt",
+                content: "enabled=true\n",
+                byteCount: 128
+            )
         )
         let files = FilesViewController()
         files.loadView()
@@ -2757,15 +2674,11 @@ final class FilesCoordinatorTests: XCTestCase {
             downloadDestinationPicker: destinationPicker,
             operationPrompt: RecordingRemoteFileOperationPrompt(backupDestination: .local),
             remoteEditCache: RemoteEditCache(rootDirectory: cacheRoot),
+            remoteEditOpener: RecordingRemoteEditOpener(),
+            currentEditorProvider: { editor },
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
-        files.setRemoteEntries([
-            RemoteFileEntry(kind: .file, path: "/srv/app/config.txt", size: 128, linkTarget: nil)
-        ])
-        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        files.performOpenRemoteEditForTesting()
-        XCTAssertTrue(waitUntil { files.embeddedEditorViewControllerForTesting != nil })
 
         coordinator.performBackupFromInspector(date: fixedBackupDate(), timeZone: fixedBackupTimeZone())
 
@@ -5553,6 +5466,31 @@ private final class RecordingSCPTransferScheduler: SCPTransferScheduling {
     func updateScheduledTransferEstimatedByteTotal(jobID: String, bytesTotal: UInt64) {
         estimatedByteTotals[jobID] = bytesTotal
     }
+}
+
+@MainActor
+private struct FilesCoordinatorPresentationHarness {
+    let center: WorkbenchCenterContainerViewController
+    let presentation: RemoteEditorPresentationCoordinator
+}
+
+@MainActor
+private func makeFilesCoordinatorPresentationHarness(testName: String) -> FilesCoordinatorPresentationHarness {
+    let defaults = UserDefaults(suiteName: "Stacio.FilesCoordinatorTests.\(testName).\(UUID().uuidString)")!
+    let store = UserDefaultsRemoteEditorPresentationStore(
+        defaults: defaults,
+        frameAutosaveName: .init("FilesCoordinator.Editor.Test")
+    )
+    let center = WorkbenchCenterContainerViewController(
+        workspaceViewController: NSViewController(),
+        presentationStore: store
+    )
+    let presentation = RemoteEditorPresentationCoordinator(
+        dockHost: center,
+        presentationStore: store,
+        screenProvider: AppKitRemoteEditorScreenProvider()
+    )
+    return FilesCoordinatorPresentationHarness(center: center, presentation: presentation)
 }
 
 private final class RecordingRemoteEditOpener: RemoteEditOpening {

@@ -9,7 +9,6 @@ private struct InspectorUncheckedSendable<Value>: @unchecked Sendable {
 public final class InspectorViewController: NSViewController {
     private static let headerTopMargin: CGFloat = 18
     private static let headerHorizontalMargin: CGFloat = 12
-    private static let minimumHeaderAnchoredWidth: CGFloat = 160
     private static let maximumCompactToolbarTopInset: CGFloat = 16
 
     private final class CompressibleInspectorRootView: NSView {
@@ -64,12 +63,6 @@ public final class InspectorViewController: NSViewController {
         }
     }
 
-    private enum EditorActionPresentation {
-        case closed
-        case expanded
-        case collapsed
-    }
-
     private let sectionControl = NSSegmentedControl(labels: Section.allCases.map(\.label), trackingMode: .selectOne, target: nil, action: nil)
     private let editorCloseButton = InspectorViewController.makeHeaderButton(
         symbolName: "xmark.circle",
@@ -110,8 +103,7 @@ public final class InspectorViewController: NSViewController {
     private let tunnelLiveSessionContextProvider: () -> TunnelLiveSessionContext?
     private let workspaceSessionProtocolProvider: () -> WorkspaceSessionProtocol
     private let remoteFilePathTerminalSender: (String) -> Void
-    private let filesEmbeddedCapabilityOpenHandler: () -> Void
-    private let filesEmbeddedCapabilityCloseHandler: (CGFloat) -> Void
+    private weak var remoteEditorPresentation: (any RemoteEditorPresentationRouting)?
     private let tunnelLiveBridge: LiveTunnelCoreBridging
     private let remoteBrowserRuntimeBridge: TunnelRuntimeBridging?
     private let remoteChromiumRuntime: RemoteChromiumRuntimeControlling?
@@ -174,8 +166,6 @@ public final class InspectorViewController: NSViewController {
         workspaceSessionProtocolProvider: @escaping () -> WorkspaceSessionProtocol = { .noSession },
         tunnelLiveSessionContextProvider: @escaping () -> TunnelLiveSessionContext? = { nil },
         remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in },
-        filesEmbeddedCapabilityOpenHandler: @escaping () -> Void = {},
-        filesEmbeddedCapabilityCloseHandler: @escaping (CGFloat) -> Void = { _ in },
         tunnelLiveBridge: LiveTunnelCoreBridging = CoreLiveTunnelBridge(),
         remoteBrowserRuntimeBridge: TunnelRuntimeBridging? = nil,
         remoteChromiumRuntime: RemoteChromiumRuntimeControlling? = nil,
@@ -199,7 +189,8 @@ public final class InspectorViewController: NSViewController {
         settingsStore: AppSettingsStore = .shared,
         licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         transferCompletionNotificationPresenter: TransferCompletionNotificationPresenting? = nil,
-        transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)? = nil
+        transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)? = nil,
+        remoteEditorPresentation: (any RemoteEditorPresentationRouting)? = nil
     ) {
         self.transferHistoryStore = transferHistoryStore
         self.tunnelProfileStore = tunnelProfileStore
@@ -210,8 +201,7 @@ public final class InspectorViewController: NSViewController {
         self.workspaceSessionProtocolProvider = workspaceSessionProtocolProvider
         self.tunnelLiveSessionContextProvider = tunnelLiveSessionContextProvider
         self.remoteFilePathTerminalSender = remoteFilePathTerminalSender
-        self.filesEmbeddedCapabilityOpenHandler = filesEmbeddedCapabilityOpenHandler
-        self.filesEmbeddedCapabilityCloseHandler = filesEmbeddedCapabilityCloseHandler
+        self.remoteEditorPresentation = remoteEditorPresentation
         self.tunnelLiveBridge = tunnelLiveBridge
         self.remoteBrowserRuntimeBridge = remoteBrowserRuntimeBridge
         self.remoteChromiumRuntime = remoteChromiumRuntime
@@ -296,20 +286,7 @@ public final class InspectorViewController: NSViewController {
         files.onSendPathToTerminal = { [remoteFilePathTerminalSender] path in
             remoteFilePathTerminalSender(path)
         }
-        files.onAIQuestionRequested = { [weak self] question in
-            self?.showAIAssistantForFileQuestion(question)
-        }
-        files.onEmbeddedCapabilityWillOpen = { [weak self, filesEmbeddedCapabilityOpenHandler] in
-            filesEmbeddedCapabilityOpenHandler()
-            self?.updateEditorActionControls(.expanded)
-            self?.synchronizeHeaderHorizontalLayout()
-        }
-        files.onEmbeddedCapabilityClosed = { [weak self, filesEmbeddedCapabilityCloseHandler] fileBrowserWidth in
-            filesEmbeddedCapabilityCloseHandler(fileBrowserWidth)
-            self?.updateEditorActionControls()
-            self?.synchronizeHeaderHorizontalLayout()
-        }
-        files.onFileBrowserPaneFrameChanged = { [weak self] in
+        files.onPaneFrameChanged = { [weak self] in
             self?.scheduleHeaderHorizontalLayoutSynchronization()
         }
         transferQueueViewController = transferQueue
@@ -350,10 +327,20 @@ public final class InspectorViewController: NSViewController {
             },
             transferScheduler: filesTransferSchedulerOverride ?? transferQueueCoordinator,
             downloadDestinationPicker: remoteBrowserDownloadDestinationPicker,
+            remoteEditOpener: remoteEditorPresentation,
+            currentEditorProvider: { [weak remoteEditorPresentation] in
+                remoteEditorPresentation?.currentEditor
+            },
             remoteEditSessionIDProvider: { [weak self] in
                 self?.remoteFilesBinding?.runtimeID ?? "inspector"
             }
         )
+        remoteEditorPresentation?.onSnapshotChanged = { [weak self] snapshot in
+            self?.updateEditorActionControls(snapshot)
+        }
+        remoteEditorPresentation?.onAIQuestionRequested = { [weak self] question in
+            self?.showAIAssistantForFileQuestion(question)
+        }
 
         let tunnels = TunnelsViewController(
             runtimeBridge: CoreBridgeTunnelRuntimeBridge(
@@ -510,7 +497,15 @@ public final class InspectorViewController: NSViewController {
         ])
 
         switchToSection(.files)
-        updateEditorActionControls(.closed)
+        updateEditorActionControls(
+            remoteEditorPresentation?.snapshot
+                ?? RemoteEditorPresentationSnapshot(
+                    mode: .closed,
+                    hasEditor: false,
+                    isTransitioning: false,
+                    detachedFeatureEnabled: false
+                )
+        )
         didFinishInitialSectionSetup = true
         view = container
         refreshWorkspaceCapabilities()
@@ -732,7 +727,11 @@ public final class InspectorViewController: NSViewController {
             _ = transferQueueCoordinator?.disconnectTransfers(runtimeID: runtimeID)
             return true
         }
-        guard filesViewController?.closeEmbeddedEditorIfNeeded() != false else {
+        let closeDisposition = remoteEditorPresentation?.requestClose(
+            parentWindow: view.window,
+            completion: nil
+        ) ?? .ready
+        guard closeDisposition == .ready else {
             return false
         }
         do {
@@ -793,12 +792,6 @@ public final class InspectorViewController: NSViewController {
         else {
             return
         }
-        if currentSection == .files,
-           filesViewController?.closeEmbeddedEditorIfNeeded() == false
-        {
-            return
-        }
-
         cancelPendingDirectoryFollow()
         filesCoordinator.invalidatePendingDirectoryRefresh()
         remoteFilesBinding = nil
@@ -1027,17 +1020,15 @@ public final class InspectorViewController: NSViewController {
     }
 
     @objc private func editorCloseButtonPressed(_ sender: Any?) {
-        _ = filesViewController?.closeEmbeddedEditorIfNeeded()
-        updateEditorActionControls()
+        _ = remoteEditorPresentation?.requestClose(parentWindow: view.window, completion: nil)
     }
 
     @objc private func editorCollapseButtonPressed(_ sender: Any?) {
-        if filesViewController?.isEmbeddedCapabilityCollapsedForInspectorControls == true {
-            filesViewController?.expandEmbeddedCapability()
+        if remoteEditorPresentation?.snapshot.isCollapsed == true {
+            remoteEditorPresentation?.expandDockedEditor()
         } else {
-            filesViewController?.collapseEmbeddedCapability()
+            remoteEditorPresentation?.collapseDockedEditor()
         }
-        updateEditorActionControls()
     }
 
     @objc private func editorBackupButtonPressed(_ sender: Any?) {
@@ -1045,7 +1036,7 @@ public final class InspectorViewController: NSViewController {
     }
 
     @objc private func editorAskAIButtonPressed(_ sender: Any?) {
-        filesViewController?.requestAIForEmbeddedEditor()
+        remoteEditorPresentation?.requestAIForActiveDocument()
     }
 
     @objc private func editorRestoreButtonPressed(_ sender: Any?) {
@@ -1060,39 +1051,14 @@ public final class InspectorViewController: NSViewController {
         aiAssistantViewController?.focusQuestionField()
     }
 
-    private func updateEditorActionControls(_ presentation: EditorActionPresentation? = nil) {
-        let resolvedPresentation: EditorActionPresentation
-        if let presentation {
-            resolvedPresentation = presentation
-        } else if filesViewController?.hasEmbeddedCapabilityForInspectorControls != true {
-            resolvedPresentation = .closed
-        } else if filesViewController?.isEmbeddedCapabilityCollapsedForInspectorControls == true {
-            resolvedPresentation = .collapsed
-        } else {
-            resolvedPresentation = .expanded
-        }
-
-        switch resolvedPresentation {
-        case .closed:
-            editorActionRow?.isHidden = true
-            configureEditorCollapseButtonForCollapsedState(false)
-        case .expanded:
-            editorActionRow?.isHidden = false
-            editorCloseButton.isHidden = false
-            editorCollapseButton.isHidden = false
-            editorBackupButton.isHidden = false
-            editorAskAIButton.isHidden = false
-            editorRestoreButton.isHidden = false
-            configureEditorCollapseButtonForCollapsedState(false)
-        case .collapsed:
-            editorActionRow?.isHidden = false
-            editorCloseButton.isHidden = true
-            editorCollapseButton.isHidden = false
-            editorBackupButton.isHidden = true
-            editorAskAIButton.isHidden = true
-            editorRestoreButton.isHidden = true
-            configureEditorCollapseButtonForCollapsedState(true)
-        }
+    private func updateEditorActionControls(_ snapshot: RemoteEditorPresentationSnapshot) {
+        editorActionRow?.isHidden = snapshot.mode == .closed || snapshot.mode == .opening
+        editorCloseButton.isHidden = snapshot.isCollapsed
+        editorCollapseButton.isHidden = snapshot.canCollapse == false
+        editorBackupButton.isHidden = snapshot.isCollapsed
+        editorAskAIButton.isHidden = snapshot.isCollapsed
+        editorRestoreButton.isHidden = snapshot.isCollapsed
+        configureEditorCollapseButtonForCollapsedState(snapshot.isCollapsed)
         updateContentContainerTopConstraint(for: currentSection)
     }
 
@@ -1113,15 +1079,6 @@ public final class InspectorViewController: NSViewController {
         guard currentSection != section || contentContainer.subviews.isEmpty else {
             return
         }
-        if currentSection == .files,
-           section != .files,
-           allowsWorkspaceSection(currentSection),
-           filesViewController?.closeEmbeddedEditorIfNeeded() == false
-        {
-            sectionControl.selectedSegment = currentSection.rawValue
-            return
-        }
-
         currentSection = section
         sectionControl.selectedSegment = section.rawValue
         updateContentContainerTopConstraint(for: section)
@@ -1228,29 +1185,13 @@ public final class InspectorViewController: NSViewController {
             return false
         }
 
-        var editorLeadingInset: CGFloat = 0
-        var editorTrailingInset: CGFloat = 0
-        if currentSection == .files,
-           let filesViewController
-        {
-            if let editorFrame = filesViewController.embeddedCapabilityFrameForInspectorHeader(in: view) {
-                let anchoredLeadingInset = max(0, editorFrame.minX - view.bounds.minX)
-                let anchoredTrailingInset = max(0, view.bounds.maxX - editorFrame.maxX)
-                if view.bounds.width - anchoredLeadingInset - anchoredTrailingInset >= Self.minimumHeaderAnchoredWidth {
-                    editorLeadingInset = anchoredLeadingInset
-                    editorTrailingInset = anchoredTrailingInset
-                }
-            }
-        }
-
         var changed = false
-        if abs(editorActionLeadingConstraint.constant - editorLeadingInset) > 0.5 {
-            editorActionLeadingConstraint.constant = editorLeadingInset
+        if abs(editorActionLeadingConstraint.constant) > 0.5 {
+            editorActionLeadingConstraint.constant = 0
             changed = true
         }
-        let editorTrailingConstant = -editorTrailingInset
-        if abs(editorActionTrailingConstraint.constant - editorTrailingConstant) > 0.5 {
-            editorActionTrailingConstraint.constant = editorTrailingConstant
+        if abs(editorActionTrailingConstraint.constant) > 0.5 {
+            editorActionTrailingConstraint.constant = 0
             changed = true
         }
         if changed {

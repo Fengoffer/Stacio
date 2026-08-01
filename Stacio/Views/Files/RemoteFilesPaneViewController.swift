@@ -41,6 +41,10 @@ public final class RemoteFilesPaneViewController: NSViewController {
         return filesViewController.currentRemotePath
     }
 
+    var currentTextEditor: RemoteTextEditorViewController? {
+        textEditorViewController
+    }
+
     private let filesViewController = FilesViewController()
     private let localFilesViewController: LocalFilePaneViewController
     private let fileTransferSplitView = NSSplitView()
@@ -202,6 +206,7 @@ public final class RemoteFilesPaneViewController: NSViewController {
             transferScheduler: transferScheduler,
             ftpTransferScheduler: nil,
             remoteEditOpener: RemoteFilesPaneRemoteEditOpener(filesPane: self),
+            currentEditorProvider: { [weak self] in self?.currentTextEditor },
             remoteEditSessionIDProvider: { [runtimeID] in runtimeID }
         )
         filesCoordinator = coordinator

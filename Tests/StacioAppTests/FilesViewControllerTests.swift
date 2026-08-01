@@ -769,199 +769,22 @@ final class FilesViewControllerTests: XCTestCase {
         }
     }
 
-    func testEmbeddedEditorDefaultsWideAndCanBeDraggedWider() throws {
+    func testFilesControllerOwnsOnlyBrowserPaneAndFillsRoot() {
         let controller = FilesViewController()
         controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let fileURL = try makeTemporaryEditorFile(name: "sshd_config", contents: "PermitRootLogin no\n")
-
-        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.needsLayout = true
+        controller.view.frame = NSRect(x: 0, y: 0, width: 720, height: 640)
         controller.view.layoutSubtreeIfNeeded()
 
-        let splitView = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Files.editorSplit") as? NSSplitView
-        )
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-        let initialEditorFrame = editor.view.convert(editor.view.bounds, to: controller.view)
-        let initialBrowserFrame = controller.fileBrowserPaneViewForTesting.convert(
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Files.editorSplit"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
+        let browserFrame = controller.fileBrowserPaneViewForTesting.convert(
             controller.fileBrowserPaneViewForTesting.bounds,
             to: controller.view
         )
-
-        XCTAssertTrue(splitView.arrangedSubviews[0] === editor.view)
-        XCTAssertTrue(splitView.arrangedSubviews[1] === controller.fileBrowserPaneViewForTesting)
-        XCTAssertLessThan(initialEditorFrame.minX, initialBrowserFrame.minX)
-        XCTAssertGreaterThanOrEqual(initialEditorFrame.width, 680)
-        XCTAssertGreaterThanOrEqual(initialBrowserFrame.width, 240)
-
-        controller.view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 640)
-        controller.view.needsLayout = true
-        controller.view.layoutSubtreeIfNeeded()
-        splitView.setPosition(1_050, ofDividerAt: 0)
-        splitView.layoutSubtreeIfNeeded()
-        controller.view.layoutSubtreeIfNeeded()
-
-        let draggedEditorFrame = editor.view.convert(editor.view.bounds, to: controller.view)
-        let draggedBrowserFrame = controller.fileBrowserPaneViewForTesting.convert(
-            controller.fileBrowserPaneViewForTesting.bounds,
-            to: controller.view
-        )
-        XCTAssertGreaterThan(draggedEditorFrame.width, initialEditorFrame.width)
-        XCTAssertGreaterThanOrEqual(draggedEditorFrame.width, 900)
-        XCTAssertGreaterThanOrEqual(draggedBrowserFrame.width, 240)
-        XCTAssertLessThan(draggedEditorFrame.minX, draggedBrowserFrame.minX)
-    }
-
-    func testEmbeddedEditorFileBrowserCanCollapseAndRestoreWithShortcutAction() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-        let expandedFrame = editor.view.convert(editor.view.bounds, to: controller.view)
-
-        XCTAssertTrue(performControlBShortcut(on: controller.view))
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertTrue(controller.fileBrowserPaneViewForTesting.isHidden)
-        let collapsedFrame = editor.view.convert(editor.view.bounds, to: controller.view)
-        XCTAssertGreaterThan(collapsedFrame.width, expandedFrame.width)
-
-        XCTAssertTrue(performControlBShortcut(on: controller.view))
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertFalse(controller.fileBrowserPaneViewForTesting.isHidden)
-        let restoredFrame = editor.view.convert(editor.view.bounds, to: controller.view)
-        XCTAssertLessThan(restoredFrame.width, collapsedFrame.width)
-    }
-
-    func testEmbeddedEditorCanCollapseToFloatingExpandButtonAndRestoreState() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-
-        controller.collapseEmbeddedCapabilityForTesting()
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertTrue(controller.isEmbeddedCapabilityCollapsedForTesting)
-        XCTAssertTrue(editor.view.isHidden)
-        XCTAssertFalse(controller.fileBrowserPaneViewForTesting.isHidden)
-        let expandButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Files.expandEmbeddedCapability") as? NSButton
-        )
-        XCTAssertFalse(expandButton.isHidden)
-        XCTAssertEqual(editor.activeFileNameForTesting, "service.conf")
-
-        expandButton.performClick(nil as Any?)
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertFalse(controller.isEmbeddedCapabilityCollapsedForTesting)
-        XCTAssertFalse(editor.view.isHidden)
-        XCTAssertTrue(expandButton.isHidden)
-        XCTAssertEqual(editor.activeFileNameForTesting, "service.conf")
-    }
-
-    func testRestoringCollapsedEditorForcesLayoutWhenItsSizeIsUnchanged() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-        editor.markEditorReadyForTesting()
-        editor.viewDidLayout()
-        XCTAssertTrue(waitUntil {
-            editor.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
-        })
-        editor.resetEditorFunctionCallsForTesting()
-
-        controller.collapseEmbeddedCapabilityForTesting()
-        controller.expandEmbeddedCapabilityForTesting()
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertTrue(waitUntil {
-            editor.editorFunctionCallsForTesting.filter { $0 == "layout" }.count == 1
-        })
-    }
-
-    func testCollapsedEmbeddedEditorRestoresUserAdjustedFileBrowserWidth() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 640)
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        controller.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
-        let splitView = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Files.editorSplit") as? NSSplitView
-        )
-        splitView.setPosition(650, ofDividerAt: 0)
-        splitView.layoutSubtreeIfNeeded()
-        controller.view.layoutSubtreeIfNeeded()
-        let browserWidthBeforeCollapse = controller.fileBrowserPaneViewForTesting.convert(
-            controller.fileBrowserPaneViewForTesting.bounds,
-            to: controller.view
-        ).width
-
-        controller.collapseEmbeddedCapabilityForTesting()
-        let expandButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Files.expandEmbeddedCapability") as? NSButton
-        )
-        expandButton.performClick(nil as Any?)
-        controller.view.layoutSubtreeIfNeeded()
-
-        let restoredBrowserWidth = controller.fileBrowserPaneViewForTesting.convert(
-            controller.fileBrowserPaneViewForTesting.bounds,
-            to: controller.view
-        ).width
-        XCTAssertEqual(restoredBrowserWidth, browserWidthBeforeCollapse, accuracy: 1)
-    }
-
-    func testEmbeddedMediaPreviewUsesEditorTabsInsteadOfReplacingTheEditor() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let textURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-        let imageURL = try makeTemporaryEditorFile(name: "screenshot.png", data: Data([0x89, 0x50, 0x4e, 0x47]))
-
-        controller.presentEmbeddedEditor(localURL: textURL, saveHandler: nil)
-        controller.presentEmbeddedMediaPreview(localURL: imageURL)
-        controller.view.layoutSubtreeIfNeeded()
-
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-        XCTAssertNil(controller.embeddedMediaPreviewViewControllerForTesting)
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
-        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.MediaPreview.root"))
-        XCTAssertEqual(editor.tabTitlesForTesting, ["service.conf", "screenshot.png"])
-        XCTAssertEqual(editor.activeFileNameForTesting, "screenshot.png")
-        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "image")
-    }
-
-    func testEmbeddedMediaPreviewCreatesEditorWorkspaceWhenOpenedFirst() throws {
-        let controller = FilesViewController()
-        controller.loadView()
-        controller.view.frame = NSRect(x: 0, y: 0, width: 980, height: 640)
-        let imageURL = try makeTemporaryEditorFile(name: "screenshot.png", data: Data([0x89, 0x50, 0x4e, 0x47]))
-
-        controller.presentEmbeddedMediaPreview(localURL: imageURL)
-        controller.view.layoutSubtreeIfNeeded()
-
-        let editor = try XCTUnwrap(controller.embeddedEditorViewControllerForTesting)
-        XCTAssertNil(controller.embeddedMediaPreviewViewControllerForTesting)
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
-        XCTAssertEqual(editor.tabTitlesForTesting, ["screenshot.png"])
-        XCTAssertEqual(editor.activeDocumentDisplayModeForTesting, "image")
+        XCTAssertEqual(browserFrame.minX, controller.view.bounds.minX, accuracy: 1)
+        XCTAssertEqual(browserFrame.maxX, controller.view.bounds.maxX, accuracy: 1)
+        XCTAssertEqual(browserFrame.minY, controller.view.bounds.minY, accuracy: 1)
+        XCTAssertEqual(browserFrame.maxY, controller.view.bounds.maxY, accuracy: 1)
     }
 
     func testDownloadButtonRequestsSelectedFilesAndDirectories() throws {
@@ -2134,14 +1957,15 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertTrue(transferScrollView.hasVerticalScroller)
     }
 
-    func testInspectorFilesCoordinatorUsesEmbeddedStacioEditorOpener() {
-        let controller = InspectorViewController(transferHistoryStore: NoOpSCPTransferHistoryStore())
-        controller.loadView()
+    func testInspectorFilesCoordinatorUsesInjectedEditorPresentationOpener() {
+        let harness = makeInspectorEditorHarness(testName: #function)
 
-        XCTAssertTrue(controller.filesCoordinatorForTesting.remoteEditOpenerForTesting is EmbeddedRemoteEditOpener)
+        XCTAssertTrue(
+            harness.inspector.filesCoordinatorForTesting.remoteEditOpenerForTesting as AnyObject === harness.presentation
+        )
     }
 
-    func testInspectorEditorAIButtonPrefillsAssistantWithRemoteFileQuestion() throws {
+    func testInspectorEditorControlsRouteThroughPresentationCoordinator() throws {
         let aiPanel = AIAssistantPanelViewController(
             coordinator: AIAssistantCoordinator(
                 provider: RuleBasedAIAssistantProvider(),
@@ -2149,12 +1973,9 @@ final class FilesViewControllerTests: XCTestCase {
             ),
             contextProvider: { nil }
         )
-        let controller = InspectorViewController(
-            transferHistoryStore: NoOpSCPTransferHistoryStore(),
-            aiAssistantViewController: aiPanel
-        )
-        controller.loadView()
-        controller.filesViewController?.presentEmbeddedRemoteDocument(
+        let harness = makeInspectorEditorHarness(testName: #function, aiPanel: aiPanel)
+        openInspectorEditor(
+            presentation: harness.presentation,
             RemoteTextEditorDocumentDescriptor(
                 remotePath: "/etc/nginx/nginx.conf",
                 fileName: "nginx.conf",
@@ -2162,98 +1983,103 @@ final class FilesViewControllerTests: XCTestCase {
                 byteCount: 24
             )
         )
-        controller.view.layoutSubtreeIfNeeded()
+        harness.inspector.view.layoutSubtreeIfNeeded()
+        let actionRow = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
+        )
+        let closeButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
+        )
+        let collapseButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
+        )
 
         let aiButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
         )
-        aiButton.performClick(nil as Any?)
-
-        XCTAssertEqual(controller.selectedTabLabel, L10n.AI.title)
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("nginx.conf"))
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("/etc/nginx/nginx.conf"))
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("listen 80"))
-    }
-
-    func testInspectorEditorActionRowIsHiddenUntilEditorOpensAndAfterEditorCloses() throws {
-        let controller = InspectorViewController(transferHistoryStore: NoOpSCPTransferHistoryStore())
-        controller.loadView()
-        let actionRow = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
-        )
-        let closeButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
-        )
-        let collapseButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
-        )
-        let backupButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup") as? NSButton
-        )
-        let restoreButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore") as? NSButton
-        )
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        XCTAssertTrue(actionRow.isHidden)
-
-        controller.filesViewController?.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
 
         XCTAssertFalse(actionRow.isHidden)
-        XCTAssertFalse(closeButton.isHidden)
-        XCTAssertFalse(collapseButton.isHidden)
-        XCTAssertFalse(backupButton.isHidden)
-        XCTAssertFalse(restoreButton.isHidden)
-        XCTAssertEqual(collapseButton.toolTip, "收起编辑器")
-
-        closeButton.performClick(nil as Any?)
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertTrue(actionRow.isHidden)
-    }
-
-    func testInspectorEditorActionRowShowsOnlyExpandButtonWhenEditorIsCollapsed() throws {
-        let controller = InspectorViewController(transferHistoryStore: NoOpSCPTransferHistoryStore())
-        controller.loadView()
-        let actionRow = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
-        )
-        let closeButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
-        )
-        let collapseButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
-        )
-        let backupButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup") as? NSButton
-        )
-        let restoreButton = try XCTUnwrap(
-            controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore") as? NSButton
-        )
-        let fileURL = try makeTemporaryEditorFile(name: "service.conf", contents: "enabled=true\n")
-
-        controller.filesViewController?.presentEmbeddedEditor(localURL: fileURL, saveHandler: nil)
-        controller.view.layoutSubtreeIfNeeded()
         collapseButton.performClick(nil as Any?)
-        controller.view.layoutSubtreeIfNeeded()
-
-        XCTAssertFalse(actionRow.isHidden)
-        XCTAssertTrue(closeButton.isHidden)
-        XCTAssertFalse(collapseButton.isHidden)
-        XCTAssertTrue(backupButton.isHidden)
-        XCTAssertTrue(restoreButton.isHidden)
+        XCTAssertEqual(harness.presentation.snapshot.mode, .dockedHidden)
         XCTAssertEqual(collapseButton.toolTip, "展开编辑器")
 
         collapseButton.performClick(nil as Any?)
-        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
+        XCTAssertEqual(collapseButton.toolTip, "收起编辑器")
+
+        aiButton.performClick(nil as Any?)
+        XCTAssertEqual(harness.inspector.selectedTabLabel, L10n.AI.title)
+        XCTAssertTrue(aiPanel.questionTextForTesting.contains("nginx.conf"))
+        XCTAssertTrue(aiPanel.questionTextForTesting.contains("/etc/nginx/nginx.conf"))
+        XCTAssertTrue(aiPanel.questionTextForTesting.contains("listen 80"))
+
+        closeButton.performClick(nil as Any?)
+        XCTAssertEqual(harness.presentation.snapshot.mode, .closed)
+        XCTAssertTrue(actionRow.isHidden)
+        XCTAssertNil(harness.files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
+    }
+
+    func testInspectorSectionSwitchingKeepsPresentationEditorVisible() {
+        let harness = makeInspectorEditorHarness(testName: #function)
+        openInspectorEditor(
+            presentation: harness.presentation,
+            RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/app.conf",
+                fileName: "app.conf",
+                content: "enabled=true\n"
+            )
+        )
+
+        harness.inspector.selectTunnelsTab()
+
+        XCTAssertEqual(harness.inspector.selectedTabLabel, L10n.Inspector.tunnels)
+        XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
+        XCTAssertFalse(harness.center.isEditorSidecarCollapsed)
+        XCTAssertNotNil(harness.presentation.currentEditor)
+
+        harness.inspector.selectFilesTabForTesting()
+
+        XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
+        XCTAssertFalse(harness.center.isEditorSidecarCollapsed)
+        XCTAssertNotNil(harness.presentation.currentEditor)
+    }
+
+    func testInspectorFloatingSnapshotHidesOnlyMeaninglessCollapseControl() throws {
+        let harness = makeInspectorEditorHarness(testName: #function)
+        let actionRow = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
+        )
+        let closeButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
+        )
+        let collapseButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
+        )
+        let backupButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup") as? NSButton
+        )
+        let aiButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
+        )
+        let restoreButton = try XCTUnwrap(
+            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore") as? NSButton
+        )
+
+        harness.presentation.onSnapshotChanged?(
+            RemoteEditorPresentationSnapshot(
+                mode: .floating,
+                hasEditor: true,
+                isTransitioning: false,
+                detachedFeatureEnabled: true
+            )
+        )
 
         XCTAssertFalse(actionRow.isHidden)
         XCTAssertFalse(closeButton.isHidden)
-        XCTAssertFalse(collapseButton.isHidden)
+        XCTAssertTrue(collapseButton.isHidden)
         XCTAssertFalse(backupButton.isHidden)
+        XCTAssertFalse(aiButton.isHidden)
         XCTAssertFalse(restoreButton.isHidden)
-        XCTAssertEqual(collapseButton.toolTip, "收起编辑器")
     }
 
     func testInspectorPassesLiveSessionContextProviderToFilesCoordinator() throws {
@@ -2430,7 +2256,7 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertFalse(controller.filesViewController?.visibleTextSnapshot.contains("无法刷新远端目录") == true)
     }
 
-    func testInspectorDisconnectRuntimeCleansFilesEditorCacheAndTransfersWithoutTouchingOtherRuntime() throws {
+    func testInspectorDisconnectRuntimeCleansFilesCacheAndTransfersWithoutTouchingOtherRuntime() throws {
         let bridge = RecordingInspectorRemoteFilesBridge(entries: [
             RemoteFileEntry(kind: .file, path: "/srv/app/current.log", size: 64, linkTarget: nil)
         ])
@@ -2460,12 +2286,6 @@ final class FilesViewControllerTests: XCTestCase {
         )
         let targetLocalURL = try makeTemporaryEditorFile(name: "target.conf", contents: "enabled=false\n")
         let otherLocalURL = try makeTemporaryEditorFile(name: "other.conf", contents: "enabled=false\n")
-        controller.filesViewController?.presentEmbeddedEditor(
-            localURL: targetLocalURL,
-            saveHandler: nil,
-            closeConfirmer: FilesViewControllerRecordingRemoteTextEditorCloseConfirmer(decision: .discard)
-        )
-        controller.filesViewController?.embeddedEditorViewControllerForTesting?.replaceTextForTesting("enabled=true\n")
         try controller.filesCoordinatorForTesting.registerRemoteEditCacheItemForTesting(
             remotePath: "/srv/app/target.conf",
             localURL: targetLocalURL,
@@ -2497,7 +2317,6 @@ final class FilesViewControllerTests: XCTestCase {
 
         controller.disconnectFilesBindingIfNeeded(runtimeID: "runtime-target")
 
-        XCTAssertNil(controller.filesViewController?.embeddedEditorViewControllerForTesting)
         XCTAssertFalse(FileManager.default.fileExists(atPath: targetLocalURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: otherLocalURL.path))
         XCTAssertEqual(controller.transferQueueViewController?.snapshotForTesting.rows.map(\.jobID), ["other-transfer"])
@@ -2508,7 +2327,7 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.transferQueueViewController?.snapshotForTesting.rows.map(\.jobID), ["other-transfer"])
     }
 
-    func testDisconnectFilesBindingReturnsFalseAndKeepsBindingWhenEmbeddedEditorCloseIsCanceled() throws {
+    func testDisconnectFilesBindingReturnsFalseAndKeepsBindingWhenPresentationCloseIsCanceled() throws {
         let bridge = RecordingInspectorRemoteFilesBridge(entries: [])
         let context = TunnelLiveSessionContext(
             config: SshConnectionConfig(
@@ -2526,21 +2345,24 @@ final class FilesViewControllerTests: XCTestCase {
             context: context,
             remotePath: "/srv/app"
         )
-        let controller = InspectorViewController(
-            transferHistoryStore: NoOpSCPTransferHistoryStore(),
+        let harness = makeInspectorEditorHarness(
+            testName: #function,
+            closeDecision: .cancel,
             tunnelLiveSessionContextProvider: { context },
             remoteFilesBridge: bridge
         )
+        let controller = harness.inspector
         controller.loadView()
         try controller.selectFilesTabAndLoadCurrentDirectory(binding: binding)
         let targetLocalURL = try makeTemporaryEditorFile(name: "target.conf", contents: "enabled=false\n")
         defer { try? FileManager.default.removeItem(at: targetLocalURL) }
-        controller.filesViewController?.presentEmbeddedEditor(
-            localURL: targetLocalURL,
-            saveHandler: nil as RemoteEditSaveHandler?,
-            closeConfirmer: FilesViewControllerRecordingRemoteTextEditorCloseConfirmer(decision: .cancel)
+        harness.presentation.openLocalCopy(
+            at: targetLocalURL,
+            mode: .textEditor,
+            applicationURL: nil,
+            saveHandler: nil
         )
-        let editor = try XCTUnwrap(controller.filesViewController?.embeddedEditorViewControllerForTesting)
+        let editor = try XCTUnwrap(harness.presentation.currentEditor)
         XCTAssertTrue(waitUntil {
             editor.hasPendingLocalDocumentLoadsForTesting == false
                 && editor.canEditTextForTesting
@@ -2553,7 +2375,7 @@ final class FilesViewControllerTests: XCTestCase {
 
         XCTAssertFalse(didDisconnect)
         XCTAssertTrue(controller.isFilesTabBound(to: binding))
-        XCTAssertNotNil(controller.filesViewController?.embeddedEditorViewControllerForTesting)
+        XCTAssertNotNil(harness.presentation.currentEditor)
         XCTAssertFalse(controller.filesViewController?.visibleTextSnapshot.contains("文件连接已断开") == true)
     }
 }
@@ -2702,6 +2524,73 @@ private extension FilesCoordinator {
         let mirror = Mirror(reflecting: self)
         return mirror.children.first { $0.label == "remoteEditOpener" }?.value as! RemoteEditOpening
     }
+}
+
+@MainActor
+private struct InspectorEditorHarness {
+    let center: WorkbenchCenterContainerViewController
+    let presentation: RemoteEditorPresentationCoordinator
+    let inspector: InspectorViewController
+
+    var files: FilesViewController {
+        inspector.filesViewController!
+    }
+}
+
+@MainActor
+private func makeInspectorEditorHarness(
+    testName: String,
+    aiPanel: AIAssistantPanelViewController? = nil,
+    closeDecision: RemoteTextEditorCloseDecision = .discard,
+    tunnelLiveSessionContextProvider: @escaping () -> TunnelLiveSessionContext? = { nil },
+    remoteFilesBridge: RemoteFilesBridging = CoreBridgeRemoteFilesBridge()
+) -> InspectorEditorHarness {
+    let defaults = UserDefaults(suiteName: "Stacio.FilesViewControllerTests.\(testName).\(UUID().uuidString)")!
+    let store = UserDefaultsRemoteEditorPresentationStore(
+        defaults: defaults,
+        frameAutosaveName: .init("Inspector.Editor.Test")
+    )
+    let center = WorkbenchCenterContainerViewController(
+        workspaceViewController: NSViewController(),
+        presentationStore: store
+    )
+    let presentation = RemoteEditorPresentationCoordinator(
+        dockHost: center,
+        presentationStore: store,
+        screenProvider: AppKitRemoteEditorScreenProvider(),
+        closeConfirmer: FilesViewControllerRecordingRemoteTextEditorCloseConfirmer(decision: closeDecision)
+    )
+    let inspector = InspectorViewController(
+        transferHistoryStore: NoOpSCPTransferHistoryStore(),
+        aiAssistantViewController: aiPanel,
+        tunnelLiveSessionContextProvider: tunnelLiveSessionContextProvider,
+        remoteFilesBridge: remoteFilesBridge,
+        remoteEditorPresentation: presentation
+    )
+    inspector.loadView()
+    return InspectorEditorHarness(center: center, presentation: presentation, inspector: inspector)
+}
+
+@MainActor
+private func openInspectorEditor(
+    presentation: RemoteEditorPresentationCoordinator,
+    _ descriptor: RemoteTextEditorDocumentDescriptor
+) {
+    let selection = RemoteFileSelection(
+        path: descriptor.remotePath,
+        size: descriptor.byteCount,
+        kind: .file
+    )
+    guard let request = presentation.prepareRemoteOpen(selection: selection, mode: .textEditor) else {
+        XCTFail("Expected presentation to accept remote editor request")
+        return
+    }
+    presentation.openRemoteDocument(
+        descriptor,
+        mode: .textEditor,
+        saveHandler: nil,
+        request: request
+    )
 }
 
 private func makeTemporaryEditorFile(name: String, contents: String) throws -> URL {

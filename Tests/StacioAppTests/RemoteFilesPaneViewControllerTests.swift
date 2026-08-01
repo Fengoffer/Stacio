@@ -292,6 +292,29 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         XCTAssertNotNil(pane.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
+    func testRightWorkspaceCurrentEditorBoundaryTracksCoordinatorEditorLifecycle() throws {
+        let fileURL = try makeTemporaryFile(name: "backup.conf", contents: "enabled=true\n")
+        let pane = RemoteFilesPaneViewController(
+            runtimeID: "scp_editor_coordinator_boundary",
+            context: Self.liveContext(),
+            title: "远端文件",
+            bridge: RetryingRemoteFilesBridge(results: [.success([])]),
+            transferScheduler: nil,
+            rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
+        )
+        pane.loadView()
+
+        XCTAssertNil(pane.currentTextEditor)
+
+        pane.presentTextEditorForTesting(localURL: fileURL, saveHandler: nil)
+        let editor = try XCTUnwrap(pane.textEditorViewControllerForTesting)
+
+        XCTAssertTrue(pane.currentTextEditor === editor)
+
+        XCTAssertTrue(pane.closeRightWorkspaceForTesting())
+        XCTAssertNil(pane.currentTextEditor)
+    }
+
     func testRightWorkspaceForwardsEditorAIQuestionRequests() throws {
         let fileURL = try makeTemporaryFile(name: "nginx.conf", contents: "server { listen 80; }\n")
         let pane = RemoteFilesPaneViewController(

@@ -80,17 +80,10 @@ public struct RemoteFileSearchResult: Equatable {
 }
 
 @MainActor
-public final class FilesViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSDraggingDestination, NSSplitViewDelegate {
+public final class FilesViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSDraggingDestination {
     private enum PreferenceKey {
         static let sortMode = "Stacio.FilesPanel.sortMode"
         static let showHiddenFiles = "Stacio.FilesPanel.showHiddenFiles"
-    }
-
-    private enum EditorCapabilityLayout {
-        static let minimumBrowserWidth: CGFloat = 240
-        static let minimumEditorWidth: CGFloat = 360
-        static let preferredEditorWidth: CGFloat = 680
-        static let preferredEditorWidthFraction: CGFloat = 0.72
     }
 
     private enum RemoteFileSortMode: String, CaseIterable {
@@ -216,12 +209,9 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     public var onCompareFiles: (([RemoteFileSelection]) -> Void)?
     public var onSaveRemoteEdit: ((RemoteFileSelection) -> Void)?
     public var onSyncChangedRemoteEdits: (() -> Void)?
-    var onFileBrowserPaneFrameChanged: (() -> Void)?
+    var onPaneFrameChanged: (() -> Void)?
     public var onChmodPath: ((RemoteFileSelection) -> Void)?
     public var onSendPathToTerminal: ((String) -> Void)?
-    public var onAIQuestionRequested: ((String) -> Void)?
-    public var onEmbeddedCapabilityWillOpen: (() -> Void)?
-    public var onEmbeddedCapabilityClosed: ((CGFloat) -> Void)?
     public var onTransferStatusAction: ((TransferQueueAction, String) -> Void)?
     public var onSearchRemoteFiles: ((String, String, Int) -> Void)?
     public var onOpenSearchResult: ((RemoteFileSearchResult) -> Void)?
@@ -271,12 +261,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         accessibilityDescription: "更多",
         identifier: "Stacio.Files.more"
     )
-    private let embeddedCapabilityExpandButton = FilesViewController.makeToolbarButton(
-        title: "展开编辑器",
-        symbolName: "arrow.up.left.and.arrow.down.right",
-        accessibilityDescription: "展开编辑器",
-        identifier: "Stacio.Files.expandEmbeddedCapability"
-    )
     private let directoryFollowButton = NSButton()
     private let showHiddenFilesButton = NSButton()
     private let sizeUnitPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -290,10 +274,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private let searchDepthStepper = NSStepper()
     private let uploadMenu = NSMenu(title: L10n.Files.upload)
     private let moreMenu = NSMenu(title: "更多")
-    private let contentSplitView = NSSplitView()
     private let fileBrowserPaneView = CompressibleFilesPaneView()
-    private var fileBrowserStandaloneConstraints: [NSLayoutConstraint] = []
-    private var contentSplitConstraints: [NSLayoutConstraint] = []
     private var searchBarHeightConstraint: NSLayoutConstraint?
     private var allRows: [RemoteFileRow] = []
     private var searchRows: [RemoteFileRow] = []
@@ -306,19 +287,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var searchKeyword = ""
     private var rowContextMenuRow = -1
     private var lastPresentedPropertiesText: String?
-    private var embeddedEditorViewController: RemoteTextEditorViewController?
-    private var embeddedMediaPreviewViewController: RemoteMediaPreviewViewController?
-    private var embeddedOpenProgressViewController: RemoteFileOpenProgressViewController?
-    private var embeddedOpenRequestIDs = Set<UUID>()
-    private var embeddedEditorCloseConfirmer: RemoteTextEditorCloseConfirming?
-    private var editorSplitWidthConstraints: [NSLayoutConstraint] = []
-    private var fileBrowserMinimumWidthConstraint: NSLayoutConstraint?
-    private var fileBrowserCurrentWidthConstraint: NSLayoutConstraint?
-    private var fileBrowserWidthBeforeCollapse: CGFloat?
-    private var fileBrowserWidthBeforeCapabilityCollapse: CGFloat?
-    private var isEmbeddedCapabilityCollapsed = false
-    private var lastKnownVisibleFileBrowserWidth: CGFloat?
-    private var needsInitialEditorSplitPosition = false
     private var transferStatusHeightConstraint: NSLayoutConstraint?
     private var transferSamplesByJobID: [String: FilesTransferSample] = [:]
     private var transferStatusRowViews: [FilesTransferStatusRowView] = []
@@ -406,47 +374,12 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         lastPresentedPropertiesText
     }
 
-    public var embeddedEditorViewControllerForTesting: RemoteTextEditorViewController? {
-        embeddedEditorViewController
-    }
-
-    public var embeddedMediaPreviewViewControllerForTesting: RemoteMediaPreviewViewController? {
-        embeddedMediaPreviewViewController
-    }
-
-    public var embeddedOpenProgressViewControllerForTesting: RemoteFileOpenProgressViewController? {
-        embeddedOpenProgressViewController
-    }
-
     public var fileBrowserPaneViewForTesting: NSView {
         fileBrowserPaneView
     }
 
-    public var isEmbeddedCapabilityCollapsedForTesting: Bool {
-        isEmbeddedCapabilityCollapsed
-    }
-
-    var hasEmbeddedCapabilityForInspectorControls: Bool {
-        embeddedEditorViewController != nil || embeddedMediaPreviewViewController != nil
-    }
-
-    var isEmbeddedCapabilityExpandedForInspectorControls: Bool {
-        hasEmbeddedCapabilityForInspectorControls && isEmbeddedCapabilityCollapsed == false
-    }
-
-    var isEmbeddedCapabilityCollapsedForInspectorControls: Bool {
-        isEmbeddedCapabilityCollapsed
-    }
-
-    var isEmbeddedOpenProgressVisibleForInspectorControls: Bool {
-        embeddedOpenProgressViewController != nil
-    }
-
     public override func loadView() {
         let root = FilesShortcutRootView()
-        root.onToggleFileBrowser = { [weak self] in
-            self?.toggleFileBrowserVisibility()
-        }
         root.onCloseRemoteSearch = { [weak self] in
             self?.closeRemoteSearch(restoreDirectoryRows: true) == true
         }
@@ -458,14 +391,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
         root.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.applyInspectorContentSurface(root)
-
-        contentSplitView.isVertical = true
-        contentSplitView.dividerStyle = .thin
-        contentSplitView.translatesAutoresizingMaskIntoConstraints = false
-        contentSplitView.setAccessibilityIdentifier("Stacio.Files.editorSplit")
-        contentSplitView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        contentSplitView.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        contentSplitView.delegate = self
 
         fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = false
         fileBrowserPaneView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -507,9 +432,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         downloadButton.action = #selector(downloadButtonPressed(_:))
         moreButton.target = self
         moreButton.action = #selector(moreButtonPressed(_:))
-        embeddedCapabilityExpandButton.target = self
-        embeddedCapabilityExpandButton.action = #selector(embeddedCapabilityExpandButtonPressed(_:))
-        embeddedCapabilityExpandButton.isHidden = true
         configureSizeUnitPopup()
         configurePathBreadcrumbs()
         configureDirectoryFollowButton()
@@ -619,9 +541,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         configureTransferStatusStrip()
 
         root.addSubview(fileBrowserPaneView)
-        root.addSubview(embeddedCapabilityExpandButton)
 
-        fileBrowserPaneView.autoresizingMask = [.width, .height]
         fileBrowserPaneView.addSubview(titleLabel)
         fileBrowserPaneView.addSubview(engineLabel)
         fileBrowserPaneView.addSubview(toolbar)
@@ -631,13 +551,12 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         fileBrowserPaneView.addSubview(emptyLabel)
         fileBrowserPaneView.addSubview(transferStatusContainer)
 
-        fileBrowserStandaloneConstraints = [
+        let fileBrowserConstraints = [
             fileBrowserPaneView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             fileBrowserPaneView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             fileBrowserPaneView.topAnchor.constraint(equalTo: root.topAnchor),
             fileBrowserPaneView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ]
-        NSLayoutConstraint.deactivate(fileBrowserStandaloneConstraints)
         transferStatusHeightConstraint = transferStatusContainer.heightAnchor.constraint(equalToConstant: 0)
         transferStatusHeightConstraint?.priority = .defaultHigh
         searchBarHeightConstraint = searchBar.heightAnchor.constraint(equalToConstant: 0)
@@ -706,11 +625,10 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
             emptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: scrollView.leadingAnchor, constant: 16),
-            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor, constant: -16),
-
-            embeddedCapabilityExpandButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            embeddedCapabilityExpandButton.topAnchor.constraint(equalTo: root.topAnchor, constant: 12)
+            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: scrollView.trailingAnchor, constant: -16)
         ])
+
+        NSLayoutConstraint.activate(fileBrowserConstraints)
 
         synchronizeTableSortDescriptors()
         rebuildPathBreadcrumbs()
@@ -725,13 +643,10 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
 
     public override func viewDidLayout() {
         super.viewDidLayout()
-        synchronizeStandaloneFileBrowserFrameIfNeeded()
         updateTransferStatusScrollerVisibility()
-        applyInitialEditorSplitPositionIfNeeded()
         layoutPathBreadcrumbs()
         scrollPathBreadcrumbsToCurrentDirectory()
-        rememberVisibleFileBrowserWidth()
-        onFileBrowserPaneFrameChanged?()
+        onPaneFrameChanged?()
     }
 
     public func synchronizeInspectorColumnLayout() {
@@ -740,8 +655,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         {
             view.frame = superview.bounds
         }
-        synchronizeStandaloneFileBrowserFrameIfNeeded()
-        synchronizeEditorSplitFrameWithRootIfNeeded()
         view.needsLayout = true
     }
 
@@ -751,67 +664,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         {
             view.frame = superview.bounds
         }
-        // spec: fix-workbench-window-resize — standalone 模式下用 frame+autoresizingMask 同步尺寸。
-        // ensureEditorSplitViewAttached 在切换到 split 模式时会重置 translatesAutoresizingMaskIntoConstraints。
-        if contentSplitView.superview == nil,
-           fileBrowserPaneView.superview === view,
-           fileBrowserPaneView.frame != view.bounds
-        {
-            fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = true
-            fileBrowserPaneView.autoresizingMask = [.width, .height]
-            fileBrowserPaneView.frame = view.bounds
-        }
-        if contentSplitView.superview != nil,
-           contentSplitView.frame != view.bounds
-        {
-            contentSplitView.frame = view.bounds
-        }
-    }
-
-    func fileBrowserPaneFrameForInspectorHeader(in targetView: NSView) -> NSRect? {
-        guard isViewLoaded,
-              contentSplitView.superview != nil,
-              fileBrowserPaneView.isHidden == false
-        else {
-            return nil
-        }
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        fileBrowserPaneView.layoutSubtreeIfNeeded()
-        let frame = fileBrowserPaneView.convert(fileBrowserPaneView.bounds, to: targetView)
-        guard frame.minX.isFinite,
-              frame.maxX.isFinite,
-              frame.width.isFinite,
-              frame.width > 0,
-              frame.minX > targetView.bounds.minX + 1,
-              frame.maxX > targetView.bounds.minX,
-              frame.minX < targetView.bounds.maxX
-        else {
-            return nil
-        }
-        return frame
-    }
-
-    func embeddedCapabilityFrameForInspectorHeader(in targetView: NSView) -> NSRect? {
-        guard isViewLoaded,
-              contentSplitView.superview != nil,
-              let capabilityView = embeddedCapabilityView(),
-              capabilityView.isHidden == false
-        else {
-            return nil
-        }
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        capabilityView.layoutSubtreeIfNeeded()
-        let frame = capabilityView.convert(capabilityView.bounds, to: targetView)
-        guard frame.minX.isFinite,
-              frame.maxX.isFinite,
-              frame.width.isFinite,
-              frame.width > 0,
-              frame.maxX > targetView.bounds.minX,
-              frame.minX < targetView.bounds.maxX
-        else {
-            return nil
-        }
-        return frame
     }
 
     public func setEngineSummary(_ value: String) {
@@ -920,33 +772,12 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         performMoreActionForTesting(title: L10n.Files.syncChangedEdits)
     }
 
-    public func toggleFileBrowserVisibilityForTesting() {
-        toggleFileBrowserVisibility()
-    }
-
     public func toggleShowHiddenFilesForTesting() {
         setShowHiddenFilesEnabled(!showHiddenFilesEnabled)
     }
 
     private func toggleShowHiddenFilesFromUserAction() {
         updateShowHiddenFilesEnabled(!showHiddenFilesEnabled, persist: true)
-    }
-
-    public func collapseEmbeddedCapabilityForTesting() {
-        collapseEmbeddedCapability()
-    }
-
-    public func expandEmbeddedCapabilityForTesting() {
-        expandEmbeddedCapability()
-    }
-
-    public func expandEmbeddedCapability() {
-        restoreCollapsedEmbeddedCapability()
-    }
-
-    @discardableResult
-    public func closeEmbeddedEditorForTesting() -> Bool {
-        closeEmbeddedEditorIfNeeded()
     }
 
     public func performChmodSelectedEntryForTesting() {
@@ -1134,648 +965,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         setRefreshButtonTitle(L10n.Files.refresh)
         tableView.reloadData()
         updateEmptyState()
-    }
-
-    public func presentEmbeddedEditor(
-        localURL: URL,
-        saveHandler: RemoteEditSaveHandler?,
-        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
-    ) {
-        if isViewLoaded == false {
-            loadView()
-        }
-        if let embeddedEditorViewController,
-           embeddedMediaPreviewViewController == nil
-        {
-            embeddedEditorViewController.openDocument(localURL: localURL) { _ in
-                try saveHandler?()
-            }
-            restoreCollapsedEmbeddedCapability()
-            return
-        }
-        if embeddedOpenProgressViewController != nil,
-           embeddedEditorViewController == nil,
-           embeddedMediaPreviewViewController == nil
-        {
-            removeEmbeddedOpenProgressForReplacement()
-        } else {
-            guard closeEmbeddedCapabilityIfNeeded() else { return }
-        }
-
-        view.layoutSubtreeIfNeeded()
-        let editor = RemoteTextEditorViewController(localURL: localURL) { _ in
-            try saveHandler?()
-        }
-        embeddedEditorCloseConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
-        editor.onCloseRequested = { [weak self] in
-            _ = self?.closeEmbeddedEditorIfNeeded()
-        }
-        editor.onAIQuestionRequested = { [weak self] question in
-            self?.onAIQuestionRequested?(question)
-        }
-        ensureEditorSplitViewAttached()
-        addChild(editor)
-        let editorView = editor.view
-        editorView.translatesAutoresizingMaskIntoConstraints = false
-        installCapabilityViewInSplit(editorView)
-        installEditorSplitWidthConstraints(editorView: editorView)
-        contentSplitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
-        contentSplitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
-        needsInitialEditorSplitPosition = true
-        embeddedEditorViewController = editor
-        embeddedMediaPreviewViewController = nil
-        embeddedOpenProgressViewController = nil
-        onEmbeddedCapabilityWillOpen?()
-        view.layoutSubtreeIfNeeded()
-        applyInitialEditorSplitPositionIfNeeded()
-    }
-
-    public func presentEmbeddedRemoteDocument(
-        _ document: RemoteTextEditorDocumentDescriptor,
-        onSaveText: ((String) throws -> Void)? = nil,
-        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
-    ) {
-        if isViewLoaded == false {
-            loadView()
-        }
-        if let embeddedEditorViewController,
-           embeddedMediaPreviewViewController == nil
-        {
-            embeddedEditorViewController.openDocument(document, onSaveText: onSaveText)
-            restoreCollapsedEmbeddedCapability()
-            return
-        }
-        if embeddedOpenProgressViewController != nil,
-           embeddedEditorViewController == nil,
-           embeddedMediaPreviewViewController == nil
-        {
-            removeEmbeddedOpenProgressForReplacement()
-        } else {
-            guard closeEmbeddedCapabilityIfNeeded() else { return }
-        }
-
-        view.layoutSubtreeIfNeeded()
-        let editor = RemoteTextEditorViewController(document: document, onSaveText: onSaveText)
-        embeddedEditorCloseConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
-        editor.onCloseRequested = { [weak self] in
-            _ = self?.closeEmbeddedEditorIfNeeded()
-        }
-        editor.onAIQuestionRequested = { [weak self] question in
-            self?.onAIQuestionRequested?(question)
-        }
-        ensureEditorSplitViewAttached()
-        addChild(editor)
-        let editorView = editor.view
-        editorView.translatesAutoresizingMaskIntoConstraints = false
-        installCapabilityViewInSplit(editorView)
-        installEditorSplitWidthConstraints(editorView: editorView)
-        contentSplitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
-        contentSplitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
-        needsInitialEditorSplitPosition = true
-        embeddedEditorViewController = editor
-        embeddedMediaPreviewViewController = nil
-        embeddedOpenProgressViewController = nil
-        onEmbeddedCapabilityWillOpen?()
-        view.layoutSubtreeIfNeeded()
-        applyInitialEditorSplitPositionIfNeeded()
-    }
-
-    public func presentEmbeddedMediaPreview(localURL: URL) {
-        presentEmbeddedEditor(localURL: localURL, saveHandler: nil)
-    }
-
-    public func requestAIForEmbeddedEditor() {
-        embeddedEditorViewController?.requestAIForActiveDocument()
-    }
-
-    func beginEmbeddedOpenRequest(
-        selection: RemoteFileSelection,
-        mode: RemoteFileOpenMode,
-        requestID: UUID = UUID()
-    ) -> UUID? {
-        guard presentEmbeddedOpenProgress(selection: selection, mode: mode) else {
-            return nil
-        }
-        embeddedOpenRequestIDs.insert(requestID)
-        return requestID
-    }
-
-    func isEmbeddedOpenRequestActive(_ requestID: UUID?) -> Bool {
-        guard let requestID else {
-            return false
-        }
-        return embeddedOpenRequestIDs.contains(requestID)
-    }
-
-    func finishEmbeddedOpenRequest(_ requestID: UUID?) {
-        guard let requestID,
-              embeddedOpenRequestIDs.contains(requestID)
-        else {
-            return
-        }
-        embeddedOpenRequestIDs.remove(requestID)
-    }
-
-    @discardableResult
-    public func presentEmbeddedOpenProgress(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> Bool {
-        if isViewLoaded == false {
-            loadView()
-        }
-        if embeddedOpenProgressViewController != nil,
-           embeddedEditorViewController == nil,
-           embeddedMediaPreviewViewController == nil
-        {
-            removeEmbeddedOpenProgressForReplacement()
-        }
-        guard embeddedEditorViewController == nil,
-              embeddedMediaPreviewViewController == nil
-        else {
-            return true
-        }
-        guard closeEmbeddedCapabilityIfNeeded() else { return false }
-
-        let progress = RemoteFileOpenProgressViewController(selection: selection, mode: mode)
-        progress.onCloseRequested = { [weak self] in
-            _ = self?.closeEmbeddedEditorIfNeeded()
-        }
-        ensureEditorSplitViewAttached()
-        addChild(progress)
-        let progressView = progress.view
-        progressView.translatesAutoresizingMaskIntoConstraints = false
-        installCapabilityViewInSplit(progressView)
-        installEditorSplitWidthConstraints(editorView: progressView)
-        contentSplitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
-        contentSplitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
-        needsInitialEditorSplitPosition = true
-        embeddedEditorViewController = nil
-        embeddedMediaPreviewViewController = nil
-        embeddedOpenProgressViewController = progress
-        onEmbeddedCapabilityWillOpen?()
-        view.layoutSubtreeIfNeeded()
-        applyInitialEditorSplitPositionIfNeeded()
-        return true
-    }
-
-    public func presentEmbeddedOpenFailure(
-        selection: RemoteFileSelection,
-        mode: RemoteFileOpenMode,
-        message: String
-    ) {
-        if let embeddedOpenProgressViewController {
-            embeddedOpenProgressViewController.showFailure(message)
-            return
-        }
-        guard presentEmbeddedOpenProgress(selection: selection, mode: mode),
-              let embeddedOpenProgressViewController
-        else {
-            return
-        }
-        embeddedOpenProgressViewController.showFailure(message)
-    }
-
-    @discardableResult
-    public func closeEmbeddedEditorIfNeeded() -> Bool {
-        closeEmbeddedCapabilityIfNeeded()
-    }
-
-    @discardableResult
-    private func closeEmbeddedCapabilityIfNeeded() -> Bool {
-        let controller: NSViewController?
-        if let editor = embeddedEditorViewController {
-            controller = editor
-        } else if let progress = embeddedOpenProgressViewController {
-            controller = progress
-        } else {
-            controller = embeddedMediaPreviewViewController
-        }
-        guard let controller else {
-            return true
-        }
-        if let editor = embeddedEditorViewController {
-            let confirmer = embeddedEditorCloseConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
-            guard editor.canClose(parentWindow: view.window, closeConfirmer: confirmer) else {
-                return false
-            }
-        }
-        let fileBrowserWidth = fileBrowserWidthForRestoredStandaloneMode()
-        NSLayoutConstraint.deactivate(editorSplitWidthConstraints)
-        editorSplitWidthConstraints = []
-        fileBrowserMinimumWidthConstraint = nil
-        fileBrowserCurrentWidthConstraint = nil
-        fileBrowserWidthBeforeCollapse = nil
-        fileBrowserWidthBeforeCapabilityCollapse = nil
-        isEmbeddedCapabilityCollapsed = false
-        embeddedCapabilityExpandButton.isHidden = true
-        needsInitialEditorSplitPosition = false
-        fileBrowserPaneView.isHidden = false
-        controller.view.isHidden = false
-        contentSplitView.removeArrangedSubview(controller.view)
-        controller.view.removeFromSuperview()
-        controller.removeFromParent()
-        embeddedEditorViewController = nil
-        embeddedMediaPreviewViewController = nil
-        embeddedOpenProgressViewController = nil
-        embeddedOpenRequestIDs.removeAll()
-        embeddedEditorCloseConfirmer = nil
-        restoreStandaloneFileBrowserIfNeeded()
-        onEmbeddedCapabilityClosed?(fileBrowserWidth)
-        return true
-    }
-
-    private func removeEmbeddedOpenProgressForReplacement() {
-        guard let progress = embeddedOpenProgressViewController else {
-            return
-        }
-        NSLayoutConstraint.deactivate(editorSplitWidthConstraints)
-        editorSplitWidthConstraints = []
-        fileBrowserMinimumWidthConstraint = nil
-        fileBrowserCurrentWidthConstraint = nil
-        isEmbeddedCapabilityCollapsed = false
-        embeddedCapabilityExpandButton.isHidden = true
-        fileBrowserPaneView.isHidden = false
-        progress.view.isHidden = false
-        if contentSplitView.arrangedSubviews.contains(progress.view) {
-            contentSplitView.removeArrangedSubview(progress.view)
-        }
-        progress.view.removeFromSuperview()
-        progress.removeFromParent()
-        embeddedOpenProgressViewController = nil
-        embeddedOpenRequestIDs.removeAll()
-    }
-
-    private func fileBrowserWidthForRestoredStandaloneMode() -> CGFloat {
-        if fileBrowserPaneView.isHidden {
-            return max(
-                fileBrowserWidthBeforeCollapse ?? EditorCapabilityLayout.minimumBrowserWidth,
-                EditorCapabilityLayout.minimumBrowserWidth
-            )
-        }
-        if contentSplitView.superview != nil,
-           embeddedCapabilityView() != nil
-        {
-            let width = fileBrowserPaneView.convert(fileBrowserPaneView.bounds, to: view).width
-            if width.isFinite, width > 0 {
-                return max(width, EditorCapabilityLayout.minimumBrowserWidth)
-            }
-            if let constrainedWidth = fileBrowserCurrentWidthConstraint?.constant,
-               constrainedWidth.isFinite,
-               constrainedWidth > 0
-            {
-                return max(constrainedWidth, EditorCapabilityLayout.minimumBrowserWidth)
-            }
-        }
-        if let lastKnownVisibleFileBrowserWidth,
-           lastKnownVisibleFileBrowserWidth.isFinite,
-           lastKnownVisibleFileBrowserWidth > 0
-        {
-            return max(lastKnownVisibleFileBrowserWidth, EditorCapabilityLayout.minimumBrowserWidth)
-        }
-        let visibleRectWidth = fileBrowserPaneView.visibleRect.width
-        if visibleRectWidth.isFinite, visibleRectWidth > 0 {
-            return max(visibleRectWidth, EditorCapabilityLayout.minimumBrowserWidth)
-        }
-        if let contentView = fileBrowserPaneView.window?.contentView {
-            let rootFrame = view.convert(view.bounds, to: contentView)
-            let browserFrame = fileBrowserPaneView.convert(fileBrowserPaneView.bounds, to: contentView)
-            let rightAlignedVisibleWidth = rootFrame.maxX - browserFrame.minX
-            if rightAlignedVisibleWidth.isFinite, rightAlignedVisibleWidth > 0 {
-                return max(rightAlignedVisibleWidth, EditorCapabilityLayout.minimumBrowserWidth)
-            }
-            if browserFrame.width.isFinite, browserFrame.width > 0 {
-                return max(browserFrame.width, EditorCapabilityLayout.minimumBrowserWidth)
-            }
-        }
-        if let constrainedWidth = fileBrowserCurrentWidthConstraint?.constant,
-           constrainedWidth.isFinite,
-           constrainedWidth > 0
-        {
-            return max(constrainedWidth, EditorCapabilityLayout.minimumBrowserWidth)
-        }
-        let width = fileBrowserPaneView.convert(fileBrowserPaneView.bounds, to: view).width
-        guard width.isFinite, width > 0 else {
-            return max(
-                fileBrowserCurrentWidthConstraint?.constant ?? EditorCapabilityLayout.minimumBrowserWidth,
-                EditorCapabilityLayout.minimumBrowserWidth
-            )
-        }
-        return max(width, EditorCapabilityLayout.minimumBrowserWidth)
-    }
-
-    private func rememberVisibleFileBrowserWidth() {
-        guard fileBrowserPaneView.isHidden == false,
-              contentSplitView.superview == nil,
-              let contentView = fileBrowserPaneView.window?.contentView
-        else {
-            return
-        }
-        let rootFrame = view.convert(view.bounds, to: contentView)
-        let browserFrame = fileBrowserPaneView.convert(fileBrowserPaneView.bounds, to: contentView)
-        let width = rootFrame.maxX - browserFrame.minX
-        guard width.isFinite, width > 0 else {
-            return
-        }
-        lastKnownVisibleFileBrowserWidth = max(width, EditorCapabilityLayout.minimumBrowserWidth)
-    }
-
-    private func ensureEditorSplitViewAttached() {
-        guard contentSplitView.superview == nil else {
-            return
-        }
-        NSLayoutConstraint.deactivate(fileBrowserStandaloneConstraints)
-        // spec: fix-workbench-window-resize — 重置 translatesAutoresizingMaskIntoConstraints，
-        // 因为 synchronizeStandaloneFileBrowserFrameIfNeeded 在拖拽窗口时可能将其设为 true，
-        // 若不重置，fileBrowserPaneView 进入 contentSplitView 后 Auto Layout 约束失效，
-        // editorView 被挤压到 0，Monaco 编辑器无法渲染。
-        fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = false
-        fileBrowserPaneView.removeFromSuperview()
-        view.addSubview(contentSplitView)
-        contentSplitConstraints = [
-            contentSplitView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            contentSplitView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            contentSplitView.topAnchor.constraint(equalTo: view.topAnchor),
-            contentSplitView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
-        ]
-        NSLayoutConstraint.activate(contentSplitConstraints)
-        contentSplitView.needsLayout = true
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        contentSplitView.adjustSubviews()
-    }
-
-    private func installCapabilityViewInSplit(_ capabilityView: NSView) {
-        if contentSplitView.arrangedSubviews.contains(where: { $0 === fileBrowserPaneView }) {
-            contentSplitView.removeArrangedSubview(fileBrowserPaneView)
-            fileBrowserPaneView.removeFromSuperview()
-        }
-        contentSplitView.addArrangedSubview(capabilityView)
-        contentSplitView.addArrangedSubview(fileBrowserPaneView)
-    }
-
-    private func restoreStandaloneFileBrowserIfNeeded() {
-        guard contentSplitView.superview != nil else {
-            return
-        }
-        contentSplitView.removeArrangedSubview(fileBrowserPaneView)
-        fileBrowserPaneView.removeFromSuperview()
-        NSLayoutConstraint.deactivate(contentSplitConstraints)
-        contentSplitConstraints = []
-        contentSplitView.removeFromSuperview()
-        view.addSubview(fileBrowserPaneView)
-        // spec: fix-workbench-window-resize — 确保 standalone 约束模式下
-        // translatesAutoresizingMaskIntoConstraints = false，Auto Layout 约束才能生效
-        fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate(fileBrowserStandaloneConstraints)
-        view.layoutSubtreeIfNeeded()
-    }
-
-    private func installEditorSplitWidthConstraints(editorView: NSView) {
-        NSLayoutConstraint.deactivate(editorSplitWidthConstraints)
-        let browserWidth = fileBrowserPaneView.widthAnchor.constraint(
-            greaterThanOrEqualToConstant: EditorCapabilityLayout.minimumBrowserWidth
-        )
-        let editorWidth = editorView.widthAnchor.constraint(
-            greaterThanOrEqualToConstant: EditorCapabilityLayout.minimumEditorWidth
-        )
-        let currentFileBrowserWidth = fileBrowserPaneView.widthAnchor.constraint(
-            equalToConstant: EditorCapabilityLayout.minimumBrowserWidth
-        )
-        browserWidth.priority = .defaultHigh
-        editorWidth.priority = .defaultHigh
-        // Keep the browser width authoritative while the split view applies the
-        // initial editor-first position or a user drag.
-        currentFileBrowserWidth.priority = .required
-        fileBrowserMinimumWidthConstraint = browserWidth
-        fileBrowserCurrentWidthConstraint = currentFileBrowserWidth
-        editorSplitWidthConstraints = [browserWidth, editorWidth, currentFileBrowserWidth]
-        NSLayoutConstraint.activate(editorSplitWidthConstraints)
-    }
-
-    public func collapseEmbeddedCapability() {
-        guard contentSplitView.superview != nil,
-              contentSplitView.arrangedSubviews.count == 2,
-              let capabilityView = embeddedCapabilityView(),
-              !isEmbeddedCapabilityCollapsed
-        else {
-            return
-        }
-        let fileBrowserWidth = fileBrowserWidthForRestoredStandaloneMode()
-        fileBrowserWidthBeforeCapabilityCollapse = fileBrowserWidth
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        NSLayoutConstraint.deactivate(editorSplitWidthConstraints)
-        editorSplitWidthConstraints = []
-        fileBrowserMinimumWidthConstraint = nil
-        fileBrowserCurrentWidthConstraint = nil
-        contentSplitView.removeArrangedSubview(capabilityView)
-        capabilityView.removeFromSuperview()
-        capabilityView.isHidden = true
-        fileBrowserPaneView.isHidden = false
-        isEmbeddedCapabilityCollapsed = true
-        embeddedCapabilityExpandButton.isHidden = false
-        contentSplitView.layoutSubtreeIfNeeded()
-        view.layoutSubtreeIfNeeded()
-        onEmbeddedCapabilityClosed?(fileBrowserWidth)
-    }
-
-    private func restoreCollapsedEmbeddedCapability() {
-        guard isEmbeddedCapabilityCollapsed,
-              contentSplitView.superview != nil,
-              let capabilityView = embeddedCapabilityView()
-        else {
-            return
-        }
-        onEmbeddedCapabilityWillOpen?()
-        capabilityView.isHidden = false
-        isEmbeddedCapabilityCollapsed = false
-        embeddedCapabilityExpandButton.isHidden = true
-        installCapabilityViewInSplit(capabilityView)
-        installEditorSplitWidthConstraints(editorView: capabilityView)
-        let restoredBrowserWidth = fileBrowserWidthBeforeCapabilityCollapse
-        fileBrowserWidthBeforeCapabilityCollapse = nil
-        needsInitialEditorSplitPosition = restoredBrowserWidth == nil
-        view.layoutSubtreeIfNeeded()
-        if let restoredBrowserWidth {
-            applyEditorSplitPosition(browserWidth: restoredBrowserWidth)
-        } else {
-            applyInitialEditorSplitPositionIfNeeded()
-        }
-        embeddedEditorViewController?.synchronizeLayoutAfterContainerChange()
-    }
-
-    private func embeddedCapabilityView() -> NSView? {
-        if let editor = embeddedEditorViewController {
-            return editor.view
-        }
-        if let progress = embeddedOpenProgressViewController {
-            return progress.view
-        }
-        return embeddedMediaPreviewViewController?.view
-    }
-
-    private func toggleFileBrowserVisibility() {
-        guard contentSplitView.superview != nil,
-              contentSplitView.arrangedSubviews.count == 2,
-              embeddedCapabilityView() != nil
-        else {
-            return
-        }
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        let availableWidth = contentSplitView.bounds.width
-        guard availableWidth > 0 else { return }
-        let dividerWidth = contentSplitView.dividerThickness
-
-        let shouldCollapse = fileBrowserPaneView.isHidden == false
-        if shouldCollapse == false {
-            let restoredBrowserWidth = max(
-                fileBrowserWidthBeforeCollapse ?? EditorCapabilityLayout.minimumBrowserWidth,
-                EditorCapabilityLayout.minimumBrowserWidth
-            )
-            fileBrowserPaneView.isHidden = false
-            fileBrowserMinimumWidthConstraint?.constant = EditorCapabilityLayout.minimumBrowserWidth
-            fileBrowserCurrentWidthConstraint?.constant = restoredBrowserWidth
-            let editorWidth = max(
-                EditorCapabilityLayout.minimumEditorWidth,
-                availableWidth - dividerWidth - restoredBrowserWidth
-            )
-            contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
-        } else {
-            let currentBrowserWidth = fileBrowserPaneView.convert(
-                fileBrowserPaneView.bounds,
-                to: view
-            ).width
-            fileBrowserWidthBeforeCollapse = max(
-                currentBrowserWidth,
-                EditorCapabilityLayout.minimumBrowserWidth
-            )
-            fileBrowserMinimumWidthConstraint?.constant = 0
-            fileBrowserCurrentWidthConstraint?.constant = 0
-            fileBrowserPaneView.isHidden = true
-            contentSplitView.setPosition(
-                max(EditorCapabilityLayout.minimumEditorWidth, availableWidth - dividerWidth),
-                ofDividerAt: 0
-            )
-        }
-        fileBrowserPaneView.isHidden = shouldCollapse
-        contentSplitView.layoutSubtreeIfNeeded()
-        view.layoutSubtreeIfNeeded()
-    }
-
-    private func applyInitialEditorSplitPositionIfNeeded() {
-        guard needsInitialEditorSplitPosition,
-              contentSplitView.superview != nil,
-              embeddedCapabilityView() != nil,
-              contentSplitView.arrangedSubviews.count == 2
-        else {
-            return
-        }
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        let availableWidth = contentSplitView.bounds.width
-        guard availableWidth > 0 else { return }
-        let dividerWidth = contentSplitView.dividerThickness
-        let maximumEditorWidth = availableWidth
-            - dividerWidth
-            - EditorCapabilityLayout.minimumBrowserWidth
-        guard maximumEditorWidth >= EditorCapabilityLayout.minimumEditorWidth else { return }
-
-        let preferredWidth = max(
-            EditorCapabilityLayout.preferredEditorWidth,
-            availableWidth * EditorCapabilityLayout.preferredEditorWidthFraction
-        )
-        let editorWidth = min(max(preferredWidth, EditorCapabilityLayout.minimumEditorWidth), maximumEditorWidth)
-        let browserWidth = availableWidth - dividerWidth - editorWidth
-        fileBrowserCurrentWidthConstraint?.constant = browserWidth
-        needsInitialEditorSplitPosition = false
-        contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
-        fileBrowserCurrentWidthConstraint?.constant = browserWidth
-        contentSplitView.adjustSubviews()
-        contentSplitView.layoutSubtreeIfNeeded()
-        view.layoutSubtreeIfNeeded()
-    }
-
-    private func applyEditorSplitPosition(browserWidth: CGFloat) {
-        guard contentSplitView.superview != nil,
-              embeddedCapabilityView() != nil,
-              contentSplitView.arrangedSubviews.count == 2
-        else {
-            return
-        }
-        synchronizeEditorSplitFrameWithRootIfNeeded()
-        let availableWidth = contentSplitView.bounds.width
-        guard availableWidth > 0 else { return }
-        let dividerWidth = contentSplitView.dividerThickness
-        let maximumBrowserWidth = availableWidth
-            - dividerWidth
-            - EditorCapabilityLayout.minimumEditorWidth
-        guard maximumBrowserWidth >= EditorCapabilityLayout.minimumBrowserWidth else {
-            return
-        }
-        let restoredBrowserWidth = min(
-            max(browserWidth, EditorCapabilityLayout.minimumBrowserWidth),
-            maximumBrowserWidth
-        )
-        let editorWidth = availableWidth - dividerWidth - restoredBrowserWidth
-        fileBrowserCurrentWidthConstraint?.constant = restoredBrowserWidth
-        contentSplitView.setPosition(editorWidth, ofDividerAt: 0)
-        contentSplitView.adjustSubviews()
-        contentSplitView.layoutSubtreeIfNeeded()
-        view.layoutSubtreeIfNeeded()
-    }
-
-    private func synchronizeEditorSplitFrameWithRootIfNeeded() {
-        guard contentSplitView.superview != nil, view.bounds.width > 0, view.bounds.height > 0 else {
-            return
-        }
-        let splitFrame = contentSplitView.frame
-        guard splitFrame.size != view.bounds.size || splitFrame.origin != .zero else {
-            return
-        }
-        contentSplitView.frame = view.bounds
-        contentSplitView.layoutSubtreeIfNeeded()
-    }
-
-    private func synchronizeStandaloneFileBrowserFrameIfNeeded() {
-        guard contentSplitView.superview == nil,
-              fileBrowserPaneView.superview === view,
-              view.bounds.width > 0,
-              view.bounds.height > 0
-        else {
-            return
-        }
-        // spec: fix-workbench-window-resize — standalone 模式下用 frame+autoresizingMask 同步尺寸。
-        // 注意：此处设置 translatesAutoresizingMaskIntoConstraints = true 是 standalone 模式的正常状态。
-        // ensureEditorSplitViewAttached 在切换到 split 模式时会重置为 false。
-        if fileBrowserPaneView.frame != view.bounds {
-            fileBrowserPaneView.translatesAutoresizingMaskIntoConstraints = true
-            fileBrowserPaneView.autoresizingMask = [.width, .height]
-            fileBrowserPaneView.frame = view.bounds
-            fileBrowserPaneView.needsLayout = true
-        }
-    }
-
-    public func splitView(
-        _ splitView: NSSplitView,
-        constrainSplitPosition proposedPosition: CGFloat,
-        ofSubviewAt dividerIndex: Int
-    ) -> CGFloat {
-        guard splitView === contentSplitView,
-              dividerIndex == 0,
-              splitView.arrangedSubviews.count == 2
-        else {
-            return proposedPosition
-        }
-        let dividerWidth = splitView.dividerThickness
-        let minimumBrowserWidth = fileBrowserPaneView.isHidden ? 0 : EditorCapabilityLayout.minimumBrowserWidth
-        let maximumEditorWidth = splitView.bounds.width
-            - dividerWidth
-            - minimumBrowserWidth
-        guard maximumEditorWidth >= EditorCapabilityLayout.minimumEditorWidth else {
-            return proposedPosition
-        }
-        let editorWidth = min(
-            max(proposedPosition, EditorCapabilityLayout.minimumEditorWidth),
-            maximumEditorWidth
-        )
-        let browserWidth = splitView.bounds.width - dividerWidth - editorWidth
-        fileBrowserCurrentWidthConstraint?.constant = browserWidth
-        return editorWidth
     }
 
     public func setRemoteListingError(_ detail: String) {
@@ -2385,10 +1574,6 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             return
         }
         applySizeUnit(unit)
-    }
-
-    @objc private func embeddedCapabilityExpandButtonPressed(_ sender: Any?) {
-        restoreCollapsedEmbeddedCapability()
     }
 
     private func handleDroppedLocalFilePaths(_ localPaths: [String], proposedRow: Int? = nil) {
@@ -3857,7 +3042,6 @@ private final class RemoteFilesDropClipView: NSClipView {
 }
 
 private final class FilesShortcutRootView: NSView {
-    var onToggleFileBrowser: (() -> Void)?
     var onCloseRemoteSearch: (() -> Bool)?
     var onToggleHiddenFiles: (() -> Void)?
     var localFileDropHandler: (([String]) -> Void)? {
@@ -3889,12 +3073,6 @@ private final class FilesShortcutRootView: NSView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.keyCode == 53 || event.charactersIgnoringModifiers == "\u{1b}" {
             return onCloseRemoteSearch?() == true || super.performKeyEquivalent(with: event)
-        }
-        if event.modifierFlags.contains(.control),
-           event.charactersIgnoringModifiers?.lowercased() == "b"
-        {
-            onToggleFileBrowser?()
-            return true
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command),

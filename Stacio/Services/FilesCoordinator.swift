@@ -2316,293 +2316,6 @@ public final class AppKitRemoteEditOpener: RemoteEditOpening {
     }
 }
 
-@MainActor
-public final class EmbeddedRemoteEditOpener: RemoteEditOpening {
-    private weak var filesViewController: FilesViewController?
-    private let fallbackOpener: RemoteEditOpening
-    private var embeddedOpenRequestIDsByKey: [String: UUID] = [:]
-    private var embeddedOpenRequestKeysByID: [UUID: String] = [:]
-
-    public init(
-        filesViewController: FilesViewController,
-        fallbackOpener: RemoteEditOpening? = nil
-    ) {
-        self.filesViewController = filesViewController
-        self.fallbackOpener = fallbackOpener ?? AppKitRemoteEditOpener()
-    }
-
-    public func prepareToOpenRemote(selection: RemoteFileSelection, mode: RemoteFileOpenMode) -> Bool {
-        guard let filesViewController else {
-            return fallbackOpener.prepareToOpenRemote(selection: selection, mode: mode)
-        }
-
-        switch mode {
-        case .textEditor, .mediaPreview:
-            guard let requestID = filesViewController.beginEmbeddedOpenRequest(selection: selection, mode: mode) else {
-                return false
-            }
-            embeddedOpenRequestIDsByKey[embeddedOpenRequestKey(remotePath: selection.path, mode: mode)] = requestID
-            return true
-        case .chooseApplication, .defaultApplication:
-            return fallbackOpener.prepareToOpenRemote(selection: selection, mode: mode)
-        }
-    }
-
-    public func prepareRemoteOpen(
-        selection: RemoteFileSelection,
-        mode: RemoteFileOpenMode
-    ) -> RemoteEditOpenRequest? {
-        guard let filesViewController else {
-            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
-        }
-
-        switch mode {
-        case .textEditor, .mediaPreview:
-            let request = RemoteEditOpenRequest()
-            guard filesViewController.beginEmbeddedOpenRequest(
-                selection: selection,
-                mode: mode,
-                requestID: request.id
-            ) != nil else {
-                return nil
-            }
-            embeddedOpenRequestKeysByID[request.id] = embeddedOpenRequestKey(
-                remotePath: selection.path,
-                mode: mode
-            )
-            return request
-        case .chooseApplication, .defaultApplication:
-            return fallbackOpener.prepareRemoteOpen(selection: selection, mode: mode)
-        }
-    }
-
-    public func openLocalCopy(
-        at url: URL,
-        mode: RemoteFileOpenMode,
-        applicationURL: URL?,
-        saveHandler: RemoteEditSaveHandler?
-    ) {
-        guard let filesViewController else {
-            fallbackOpener.openLocalCopy(
-                at: url,
-                mode: mode,
-                applicationURL: applicationURL,
-                saveHandler: saveHandler
-            )
-            return
-        }
-
-        switch mode {
-        case .textEditor:
-            filesViewController.presentEmbeddedEditor(
-                localURL: url,
-                saveHandler: saveHandler
-            )
-        case .mediaPreview:
-            filesViewController.presentEmbeddedMediaPreview(localURL: url)
-        case .chooseApplication, .defaultApplication:
-            fallbackOpener.openLocalCopy(
-                at: url,
-                mode: mode,
-                applicationURL: applicationURL,
-                saveHandler: saveHandler
-            )
-        }
-    }
-
-    public func openLocalCopy(
-        at url: URL,
-        mode: RemoteFileOpenMode,
-        applicationURL: URL?,
-        saveHandler: RemoteEditSaveHandler?,
-        request: RemoteEditOpenRequest
-    ) {
-        guard mode == .textEditor || mode == .mediaPreview else {
-            fallbackOpener.openLocalCopy(
-                at: url,
-                mode: mode,
-                applicationURL: applicationURL,
-                saveHandler: saveHandler,
-                request: request
-            )
-            return
-        }
-        guard let filesViewController,
-              consumeEmbeddedRequest(request, mode: mode, filesViewController: filesViewController) != nil
-        else { return }
-
-        switch mode {
-        case .textEditor:
-            filesViewController.presentEmbeddedEditor(localURL: url, saveHandler: saveHandler)
-        case .mediaPreview:
-            filesViewController.presentEmbeddedMediaPreview(localURL: url)
-        case .chooseApplication, .defaultApplication:
-            break
-        }
-        filesViewController.finishEmbeddedOpenRequest(request.id)
-    }
-
-    public func openRemoteDocument(
-        _ document: RemoteTextEditorDocumentDescriptor,
-        mode: RemoteFileOpenMode,
-        saveHandler: ((String) throws -> Void)?
-    ) {
-        guard let filesViewController else {
-            fallbackOpener.openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
-            return
-        }
-
-        switch mode {
-        case .textEditor, .mediaPreview:
-            let requestKey = embeddedOpenRequestKey(remotePath: document.remotePath, mode: mode)
-            let requestID = embeddedOpenRequestIDsByKey[requestKey]
-            guard filesViewController.isEmbeddedOpenRequestActive(requestID) else {
-                embeddedOpenRequestIDsByKey[requestKey] = nil
-                return
-            }
-            filesViewController.presentEmbeddedRemoteDocument(document, onSaveText: saveHandler)
-            filesViewController.finishEmbeddedOpenRequest(requestID)
-            embeddedOpenRequestIDsByKey[requestKey] = nil
-        case .chooseApplication, .defaultApplication:
-            fallbackOpener.openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
-        }
-    }
-
-    public func openRemoteDocument(
-        _ document: RemoteTextEditorDocumentDescriptor,
-        mode: RemoteFileOpenMode,
-        saveHandler: ((String) throws -> Void)?,
-        request: RemoteEditOpenRequest
-    ) {
-        guard mode == .textEditor || mode == .mediaPreview else {
-            fallbackOpener.openRemoteDocument(
-                document,
-                mode: mode,
-                saveHandler: saveHandler,
-                request: request
-            )
-            return
-        }
-        guard let filesViewController,
-              consumeEmbeddedRequest(
-                request,
-                expectedKey: embeddedOpenRequestKey(remotePath: document.remotePath, mode: mode),
-                filesViewController: filesViewController
-              ) != nil
-        else { return }
-
-        filesViewController.presentEmbeddedRemoteDocument(document, onSaveText: saveHandler)
-        filesViewController.finishEmbeddedOpenRequest(request.id)
-    }
-
-    public func remoteOpenDidFail(selection: RemoteFileSelection, mode: RemoteFileOpenMode, message: String) {
-        guard let filesViewController else {
-            fallbackOpener.remoteOpenDidFail(selection: selection, mode: mode, message: message)
-            return
-        }
-
-        switch mode {
-        case .textEditor, .mediaPreview:
-            let requestKey = embeddedOpenRequestKey(remotePath: selection.path, mode: mode)
-            let requestID = embeddedOpenRequestIDsByKey[requestKey]
-            guard filesViewController.isEmbeddedOpenRequestActive(requestID) else {
-                embeddedOpenRequestIDsByKey[requestKey] = nil
-                return
-            }
-            if let editor = filesViewController.embeddedEditorViewControllerForTesting {
-                editor.openFailedDocument(
-                    remotePath: selection.path,
-                    fileName: (selection.path as NSString).lastPathComponent,
-                    message: message,
-                    byteCount: selection.size
-                )
-                filesViewController.finishEmbeddedOpenRequest(requestID)
-                embeddedOpenRequestIDsByKey[requestKey] = nil
-                return
-            }
-            filesViewController.presentEmbeddedOpenFailure(selection: selection, mode: mode, message: message)
-            filesViewController.finishEmbeddedOpenRequest(requestID)
-            embeddedOpenRequestIDsByKey[requestKey] = nil
-        case .chooseApplication, .defaultApplication:
-            fallbackOpener.remoteOpenDidFail(selection: selection, mode: mode, message: message)
-        }
-    }
-
-    public func remoteOpenDidFail(
-        selection: RemoteFileSelection,
-        mode: RemoteFileOpenMode,
-        message: String,
-        request: RemoteEditOpenRequest
-    ) {
-        guard mode == .textEditor || mode == .mediaPreview else {
-            fallbackOpener.remoteOpenDidFail(
-                selection: selection,
-                mode: mode,
-                message: message,
-                request: request
-            )
-            return
-        }
-        guard let filesViewController,
-              consumeEmbeddedRequest(
-                request,
-                expectedKey: embeddedOpenRequestKey(remotePath: selection.path, mode: mode),
-                filesViewController: filesViewController
-              ) != nil
-        else { return }
-
-        if let editor = filesViewController.embeddedEditorViewControllerForTesting {
-            editor.openFailedDocument(
-                remotePath: selection.path,
-                fileName: (selection.path as NSString).lastPathComponent,
-                message: message,
-                byteCount: selection.size
-            )
-        } else {
-            filesViewController.presentEmbeddedOpenFailure(
-                selection: selection,
-                mode: mode,
-                message: message
-            )
-        }
-        filesViewController.finishEmbeddedOpenRequest(request.id)
-    }
-
-    public func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws {
-        try fallbackOpener.compareLocalCopies(urls, parentWindow: parentWindow)
-    }
-
-    private func embeddedOpenRequestKey(remotePath: String, mode: RemoteFileOpenMode) -> String {
-        "\(mode.logName):\(remotePath)"
-    }
-
-    private func consumeEmbeddedRequest(
-        _ request: RemoteEditOpenRequest,
-        mode: RemoteFileOpenMode,
-        filesViewController: FilesViewController
-    ) -> UUID? {
-        guard let expectedKey = embeddedOpenRequestKeysByID[request.id],
-              expectedKey.hasPrefix("\(mode.logName):")
-        else { return nil }
-        return consumeEmbeddedRequest(
-            request,
-            expectedKey: expectedKey,
-            filesViewController: filesViewController
-        )
-    }
-
-    private func consumeEmbeddedRequest(
-        _ request: RemoteEditOpenRequest,
-        expectedKey: String,
-        filesViewController: FilesViewController
-    ) -> UUID? {
-        guard embeddedOpenRequestKeysByID[request.id] == expectedKey else { return nil }
-        embeddedOpenRequestKeysByID[request.id] = nil
-        guard filesViewController.isEmbeddedOpenRequestActive(request.id) else { return nil }
-        return request.id
-    }
-}
-
 public enum RemoteFileCompareError: Error, LocalizedError, Equatable {
     case fileMergeUnavailable
     case requiresTwoFiles
@@ -2757,6 +2470,7 @@ public final class FilesCoordinator {
     private let conflictResolver: RemoteFileConflictResolving
     private let remoteEditCache: RemoteEditCache
     private let remoteEditOpener: RemoteEditOpening
+    private let currentEditorProvider: () -> RemoteTextEditorViewController?
     private let documentCoordinator: FileTransferDocumentCoordinator
     private let remoteEditSessionIDProvider: () -> String
     private let settingsStore: AppSettingsStore
@@ -2791,6 +2505,7 @@ public final class FilesCoordinator {
         conflictResolver: RemoteFileConflictResolving = SettingsBackedRemoteFileConflictResolver(),
         remoteEditCache: RemoteEditCache? = nil,
         remoteEditOpener: RemoteEditOpening? = nil,
+        currentEditorProvider: @escaping () -> RemoteTextEditorViewController? = { nil },
         remoteEditSessionIDProvider: @escaping () -> String = { "default" },
         settingsStore: AppSettingsStore = .shared,
         localUploadSizeProvider: @escaping LocalUploadSizeProviding = LocalUploadSizeProvider.recursiveByteSize,
@@ -2808,7 +2523,8 @@ public final class FilesCoordinator {
         self.errorPresenter = errorPresenter
         self.conflictResolver = conflictResolver
         self.remoteEditCache = remoteEditCache ?? Self.makeDefaultRemoteEditCache()
-        self.remoteEditOpener = remoteEditOpener ?? EmbeddedRemoteEditOpener(filesViewController: filesViewController)
+        self.remoteEditOpener = remoteEditOpener ?? AppKitRemoteEditOpener()
+        self.currentEditorProvider = currentEditorProvider
         self.documentCoordinator = FileTransferDocumentCoordinator()
         self.remoteEditSessionIDProvider = remoteEditSessionIDProvider
         self.settingsStore = settingsStore
@@ -5510,7 +5226,7 @@ public final class FilesCoordinator {
     }
 
     private func openEditorBackupCandidates() throws -> [RemoteFileBackupCandidate] {
-        guard let editor = filesViewController?.embeddedEditorViewControllerForTesting else {
+        guard let editor = currentEditorProvider() else {
             return []
         }
         let onlineCandidates = editor.documentBackupCandidates
