@@ -1342,9 +1342,18 @@ private final class MountTableCellView: NSTableCellView {
         }
         statusIcon.image = NSImage(systemSymbolName: statusSymbol, accessibilityDescription: entry.status.rawValue)
         statusIcon.contentTintColor = statusTint
+        statusIcon.toolTip = statusToolTip(for: entry.status)
 
         // 卸载中状态禁用卸载按钮，避免重复点击
         unmountButton.isEnabled = entry.status != .unmounting
+    }
+
+    private func statusToolTip(for status: MountEntry.Status) -> String {
+        switch status {
+        case .mounted: return "已挂载"
+        case .pending: return "挂载命令已发送，等待远端确认"
+        case .unmounting: return "正在卸载"
+        }
     }
 
     @objc private func revealPressed() {
