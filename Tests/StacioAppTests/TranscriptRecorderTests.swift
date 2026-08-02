@@ -172,9 +172,11 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(header["stacio_truncated"] as? Bool, true)
     }
 
-    func testOverflowAfterCompletedDrainExportsTruncationMarker() throws {
+    func testOverflowAfterCompletedDrainWithSmallPendingCapExportsTruncationMarker() throws {
         let session = TerminalRecordingSession(
-            recorder: TimestampedRecorder(maximumByteCount: 4, maximumEntryCount: 8)
+            recorder: TimestampedRecorder(maximumByteCount: 4, maximumEntryCount: 8),
+            pendingByteLimit: 0,
+            pendingChunkLimit: 1
         )
         XCTAssertTrue(session.start())
         session.append(bytes: Array("1234".utf8))

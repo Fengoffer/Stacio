@@ -332,16 +332,36 @@ public final class TerminalRecordingSession: @unchecked Sendable {
     private var closed = false
     private var recordingWidth = 80
     private var recordingHeight = 24
+    private let pendingByteLimit: Int
+    private let pendingChunkLimit: Int
 
-    public init(
+    public convenience init(
         recorder: TimestampedRecorder = TimestampedRecorder(),
         runtimeID: String? = nil,
         hub: TerminalOutputBroadcastHub? = nil
     ) {
+        self.init(
+            recorder: recorder,
+            runtimeID: runtimeID,
+            hub: hub,
+            pendingByteLimit: Self.maximumPendingByteCount,
+            pendingChunkLimit: Self.maximumPendingChunkCount
+        )
+    }
+
+    internal init(
+        recorder: TimestampedRecorder,
+        runtimeID: String? = nil,
+        hub: TerminalOutputBroadcastHub? = nil,
+        pendingByteLimit: Int,
+        pendingChunkLimit: Int
+    ) {
         self.recorder = recorder
         self.runtimeID = runtimeID
         self.hub = runtimeID == nil ? nil : (hub ?? .shared)
-        pendingOutputs.reserveCapacity(Self.maximumPendingChunkCount)
+        self.pendingByteLimit = min(max(0, pendingByteLimit), Self.maximumPendingByteCount)
+        self.pendingChunkLimit = min(max(0, pendingChunkLimit), Self.maximumPendingChunkCount)
+        pendingOutputs.reserveCapacity(self.pendingChunkLimit)
     }
 
     public var isRecording: Bool {
@@ -492,9 +512,9 @@ public final class TerminalRecordingSession: @unchecked Sendable {
             stateLock.unlock()
             return
         }
-        let availableByteCount = Self.maximumPendingByteCount - pendingByteCount
+        let availableByteCount = pendingByteLimit - pendingByteCount
         guard availableByteCount > 0,
-              pendingOutputs.count < Self.maximumPendingChunkCount
+              pendingOutputs.count < pendingChunkLimit
         else {
             didTruncateOutput = true
             if drainScheduled == false {
