@@ -350,6 +350,141 @@ final class TerminalRecordingViewControllerTests: XCTestCase {
         XCTAssertTrue(closed)
     }
 
+    func testRecordingMenuUsesWorkspaceSelectedPaneWhenFocusIsOutsideTerminal() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { NoopTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        workspace.loadView()
+        let runtimeA = try workspace.openLocalShell()
+        let runtimeB = try workspace.openLocalShell()
+        XCTAssertTrue(workspace.activateTerminal(runtimeID: runtimeB, bringAppToFront: false))
+
+        let window = NSWindow(contentViewController: workspace)
+        defer {
+            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeA)
+            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeB)
+            window.close()
+        }
+        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
+        let nonTerminalFocus = NSButton(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
+        workspace.view.addSubview(nonTerminalFocus)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(nonTerminalFocus))
+
+        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+        coordinator.startRecordingCurrentTerminal(nil)
+
+        XCTAssertFalse(
+            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeA)?.isRecording ?? false
+        )
+        XCTAssertTrue(
+            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeB)?.isRecording ?? false
+        )
+    }
+
+    func testRecordingMenuFreezesTheRealTerminalDimensions() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { NoopTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        workspace.loadView()
+        let runtimeID = try workspace.openLocalShell()
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+
+        let window = NSWindow(contentViewController: workspace)
+        defer {
+            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeID)
+            window.close()
+        }
+        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        workspace.view.layoutSubtreeIfNeeded()
+        pane.terminalView.resize(cols: 113, rows: 37)
+
+        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+        coordinator.startRecordingCurrentTerminal(nil)
+
+        let session = try XCTUnwrap(
+            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeID)
+        )
+        let header = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(session.exportAsciinema(title: "sized").split(separator: "\n")[0].utf8)
+        ) as? [String: Any]
+        )
+        XCTAssertEqual((header["width"] as? NSNumber)?.intValue, 113)
+        XCTAssertEqual((header["height"] as? NSNumber)?.intValue, 37)
+
+        coordinator.stopRecordingCurrentTerminal(nil)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-recording-size-\(UUID().uuidString).cast")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let saved = expectation(description: "sized recording saves")
+        session.save(to: url, title: "sized") { result in
+            if case let .failure(error) = result {
+                XCTFail("save failed: \(error)")
+            }
+            saved.fulfill()
+        }
+        wait(for: [saved], timeout: 2)
+        let savedRecording = try TerminalRecordingDocument.load(from: url)
+        XCTAssertEqual(savedRecording.width, 113)
+        XCTAssertEqual(savedRecording.height, 37)
+    }
+
+    func testRecordingMenuFreezesDimensionsForSSHSerialAndTelnet() throws {
+        for connectionKind in [
+            RemoteTerminalConnectionKind.ssh,
+            .serial,
+            .telnet
+        ] {
+            let runtimeID = "recording-size-\(connectionKind)-\(UUID().uuidString)"
+            let pane = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: "remote",
+                connectionKind: connectionKind,
+                eventSink: NoopTerminalEventSink(),
+                startsPollingAutomatically: false
+            )
+            pane.loadView()
+            let window = NSWindow(contentViewController: pane)
+            defer {
+                TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeID)
+                window.close()
+            }
+            window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
+            window.makeKeyAndOrderFront(nil)
+            pane.view.layoutSubtreeIfNeeded()
+            pane.terminalView.resize(cols: 97, rows: 29)
+
+            let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+            coordinator.startRecordingCurrentTerminal(nil)
+
+            let session = try XCTUnwrap(
+                TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeID)
+            )
+            let header = try XCTUnwrap(
+                try JSONSerialization.jsonObject(
+                    with: Data(session.exportAsciinema(title: "remote").split(separator: "\n")[0].utf8)
+                ) as? [String: Any]
+            )
+            XCTAssertEqual((header["width"] as? NSNumber)?.intValue, 97, String(describing: connectionKind))
+            XCTAssertEqual((header["height"] as? NSNumber)?.intValue, 29, String(describing: connectionKind))
+        }
+    }
+
+    private final class NoopTerminalEventSink: TerminalEventSink {
+        func terminalDidResize(runtimeID: String, cols: Int, rows: Int) throws {}
+        func terminalDidProduceOutput(runtimeID: String, bytes: [UInt8]) throws {}
+        func terminalDidReceiveInput(runtimeID: String, bytes: [UInt8]) throws {}
+        func terminalDidClose(runtimeID: String) throws {}
+    }
+
     private func makePlayback() -> TerminalRecordingPlayback {
         TerminalRecordingPlayback(recording: makeRecording())
     }

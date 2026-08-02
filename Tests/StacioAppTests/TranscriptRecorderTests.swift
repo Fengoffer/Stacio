@@ -61,6 +61,117 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(recording.events.map(\.text), ["saved output"])
     }
 
+    func testSaveRetainsSessionUntilCompletionWhenOwnerIsReleasedImmediately() throws {
+        var session: TerminalRecordingSession? = TerminalRecordingSession()
+        XCTAssertTrue(session?.start() == true)
+        session?.append(
+            bytes: Array("owner released after save".utf8),
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertTrue(session?.stop() == true)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-recording-owner-release-\(UUID().uuidString).cast")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let completion = expectation(description: "save completion is delivered exactly once")
+        var completionCount = 0
+        session?.save(to: url, title: "owner release") { result in
+            completionCount += 1
+            if case let .failure(error) = result {
+                XCTFail("save failed: \(error)")
+            }
+            completion.fulfill()
+        }
+        session?.close()
+        session = nil
+
+        wait(for: [completion], timeout: 2)
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let recording = try TerminalRecordingDocument.load(from: url)
+        XCTAssertEqual(recording.events.map(\.text), ["owner released after save"])
+    }
+
+    func testStartingAgainDoesNotDiscardAnUnsavedRecording() {
+        let session = TerminalRecordingSession()
+        XCTAssertTrue(session.start())
+        session.append(bytes: Array("keep me".utf8))
+        XCTAssertTrue(session.stop())
+
+        XCTAssertFalse(session.start())
+        XCTAssertTrue(session.hasUnsavedOutput)
+        XCTAssertTrue(session.hasOutput)
+    }
+
+    func testPendingOutputStaysBoundedAndStopDoesNotWaitForUnboundedHistory() throws {
+        let session = TerminalRecordingSession()
+        XCTAssertTrue(session.start())
+        let payload = Array(repeating: UInt8(ascii: "x"), count: 8 * 1024)
+        let appendStarted = DispatchTime.now().uptimeNanoseconds
+        for _ in 0 ..< 20_000 {
+            session.append(bytes: payload)
+        }
+        let appendElapsed = Double(DispatchTime.now().uptimeNanoseconds - appendStarted) / 1_000_000_000
+
+        XCTAssertLessThan(appendElapsed, 0.05)
+        XCTAssertLessThanOrEqual(
+            session.pendingByteCountForTesting,
+            TerminalRecordingSession.maximumPendingByteCount
+        )
+        XCTAssertLessThanOrEqual(
+            session.pendingChunkCountForTesting,
+            TerminalRecordingSession.maximumPendingChunkCount
+        )
+
+        let stopStarted = DispatchTime.now().uptimeNanoseconds
+        XCTAssertTrue(session.stop())
+        let stopElapsed = Double(DispatchTime.now().uptimeNanoseconds - stopStarted) / 1_000_000_000
+        XCTAssertLessThan(stopElapsed, 0.05)
+
+        let recording = try AsciinemaV2RecordingParser.parse(
+            Data(session.exportAsciinema(title: "bounded").utf8)
+        )
+        XCTAssertFalse(recording.events.isEmpty)
+        XCTAssertTrue(session.didTruncateOutputForTesting)
+        let header = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(session.exportAsciinema(title: "bounded").split(separator: "\n")[0].utf8)
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(header["stacio_truncated"] as? Bool, true)
+    }
+
+    func testPendingOverflowPreservesAcceptedPrefixAndMarksTruncation() throws {
+        let session = TerminalRecordingSession(
+            recorder: TimestampedRecorder(
+                maximumByteCount: TerminalRecordingSession.maximumPendingByteCount * 2,
+                maximumEntryCount: 8
+            )
+        )
+        XCTAssertTrue(session.start())
+
+        let oversizedOutput = Array(
+            repeating: UInt8(ascii: "x"),
+            count: TerminalRecordingSession.maximumPendingByteCount + 1
+        )
+        session.append(bytes: oversizedOutput)
+        XCTAssertTrue(session.stop())
+
+        let recording = try AsciinemaV2RecordingParser.parse(
+            Data(session.exportAsciinema(title: "accepted prefix").utf8)
+        )
+        XCTAssertEqual(recording.events.map(\.text).joined().utf8.count,
+                       TerminalRecordingSession.maximumPendingByteCount)
+        XCTAssertTrue(session.didTruncateOutputForTesting)
+        let header = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(session.exportAsciinema(title: "accepted prefix").split(separator: "\n")[0].utf8)
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(header["stacio_truncated"] as? Bool, true)
+    }
+
     func testRuntimeScopedSessionReceivesOnlyPublishedTerminalOutputWhileRecording() throws {
         let hub = TerminalOutputBroadcastHub()
         let session = TerminalRecordingSession(

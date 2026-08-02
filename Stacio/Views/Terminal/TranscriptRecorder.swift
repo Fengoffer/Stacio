@@ -148,6 +148,11 @@ public final class TimestampedRecorder {
             "title": String(title.prefix(1_024)),
             "env": ["TERM": "xterm-256color"]
         ]
+        if isTruncated {
+            // asciinema ignores unknown header fields; this makes an intentionally
+            // bounded recording loss explicit to Stacio and other tooling.
+            header["stacio_truncated"] = true
+        }
         let firstTimestamp = entries.first?.t ?? pendingTimestamp
         if let firstTimestamp {
             header["timestamp"] = Self.unixTimestamp(for: firstTimestamp)
@@ -185,6 +190,12 @@ public final class TimestampedRecorder {
             }
         }
         return output
+    }
+
+    public func markTruncated() {
+        isTruncated = true
+        pendingUTF8Bytes.removeAll(keepingCapacity: false)
+        pendingTimestamp = nil
     }
 
     private func appendDecodedText(_ text: String, timestamp: Date) {
@@ -289,19 +300,38 @@ public final class TimestampedRecorder {
     }
 }
 
-/// Owns one terminal's recording lifecycle. The terminal output callback only
-/// enqueues a bounded write and never performs encoding or file I/O inline.
-public final class TerminalRecordingSession {
+/// Owns one terminal's recording lifecycle. Output is accepted into a small
+/// protected buffer and drained on a utility queue. State reads and stop never
+/// wait for that queue, so a high-throughput terminal cannot freeze AppKit.
+public final class TerminalRecordingSession: @unchecked Sendable {
+    public static let maximumPendingByteCount = 512 * 1024
+    public static let maximumPendingChunkCount = 512
+
+    private struct PendingOutput {
+        let bytes: [UInt8]
+        let timestamp: Date
+    }
+
     private let queue = DispatchQueue(
         label: "com.stacio.terminal-recording-session",
         qos: .utility
     )
+    private let stateLock = NSLock()
     private let recorder: TimestampedRecorder
     private let hub: TerminalOutputBroadcastHub?
     private let runtimeID: String?
     private var subscription: TerminalOutputBroadcastHub.Subscription?
+    private var pendingOutputs: [PendingOutput] = []
+    private var pendingByteCount = 0
+    private var drainScheduled = false
     private var recording = false
     private var recordedOutput = false
+    private var unsavedOutput = false
+    private var didTruncateOutput = false
+    private var saveInFlight = false
+    private var closed = false
+    private var recordingWidth = 80
+    private var recordingHeight = 24
 
     public init(
         recorder: TimestampedRecorder = TimestampedRecorder(),
@@ -311,103 +341,253 @@ public final class TerminalRecordingSession {
         self.recorder = recorder
         self.runtimeID = runtimeID
         self.hub = runtimeID == nil ? nil : (hub ?? .shared)
+        pendingOutputs.reserveCapacity(Self.maximumPendingChunkCount)
     }
 
     public var isRecording: Bool {
-        queue.sync { recording }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recording
     }
 
     public var hasOutput: Bool {
-        queue.sync { recordedOutput }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recordedOutput
     }
 
-    /// Starts a fresh recording. Repeated starts are intentionally no-ops.
+    public var canStart: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return recording == false && unsavedOutput == false && saveInFlight == false && closed == false
+    }
+
+    public var hasUnsavedOutput: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return unsavedOutput
+    }
+
+    public var isSaving: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return saveInFlight
+    }
+
+    // Kept internal for deterministic pressure tests without exposing queue state to UI.
+    var pendingByteCountForTesting: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return pendingByteCount
+    }
+
+    var pendingChunkCountForTesting: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return pendingOutputs.count
+    }
+
+    var didTruncateOutputForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return didTruncateOutput
+    }
+
+    /// Starts a fresh recording. Repeated starts and starts with unsaved output are no-ops.
     @MainActor
     @discardableResult
-    public func start() -> Bool {
-        let didStart = queue.sync { () -> Bool in
-            guard recording == false else { return false }
-            recorder.reset()
-            recordedOutput = false
-            recording = true
-            return true
+    public func start(width: Int = 80, height: Int = 24) -> Bool {
+        stateLock.lock()
+        guard recording == false,
+              unsavedOutput == false,
+              saveInFlight == false,
+              closed == false
+        else {
+            stateLock.unlock()
+            return false
         }
-        guard didStart,
-              let runtimeID,
+        recording = true
+        recordedOutput = false
+        didTruncateOutput = false
+        pendingOutputs.removeAll(keepingCapacity: true)
+        pendingByteCount = 0
+        recordingWidth = Self.clampedDimension(width)
+        recordingHeight = Self.clampedDimension(height)
+        // Queue reset is ordered before any newly scheduled drain and does not
+        // block the main actor behind a previous export.
+        queue.async { [weak self] in
+            self?.recorder.reset()
+        }
+        stateLock.unlock()
+
+        guard let runtimeID,
               let hub,
               subscription == nil
         else {
-            return didStart
+            return true
         }
         subscription = hub.subscribe(runtimeID: runtimeID) { [weak self] event in
             guard event.kind == .output else { return }
             self?.append(bytes: event.bytes, timestamp: event.createdAt)
         }
-        return didStart
+        return true
     }
 
-    /// Stops accepting future output and drains output already queued before the stop.
     @MainActor
     @discardableResult
     public func stop() -> Bool {
-        guard isRecording else { return false }
+        stateLock.lock()
+        guard recording else {
+            stateLock.unlock()
+            return false
+        }
+        recording = false
+        let subscription = self.subscription
+        self.subscription = nil
+        stateLock.unlock()
+
         if let runtimeID, let hub, let subscription {
             hub.unsubscribe(runtimeID: runtimeID, subscription: subscription)
-            self.subscription = nil
-        }
-        queue.sync {
-            recording = false
         }
         return true
     }
 
     @MainActor
     public func close() {
-        _ = stop()
-        queue.sync {
-            recorder.reset()
+        stateLock.lock()
+        recording = false
+        closed = true
+        let subscription = self.subscription
+        self.subscription = nil
+        let shouldResetRecorder = saveInFlight == false
+        // A save already queued owns the immutable lifecycle until its write
+        // completes. Do not discard its accepted pending output here.
+        if shouldResetRecorder {
+            pendingOutputs.removeAll(keepingCapacity: false)
+            pendingByteCount = 0
             recordedOutput = false
+            unsavedOutput = false
+            didTruncateOutput = false
+        }
+        stateLock.unlock()
+
+        if let runtimeID, let hub, let subscription {
+            hub.unsubscribe(runtimeID: runtimeID, subscription: subscription)
+        }
+        if shouldResetRecorder {
+            queue.async { [weak self] in
+                self?.recorder.reset()
+            }
         }
     }
 
-    /// This method is intentionally asynchronous. It is safe to call directly from
-    /// a terminal output callback because the recorder queue owns all mutation.
+    /// Accepts at most the configured pending capacity. The terminal callback
+    /// performs only a lock, bounded copy, and one queue scheduling operation.
     public func append(bytes: [UInt8], timestamp: Date = Date()) {
         guard bytes.isEmpty == false else { return }
-        queue.async { [weak self] in
-            guard let self else { return }
-            guard self.recording else { return }
-            self.recorder.append(bytes: bytes, timestamp: timestamp)
-            self.recordedOutput = true
+        var shouldScheduleDrain = false
+
+        stateLock.lock()
+        guard recording, closed == false, didTruncateOutput == false else {
+            stateLock.unlock()
+            return
         }
+        let availableByteCount = Self.maximumPendingByteCount - pendingByteCount
+        guard availableByteCount > 0,
+              pendingOutputs.count < Self.maximumPendingChunkCount
+        else {
+            didTruncateOutput = true
+            stateLock.unlock()
+            return
+        }
+
+        let acceptedByteCount = min(bytes.count, availableByteCount)
+        guard acceptedByteCount > 0 else {
+            didTruncateOutput = true
+            stateLock.unlock()
+            return
+        }
+        // Copy only the accepted prefix so an oversized caller-owned backing
+        // buffer cannot stay alive through a bounded pending chunk.
+        let accepted = Array(bytes.prefix(acceptedByteCount))
+        pendingOutputs.append(PendingOutput(bytes: accepted, timestamp: timestamp))
+        pendingByteCount += accepted.count
+        recordedOutput = true
+        unsavedOutput = true
+        if acceptedByteCount < bytes.count {
+            didTruncateOutput = true
+        }
+        if drainScheduled == false {
+            drainScheduled = true
+            shouldScheduleDrain = true
+        }
+        if shouldScheduleDrain {
+            queue.async { [weak self] in
+                self?.drainPendingOutputs()
+            }
+        }
+        stateLock.unlock()
     }
 
     public func exportAsciinema(
         title: String,
-        width: Int = 80,
-        height: Int = 24
+        width: Int? = nil,
+        height: Int? = nil
     ) -> String {
         queue.sync {
-            recorder.exportAsciinema(title: title, width: width, height: height)
+            let dimensions = dimensionsSnapshot()
+            return recorder.exportAsciinema(
+                title: title,
+                width: width ?? dimensions.width,
+                height: height ?? dimensions.height
+            )
         }
     }
 
     public func save(
         to url: URL,
         title: String,
-        width: Int = 80,
-        height: Int = 24,
+        width: Int? = nil,
+        height: Int? = nil,
         completion: @escaping (Result<URL, Error>) -> Void
     ) {
-        queue.async { [weak self] in
-            guard let self else { return }
+        stateLock.lock()
+        if closed {
+            stateLock.unlock()
+            DispatchQueue.main.async {
+                completion(.failure(NSError(
+                    domain: "Stacio.TerminalRecordingSession",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "录制会话已关闭。"]
+                )))
+            }
+            return
+        }
+        if saveInFlight {
+            stateLock.unlock()
+            DispatchQueue.main.async {
+                completion(.failure(NSError(
+                    domain: "Stacio.TerminalRecordingSession",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "当前录制正在保存。"]
+                )))
+            }
+            return
+        }
+        saveInFlight = true
+        stateLock.unlock()
+
+        // Strongly capture the session for the whole drain/export/write. This
+        // also guarantees exactly one completion if the owner window closes.
+        queue.async { [self] in
             let result: Result<URL, Error>
             do {
+                let dimensions = dimensionsSnapshot()
                 let data = Data(
-                    self.recorder.exportAsciinema(
+                    recorder.exportAsciinema(
                         title: title,
-                        width: width,
-                        height: height
+                        width: width ?? dimensions.width,
+                        height: height ?? dimensions.height
                     ).utf8
                 )
                 try data.write(to: url, options: .atomic)
@@ -415,10 +595,67 @@ public final class TerminalRecordingSession {
             } catch {
                 result = .failure(error)
             }
+
+            stateLock.lock()
+            saveInFlight = false
+            let shouldResetAfterClose = closed
+            if case .success = result {
+                unsavedOutput = false
+            }
+            if shouldResetAfterClose {
+                recordedOutput = false
+                unsavedOutput = false
+                didTruncateOutput = false
+                pendingOutputs.removeAll(keepingCapacity: false)
+                pendingByteCount = 0
+            }
+            stateLock.unlock()
+
+            if shouldResetAfterClose {
+                recorder.reset()
+            }
+
             DispatchQueue.main.async {
                 completion(result)
             }
         }
+    }
+
+    private func drainPendingOutputs() {
+        while true {
+            let output: PendingOutput
+            let shouldFinalizeTruncation: Bool
+            stateLock.lock()
+            if pendingOutputs.isEmpty {
+                shouldFinalizeTruncation = didTruncateOutput && recorder.isTruncated == false
+                drainScheduled = false
+                stateLock.unlock()
+                if shouldFinalizeTruncation {
+                    recorder.markTruncated()
+                }
+                return
+            }
+            output = pendingOutputs.removeFirst()
+            pendingByteCount -= output.bytes.count
+            stateLock.unlock()
+
+            recorder.append(bytes: output.bytes, timestamp: output.timestamp)
+            if recorder.isTruncated {
+                stateLock.lock()
+                didTruncateOutput = true
+                stateLock.unlock()
+            }
+        }
+    }
+
+    private func dimensionsSnapshot() -> (width: Int, height: Int) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (recordingWidth, recordingHeight)
+    }
+
+    private static func clampedDimension(_ dimension: Int) -> Int {
+        min(max(dimension, 1), 1_000)
     }
 
     deinit {

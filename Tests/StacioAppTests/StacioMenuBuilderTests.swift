@@ -161,4 +161,93 @@ final class StacioMenuBuilderTests: XCTestCase {
         XCTAssertEqual(license.keyEquivalent, "")
         XCTAssertEqual(license.action, #selector(AppDelegate.showLicenseWindow(_:)))
     }
+
+    func testRecordingMenuValidationReflectsTerminalLifecycle() throws {
+        let coordinator = TerminalRecordingWindowCoordinator()
+        let start = NSMenuItem(
+            title: "开始录制当前终端",
+            action: #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+        let stop = NSMenuItem(
+            title: "停止录制当前终端",
+            action: #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+        let save = NSMenuItem(
+            title: "保存当前终端录制…",
+            action: #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+        let open = NSMenuItem(
+            title: "打开录制文件…",
+            action: #selector(TerminalRecordingWindowCoordinator.openRecordingFile(_:)),
+            keyEquivalent: ""
+        )
+
+        XCTAssertFalse(coordinator.validateMenuItem(start))
+        XCTAssertFalse(coordinator.validateMenuItem(stop))
+        XCTAssertFalse(coordinator.validateMenuItem(save))
+        XCTAssertTrue(coordinator.validateMenuItem(open))
+    }
+
+    func testRecordingMenuValidationTracksRecordingAndUnsavedOutput() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { NoopTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        workspace.loadView()
+        let runtimeID = try workspace.openLocalShell()
+        let window = NSWindow(contentViewController: workspace)
+        defer {
+            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeID)
+            window.close()
+        }
+        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
+        window.makeKeyAndOrderFront(nil)
+
+        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+        let start = NSMenuItem(
+            title: "开始录制当前终端",
+            action: #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+        let stop = NSMenuItem(
+            title: "停止录制当前终端",
+            action: #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+        let save = NSMenuItem(
+            title: "保存当前终端录制…",
+            action: #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:)),
+            keyEquivalent: ""
+        )
+
+        XCTAssertTrue(coordinator.validateMenuItem(start))
+        XCTAssertFalse(coordinator.validateMenuItem(stop))
+        XCTAssertFalse(coordinator.validateMenuItem(save))
+
+        coordinator.startRecordingCurrentTerminal(nil)
+        XCTAssertFalse(coordinator.validateMenuItem(start))
+        XCTAssertTrue(coordinator.validateMenuItem(stop))
+        XCTAssertFalse(coordinator.validateMenuItem(save))
+
+        TerminalOutputBroadcastHub.shared.publishOutput(
+            runtimeID: runtimeID,
+            bytes: Array("menu output".utf8)
+        )
+        XCTAssertTrue(coordinator.validateMenuItem(save))
+        coordinator.stopRecordingCurrentTerminal(nil)
+        XCTAssertFalse(coordinator.validateMenuItem(start))
+        XCTAssertFalse(coordinator.validateMenuItem(stop))
+        XCTAssertTrue(coordinator.validateMenuItem(save))
+    }
+
+    private final class NoopTerminalEventSink: TerminalEventSink {
+        func terminalDidResize(runtimeID: String, cols: Int, rows: Int) throws {}
+        func terminalDidProduceOutput(runtimeID: String, bytes: [UInt8]) throws {}
+        func terminalDidReceiveInput(runtimeID: String, bytes: [UInt8]) throws {}
+        func terminalDidClose(runtimeID: String) throws {}
+    }
 }

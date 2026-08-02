@@ -898,12 +898,18 @@ public final class TerminalRecordingSessionRegistry {
 }
 
 @MainActor
-public final class TerminalRecordingWindowCoordinator: NSObject {
+public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValidation {
     public static let shared = TerminalRecordingWindowCoordinator()
 
+    private let windowProvider: @MainActor () -> NSWindow?
     private var windowController: TerminalRecordingWindowController?
     private var loadingTask: Task<Void, Never>?
     private var loadRequestID: UUID?
+
+    public init(windowProvider: @escaping @MainActor () -> NSWindow? = { NSApplication.shared.keyWindow }) {
+        self.windowProvider = windowProvider
+        super.init()
+    }
 
     @objc
     public func startRecordingCurrentTerminal(_ sender: Any?) {
@@ -913,7 +919,8 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
             title: target.agentTitle,
             owner: target as AnyObject
         )
-        _ = session.start()
+        let dimensions = terminalDimensions(for: target)
+        _ = session.start(width: dimensions.width, height: dimensions.height)
     }
 
     @objc
@@ -940,8 +947,8 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
         if let castType = UTType(filenameExtension: "cast") {
             panel.allowedContentTypes = [castType]
         }
-        let completion: (NSApplication.ModalResponse) -> Void = { [weak session, weak panel] response in
-            guard response == .OK, let url = panel?.url, let session else { return }
+        let completion: (NSApplication.ModalResponse) -> Void = { [session, weak panel] response in
+            guard response == .OK, let url = panel?.url else { return }
             session.save(to: url, title: target.agentTitle) { result in
                 if case let .failure(error) = result {
                     let alert = NSAlert(error: error)
@@ -949,7 +956,7 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
                 }
             }
         }
-        if let window = NSApp.keyWindow, window.isVisible {
+        if let window = windowProvider(), window.isVisible {
             panel.beginSheetModal(for: window, completionHandler: completion)
         } else {
             panel.begin(completionHandler: completion)
@@ -1049,8 +1056,30 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
         loadRequestID = nil
     }
 
+    public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:))
+                || menuItem.action == #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:))
+                || menuItem.action == #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:))
+        else {
+            return true
+        }
+        guard let target = currentTerminalTarget() else { return false }
+        let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID)
+
+        switch menuItem.action {
+        case #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)):
+            return session?.canStart ?? true
+        case #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:)):
+            return session?.isRecording ?? false
+        case #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:)):
+            return session?.hasOutput == true && session?.isSaving == false
+        default:
+            return true
+        }
+    }
+
     private func currentTerminalTarget() -> AgentTerminalTarget? {
-        guard let window = NSApp.keyWindow,
+        guard let window = windowProvider(),
               let root = window.contentViewController
         else { return nil }
         let firstResponder = window.firstResponder as? NSView
@@ -1059,7 +1088,14 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
             [controller] + controller.children.flatMap(descendants)
         }
 
-        let candidates = descendants(of: root).compactMap { controller -> (AgentTerminalTarget, NSViewController)? in
+        let controllers = descendants(of: root)
+        if let workspace = controllers.first(where: { $0 is WorkspaceViewController }) as? WorkspaceViewController {
+            // Workspace owns the selected tab/split state. A toolbar, AI panel,
+            // or file pane may be first responder without changing that choice.
+            return workspace.currentAgentTerminalTarget
+        }
+
+        let candidates = controllers.compactMap { controller -> (AgentTerminalTarget, NSViewController)? in
             guard let target = controller as? AgentTerminalTarget,
                   controller.view.window === window
             else { return nil }
@@ -1073,5 +1109,22 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
             }
         }
         return candidates.first?.0
+    }
+
+    private func terminalDimensions(for target: AgentTerminalTarget) -> (width: Int, height: Int) {
+        let dimensions: (Int, Int)
+        if let local = target as? TerminalPaneViewController {
+            let terminal = local.terminalView.getTerminal()
+            dimensions = (terminal.cols, terminal.rows)
+        } else if let remote = target as? RemoteTerminalPaneViewController {
+            let terminal = remote.terminalView.getTerminal()
+            dimensions = (terminal.cols, terminal.rows)
+        } else {
+            dimensions = (80, 24)
+        }
+        return (
+            min(max(dimensions.0, 1), 1_000),
+            min(max(dimensions.1, 1), 1_000)
+        )
     }
 }
