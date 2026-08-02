@@ -497,14 +497,32 @@ public final class TerminalRecordingSession: @unchecked Sendable {
               pendingOutputs.count < Self.maximumPendingChunkCount
         else {
             didTruncateOutput = true
+            if drainScheduled == false {
+                drainScheduled = true
+                shouldScheduleDrain = true
+            }
             stateLock.unlock()
+            if shouldScheduleDrain {
+                queue.async { [weak self] in
+                    self?.drainPendingOutputs()
+                }
+            }
             return
         }
 
         let acceptedByteCount = min(bytes.count, availableByteCount)
         guard acceptedByteCount > 0 else {
             didTruncateOutput = true
+            if drainScheduled == false {
+                drainScheduled = true
+                shouldScheduleDrain = true
+            }
             stateLock.unlock()
+            if shouldScheduleDrain {
+                queue.async { [weak self] in
+                    self?.drainPendingOutputs()
+                }
+            }
             return
         }
         // Copy only the accepted prefix so an oversized caller-owned backing

@@ -172,6 +172,26 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertEqual(header["stacio_truncated"] as? Bool, true)
     }
 
+    func testOverflowAfterCompletedDrainExportsTruncationMarker() throws {
+        let session = TerminalRecordingSession(
+            recorder: TimestampedRecorder(maximumByteCount: 4, maximumEntryCount: 8)
+        )
+        XCTAssertTrue(session.start())
+        session.append(bytes: Array("1234".utf8))
+
+        // exportAsciinema is a queue barrier; the first append has fully drained.
+        _ = session.exportAsciinema(title: "before overflow")
+
+        session.append(bytes: Array(repeating: UInt8(ascii: "x"), count: 4))
+        XCTAssertTrue(session.stop())
+
+        let headerLine = try XCTUnwrap(session.exportAsciinema(title: "after overflow").split(separator: "\n").first)
+        let header = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(headerLine.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(header["stacio_truncated"] as? Bool, true)
+    }
+
     func testRuntimeScopedSessionReceivesOnlyPublishedTerminalOutputWhileRecording() throws {
         let hub = TerminalOutputBroadcastHub()
         let session = TerminalRecordingSession(
