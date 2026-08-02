@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 public struct StacioMenuBuilder {
     private weak var target: AppDelegate?
     private let licenseAccess: any LicenseFeatureAccessProviding
@@ -87,6 +88,12 @@ public struct StacioMenuBuilder {
         }
         importItem.submenu = importMenu
         submenu.addItem(importItem)
+        submenu.addItem(menuItem(
+            title: "打开录制文件…",
+            action: #selector(TerminalRecordingWindowCoordinator.openRecordingFile(_:)),
+            key: "",
+            target: TerminalRecordingWindowCoordinator.shared
+        ))
         submenu.addItem(.separator())
         submenu.addItem(menuItem(
             title: L10n.Menu.closeCurrentTerminal,

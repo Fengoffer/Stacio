@@ -34,6 +34,14 @@ final class StacioMenuBuilderTests: XCTestCase {
 
         XCTAssertNil(fileMenu.item(withTitle: "快速连接"))
 
+        let openRecording = try XCTUnwrap(fileMenu.item(withTitle: "打开录制文件…"))
+        XCTAssertEqual(openRecording.keyEquivalent, "")
+        XCTAssertEqual(
+            openRecording.action,
+            #selector(TerminalRecordingWindowCoordinator.openRecordingFile(_:))
+        )
+        XCTAssertTrue(openRecording.target === TerminalRecordingWindowCoordinator.shared)
+
         let closeCurrent = try XCTUnwrap(fileMenu.item(withTitle: "关闭当前终端"))
         XCTAssertEqual(closeCurrent.keyEquivalent, "w")
         XCTAssertEqual(closeCurrent.action, #selector(AppDelegate.closeCurrentTerminalFromMenu(_:)))
