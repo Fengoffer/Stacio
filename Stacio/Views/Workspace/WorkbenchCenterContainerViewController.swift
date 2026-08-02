@@ -55,6 +55,7 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
     private var programmaticLayoutDepth = 0
     private var lastObservedAvailableWidth: CGFloat?
     private var isUserDividerDragInProgress = false
+    private var isEditorTargetWidthRestoreScheduled = false
     private var isEditorLayoutSynchronizationScheduled = false
 
     public init(
@@ -92,7 +93,7 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             self?.persistUserDividerResult()
         }
         splitView.onLayoutCompleted = { [weak self] in
-            self?.restoreTargetWidthAfterSplitLayoutIfNeeded()
+            self?.scheduleEditorTargetWidthRestore()
         }
 
         addChild(workspaceViewController)
@@ -124,9 +125,7 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
            isUserDividerDragInProgress == false,
            programmaticLayoutDepth == 0
         {
-            performProgrammaticLayout {
-                applyEditorTargetWidth()
-            }
+            scheduleEditorTargetWidthRestore()
         }
         if widthChanged {
             scheduleEditorLayoutSynchronization()
@@ -399,6 +398,16 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
         }
         performProgrammaticLayout {
             applyEditorTargetWidth()
+        }
+    }
+
+    private func scheduleEditorTargetWidthRestore() {
+        guard isEditorTargetWidthRestoreScheduled == false else { return }
+        isEditorTargetWidthRestoreScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isEditorTargetWidthRestoreScheduled = false
+            self.restoreTargetWidthAfterSplitLayoutIfNeeded()
         }
     }
 

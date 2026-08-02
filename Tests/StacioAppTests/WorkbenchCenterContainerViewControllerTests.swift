@@ -271,6 +271,29 @@ final class WorkbenchCenterContainerViewControllerTests: XCTestCase {
         XCTAssertEqual(layoutCallCount(in: editor), 1)
     }
 
+    func testWindowResizeDefersTargetWidthRestoreUntilAfterActiveLayoutPass() throws {
+        let controller = makeCenter(
+            width: 1_400,
+            store: RecordingRemoteEditorPresentationStore(sidecarWidth: 760)
+        )
+        try controller.installEditorContent(PlainCenterChildViewController())
+        layout(controller)
+        drainMainRunLoop()
+        controller.setEditorSidecarWidthForTesting(620, userInitiated: false)
+
+        controller.view.frame.size.width = 1_500
+        layout(controller)
+
+        XCTAssertGreaterThan(
+            abs(controller.editorSidecarWidthForTesting - 760),
+            1,
+            "The split divider must not move synchronously from inside an AppKit layout pass."
+        )
+        XCTAssertTrue(waitUntil {
+            abs(controller.editorSidecarWidthForTesting - 760) <= 1
+        })
+    }
+
     private func makeCenter(
         width: CGFloat,
         store: RecordingRemoteEditorPresentationStore
@@ -291,6 +314,7 @@ final class WorkbenchCenterContainerViewControllerTests: XCTestCase {
     ) {
         controller.view.frame.size.width = width
         layout(controller)
+        drainMainRunLoop()
     }
 
     private func layout(_ controller: WorkbenchCenterContainerViewController) {
