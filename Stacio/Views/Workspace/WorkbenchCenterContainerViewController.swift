@@ -174,7 +174,7 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             NSLayoutConstraint.activate([
                 contentView.leadingAnchor.constraint(equalTo: editorHostView.leadingAnchor),
                 contentView.trailingAnchor.constraint(equalTo: editorHostView.trailingAnchor),
-                contentView.topAnchor.constraint(equalTo: editorHostView.topAnchor),
+                contentView.topAnchor.constraint(equalTo: editorHostView.safeAreaLayoutGuide.topAnchor),
                 contentView.bottomAnchor.constraint(equalTo: editorHostView.bottomAnchor)
             ])
             hostedEditorContentViewController = controller

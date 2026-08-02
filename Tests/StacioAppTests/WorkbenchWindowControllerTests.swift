@@ -1446,6 +1446,36 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         assertWindowFrame(window, equals: userFrame)
     }
 
+    func testDockedEditorToolbarStaysBelowUnifiedWindowToolbar() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+
+        try harness.openLocalDocument(
+            name: "toolbar-safe-area.md",
+            contents: "# Ready\n"
+        )
+        harness.layout()
+
+        let contentView = try XCTUnwrap(harness.window.contentView)
+        let editorToolbar = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Editor.Toolbar")
+        )
+        let editorToolbarFrame = editorToolbar.convert(editorToolbar.bounds, to: contentView)
+        let contentLayoutFrame = contentView.convert(
+            harness.window.contentLayoutRect,
+            from: nil
+        )
+
+        XCTAssertLessThanOrEqual(
+            editorToolbarFrame.maxY,
+            contentLayoutFrame.maxY + 1,
+            "Docked editor controls must stay below the unified window toolbar"
+        )
+    }
+
     func testEditorOpenCollapseExpandAndCloseNeverChangeInspectorOrFilesWidth() throws {
         let harness = try makeWorkbenchEditorHarness(
             windowWidth: 2_100,
