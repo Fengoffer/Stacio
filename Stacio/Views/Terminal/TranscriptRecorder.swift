@@ -134,11 +134,17 @@ public final class TimestampedRecorder {
         pendingTimestamp = nil
     }
 
-    public func exportAsciinema(title: String) -> String {
+    public func exportAsciinema(
+        title: String,
+        width: Int = 80,
+        height: Int = 24
+    ) -> String {
+        let safeWidth = min(max(width, 1), 1_000)
+        let safeHeight = min(max(height, 1), 1_000)
         var header: [String: Any] = [
             "version": 2,
-            "width": 80,
-            "height": 24,
+            "width": safeWidth,
+            "height": safeHeight,
             "title": String(title.prefix(1_024)),
             "env": ["TERM": "xterm-256color"]
         ]
@@ -280,5 +286,146 @@ public final class TimestampedRecorder {
             return "null"
         }
         return line
+    }
+}
+
+/// Owns one terminal's recording lifecycle. The terminal output callback only
+/// enqueues a bounded write and never performs encoding or file I/O inline.
+public final class TerminalRecordingSession {
+    private let queue = DispatchQueue(
+        label: "com.stacio.terminal-recording-session",
+        qos: .utility
+    )
+    private let recorder: TimestampedRecorder
+    private let hub: TerminalOutputBroadcastHub?
+    private let runtimeID: String?
+    private var subscription: TerminalOutputBroadcastHub.Subscription?
+    private var recording = false
+    private var recordedOutput = false
+
+    public init(
+        recorder: TimestampedRecorder = TimestampedRecorder(),
+        runtimeID: String? = nil,
+        hub: TerminalOutputBroadcastHub? = nil
+    ) {
+        self.recorder = recorder
+        self.runtimeID = runtimeID
+        self.hub = runtimeID == nil ? nil : (hub ?? .shared)
+    }
+
+    public var isRecording: Bool {
+        queue.sync { recording }
+    }
+
+    public var hasOutput: Bool {
+        queue.sync { recordedOutput }
+    }
+
+    /// Starts a fresh recording. Repeated starts are intentionally no-ops.
+    @MainActor
+    @discardableResult
+    public func start() -> Bool {
+        let didStart = queue.sync { () -> Bool in
+            guard recording == false else { return false }
+            recorder.reset()
+            recordedOutput = false
+            recording = true
+            return true
+        }
+        guard didStart,
+              let runtimeID,
+              let hub,
+              subscription == nil
+        else {
+            return didStart
+        }
+        subscription = hub.subscribe(runtimeID: runtimeID) { [weak self] event in
+            guard event.kind == .output else { return }
+            self?.append(bytes: event.bytes, timestamp: event.createdAt)
+        }
+        return didStart
+    }
+
+    /// Stops accepting future output and drains output already queued before the stop.
+    @MainActor
+    @discardableResult
+    public func stop() -> Bool {
+        guard isRecording else { return false }
+        if let runtimeID, let hub, let subscription {
+            hub.unsubscribe(runtimeID: runtimeID, subscription: subscription)
+            self.subscription = nil
+        }
+        queue.sync {
+            recording = false
+        }
+        return true
+    }
+
+    @MainActor
+    public func close() {
+        _ = stop()
+        queue.sync {
+            recorder.reset()
+            recordedOutput = false
+        }
+    }
+
+    /// This method is intentionally asynchronous. It is safe to call directly from
+    /// a terminal output callback because the recorder queue owns all mutation.
+    public func append(bytes: [UInt8], timestamp: Date = Date()) {
+        guard bytes.isEmpty == false else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.recording else { return }
+            self.recorder.append(bytes: bytes, timestamp: timestamp)
+            self.recordedOutput = true
+        }
+    }
+
+    public func exportAsciinema(
+        title: String,
+        width: Int = 80,
+        height: Int = 24
+    ) -> String {
+        queue.sync {
+            recorder.exportAsciinema(title: title, width: width, height: height)
+        }
+    }
+
+    public func save(
+        to url: URL,
+        title: String,
+        width: Int = 80,
+        height: Int = 24,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result: Result<URL, Error>
+            do {
+                let data = Data(
+                    self.recorder.exportAsciinema(
+                        title: title,
+                        width: width,
+                        height: height
+                    ).utf8
+                )
+                try data.write(to: url, options: .atomic)
+                result = .success(url)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    deinit {
+        if let runtimeID, let hub, let subscription {
+            Task { @MainActor in
+                hub.unsubscribe(runtimeID: runtimeID, subscription: subscription)
+            }
+        }
     }
 }

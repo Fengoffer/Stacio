@@ -1,6 +1,7 @@
 import AppKit
 import CoreFoundation
 import Foundation
+import ObjectiveC
 import SwiftTerm
 import UniformTypeIdentifiers
 
@@ -779,12 +780,181 @@ public final class TerminalRecordingWindowController: NSWindowController {
 extension TerminalRecordingWindowController: NSWindowDelegate {}
 
 @MainActor
+public final class TerminalRecordingSessionRegistry {
+    public static let shared = TerminalRecordingSessionRegistry()
+
+    private final class OwnerReference {
+        weak var owner: AnyObject?
+
+        init(owner: AnyObject?) {
+            self.owner = owner
+        }
+    }
+
+    private final class OwnerCleanupStore {
+        var tokens: [String: OwnerCleanupToken] = [:]
+    }
+
+    private final class OwnerCleanupToken {
+        weak var registry: TerminalRecordingSessionRegistry?
+        weak var session: TerminalRecordingSession?
+        let runtimeID: String
+
+        init(
+            registry: TerminalRecordingSessionRegistry,
+            session: TerminalRecordingSession,
+            runtimeID: String
+        ) {
+            self.registry = registry
+            self.session = session
+            self.runtimeID = runtimeID
+        }
+
+        deinit {
+            guard let registry = self.registry,
+                  let session = self.session
+            else {
+                return
+            }
+            let runtimeID = self.runtimeID
+            Task { @MainActor in
+                registry.remove(runtimeID: runtimeID, ifMatches: session)
+            }
+        }
+    }
+
+    private static var ownerCleanupStoreKey: UInt8 = 0
+
+    private var sessions: [String: TerminalRecordingSession] = [:]
+    private var owners: [String: OwnerReference] = [:]
+
+    public func session(
+        for runtimeID: String,
+        title: String,
+        owner: AnyObject? = nil
+    ) -> TerminalRecordingSession {
+        prune()
+        if let existing = sessions[runtimeID] {
+            owners[runtimeID] = OwnerReference(owner: owner)
+            bindOwner(owner, runtimeID: runtimeID, session: existing)
+            return existing
+        }
+        let session = TerminalRecordingSession(runtimeID: runtimeID)
+        sessions[runtimeID] = session
+        owners[runtimeID] = OwnerReference(owner: owner)
+        bindOwner(owner, runtimeID: runtimeID, session: session)
+        return session
+    }
+
+    public func existingSession(for runtimeID: String) -> TerminalRecordingSession? {
+        prune()
+        return sessions[runtimeID]
+    }
+
+    public func remove(runtimeID: String) {
+        sessions.removeValue(forKey: runtimeID)?.close()
+        owners.removeValue(forKey: runtimeID)
+    }
+
+    private func remove(runtimeID: String, ifMatches expectedSession: TerminalRecordingSession) {
+        guard sessions[runtimeID] === expectedSession else { return }
+        remove(runtimeID: runtimeID)
+    }
+
+    private func prune() {
+        for (runtimeID, owner) in owners where owner.owner == nil {
+            remove(runtimeID: runtimeID)
+        }
+    }
+
+    private func bindOwner(
+        _ owner: AnyObject?,
+        runtimeID: String,
+        session: TerminalRecordingSession
+    ) {
+        guard let owner else { return }
+        let store: OwnerCleanupStore
+        if let existing = objc_getAssociatedObject(owner, &Self.ownerCleanupStoreKey) as? OwnerCleanupStore {
+            store = existing
+        } else {
+            let created = OwnerCleanupStore()
+            objc_setAssociatedObject(
+                owner,
+                &Self.ownerCleanupStoreKey,
+                created,
+                .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+            )
+            store = created
+        }
+        if store.tokens[runtimeID]?.session === session {
+            return
+        }
+        store.tokens[runtimeID] = OwnerCleanupToken(
+            registry: self,
+            session: session,
+            runtimeID: runtimeID
+        )
+    }
+}
+
+@MainActor
 public final class TerminalRecordingWindowCoordinator: NSObject {
     public static let shared = TerminalRecordingWindowCoordinator()
 
     private var windowController: TerminalRecordingWindowController?
     private var loadingTask: Task<Void, Never>?
     private var loadRequestID: UUID?
+
+    @objc
+    public func startRecordingCurrentTerminal(_ sender: Any?) {
+        guard let target = currentTerminalTarget() else { return }
+        let session = TerminalRecordingSessionRegistry.shared.session(
+            for: target.runtimeID,
+            title: target.agentTitle,
+            owner: target as AnyObject
+        )
+        _ = session.start()
+    }
+
+    @objc
+    public func stopRecordingCurrentTerminal(_ sender: Any?) {
+        guard let target = currentTerminalTarget(),
+              let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID)
+        else { return }
+        _ = session.stop()
+    }
+
+    @objc
+    public func saveRecordingCurrentTerminal(_ sender: Any?) {
+        guard let target = currentTerminalTarget(),
+              let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID),
+              session.hasOutput
+        else { return }
+        _ = session.stop()
+
+        let panel = NSSavePanel()
+        panel.title = "保存录制"
+        panel.message = "保存当前终端的 asciinema v2 录制文件。"
+        panel.prompt = "保存"
+        panel.nameFieldStringValue = "\(target.runtimeID).cast"
+        if let castType = UTType(filenameExtension: "cast") {
+            panel.allowedContentTypes = [castType]
+        }
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak session, weak panel] response in
+            guard response == .OK, let url = panel?.url, let session else { return }
+            session.save(to: url, title: target.agentTitle) { result in
+                if case let .failure(error) = result {
+                    let alert = NSAlert(error: error)
+                    alert.runModal()
+                }
+            }
+        }
+        if let window = NSApp.keyWindow, window.isVisible {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
 
     public static func makeOpenPanel() -> NSOpenPanel {
         let panel = NSOpenPanel()
@@ -877,5 +1047,31 @@ public final class TerminalRecordingWindowCoordinator: NSObject {
         loadingTask?.cancel()
         loadingTask = nil
         loadRequestID = nil
+    }
+
+    private func currentTerminalTarget() -> AgentTerminalTarget? {
+        guard let window = NSApp.keyWindow,
+              let root = window.contentViewController
+        else { return nil }
+        let firstResponder = window.firstResponder as? NSView
+
+        func descendants(of controller: NSViewController) -> [NSViewController] {
+            [controller] + controller.children.flatMap(descendants)
+        }
+
+        let candidates = descendants(of: root).compactMap { controller -> (AgentTerminalTarget, NSViewController)? in
+            guard let target = controller as? AgentTerminalTarget,
+                  controller.view.window === window
+            else { return nil }
+            return (target, controller)
+        }
+        if let firstResponder {
+            if let current = candidates.first(where: { _, controller in
+                controller.view === firstResponder || firstResponder.isDescendant(of: controller.view)
+            }) {
+                return current.0
+            }
+        }
+        return candidates.first?.0
     }
 }

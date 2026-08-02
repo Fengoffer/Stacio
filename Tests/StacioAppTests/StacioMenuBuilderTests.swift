@@ -42,6 +42,22 @@ final class StacioMenuBuilderTests: XCTestCase {
         )
         XCTAssertTrue(openRecording.target === TerminalRecordingWindowCoordinator.shared)
 
+        let startRecording = try XCTUnwrap(fileMenu.item(withTitle: "开始录制当前终端"))
+        XCTAssertEqual(
+            startRecording.action,
+            #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:))
+        )
+        let stopRecording = try XCTUnwrap(fileMenu.item(withTitle: "停止录制当前终端"))
+        XCTAssertEqual(
+            stopRecording.action,
+            #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:))
+        )
+        let saveRecording = try XCTUnwrap(fileMenu.item(withTitle: "保存当前终端录制…"))
+        XCTAssertEqual(
+            saveRecording.action,
+            #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:))
+        )
+
         let closeCurrent = try XCTUnwrap(fileMenu.item(withTitle: "关闭当前终端"))
         XCTAssertEqual(closeCurrent.keyEquivalent, "w")
         XCTAssertEqual(closeCurrent.action, #selector(AppDelegate.closeCurrentTerminalFromMenu(_:)))

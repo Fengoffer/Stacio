@@ -1,7 +1,152 @@
+import AppKit
+import StacioCoreBindings
+import StacioAgentBridge
+import SwiftTerm
 import XCTest
 @testable import StacioApp
 
+@MainActor
 final class TranscriptRecorderTests: XCTestCase {
+    func testRecordingSessionIsDefaultOffAndLifecycleIsIdempotent() throws {
+        let session = TerminalRecordingSession(
+            recorder: TimestampedRecorder(maximumByteCount: 1_024, maximumEntryCount: 16)
+        )
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+
+        session.append(bytes: Array("ignored".utf8), timestamp: timestamp)
+        XCTAssertFalse(session.isRecording)
+        XCTAssertFalse(session.hasOutput)
+
+        XCTAssertTrue(session.start())
+        XCTAssertFalse(session.start())
+        session.append(bytes: Array("captured".utf8), timestamp: timestamp)
+        XCTAssertTrue(session.hasOutput)
+        XCTAssertTrue(session.stop())
+        XCTAssertFalse(session.stop())
+        session.append(bytes: Array("ignored after stop".utf8), timestamp: timestamp)
+
+        let recording = try AsciinemaV2RecordingParser.parse(
+            Data(session.exportAsciinema(title: "session").utf8)
+        )
+        XCTAssertEqual(recording.events.map(\.text), ["captured"])
+    }
+
+    func testRecordingSessionSavesWithoutBlockingCaller() throws {
+        let session = TerminalRecordingSession()
+        XCTAssertTrue(session.start())
+        session.append(
+            bytes: Array("saved output".utf8),
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertTrue(session.stop())
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-recording-session-\(UUID().uuidString).cast")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let expectation = expectation(description: "recording save completes")
+        let callStarted = Date()
+        session.save(to: url, title: "saved") { result in
+            switch result {
+            case .success:
+                break
+            case let .failure(error):
+                XCTFail("save failed: \(error)")
+            }
+            expectation.fulfill()
+        }
+
+        XCTAssertLessThan(Date().timeIntervalSince(callStarted), 0.2)
+        wait(for: [expectation], timeout: 2)
+        let recording = try TerminalRecordingDocument.load(from: url)
+        XCTAssertEqual(recording.events.map(\.text), ["saved output"])
+    }
+
+    func testRuntimeScopedSessionReceivesOnlyPublishedTerminalOutputWhileRecording() throws {
+        let hub = TerminalOutputBroadcastHub()
+        let session = TerminalRecordingSession(
+            runtimeID: "runtime-local",
+            hub: hub
+        )
+        hub.publishOutput(runtimeID: "runtime-local", bytes: Array("before".utf8))
+        XCTAssertTrue(session.start())
+        hub.publishOutput(runtimeID: "runtime-remote", bytes: Array("other".utf8))
+        hub.publishOutput(runtimeID: "runtime-local", bytes: Array("captured".utf8))
+        XCTAssertTrue(session.stop())
+        hub.publishOutput(runtimeID: "runtime-local", bytes: Array("after".utf8))
+
+        let recording = try AsciinemaV2RecordingParser.parse(
+            Data(session.exportAsciinema(title: "runtime").utf8)
+        )
+        XCTAssertEqual(recording.events.map(\.text), ["captured"])
+    }
+
+    func testLocalPaneOutputEntersRuntimeScopedRecordingThroughProductionHub() throws {
+        let runtimeID = "recording-local-\(UUID().uuidString)"
+        let session = TerminalRecordingSession(runtimeID: runtimeID)
+        let controller = TerminalPaneViewController(
+            runtimeID: runtimeID,
+            shellPath: "/bin/zsh",
+            eventSink: NoopTerminalEventSink(),
+            autoStartProcess: false
+        )
+        controller.loadView()
+
+        XCTAssertTrue(session.start())
+        controller.terminalView.onOutput?(Array("local output".utf8))
+        XCTAssertTrue(session.stop())
+
+        let recording = try AsciinemaV2RecordingParser.parse(
+            Data(session.exportAsciinema(title: "local").utf8)
+        )
+        XCTAssertEqual(recording.events.map(\.text), ["local output"])
+    }
+
+    func testRemotePaneOutputEntersRuntimeScopedRecordingForSSHSerialAndTelnet() throws {
+        for connectionKind in [
+            RemoteTerminalConnectionKind.ssh,
+            .serial,
+            .telnet
+        ] {
+            let runtimeID = "recording-remote-\(connectionKind)-\(UUID().uuidString)"
+            let session = TerminalRecordingSession(runtimeID: runtimeID)
+            let controller = RemoteTerminalPaneViewController(
+                runtimeID: runtimeID,
+                title: "remote",
+                connectionKind: connectionKind,
+                eventSink: NoopTerminalEventSink(),
+                startsPollingAutomatically: false
+            )
+            controller.loadView()
+
+            XCTAssertTrue(session.start())
+            controller.feedRemoteOutput(Array("remote output".utf8))
+            XCTAssertTrue(session.stop())
+
+            let recording = try AsciinemaV2RecordingParser.parse(
+                Data(session.exportAsciinema(title: "remote").utf8)
+            )
+            XCTAssertEqual(recording.events.map(\.text), ["remote output"], String(describing: connectionKind))
+        }
+    }
+
+    func testRegistryReleasesRecordingWhenTerminalOwnerIsDestroyed() {
+        let registry = TerminalRecordingSessionRegistry()
+        let runtimeID = "recording-owner-lifecycle-\(UUID().uuidString)"
+        var owner: RecordingOwner? = RecordingOwner()
+        let session = registry.session(
+            for: runtimeID,
+            title: "lifecycle",
+            owner: owner
+        )
+
+        XCTAssertTrue(session.start())
+        XCTAssertTrue(session.isRecording)
+        owner = nil
+
+        XCTAssertNil(registry.existingSession(for: runtimeID))
+        XCTAssertFalse(session.isRecording)
+    }
+
     func testRecorderAppendsUtf8OutputSlices() {
         let recorder = TranscriptRecorder()
 
@@ -168,3 +313,12 @@ final class TranscriptRecorderTests: XCTestCase {
         XCTAssertTrue(recorder.isTruncated)
     }
 }
+
+private final class NoopTerminalEventSink: TerminalEventSink {
+    func terminalDidResize(runtimeID: String, cols: Int, rows: Int) throws {}
+    func terminalDidProduceOutput(runtimeID: String, bytes: [UInt8]) throws {}
+    func terminalDidReceiveInput(runtimeID: String, bytes: [UInt8]) throws {}
+    func terminalDidClose(runtimeID: String) throws {}
+}
+
+private final class RecordingOwner: NSObject {}
