@@ -1498,16 +1498,17 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
         defer { harness.closeAndClearDefaults() }
 
+        let documentContents = "# Inspect this file\nattachment-only-marker\n"
         try harness.openLocalDocument(
             name: "ask-ai-layout.md",
-            contents: "# Inspect this file\n"
+            contents: documentContents
         )
         harness.layout()
 
         let contentView = try XCTUnwrap(harness.window.contentView)
         let inspector = try XCTUnwrap(harness.controller.inspectorViewControllerForTesting)
         let askAIButton = try XCTUnwrap(
-            contentView.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
+            contentView.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.askAI") as? NSButton
         )
 
         askAIButton.performClick(nil as Any?)
@@ -1523,6 +1524,14 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(aiView.frame.minY, inspectorContent.bounds.minY, accuracy: 1)
         XCTAssertEqual(aiView.frame.height, inspectorContent.bounds.height, accuracy: 1)
         XCTAssertGreaterThan(aiView.frame.height, inspector.view.bounds.height * 0.75)
+        XCTAssertEqual(
+            inspector.aiAssistantViewController?.composerAttachmentCardTitlesForTesting,
+            ["ask-ai-layout.md"]
+        )
+        XCTAssertFalse(
+            inspector.aiAssistantViewController?.questionTextForTesting.contains("attachment-only-marker") == true,
+            "编辑器正文不应作为可见问题文本进入 AI 对话流"
+        )
     }
 
     func testEditorOpenCollapseExpandAndCloseNeverChangeInspectorOrFilesWidth() throws {
@@ -6074,12 +6083,24 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         try assertInspectorUsesCompactToolbarInset(in: window)
     }
 
-    func testInspectorHeaderUsesBaseTopMarginWhenWindowHasNoToolbar() throws {
+    func testInspectorContentUsesBaseTopMarginWhenWindowHasNoToolbar() throws {
         let inspector = InspectorViewController()
         inspector.view.frame = NSRect(x: 0, y: 0, width: 420, height: 640)
         inspector.view.layoutSubtreeIfNeeded()
 
-        try assertInspectorHeaderTopConstraint(in: inspector.view, expectedToolbarInset: 0)
+        let content = try XCTUnwrap(
+            inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.content")
+        )
+        let topConstraint = try XCTUnwrap(
+            inspector.view.constraints.first { constraint in
+                (constraint.firstItem as? NSView) === content
+                    && constraint.firstAttribute == .top
+                    && constraint.secondItem === inspector.view
+                    && constraint.secondAttribute == .top
+            }
+        )
+
+        XCTAssertEqual(topConstraint.constant, 18, accuracy: 1)
     }
 
     func testFilesInspectorTitleStartsNearToolbarOnInitialWindowDisplay() throws {
@@ -8646,67 +8667,6 @@ private func assertInspectorUsesCompactToolbarInset(
         expectedInset + 18,
         accuracy: 1,
         "Inspector content should cap the toolbar inset so hidden headers do not leave a large blank region",
-        file: file,
-        line: line
-    )
-}
-
-private func assertInspectorHeaderTopConstraint(
-    in window: NSWindow,
-    expectedToolbarInset: CGFloat? = nil,
-    file: StaticString = #filePath,
-    line: UInt = #line
-) throws {
-    let contentView = try XCTUnwrap(window.contentView, file: file, line: line)
-    let header = try XCTUnwrap(
-        contentView.firstSubview(withIdentifier: "Stacio.Inspector.header"),
-        file: file,
-        line: line
-    )
-    let inspectorRoot = try XCTUnwrap(header.superview, file: file, line: line)
-    try assertInspectorHeaderTopConstraint(
-        in: inspectorRoot,
-        expectedToolbarInset: expectedToolbarInset ?? 0,
-        file: file,
-        line: line
-    )
-}
-
-private func assertInspectorHeaderTopConstraint(
-    in inspectorRoot: NSView,
-    expectedToolbarInset: CGFloat,
-    file: StaticString = #filePath,
-    line: UInt = #line
-) throws {
-    let header = try XCTUnwrap(
-        inspectorRoot.firstSubview(withIdentifier: "Stacio.Inspector.header"),
-        file: file,
-        line: line
-    )
-    let topConstraint = try XCTUnwrap(
-        inspectorRoot.constraints.first { constraint in
-            (constraint.firstItem as? NSView) === header
-                && constraint.firstAttribute == .top
-        },
-        file: file,
-        line: line
-    )
-
-    XCTAssertTrue(
-        topConstraint.secondItem === inspectorRoot,
-        "Inspector header top constraint should use the compact root inset instead of the full window safe area",
-        file: file,
-        line: line
-    )
-    let expectedCompactInset = min(
-        max(0, expectedToolbarInset),
-        InspectorViewController().maximumCompactToolbarTopInsetForTesting
-    )
-    XCTAssertEqual(
-        topConstraint.constant,
-        expectedCompactInset + 18,
-        accuracy: 1,
-        "Inspector header should keep only the compact toolbar inset plus the base margin",
         file: file,
         line: line
     )

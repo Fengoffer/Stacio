@@ -715,7 +715,104 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertTrue(html.contains("tabDragCandidate"))
         XCTAssertTrue(html.contains("event.target.closest('.tab-close, .tab-scroll')"))
         XCTAssertTrue(html.contains("event.button !== 0"))
+        XCTAssertTrue(html.contains("(event.buttons & 1) === 0"))
+        XCTAssertTrue(html.contains("tabDragCancelled"))
+        XCTAssertTrue(html.contains("addEventListener('pointerup', cancelTabDragCandidate, { capture: true })"))
+        XCTAssertTrue(html.contains("addEventListener('pointercancel', cancelTabDragCandidate, { capture: true })"))
+        XCTAssertTrue(html.contains("addEventListener('blur', cancelTabDragCandidate)"))
         XCTAssertTrue(html.contains("pageLoadGeneration"))
+    }
+
+    func testTabDragCandidateArrivingAfterPrimaryButtonReleaseIsRejected() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        var requests = 0
+        editor.onDragDetachRequested = { _ in requests += 1 }
+
+        editor.receiveTabDragCandidateForTesting(
+            pageLoadGeneration: editor.pageLoadGenerationForTesting,
+            pointInWindow: .zero,
+            pointerID: 7,
+            eventButtons: 1,
+            pressedMouseButtons: 0
+        )
+        editor.simulateTrackedTabDragForTesting(
+            to: NSPoint(x: 20, y: 0),
+            eventType: .leftMouseDragged,
+            buttonNumber: 0,
+            pressedMouseButtons: 1
+        )
+
+        XCTAssertFalse(editor.isTabDragTrackingForTesting)
+        XCTAssertEqual(requests, 0)
+    }
+
+    func testTabDragTrackingCancelsWhenPrimaryButtonIsNoLongerPressed() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        var requests = 0
+        editor.onDragDetachRequested = { _ in requests += 1 }
+
+        editor.receiveTabDragCandidateForTesting(
+            pageLoadGeneration: editor.pageLoadGenerationForTesting,
+            pointInWindow: .zero,
+            pointerID: 8,
+            eventButtons: 1,
+            pressedMouseButtons: 1
+        )
+        XCTAssertTrue(editor.isTabDragTrackingForTesting)
+
+        editor.simulateTrackedTabDragForTesting(
+            to: NSPoint(x: 20, y: 0),
+            eventType: .leftMouseDragged,
+            buttonNumber: 0,
+            pressedMouseButtons: 0
+        )
+        editor.simulateTrackedTabDragForTesting(
+            to: NSPoint(x: 30, y: 0),
+            eventType: .leftMouseDragged,
+            buttonNumber: 0,
+            pressedMouseButtons: 1
+        )
+
+        XCTAssertFalse(editor.isTabDragTrackingForTesting)
+        XCTAssertEqual(requests, 0)
+    }
+
+    func testTabDragTrackingStillDetachesForHeldPrimaryButtonPastThreshold() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        var requests = 0
+        editor.onDragDetachRequested = { _ in requests += 1 }
+
+        editor.receiveTabDragCandidateForTesting(
+            pageLoadGeneration: editor.pageLoadGenerationForTesting,
+            pointInWindow: .zero,
+            pointerID: 9,
+            eventButtons: 1,
+            pressedMouseButtons: 1
+        )
+        editor.simulateTrackedTabDragForTesting(
+            to: NSPoint(x: 9, y: 0),
+            eventType: .leftMouseDragged,
+            buttonNumber: 0,
+            pressedMouseButtons: 1
+        )
+
+        XCTAssertFalse(editor.isTabDragTrackingForTesting)
+        XCTAssertEqual(requests, 1)
     }
 
     func testStalePageGenerationCannotStartTabDrag() {
@@ -892,7 +989,7 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(delegate.closeReasons, [true])
     }
 
-    func testEditorBuildsAIQuestionForActiveRemoteTextDocument() throws {
+    func testEditorBuildsAIAttachmentForActiveRemoteTextDocument() throws {
         let descriptor = RemoteTextEditorDocumentDescriptor(
             remotePath: "/etc/nginx/nginx.conf",
             fileName: "nginx.conf",
@@ -900,18 +997,21 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             byteCount: 64
         )
         let controller = RemoteTextEditorViewController(document: descriptor)
-        var prompts: [String] = []
-        controller.onAIQuestionRequested = { prompts.append($0) }
+        var requests: [RemoteTextEditorAIRequest] = []
+        controller.onAIQuestionRequested = { requests.append($0) }
 
         controller.loadView()
         controller.requestAIForActiveDocumentForTesting()
 
-        let prompt = try XCTUnwrap(prompts.first)
-        XCTAssertTrue(prompt.contains("解释并排查这个远程文件"))
-        XCTAssertTrue(prompt.contains("nginx.conf"))
-        XCTAssertTrue(prompt.contains("/etc/nginx/nginx.conf"))
-        XCTAssertTrue(prompt.contains("ini"))
-        XCTAssertTrue(prompt.contains("proxy_pass"))
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertTrue(request.question.contains("请阅读附件"))
+        XCTAssertTrue(request.question.contains("nginx.conf"))
+        XCTAssertFalse(request.question.contains("/etc/nginx/nginx.conf"))
+        XCTAssertFalse(request.question.contains("proxy_pass"))
+        XCTAssertEqual(request.attachment.filename, "nginx.conf")
+        XCTAssertEqual(request.attachment.mimeType, "text/plain")
+        XCTAssertEqual(request.attachment.byteCount, descriptor.content.lengthOfBytes(using: .utf8))
+        XCTAssertTrue(request.attachment.textPreview?.contains("proxy_pass") == true)
     }
 
     func testEditorUsesOnlyMonacoTabsForTopChromeAndKeepsCloseOnLeft() throws {

@@ -271,6 +271,24 @@ public final class TerminalLineInfoGutterView: NSView {
     }
 }
 
+public enum TerminalFilePathInput {
+    public static func shellText(for paths: [String]) -> String {
+        let arguments = paths
+            .filter { $0.isEmpty == false }
+            .map(shellArgument(for:))
+        guard arguments.isEmpty == false else { return "" }
+        return arguments.joined(separator: " ") + " "
+    }
+
+    public static func shellArgument(for path: String) -> String {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:~+-")
+        if path.unicodeScalars.allSatisfy({ allowed.contains($0) }) {
+            return path
+        }
+        return "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+}
+
 public enum TerminalPastePreparation {
     public static func preparedPasteString(
         settings: AppSettings,

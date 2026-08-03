@@ -989,6 +989,38 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.windowFactory.createdWindows.count, 1)
     }
 
+    func testNativeDetachedWindowDragStartsWithPrimaryMouseDownInDestinationWindow() throws {
+        let windowController = RemoteTextEditorWindowController()
+        defer { windowController.closeShellForRedock() }
+        let window = try XCTUnwrap(windowController.window)
+        let sourceEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: NSPoint(x: 40, y: 20),
+            modifierFlags: [.shift],
+            timestamp: 12,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 42,
+            clickCount: 1,
+            pressure: 1
+        ))
+        let pointer = NSPoint(x: 520, y: 360)
+
+        let dragStartEvent = try XCTUnwrap(
+            RemoteEditorPresentationCoordinator.makeWindowDragStartEvent(
+                sourceEvent: sourceEvent,
+                window: window,
+                pointer: pointer
+            )
+        )
+
+        XCTAssertEqual(dragStartEvent.type, .leftMouseDown)
+        XCTAssertEqual(dragStartEvent.buttonNumber, 0)
+        XCTAssertEqual(dragStartEvent.windowNumber, window.windowNumber)
+        XCTAssertEqual(dragStartEvent.locationInWindow, window.convertPoint(fromScreen: pointer))
+        XCTAssertTrue(dragStartEvent.modifierFlags.contains(.shift))
+    }
+
     func testOrdinaryDetachCentersDefaultSizeInsideWorkbenchVisibleFrame() throws {
         let screen = makeScreen(
             id: 1,

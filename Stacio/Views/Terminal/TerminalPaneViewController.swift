@@ -150,10 +150,22 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         container.onEffectiveAppearanceChanged = { [weak self] in
             self?.terminalEffectiveAppearanceDidChange()
         }
+        container.acceptsLocalFileDrops = { [weak self] in
+            self?.canAcceptLocalFileDrops ?? false
+        }
+        container.localFileDropHandler = { [weak self] localPaths in
+            self?.handleDroppedLocalFilePaths(localPaths)
+        }
 
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.fontZoomSettingsStore = settingsStore
         terminalView.notifyUpdateChanges = true
+        terminalView.acceptsLocalFileDrops = { [weak self] in
+            self?.canAcceptLocalFileDrops ?? false
+        }
+        terminalView.localFileDropHandler = { [weak self] localPaths in
+            self?.handleDroppedLocalFilePaths(localPaths)
+        }
         TerminalAppearanceApplier.apply(settings: settingsStore.snapshot(), to: terminalView)
         observeSettingsChanges()
         terminalView.contextMenuProvider = { [weak self] selectedText in
@@ -416,6 +428,10 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     public func sendAgentInput(_ bytes: [UInt8]) {
         processLauncher.sendInput(bytes, to: terminalView)
         recordSubmittedCommands(bytes)
+    }
+
+    public func performDropLocalFilesForTesting(_ localPaths: [String]) {
+        handleDroppedLocalFilePaths(localPaths)
     }
 
     public func appendAgentTrace(
@@ -695,9 +711,27 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         return false
     }
 
+    private func handleDroppedLocalFilePaths(_ localPaths: [String]) {
+        let text = TerminalFilePathInput.shellText(for: localPaths)
+        guard text.isEmpty == false else { return }
+        StacioTerminalMouseBehavior.focusForKeyboardInput(terminalView)
+        let bytes = Array(text.utf8)
+        if handleUserInput(bytes) == false {
+            processLauncher.sendInput(bytes, to: terminalView)
+        }
+    }
+
     public func setAgentInteractionLocked(_ locked: Bool) {
         agentInteractionLocked = locked
         agentInteractionGlow.setActive(locked)
+    }
+
+    private var canAcceptLocalFileDrops: Bool {
+        agentInteractionLocked == false
+    }
+
+    var canAcceptLocalFileDropsForTesting: Bool {
+        canAcceptLocalFileDrops
     }
 
     public var agentInteractionGlowActiveForTesting: Bool {

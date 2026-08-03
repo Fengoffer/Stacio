@@ -82,6 +82,9 @@ public enum TerminalSemanticOutputHighlighter {
     private static let compiledPromptRules: [CompiledRule] = compiledRules
         .filter { $0.rule.group == "prompt" }
 
+    private static let compiledIncompleteLineRules: [CompiledRule] = compiledRules
+        .filter { ["prompt", "status", "time", "network", "git"].contains($0.rule.group) }
+
     private static let compiledNetworkDeviceRules: [CompiledRule] = networkDeviceRuleGroups
         .flatMap { $0 }
         .map { CompiledRule(rule: $0, regex: $0.regex) }
@@ -248,7 +251,8 @@ public enum TerminalSemanticOutputHighlighter {
         level: TerminalHighlightLevelPreference,
         richHighlightingEnabled: Bool = true,
         theme: TerminalColorTheme = .portDeskDark,
-        profile: TerminalSemanticHighlightProfile = .generalPurpose
+        profile: TerminalSemanticHighlightProfile = .generalPurpose,
+        highlightsIncompleteLines: Bool = true
     ) -> String {
         guard level != .off,
               text.isEmpty == false,
@@ -276,7 +280,10 @@ public enum TerminalSemanticOutputHighlighter {
             if line.utf16.count > maximumHighlightedLineLength || isCompletedNetworkDeviceLine == false {
                 result.append(line)
             } else {
-                result.append(highlightLine(line, palette: palette, rules: rules))
+                let lineRules = highlightsIncompleteLines == false && trailing.isEmpty
+                    ? compiledIncompleteLineRules
+                    : rules
+                result.append(highlightLine(line, palette: palette, rules: lineRules))
             }
             result.append(contentsOf: trailing)
         }
@@ -294,7 +301,8 @@ public enum TerminalSemanticOutputHighlighter {
         level: TerminalHighlightLevelPreference,
         richHighlightingEnabled: Bool = true,
         theme: TerminalColorTheme = .portDeskDark,
-        profile: TerminalSemanticHighlightProfile = .generalPurpose
+        profile: TerminalSemanticHighlightProfile = .generalPurpose,
+        highlightsIncompleteLines: Bool = true
     ) -> [UInt8] {
         guard level != .off,
               let text = String(bytes: bytes, encoding: .utf8)
@@ -306,7 +314,8 @@ public enum TerminalSemanticOutputHighlighter {
             level: level,
             richHighlightingEnabled: richHighlightingEnabled,
             theme: theme,
-            profile: profile
+            profile: profile,
+            highlightsIncompleteLines: highlightsIncompleteLines
         )
         return highlighted == text ? bytes : Array(highlighted.utf8)
     }
@@ -707,17 +716,20 @@ struct TerminalSemanticHighlightConfiguration {
     let richHighlightingEnabled: Bool
     let theme: TerminalColorTheme
     let profile: TerminalSemanticHighlightProfile
+    let highlightsIncompleteLines: Bool
 
     init(
         level: TerminalHighlightLevelPreference,
         richHighlightingEnabled: Bool,
         theme: TerminalColorTheme,
-        profile: TerminalSemanticHighlightProfile = .generalPurpose
+        profile: TerminalSemanticHighlightProfile = .generalPurpose,
+        highlightsIncompleteLines: Bool = true
     ) {
         self.level = level
         self.richHighlightingEnabled = richHighlightingEnabled
         self.theme = theme
         self.profile = profile
+        self.highlightsIncompleteLines = highlightsIncompleteLines
     }
 
     func apply(to bytes: [UInt8]) -> [UInt8] {
@@ -726,7 +738,8 @@ struct TerminalSemanticHighlightConfiguration {
             level: level,
             richHighlightingEnabled: richHighlightingEnabled,
             theme: theme,
-            profile: profile
+            profile: profile,
+            highlightsIncompleteLines: highlightsIncompleteLines
         )
     }
 }

@@ -947,6 +947,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         updateQuestionControlState()
     }
 
+    public func prefillQuestion(
+        _ text: String,
+        attachments: [AIAssistantAttachment]
+    ) {
+        prefillQuestion(text)
+        composerAttachments = attachments
+        refreshComposerControls()
+    }
+
     @objc
     private func surfaceModeChanged(_ sender: NSSegmentedControl) {
         guard let nextMode = AIAssistantSurfaceMode(rawValue: sender.selectedSegment) else {
@@ -1218,7 +1227,14 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         isAsking = true
         refreshHeaderStatus(context: context)
         statusLabel.stringValue = L10n.AI.thinking
-        appendTranscript(.user, question)
+        appendTranscript(
+            .user,
+            question,
+            conversationContent: userConversationContent(
+                question: question,
+                attachments: composerAttachments
+            )
+        )
         messageLabel.stringValue = ""
         setCommandProposals([])
         updateQuestionControlState()
@@ -1313,13 +1329,27 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         transcriptEntries.compactMap { entry in
             switch entry.role {
             case .user:
-                return AIAssistantConversationMessage(role: .user, content: entry.text)
+                return AIAssistantConversationMessage(
+                    role: .user,
+                    content: entry.conversationContent ?? entry.text
+                )
             case .assistant:
                 return AIAssistantConversationMessage(role: .assistant, content: entry.text)
             case .system, .command, .terminal, .plan, .step:
                 return nil
             }
         }
+    }
+
+    private func userConversationContent(
+        question: String,
+        attachments: [AIAssistantAttachment]
+    ) -> String {
+        guard attachments.isEmpty == false else { return question }
+        let attachmentContext = attachments.enumerated().map { index, attachment in
+            "\(index + 1). \(attachment.promptSummary)"
+        }
+        return ([question, "附件上下文："] + attachmentContext).joined(separator: "\n")
     }
 
     @objc
@@ -2794,12 +2824,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         if goalModeEnabled {
             contextLines.append("追求目标：请像 Codex 目标模式一样围绕当前目标持续推进，记录假设、下一步和完成标准。")
         }
-        if composerAttachments.isEmpty == false {
-            contextLines.append("附件上下文：")
-            contextLines.append(contentsOf: composerAttachments.enumerated().map { index, attachment in
-                "\(index + 1). \(attachment.promptSummary)"
-            })
-        }
         guard contextLines.isEmpty == false else {
             return question
         }
@@ -2815,7 +2839,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             ? composerModelButton.title
             : Self.unconfiguredProviderMessage
         composerModelButton.setAccessibilityLabel(composerModelButton.title)
-        refreshContextUsageRing()
         renderComposerAttachments()
         let context = composerContextItems()
         composerContextLabel.stringValue = context.joined(separator: " · ")
@@ -3583,18 +3606,29 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             ),
             1
         )
-        guard let context else {
-            return (0, "上下文 0%")
-        }
-        let effectiveTranscript = AIAssistantCoordinator.effectiveRecentTranscript(
-            for: context,
+        let resolvedContext = context ?? AITerminalContext(
+            runtimeID: "context-preview",
+            title: "",
+            currentDirectory: nil,
+            recentTranscript: ""
+        )
+        let conversationHistory = assistantConversationContext()
+        let preparedRequest = AIAssistantCoordinator.preparedRequest(
+            question: questionField.stringValue,
+            context: resolvedContext,
+            conversationHistory: conversationHistory,
+            attachments: composerAttachments,
             settings: settings,
             requestedSelection: selection
         )
-        let used = effectiveTranscript.count
+        let used = AIAssistantCoordinator.dynamicContextCharacterCount(in: preparedRequest)
         let fraction = min(max(Double(used) / Double(limit), 0), 1)
         let percent = Int((fraction * 100).rounded())
-        let label = context.recentTranscript.count > used
+        let unboundedUsed = questionField.stringValue.count
+            + conversationHistory.reduce(0) { $0 + $1.content.count }
+            + composerAttachments.reduce(0) { $0 + $1.promptSummary.count }
+            + (settings.aiIncludeRecentTerminalTranscript ? resolvedContext.recentTranscript.count : 0)
+        let label = unboundedUsed > used
             ? "上下文 \(percent)% · 已自动压缩"
             : "上下文 \(percent)%"
         return (fraction, label)
@@ -4105,6 +4139,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func appendTranscript(
         _ role: AITranscriptRole,
         _ text: String,
+        conversationContent: String? = nil,
         requestID: String? = nil,
         persistHistory: Bool = true,
         isProcessEntry: Bool? = nil
@@ -4116,6 +4151,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let entry = AITranscriptEntry(
             role: role,
             text: trimmed,
+            conversationContent: conversationContent,
             requestID: requestID,
             isProcessEntry: processEntry,
             processGroupID: processEntry ? activeProcessGroupID : nil,
@@ -4687,6 +4723,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         askButton.setAccessibilityLabel(isActive ? "停止当前 AI 请求" : L10n.AI.ask)
         askButton.toolTip = isActive ? "停止当前 AI 请求" : L10n.AI.ask
         composerModelButton.isEnabled = hasActiveAIActivity == false && capturedTaskModelSelection == nil
+        refreshContextUsageRing()
     }
 
     private var hasActiveAIActivity: Bool {
@@ -7221,6 +7258,7 @@ private struct AITranscriptEntry {
     let id: UUID = UUID()
     let role: AITranscriptRole
     var text: String
+    var conversationContent: String? = nil
     let requestID: String?
     var isProcessEntry: Bool = false
     var processGroupID: UUID? = nil

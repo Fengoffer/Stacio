@@ -135,7 +135,7 @@ public protocol RemoteEditorPresentationRouting: RemoteEditOpening, AnyObject {
     var currentEditor: RemoteTextEditorViewController? { get }
     var snapshot: RemoteEditorPresentationSnapshot { get }
     var onSnapshotChanged: ((RemoteEditorPresentationSnapshot) -> Void)? { get set }
-    var onAIQuestionRequested: ((String) -> Void)? { get set }
+    var onAIQuestionRequested: ((RemoteTextEditorAIRequest) -> Void)? { get set }
     var onBackupRequested: (() -> Void)? { get set }
     var onRestoreRequested: (() -> Void)? { get set }
 
@@ -202,7 +202,7 @@ public final class RemoteEditorPresentationCoordinator:
     }
 
     public var onSnapshotChanged: ((RemoteEditorPresentationSnapshot) -> Void)?
-    public var onAIQuestionRequested: ((String) -> Void)?
+    public var onAIQuestionRequested: ((RemoteTextEditorAIRequest) -> Void)?
     public var onBackupRequested: (() -> Void)?
     public var onRestoreRequested: (() -> Void)?
     public var onWillPresentDockedEditor: ((CGFloat) -> Void)?
@@ -1644,8 +1644,8 @@ public final class RemoteEditorPresentationCoordinator:
         editor.onDragDetachRequested = { [weak self] event in
             self?.handleAdvancedDragDetach(event)
         }
-        editor.onAIQuestionRequested = { [weak self] question in
-            self?.onAIQuestionRequested?(question)
+        editor.onAIQuestionRequested = { [weak self] request in
+            self?.onAIQuestionRequested?(request)
         }
         editor.onBackupRequested = { [weak self] in
             self?.onBackupRequested?()
@@ -1774,16 +1774,44 @@ public final class RemoteEditorPresentationCoordinator:
     }
 
     private func handleAdvancedDragDetach(_ event: NSEvent) {
-        guard event.buttonNumber == 0 else { return }
+        guard event.type == .leftMouseDragged, event.buttonNumber == 0 else { return }
+        let pointer = event.window.map { $0.convertPoint(toScreen: event.locationInWindow) }
+            ?? NSEvent.mouseLocation
         do {
             try detachEditor()
             positionDetachedWindow(around: event)
-            if let window = currentWindowController?.window {
-                window.performDrag(with: event)
-            }
+            guard let window = currentWindowController?.window,
+                  let dragStartEvent = Self.makeWindowDragStartEvent(
+                      sourceEvent: event,
+                      window: window,
+                      pointer: pointer
+                  )
+            else { return }
+            // NSWindow begins its native tracking loop from a mouse-down event.
+            // Forwarding the threshold-crossing dragged event can leave that
+            // loop out of phase with the physical button lifecycle.
+            window.performDrag(with: dragStartEvent)
         } catch {
             return
         }
+    }
+
+    static func makeWindowDragStartEvent(
+        sourceEvent: NSEvent,
+        window: NSWindow,
+        pointer: NSPoint
+    ) -> NSEvent? {
+        NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: window.convertPoint(fromScreen: pointer),
+            modifierFlags: sourceEvent.modifierFlags,
+            timestamp: sourceEvent.timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: sourceEvent.eventNumber,
+            clickCount: 1,
+            pressure: sourceEvent.pressure
+        )
     }
 
     private var currentWindowController: RemoteTextEditorWindowController? {

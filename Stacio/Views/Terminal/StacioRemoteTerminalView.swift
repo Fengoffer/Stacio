@@ -80,7 +80,8 @@ import SwiftTerm
                     level: settings.terminalHighlightLevel,
                     richHighlightingEnabled: settings.terminalRichHighlightingEnabled,
                     theme: semanticHighlightThemeOverride ?? TerminalAppearanceApplier.highlightTheme(for: settings),
-                    profile: semanticHighlightProfile
+                    profile: semanticHighlightProfile,
+                    highlightsIncompleteLines: false
                 )
             } else {
                 configuration = nil

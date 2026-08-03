@@ -456,6 +456,46 @@ final class TerminalThemeImportTests: XCTestCase {
         }
     }
 
+    func testGeneralPurposeHighlighterLeavesIncompleteInteractivePathEchoByteExact() {
+        let interactiveChunks = [
+            "sudo xattr -cr /Applications/",
+            "sudo xattr -cr /Users/mac/Downloads/ant-browser-macos-arm64/AntBrowser-1.5.0-macos-arm64.app"
+        ]
+
+        for chunk in interactiveChunks {
+            XCTAssertEqual(
+                TerminalSemanticOutputHighlighter.highlight(
+                    chunk,
+                    level: .commandLineEnhanced,
+                    richHighlightingEnabled: true,
+                    theme: .oneHalfDark,
+                    profile: .generalPurpose,
+                    highlightsIncompleteLines: false
+                ),
+                chunk,
+                "unfinished local or SSH input must remain byte exact so highlighting cannot create phantom gaps before the caret"
+            )
+        }
+    }
+
+    func testGeneralPurposeHighlighterColorsSafeDiagnosticsBeforeLineEndingArrives() {
+        let chunk = "ERROR failed while connecting to 192.168.8.10"
+
+        let highlighted = TerminalSemanticOutputHighlighter.highlight(
+            chunk,
+            level: .commandLineEnhanced,
+            richHighlightingEnabled: true,
+            theme: .oneHalfDark,
+            profile: .generalPurpose,
+            highlightsIncompleteLines: false
+        )
+
+        XCTAssertNotEqual(highlighted, chunk)
+        XCTAssertTrue(highlighted.containsStyledToken("ERROR"))
+        XCTAssertTrue(highlighted.containsStyledToken("failed"))
+        XCTAssertTrue(highlighted.containsStyledToken("192.168.8.10"))
+    }
+
     func testNetworkDeviceConsoleHighlighterUsesReadableOneHalfColorsForCompletedDiagnostics() {
         let text = """
         Interface              IP-Address      Protocol Status

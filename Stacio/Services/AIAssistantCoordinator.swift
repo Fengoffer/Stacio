@@ -22,6 +22,7 @@ public final class AIAssistantCoordinator {
     private static let compressedContextTargetRatio = 0.65
     private static let compressedContextRecentRatio = 0.45
     private static let compressedContextSummaryMaxCharacters = 2_400
+    private static let attachmentTruncationMarker = "\n[附件文本已按上下文预算截断]"
 
     private let provider: AIAssistantProviding
     private let executionCoordinator: AgentCommandExecuting
@@ -75,32 +76,16 @@ public final class AIAssistantCoordinator {
             await MainActor.run {
                 progress("正在准备终端上下文")
             }
-            let recentTranscript = Self.effectiveRecentTranscript(
-                for: context,
-                settings: settings,
-                requestedSelection: requestedSelection
-            )
-            let boundedContext = AITerminalContext(
-                runtimeID: context.runtimeID,
-                historyScopeID: context.historyScopeID,
-                title: context.title,
-                currentDirectory: context.currentDirectory,
-                recentTranscript: recentTranscript
-            )
             await MainActor.run {
                 progress("AI 正在生成回复")
             }
-            let aiRequest = AIAssistantRequest(
+            let aiRequest = Self.preparedRequest(
                 question: question,
-                context: boundedContext,
-                conversationHistory: Self.boundedConversationHistory(
-                    conversationHistory,
-                    characterLimit: Self.effectiveContextCharacterLimit(
-                        settings: settings,
-                        requestedSelection: requestedSelection
-                    )
-                ),
-                attachments: attachments
+                context: context,
+                conversationHistory: conversationHistory,
+                attachments: attachments,
+                settings: settings,
+                requestedSelection: requestedSelection
             )
             do {
                 let response: AIAssistantResponse
@@ -145,10 +130,52 @@ public final class AIAssistantCoordinator {
         settings: AppSettings,
         requestedSelection: AIModelSelection?
     ) throws -> AIAssistantResponse {
+        return try provider.respond(to: preparedRequest(
+            question: question,
+            context: context,
+            conversationHistory: conversationHistory,
+            attachments: attachments,
+            settings: settings,
+            requestedSelection: requestedSelection
+        ))
+    }
+
+    static func preparedRequest(
+        question: String,
+        context: AITerminalContext,
+        conversationHistory: [AIAssistantConversationMessage],
+        attachments: [AIAssistantAttachment],
+        settings: AppSettings,
+        requestedSelection: AIModelSelection?
+    ) -> AIAssistantRequest {
+        let characterLimit = max(
+            0,
+            effectiveContextCharacterLimit(
+                settings: settings,
+                requestedSelection: requestedSelection
+            )
+        )
+        var remainingBudget = max(0, characterLimit - question.count)
+        let boundedAttachments = boundedAttachments(
+            attachments,
+            remainingBudget: &remainingBudget
+        )
+        let historyBudget = min(
+            remainingBudget,
+            max(0, min(12_000, characterLimit / 3))
+        )
+        let boundedHistory = boundedConversationHistory(
+            conversationHistory,
+            characterBudget: historyBudget
+        )
+        remainingBudget = max(
+            0,
+            remainingBudget - boundedHistory.reduce(0) { $0 + $1.content.count }
+        )
         let recentTranscript = effectiveRecentTranscript(
             for: context,
             settings: settings,
-            requestedSelection: requestedSelection
+            characterLimit: remainingBudget
         )
         let boundedContext = AITerminalContext(
             runtimeID: context.runtimeID,
@@ -157,18 +184,19 @@ public final class AIAssistantCoordinator {
             currentDirectory: context.currentDirectory,
             recentTranscript: recentTranscript
         )
-        return try provider.respond(to: AIAssistantRequest(
+        return AIAssistantRequest(
             question: question,
             context: boundedContext,
-            conversationHistory: boundedConversationHistory(
-                conversationHistory,
-                characterLimit: effectiveContextCharacterLimit(
-                    settings: settings,
-                    requestedSelection: requestedSelection
-                )
-            ),
-            attachments: attachments
-        ))
+            conversationHistory: boundedHistory,
+            attachments: boundedAttachments
+        )
+    }
+
+    static func dynamicContextCharacterCount(in request: AIAssistantRequest) -> Int {
+        request.question.count
+            + request.context.recentTranscript.count
+            + request.conversationHistory.reduce(0) { $0 + $1.content.count }
+            + request.attachments.reduce(0) { $0 + $1.promptSummary.count }
     }
 
     static func boundedConversationHistory(
@@ -176,6 +204,14 @@ public final class AIAssistantCoordinator {
         characterLimit: Int
     ) -> [AIAssistantConversationMessage] {
         let budget = max(0, min(12_000, characterLimit / 3))
+        return boundedConversationHistory(history, characterBudget: budget)
+    }
+
+    private static func boundedConversationHistory(
+        _ history: [AIAssistantConversationMessage],
+        characterBudget: Int
+    ) -> [AIAssistantConversationMessage] {
+        let budget = max(0, characterBudget)
         guard budget > 0 else { return [] }
         var selected: [AIAssistantConversationMessage] = []
         var used = 0
@@ -193,6 +229,56 @@ public final class AIAssistantCoordinator {
         return selected.reversed()
     }
 
+    private static func boundedAttachments(
+        _ attachments: [AIAssistantAttachment],
+        remainingBudget: inout Int
+    ) -> [AIAssistantAttachment] {
+        guard remainingBudget > 0 else { return [] }
+        var selected: [AIAssistantAttachment] = []
+        for attachment in attachments {
+            let fullCost = attachment.promptSummary.count
+            if fullCost <= remainingBudget {
+                selected.append(attachment)
+                remainingBudget -= fullCost
+                continue
+            }
+            guard let textPreview = attachment.textPreview,
+                  textPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            else {
+                continue
+            }
+            let markerOnlyAttachment = replacingTextPreview(
+                attachment,
+                with: attachmentTruncationMarker
+            )
+            let markerCost = markerOnlyAttachment.promptSummary.count
+            guard markerCost <= remainingBudget else { continue }
+            let previewBudget = remainingBudget - markerCost
+            let boundedAttachment = replacingTextPreview(
+                attachment,
+                with: String(textPreview.prefix(previewBudget))
+                    + attachmentTruncationMarker
+            )
+            selected.append(boundedAttachment)
+            remainingBudget = max(0, remainingBudget - boundedAttachment.promptSummary.count)
+        }
+        return selected
+    }
+
+    private static func replacingTextPreview(
+        _ attachment: AIAssistantAttachment,
+        with textPreview: String?
+    ) -> AIAssistantAttachment {
+        AIAssistantAttachment(
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+            byteCount: attachment.byteCount,
+            base64Data: attachment.base64Data,
+            textPreview: textPreview,
+            localFileURL: attachment.localFileURL
+        )
+    }
+
     static func effectiveRecentTranscript(
         for context: AITerminalContext,
         settings: AppSettings,
@@ -208,6 +294,24 @@ public final class AIAssistantCoordinator {
                 requestedSelection: requestedSelection
             )
         )
+    }
+
+    private static func effectiveRecentTranscript(
+        for context: AITerminalContext,
+        settings: AppSettings,
+        characterLimit: Int
+    ) -> String {
+        guard settings.aiIncludeRecentTerminalTranscript,
+              characterLimit > 0
+        else {
+            return ""
+        }
+        let compressed = compressedRecentTranscript(
+            context.recentTranscript,
+            limit: characterLimit
+        )
+        guard compressed.count > characterLimit else { return compressed }
+        return String(compressed.suffix(characterLimit))
     }
 
     static func effectiveContextCharacterLimit(

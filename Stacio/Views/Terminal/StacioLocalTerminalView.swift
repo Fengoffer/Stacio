@@ -7,6 +7,17 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
     public var onSearchViewportChanged: (() -> Void)?
     public var fontZoomSettingsStore: AppSettingsStore = .shared
     public var contextMenuProvider: ((String?) -> NSMenu?)?
+    public var acceptsLocalFileDrops: (() -> Bool)? {
+        didSet {
+            LocalFileDropHandler.register(self)
+        }
+    }
+
+    public var localFileDropHandler: (([String]) -> Void)? {
+        didSet {
+            LocalFileDropHandler.register(self)
+        }
+    }
     private let semanticOutputProcessor = TerminalSemanticOutputProcessor(
         label: "cn.stacio.terminal.semantic.local.\(UUID().uuidString)"
     )
@@ -45,7 +56,8 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
         let configuration = TerminalSemanticHighlightConfiguration(
             level: settings.terminalHighlightLevel,
             richHighlightingEnabled: settings.terminalRichHighlightingEnabled,
-            theme: TerminalAppearanceApplier.highlightTheme(for: settings)
+            theme: TerminalAppearanceApplier.highlightTheme(for: settings),
+            highlightsIncompleteLines: false
         )
         semanticOutputProcessor.process(
             bytes: bytes,
@@ -101,6 +113,22 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
             settingsStore: fontZoomSettingsStore,
             contextMenuProvider: contextMenuProvider
         )
+    }
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard acceptsLocalFileDrops?() ?? (localFileDropHandler != nil) else {
+            return []
+        }
+        return LocalFileDropHandler.operation(for: sender.draggingPasteboard)
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard acceptsLocalFileDrops?() ?? (localFileDropHandler != nil) else {
+            return false
+        }
+        return LocalFileDropHandler.performDrop(from: sender) { [weak self] paths in
+            self?.localFileDropHandler?(paths)
+        }
     }
 
     public override func viewDidMoveToWindow() {

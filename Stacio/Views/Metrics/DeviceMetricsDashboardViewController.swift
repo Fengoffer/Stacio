@@ -52,6 +52,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
     private let networkStack = NSStackView()
     private let diskStack = NSStackView()
     private weak var contentStack: NSStackView?
+    private var cachedPreferredFloatingHeight: (width: CGFloat, height: CGFloat)?
     private weak var virtualNetworkHintLabel: NSTextField?
     private var cpuHistory: [Double] = []
     private var memoryHistory: [Double] = []
@@ -209,18 +210,30 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
         guard width.isFinite, width > 20 else {
             return 180
         }
+        if let cachedPreferredFloatingHeight,
+           abs(cachedPreferredFloatingHeight.width - width) <= 0.5
+        {
+            return cachedPreferredFloatingHeight.height
+        }
         let contentWidth = max(0, floor(width - 20))
         contentStack.frame.size.width = contentWidth
         contentStack.layoutSubtreeIfNeeded()
         let contentHeight = contentStack.fittingSize.height
         // Scroll-view rounding can add a point back to the constrained frame on macOS 14.
         contentStack.frame.size.width = contentWidth
-        return ceil(contentHeight + 20)
+        let preferredHeight = ceil(contentHeight + 20)
+        cachedPreferredFloatingHeight = (width, preferredHeight)
+        return preferredHeight
+    }
+
+    private func invalidatePreferredFloatingHeight() {
+        cachedPreferredFloatingHeight = nil
     }
 
     public func setSelectedNetworkInterfacesForTesting(_ names: [String]) {
         hasManualNetworkSelection = true
         selectedNetworkNames = Set(names)
+        invalidatePreferredFloatingHeight()
         renderNetwork(latestNetworks)
         renderNetworkIO(latestNetworks, appendsHistory: false)
         if let lastSuccessfulSnapshot {
@@ -875,6 +888,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
     }
 
     private func render(_ snapshot: DeviceMetricsDisplaySnapshot) {
+        invalidatePreferredFloatingHeight()
         let settings = settingsStore.snapshot()
         lastSuccessfulSnapshot = snapshot
         statusLabel.stringValue = snapshot.cpuUsage == nil
@@ -932,6 +946,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
     }
 
     private func renderError(_ error: Error) {
+        defer { invalidatePreferredFloatingHeight() }
         let settings = settingsStore.snapshot()
         if settings.deviceMetricsKeepLastSnapshotOnFailure,
            let lastSuccessfulSnapshot {
@@ -1113,6 +1128,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
         } else {
             selectedNetworkNames.insert(interfaceName)
         }
+        invalidatePreferredFloatingHeight()
         renderNetwork(latestNetworks)
         renderNetworkIO(latestNetworks, appendsHistory: false)
         if let lastSuccessfulSnapshot {
@@ -1123,6 +1139,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
     @objc private func resetNetworkSelectionToAutomatic(_ sender: NSMenuItem) {
         hasManualNetworkSelection = false
         selectedNetworkNames = Set(defaultNetworkSelection(from: latestNetworks))
+        invalidatePreferredFloatingHeight()
         renderNetwork(latestNetworks)
         renderNetworkIO(latestNetworks, appendsHistory: false)
         if let lastSuccessfulSnapshot {

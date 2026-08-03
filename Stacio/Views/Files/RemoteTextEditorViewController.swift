@@ -231,6 +231,16 @@ public struct RemoteTextEditorDocumentDescriptor: Equatable {
     }
 }
 
+public struct RemoteTextEditorAIRequest: Equatable, Sendable {
+    public let question: String
+    public let attachment: AIAssistantAttachment
+
+    public init(question: String, attachment: AIAssistantAttachment) {
+        self.question = question
+        self.attachment = attachment
+    }
+}
+
 @MainActor
 public protocol RemoteTextEditorCloseConfirming: AnyObject {
     func confirmClose(fileName: String, parentWindow: NSWindow?) -> RemoteTextEditorCloseDecision
@@ -260,7 +270,7 @@ public final class AppKitRemoteTextEditorCloseConfirmer: RemoteTextEditorCloseCo
 }
 
 public final class RemoteTextEditorViewController: NSViewController, WKNavigationDelegate {
-    private static let aiDocumentExcerptLimit = 12_000
+    private static let aiDocumentAttachmentTextLimit = 12_000
     private static let maximumMonacoReadinessRecoveryReloads = 1
     private static let monacoReadinessGraceInterval: TimeInterval = 3
     private static let savedCloseHandshakeTimeout: TimeInterval = 2
@@ -271,7 +281,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     public var onCloseRequested: (() -> Void)?
     public var onWindowCloseReady: (() -> Void)?
     public var onPendingCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
-    public var onAIQuestionRequested: ((String) -> Void)?
+    public var onAIQuestionRequested: ((RemoteTextEditorAIRequest) -> Void)?
     public var onBackupRequested: (() -> Void)?
     public var onRestoreRequested: (() -> Void)?
     public var onToggleCollapseRequested: (() -> Void)?
@@ -326,6 +336,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private var tabDragMonitor: Any?
     private var tabDragStartPoint: NSPoint?
     private var tabDragPageLoadGeneration: Int?
+    private var tabDragPointerID: Int?
     private var editorFunctionCallsForTestingStorage: [String] = []
     private var editorFunctionScriptsForTestingStorage: [String] = []
     private var monacoPageLoadCountForTestingStorage = 0
@@ -858,32 +869,67 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         onDragDetachRequested?(event)
     }
 
-    public func receiveTabDragCandidateForTesting(pageLoadGeneration: Int, pointInWindow: NSPoint) {
-        beginTabDragCandidate(pageLoadGeneration: pageLoadGeneration, pointInWindow: pointInWindow)
+    public var isTabDragTrackingForTesting: Bool {
+        tabDragStartPoint != nil
     }
 
-    private func beginTabDragCandidate(pageLoadGeneration: Int, pointInWindow: NSPoint) {
+    public func receiveTabDragCandidateForTesting(
+        pageLoadGeneration: Int,
+        pointInWindow: NSPoint,
+        pointerID: Int = 1,
+        eventButtons: Int = 1,
+        pressedMouseButtons: Int = 1
+    ) {
+        beginTabDragCandidate(
+            pageLoadGeneration: pageLoadGeneration,
+            pointInWindow: pointInWindow,
+            pointerID: pointerID,
+            eventButtons: eventButtons,
+            pressedMouseButtons: pressedMouseButtons
+        )
+    }
+
+    private func beginTabDragCandidate(
+        pageLoadGeneration: Int,
+        pointInWindow: NSPoint,
+        pointerID: Int,
+        eventButtons: Int,
+        pressedMouseButtons: Int
+    ) {
         cancelTabDragTracking()
-        guard pageLoadGeneration == monacoPageLoadGeneration else {
+        // WKScriptMessage delivery is asynchronous. A quick click can release
+        // before this candidate reaches AppKit, so require both snapshots to
+        // still report the primary button as pressed before installing a monitor.
+        guard pageLoadGeneration == monacoPageLoadGeneration,
+              eventButtons & 1 != 0,
+              pressedMouseButtons & 1 != 0
+        else {
             return
         }
         tabDragStartPoint = pointInWindow
         tabDragPageLoadGeneration = pageLoadGeneration
+        tabDragPointerID = pointerID
         tabDragMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDragged, .leftMouseUp]
         ) { [weak self] event in
-            self?.handleTrackedTabDragEvent(event)
+            guard let self else { return event }
+            guard event.window === self.view.window else {
+                self.cancelTabDragTracking()
+                return event
+            }
+            self.handleTrackedTabDragEvent(event)
             return event
         }
     }
 
-    public func simulateTrackedTabDragForTesting(to point: NSPoint) {
-        guard let start = tabDragStartPoint,
-              tabDragPageLoadGeneration == monacoPageLoadGeneration,
-              hypot(point.x - start.x, point.y - start.y) > 8 else { return }
-        cancelTabDragTracking()
+    public func simulateTrackedTabDragForTesting(
+        to point: NSPoint,
+        eventType: NSEvent.EventType = .leftMouseDragged,
+        buttonNumber: Int = 0,
+        pressedMouseButtons: Int = 1
+    ) {
         guard let event = NSEvent.mouseEvent(
-            with: .leftMouseDragged,
+            with: eventType,
             location: point,
             modifierFlags: [],
             timestamp: 0,
@@ -893,19 +939,41 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             clickCount: 1,
             pressure: 1
         ) else { return }
-        onDragDetachRequested?(event)
+        handleTrackedTabDragEvent(
+            eventType: eventType,
+            buttonNumber: buttonNumber,
+            pressedMouseButtons: pressedMouseButtons,
+            pointInWindow: point,
+            event: event
+        )
     }
 
     private func handleTrackedTabDragEvent(_ event: NSEvent) {
-        if event.type == .leftMouseUp {
+        handleTrackedTabDragEvent(
+            eventType: event.type,
+            buttonNumber: event.buttonNumber,
+            pressedMouseButtons: NSEvent.pressedMouseButtons,
+            pointInWindow: event.locationInWindow,
+            event: event
+        )
+    }
+
+    private func handleTrackedTabDragEvent(
+        eventType: NSEvent.EventType,
+        buttonNumber: Int,
+        pressedMouseButtons: Int,
+        pointInWindow: NSPoint,
+        event: NSEvent
+    ) {
+        if eventType == .leftMouseUp || pressedMouseButtons & 1 == 0 {
             cancelTabDragTracking()
             return
         }
-        guard event.type == .leftMouseDragged,
-              event.buttonNumber == 0,
+        guard eventType == .leftMouseDragged,
+              buttonNumber == 0,
               let start = tabDragStartPoint,
               tabDragPageLoadGeneration == monacoPageLoadGeneration,
-              hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) > 8
+              hypot(pointInWindow.x - start.x, pointInWindow.y - start.y) > 8
         else { return }
         cancelTabDragTracking()
         onDragDetachRequested?(event)
@@ -918,6 +986,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
         tabDragStartPoint = nil
         tabDragPageLoadGeneration = nil
+        tabDragPointerID = nil
     }
 
     public var monacoPageLoadCountForTesting: Int {
@@ -1107,10 +1176,10 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     public func requestAIForActiveDocument() {
-        guard let prompt = aiQuestionForActiveDocument() else {
+        guard let request = aiRequestForActiveDocument() else {
             return
         }
-        onAIQuestionRequested?(prompt)
+        onAIQuestionRequested?(request)
     }
 
     @discardableResult
@@ -2029,7 +2098,9 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         switch name {
         case "tabDragCandidate":
             guard let x = payload?["x"] as? NSNumber,
-                  let y = payload?["y"] as? NSNumber
+                  let y = payload?["y"] as? NSNumber,
+                  let pointerID = payload?["pointerID"] as? NSNumber,
+                  let eventButtons = payload?["buttons"] as? NSNumber
             else { return }
             let clientPoint = NSPoint(x: x.doubleValue, y: y.doubleValue)
             let pointInWindow: NSPoint
@@ -2043,8 +2114,18 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             }
             beginTabDragCandidate(
                 pageLoadGeneration: messagePageLoadGeneration,
-                pointInWindow: pointInWindow
+                pointInWindow: pointInWindow,
+                pointerID: pointerID.intValue,
+                eventButtons: eventButtons.intValue,
+                pressedMouseButtons: NSEvent.pressedMouseButtons
             )
+        case "tabDragCancelled":
+            if let pointerID = payload?["pointerID"] as? NSNumber,
+               pointerID.intValue != tabDragPointerID
+            {
+                return
+            }
+            cancelTabDragTracking()
         case "ready":
             guard isMonacoRuntimeReady == false else { return }
             isMonacoRuntimeReady = true
@@ -2497,7 +2578,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
     }
 
-    private func aiQuestionForActiveDocument() -> String? {
+    private func aiRequestForActiveDocument() -> RemoteTextEditorAIRequest? {
         guard let document = activeDocument,
               document.displayMode == .text,
               document.canEdit,
@@ -2505,29 +2586,55 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         else {
             return nil
         }
-        let excerpt = Self.truncatedAIExcerpt(document.text)
-        let suffix = document.text.count > Self.aiDocumentExcerptLimit
-            ? "\n\n内容已截断，只包含前 \(Self.aiDocumentExcerptLimit) 个字符。"
-            : ""
-        return """
-        解释并排查这个远程文件，指出潜在风险、配置问题和可改进点。先给结论，再列建议；不要直接生成会修改远程文件的命令，除非我明确要求。
 
-        文件：\(document.fileName)
-        路径：\(document.path)
-        语言：\(document.languageIdentifier)
-
-        ```\(document.languageIdentifier)
-        \(excerpt)
-        ```
-        \(suffix)
-        """
+        let attachmentText = Self.aiAttachmentText(document.text)
+        let attachment = AIAssistantAttachment(
+            filename: document.fileName,
+            mimeType: Self.aiAttachmentMimeType(forFileName: document.fileName),
+            byteCount: document.text.lengthOfBytes(using: .utf8),
+            textPreview: attachmentText
+        )
+        let question = "请阅读附件“\(document.fileName)”，解释并排查这个文件，指出潜在风险、配置问题和可改进点。先给结论，再列建议；不要直接生成会修改文件的命令，除非我明确要求。"
+        return RemoteTextEditorAIRequest(question: question, attachment: attachment)
     }
 
-    private static func truncatedAIExcerpt(_ text: String) -> String {
-        guard text.count > aiDocumentExcerptLimit else {
+    private static func aiAttachmentText(_ text: String) -> String {
+        guard text.count > aiDocumentAttachmentTextLimit else {
             return text
         }
-        return String(text.prefix(aiDocumentExcerptLimit))
+        return String(text.prefix(aiDocumentAttachmentTextLimit))
+            + "\n\n[附件内容已截断，仅包含前 \(aiDocumentAttachmentTextLimit) 个字符]"
+    }
+
+    private static func aiAttachmentMimeType(forFileName fileName: String) -> String {
+        switch (fileName as NSString).pathExtension.lowercased() {
+        case "md", "markdown":
+            return "text/markdown"
+        case "json":
+            return "application/json"
+        case "csv":
+            return "text/csv"
+        case "xml":
+            return "application/xml"
+        case "html", "htm":
+            return "text/html"
+        case "yaml", "yml":
+            return "application/yaml"
+        case "swift":
+            return "text/x-swift"
+        case "sh", "bash", "zsh":
+            return "text/x-shellscript"
+        case "py":
+            return "text/x-python"
+        case "js":
+            return "text/javascript"
+        case "ts":
+            return "text/typescript"
+        case "css":
+            return "text/css"
+        default:
+            return "text/plain"
+        }
     }
 
     private func markDirtyIfNeeded() {
@@ -3117,15 +3224,21 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     function handleTabDragCandidate(event) {
-      if (event.button !== 0) { return; }
+      if (event.button !== 0 || (event.buttons & 1) === 0) { return; }
       if (event.target.closest('.tab-close, .tab-scroll') || event.target.closest('.close')) { return; }
       const tab = event.target.closest('.tab');
       if (!tab) { return; }
       post('tabDragCandidate', {
         x: event.clientX,
         y: event.clientY,
-        pointerID: event.pointerId
+        pointerID: event.pointerId,
+        buttons: event.buttons
       });
+    }
+
+    function cancelTabDragCandidate(event) {
+      const pointerID = event && Number.isInteger(event.pointerId) ? event.pointerId : null;
+      post('tabDragCancelled', pointerID === null ? {} : { pointerID });
     }
 
     function handleTabsMouseDown(event) {
@@ -3380,6 +3493,9 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);
     window.document.getElementById('tabs').addEventListener('click', handleTabsClick);
     window.document.getElementById('tabs').addEventListener('scroll', updateTabScrollButtons);
+    window.addEventListener('pointerup', cancelTabDragCandidate, { capture: true });
+    window.addEventListener('pointercancel', cancelTabDragCandidate, { capture: true });
+    window.addEventListener('blur', cancelTabDragCandidate);
     window.document.getElementById('language').addEventListener('change', event => setActiveLanguage(event.target.value));
     window.document.getElementById('tab-scroll-left').addEventListener('click', () => scrollTabsBy(-1));
     window.document.getElementById('tab-scroll-right').addEventListener('click', () => scrollTabsBy(1));

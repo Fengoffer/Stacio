@@ -1941,6 +1941,45 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(provider.requests[2].conversationHistory.isEmpty)
     }
 
+    func testAssistantConversationCarriesAttachmentContentIntoNextTurnWithoutDisplayingIt() throws {
+        let provider = SequencedPanelAIAssistantProvider(responses: [
+            AIAssistantResponse(message: "第一轮附件结论", commandProposals: []),
+            AIAssistantResponse(message: "第二轮延续结论", commandProposals: [])
+        ])
+        let panel = makeAssistantPanel(
+            provider: provider,
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
+        )
+        panel.loadView()
+
+        panel.prefillQuestion(
+            "先分析附件",
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "diagnostic.log",
+                    mimeType: "text/plain",
+                    byteCount: 29,
+                    textPreview: "FIRST_ATTACHMENT_BODY_92B17"
+                )
+            ]
+        )
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { panel.transcriptTextForTesting.contains("第一轮附件结论") })
+        XCTAssertFalse(panel.transcriptTextForTesting.contains("FIRST_ATTACHMENT_BODY_92B17"))
+
+        panel.setQuestionForTesting("继续结合刚才的附件分析")
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { provider.requests.count == 2 })
+        let firstUserTurn = try XCTUnwrap(
+            provider.requests[1].conversationHistory.first(where: { $0.role == .user })
+        )
+        XCTAssertTrue(firstUserTurn.content.contains("FIRST_ATTACHMENT_BODY_92B17"))
+        XCTAssertTrue(provider.requests[1].attachments.isEmpty)
+        XCTAssertFalse(panel.transcriptTextForTesting.contains("FIRST_ATTACHMENT_BODY_92B17"))
+    }
+
     func testConversationContextBudgetKeepsRecentMessagesAndRedactsSecrets() {
         let history = (0..<30).map { index in
             AIAssistantConversationMessage(
@@ -4608,6 +4647,56 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertEqual(attachment.filename, "app.conf")
         XCTAssertEqual(attachment.mimeType, "text/plain")
         XCTAssertTrue(attachment.textPreview?.contains("PORT=3000") == true)
+        XCTAssertEqual(provider.requests.first?.question, "这个配置文件有什么问题")
+        XCTAssertFalse(panel.transcriptTextForTesting.contains("PORT=3000"))
+    }
+
+    func testEditorPrefillAtomicallyReplacesExistingAttachmentsWithLatestContent() throws {
+        let provider = RecordingAIAssistantProvider(
+            response: AIAssistantResponse(message: "已读取最新附件。", commandProposals: [])
+        )
+        let panel = makeAssistantPanel(
+            provider: provider,
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
+        )
+        panel.loadView()
+
+        panel.prefillQuestion(
+            "旧文件问题",
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "app.conf",
+                    mimeType: "text/plain",
+                    byteCount: 11,
+                    textPreview: "OLD_CONTENT"
+                ),
+                AIAssistantAttachment(
+                    filename: "stale.conf",
+                    mimeType: "text/plain",
+                    byteCount: 13,
+                    textPreview: "STALE_CONTENT"
+                )
+            ]
+        )
+        panel.prefillQuestion(
+            "新文件问题",
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "app.conf",
+                    mimeType: "text/plain",
+                    byteCount: 11,
+                    textPreview: "NEW_CONTENT"
+                )
+            ]
+        )
+
+        XCTAssertEqual(panel.composerAttachmentCardTitlesForTesting, ["app.conf"])
+
+        panel.performAskForTesting()
+
+        XCTAssertTrue(waitUntil { provider.requests.count == 1 })
+        XCTAssertEqual(provider.requests[0].attachments.count, 1)
+        XCTAssertEqual(provider.requests[0].attachments[0].textPreview, "NEW_CONTENT")
     }
 
     func testAssistantComposerReportsCurrentRemoteFileAttachmentRejection() throws {
@@ -5952,6 +6041,45 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(panel.contextUsageTextForTesting.contains("40%"))
     }
 
+    func testAssistantComposerContextUsageIncludesPendingTextAttachment() throws {
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 1_000
+        )
+        let panel = makeAssistantPanel(settingsStore: store, recentTranscript: "")
+        panel.loadView()
+        panel.prefillQuestion(
+            "",
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "context.txt",
+                    mimeType: "text/plain",
+                    byteCount: 300,
+                    textPreview: String(repeating: "attachment-context-", count: 15)
+                )
+            ]
+        )
+
+        XCTAssertGreaterThan(panel.contextUsageFractionForTesting, 0)
+        XCTAssertNotEqual(panel.contextUsageTextForTesting, "上下文 0%")
+    }
+
+    func testAssistantComposerContextUsageRefreshesWhenQuestionChanges() throws {
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 1_000
+        )
+        let panel = makeAssistantPanel(settingsStore: store, recentTranscript: "")
+        panel.loadView()
+        let usageRing = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.composer.contextUsage")
+        )
+
+        panel.setQuestionForTesting(String(repeating: "q", count: 200))
+
+        XCTAssertTrue(usageRing.toolTip?.contains("20%") == true)
+    }
+
     func testAssistantComposerContextUsageReflectsCompressedTranscriptBudget() throws {
         let store = makeSettingsStore(
             autoRunProposedCommands: false,
@@ -6742,6 +6870,62 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
 
         XCTAssertEqual(response.proposedCommand, "uptime")
         XCTAssertTrue(provider.requests[0].context.recentTranscript.contains("load average"))
+    }
+
+    func testAssistantCoordinatorBoundsAttachmentsHistoryAndTranscriptWithinModelBudget() throws {
+        let provider = RecordingAIAssistantProvider(
+            response: AIAssistantResponse(message: "已分析", proposedCommand: nil)
+        )
+        let store = makeSettingsStore(
+            autoRunProposedCommands: false,
+            modelContextCharacterLimit: 100
+        )
+        store.update { settings in
+            settings.aiIncludeRecentTerminalTranscript = true
+        }
+        let coordinator = AIAssistantCoordinator(
+            provider: provider,
+            executionCoordinator: RecordingAgentCommandExecutor(),
+            settingsStore: store
+        )
+
+        _ = try coordinator.ask(
+            question: "分析附件",
+            context: AITerminalContext(
+                runtimeID: "term_budget",
+                title: "Budget",
+                currentDirectory: nil,
+                recentTranscript: String(repeating: "terminal-output-", count: 30)
+            ),
+            conversationHistory: [
+                AIAssistantConversationMessage(
+                    role: .user,
+                    content: String(repeating: "history-user-", count: 30)
+                ),
+                AIAssistantConversationMessage(
+                    role: .assistant,
+                    content: String(repeating: "history-assistant-", count: 30)
+                )
+            ],
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "a.txt",
+                    mimeType: "text/plain",
+                    byteCount: 600,
+                    textPreview: String(repeating: "A", count: 600)
+                )
+            ]
+        )
+
+        let request = try XCTUnwrap(provider.requests.first)
+        let dynamicCharacterCount = request.question.count
+            + request.context.recentTranscript.count
+            + request.conversationHistory.reduce(0) { $0 + $1.content.count }
+            + request.attachments.reduce(0) { $0 + $1.promptSummary.count }
+        XCTAssertLessThanOrEqual(dynamicCharacterCount, 100)
+        let attachmentPreview = try XCTUnwrap(request.attachments.first?.textPreview)
+        XCTAssertLessThan(attachmentPreview.count, 600)
+        XCTAssertTrue(attachmentPreview.contains("[附件文本已按上下文预算截断]"))
     }
 
     func testAssistantContextRespectsTranscriptToggleAndKeepsSmallContextVerbatim() throws {

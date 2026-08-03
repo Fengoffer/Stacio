@@ -494,6 +494,58 @@ final class DeviceMetricsDashboardViewControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(freshContent.frame.maxX, freshContainerBounds.maxX + 0.5)
     }
 
+    func testRepeatedPreferredFloatingHeightAtSameWidthStaysOnCachedDragPath() {
+        let controller = DeviceMetricsDashboardViewController(
+            runtimeID: "term_metrics_resize_performance",
+            title: "root@resize-performance",
+            provider: RecordingDeviceMetricsProvider(snapshot: .sample),
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+        controller.refreshMetricsForTesting()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 360, height: 790)
+        controller.view.layoutSubtreeIfNeeded()
+        _ = controller.preferredFloatingHeight(width: 360)
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<20 {
+            _ = controller.preferredFloatingHeight(width: 360)
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        XCTAssertLessThan(
+            elapsed,
+            0.03,
+            "拖动外层分隔线且看板宽度未变时，不应重复同步布局整棵指标视图树"
+        )
+    }
+
+    func testPreferredFloatingHeightCacheInvalidatesWhenMetricsChangeContentHeight() {
+        let provider = SequenceDeviceMetricsProvider(results: [
+            .success(.sample),
+            .success(.dense)
+        ])
+        let controller = DeviceMetricsDashboardViewController(
+            runtimeID: "term_metrics_resize_cache_invalidation",
+            title: "root@resize-cache-invalidation",
+            provider: provider,
+            startsPollingAutomatically: false
+        )
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 360, height: 790)
+
+        controller.refreshMetricsForTesting()
+        let initialHeight = controller.preferredFloatingHeight(width: 360)
+        controller.refreshMetricsForTesting()
+        let updatedHeight = controller.preferredFloatingHeight(width: 360)
+
+        XCTAssertGreaterThan(
+            updatedHeight,
+            initialHeight,
+            "指标内容增多后必须重新测量看板高度，不能复用拖动期间的旧缓存"
+        )
+    }
+
     func testDashboardMarksCustomMetricDrawingsDirtyWhenAppearanceChanges() throws {
         let provider = RecordingDeviceMetricsProvider(snapshot: .sample)
         let controller = DeviceMetricsDashboardViewController(

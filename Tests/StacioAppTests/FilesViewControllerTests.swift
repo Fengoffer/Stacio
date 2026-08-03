@@ -2100,15 +2100,8 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertNotNil(harness.presentation.onRestoreRequested)
     }
 
-    func testInspectorEditorControlsRouteThroughPresentationCoordinator() throws {
-        let aiPanel = AIAssistantPanelViewController(
-            coordinator: AIAssistantCoordinator(
-                provider: RuleBasedAIAssistantProvider(),
-                executionCoordinator: UnavailableAgentCommandExecutorForFilesTests()
-            ),
-            contextProvider: { nil }
-        )
-        let harness = makeInspectorEditorHarness(testName: #function, aiPanel: aiPanel)
+    func testInspectorDoesNotDuplicateEditorToolbarActionsInFilesPanel() throws {
+        let harness = makeInspectorEditorHarness(testName: #function)
         openInspectorEditor(
             presentation: harness.presentation,
             RemoteTextEditorDocumentDescriptor(
@@ -2119,39 +2112,33 @@ final class FilesViewControllerTests: XCTestCase {
             )
         )
         harness.inspector.view.layoutSubtreeIfNeeded()
-        let actionRow = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
-        )
-        let closeButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
-        )
-        let collapseButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
-        )
+        for identifier in [
+            "Stacio.Inspector.editorActions",
+            "Stacio.Inspector.editorClose",
+            "Stacio.Inspector.editorCollapse",
+            "Stacio.Inspector.editorBackup",
+            "Stacio.Inspector.editorAskAI",
+            "Stacio.Inspector.editorRestore"
+        ] {
+            XCTAssertNil(
+                harness.inspector.view.firstSubview(withIdentifier: identifier),
+                "Inspector 文件页不应重复显示编辑器操作：\(identifier)"
+            )
+        }
 
-        let aiButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
-        )
-
-        XCTAssertFalse(actionRow.isHidden)
-        collapseButton.performClick(nil as Any?)
-        XCTAssertEqual(harness.presentation.snapshot.mode, .dockedHidden)
-        XCTAssertEqual(collapseButton.toolTip, "展开编辑器")
-
-        collapseButton.performClick(nil as Any?)
-        XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
-        XCTAssertEqual(collapseButton.toolTip, "收起编辑器")
-
-        aiButton.performClick(nil as Any?)
-        XCTAssertEqual(harness.inspector.selectedTabLabel, L10n.AI.title)
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("nginx.conf"))
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("/etc/nginx/nginx.conf"))
-        XCTAssertTrue(aiPanel.questionTextForTesting.contains("listen 80"))
-
-        closeButton.performClick(nil as Any?)
-        XCTAssertEqual(harness.presentation.snapshot.mode, .closed)
-        XCTAssertTrue(actionRow.isHidden)
-        XCTAssertNil(harness.files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
+        let editor = try XCTUnwrap(harness.presentation.currentEditor)
+        for identifier in [
+            "Stacio.Editor.Toolbar.close",
+            "Stacio.Editor.Toolbar.collapse",
+            "Stacio.Editor.Toolbar.backup",
+            "Stacio.Editor.Toolbar.askAI",
+            "Stacio.Editor.Toolbar.restore"
+        ] {
+            XCTAssertNotNil(
+                editor.view.firstSubview(withIdentifier: identifier),
+                "编辑器自身应继续提供操作：\(identifier)"
+            )
+        }
     }
 
     func testInspectorSectionSwitchingKeepsPresentationEditorVisible() {
@@ -2177,44 +2164,6 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
         XCTAssertFalse(harness.center.isEditorSidecarCollapsed)
         XCTAssertNotNil(harness.presentation.currentEditor)
-    }
-
-    func testInspectorFloatingSnapshotHidesOnlyMeaninglessCollapseControl() throws {
-        let harness = makeInspectorEditorHarness(testName: #function)
-        let actionRow = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorActions") as? NSStackView
-        )
-        let closeButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose") as? NSButton
-        )
-        let collapseButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse") as? NSButton
-        )
-        let backupButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup") as? NSButton
-        )
-        let aiButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
-        )
-        let restoreButton = try XCTUnwrap(
-            harness.inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore") as? NSButton
-        )
-
-        harness.presentation.onSnapshotChanged?(
-            RemoteEditorPresentationSnapshot(
-                mode: .floating,
-                hasEditor: true,
-                isTransitioning: false,
-                detachedFeatureEnabled: true
-            )
-        )
-
-        XCTAssertFalse(actionRow.isHidden)
-        XCTAssertFalse(closeButton.isHidden)
-        XCTAssertTrue(collapseButton.isHidden)
-        XCTAssertFalse(backupButton.isHidden)
-        XCTAssertFalse(aiButton.isHidden)
-        XCTAssertFalse(restoreButton.isHidden)
     }
 
     func testInspectorPassesLiveSessionContextProviderToFilesCoordinator() throws {
@@ -2569,7 +2518,7 @@ private final class RecordingPendingEditorCloseRouting: RemoteEditorPresentation
         detachedFeatureEnabled: true
     )
     var onSnapshotChanged: ((RemoteEditorPresentationSnapshot) -> Void)?
-    var onAIQuestionRequested: ((String) -> Void)?
+    var onAIQuestionRequested: ((RemoteTextEditorAIRequest) -> Void)?
     var onBackupRequested: (() -> Void)?
     var onRestoreRequested: (() -> Void)?
     private var closeCompletion: ((RemoteTextEditorCloseResolution) -> Void)?

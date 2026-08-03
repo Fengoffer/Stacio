@@ -192,6 +192,52 @@ final class TerminalPaneViewControllerTests: XCTestCase {
         XCTAssertFalse(terminalView.mouseDownCanMoveWindow)
     }
 
+    func testLocalTerminalFileDropInsertsShellSafePathsIntoCurrentCommandLine() {
+        let launcher = RecordingLocalTerminalLauncher()
+        let controller = TerminalPaneViewController(
+            runtimeID: "term_local_drop",
+            shellPath: "/bin/zsh",
+            eventSink: RecordingTerminalEventSink(),
+            processLauncher: launcher,
+            autoStartProcess: false
+        )
+
+        controller.loadView()
+
+        XCTAssertTrue(controller.view.registeredDraggedTypes.contains(.fileURL))
+        XCTAssertTrue(controller.terminalView.registeredDraggedTypes.contains(.fileURL))
+
+        controller.performDropLocalFilesForTesting([
+            "/tmp/report.txt",
+            "/Users/mac/Release Builds/Stacio.app"
+        ])
+
+        XCTAssertEqual(
+            launcher.sentInput.map { String(decoding: $0, as: UTF8.self) },
+            ["/tmp/report.txt '/Users/mac/Release Builds/Stacio.app' "]
+        )
+    }
+
+    func testLocalTerminalRejectsFileDropsWhileAgentOwnsInput() {
+        let controller = TerminalPaneViewController(
+            runtimeID: "term_local_drop_lock",
+            shellPath: "/bin/zsh",
+            eventSink: RecordingTerminalEventSink(),
+            autoStartProcess: false
+        )
+        controller.loadView()
+
+        XCTAssertTrue(controller.canAcceptLocalFileDropsForTesting)
+
+        controller.setAgentInteractionLocked(true)
+
+        XCTAssertFalse(controller.canAcceptLocalFileDropsForTesting)
+
+        controller.setAgentInteractionLocked(false)
+
+        XCTAssertTrue(controller.canAcceptLocalFileDropsForTesting)
+    }
+
     func testProgrammaticLocalTerminalInputBypassesUserInputHook() {
         let terminalView = StacioLocalTerminalView(frame: .zero)
         var userInputHookCalls = 0
@@ -1930,6 +1976,17 @@ final class TerminalPaneViewControllerTests: XCTestCase {
                 pasteboard: pasteboard
             ),
             "/tmp/stacio-image.png"
+        )
+    }
+
+    func testTerminalFilePathInputBuildsShellSafeNativeStyleInsertion() {
+        XCTAssertEqual(
+            TerminalFilePathInput.shellText(for: [
+                "/tmp/report.txt",
+                "/Users/mac/Release Builds/Stacio.app",
+                "/tmp/owner's notes.txt"
+            ]),
+            "/tmp/report.txt '/Users/mac/Release Builds/Stacio.app' '/tmp/owner'\\''s notes.txt' "
         )
     }
 

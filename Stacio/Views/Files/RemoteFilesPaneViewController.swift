@@ -59,7 +59,7 @@ public final class RemoteFilesPaneViewController: NSViewController {
     private let rightCapabilityWidthDefaults: UserDefaults
     private let initialRemotePath: String
     private let remoteFilePathTerminalSender: (String) -> Void
-    public var onAIQuestionRequested: ((String) -> Void)?
+    public var onAIQuestionRequested: ((RemoteTextEditorAIRequest) -> Void)?
     private var filesCoordinator: FilesCoordinator?
     private var rightCapabilityViewController: NSViewController?
     private var textEditorViewController: RemoteTextEditorViewController?
@@ -501,8 +501,8 @@ public final class RemoteFilesPaneViewController: NSViewController {
         editor.onCloseRequested = { [weak self] in
             _ = self?.closeRightWorkspaceIfNeeded()
         }
-        editor.onAIQuestionRequested = { [weak self] question in
-            self?.onAIQuestionRequested?(question)
+        editor.onAIQuestionRequested = { [weak self] request in
+            self?.onAIQuestionRequested?(request)
         }
         textEditorViewController = editor
         mediaPreviewViewController = nil
@@ -540,9 +540,37 @@ public final class RemoteFilesPaneViewController: NSViewController {
         editor.onCloseRequested = { [weak self] in
             _ = self?.closeRightWorkspaceIfNeeded()
         }
-        editor.onAIQuestionRequested = { [weak self] question in
-            self?.onAIQuestionRequested?(question)
+        editor.onAIQuestionRequested = { [weak self] request in
+            self?.onAIQuestionRequested?(request)
         }
+        textEditorViewController = editor
+        mediaPreviewViewController = nil
+        openProgressViewController = nil
+        presentRightCapability(editor)
+    }
+
+    func presentRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler,
+        closeConfirmer: RemoteTextEditorCloseConfirming? = nil
+    ) {
+        if isViewLoaded == false { loadView() }
+        if let textEditorViewController, mediaPreviewViewController == nil {
+            textEditorViewController.openDocument(document, onSaveTextAsync: asyncSaveHandler)
+            return
+        }
+        if openProgressViewController != nil,
+           textEditorViewController == nil,
+           mediaPreviewViewController == nil
+        {
+            removeOpenProgressForReplacement()
+        } else {
+            guard closeRightWorkspaceIfNeeded() else { return }
+        }
+        let editor = RemoteTextEditorViewController(document: document, onSaveTextAsync: asyncSaveHandler)
+        rightCapabilityCloseConfirmer = closeConfirmer ?? AppKitRemoteTextEditorCloseConfirmer()
+        editor.onCloseRequested = { [weak self] in _ = self?.closeRightWorkspaceIfNeeded() }
+        editor.onAIQuestionRequested = { [weak self] request in self?.onAIQuestionRequested?(request) }
         textEditorViewController = editor
         mediaPreviewViewController = nil
         openProgressViewController = nil
@@ -1122,6 +1150,27 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
     func openRemoteDocument(
         _ document: RemoteTextEditorDocumentDescriptor,
         mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler
+    ) {
+        switch mode {
+        case .textEditor, .mediaPreview:
+            let requestKey = rightOpenRequestKey(remotePath: document.remotePath, mode: mode)
+            let requestID = rightOpenRequestIDsByKey[requestKey]
+            guard filesPane?.isRightWorkspaceOpenRequestActive(requestID) == true else {
+                rightOpenRequestIDsByKey[requestKey] = nil
+                return
+            }
+            filesPane?.presentRemoteDocument(document, asyncSaveHandler: asyncSaveHandler)
+            filesPane?.finishRightWorkspaceOpenRequest(requestID)
+            rightOpenRequestIDsByKey[requestKey] = nil
+        case .chooseApplication, .defaultApplication:
+            fallbackOpener.openRemoteDocument(document, mode: mode, asyncSaveHandler: asyncSaveHandler)
+        }
+    }
+
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
         saveHandler: ((String) throws -> Void)?,
         request: RemoteEditOpenRequest
     ) {
@@ -1143,6 +1192,28 @@ private final class RemoteFilesPaneRemoteEditOpener: RemoteEditOpening {
                 saveHandler: saveHandler,
                 request: request
             )
+        }
+        filesPane.finishRightWorkspaceOpenRequest(request.id)
+    }
+
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler,
+        request: RemoteEditOpenRequest
+    ) {
+        guard let filesPane,
+              consumeRightOpenRequest(
+                request,
+                expectedKey: rightOpenRequestKey(remotePath: document.remotePath, mode: mode),
+                filesPane: filesPane
+              ) != nil
+        else { return }
+        switch mode {
+        case .textEditor, .mediaPreview:
+            filesPane.presentRemoteDocument(document, asyncSaveHandler: asyncSaveHandler)
+        case .chooseApplication, .defaultApplication:
+            fallbackOpener.openRemoteDocument(document, mode: mode, asyncSaveHandler: asyncSaveHandler, request: request)
         }
         filesPane.finishRightWorkspaceOpenRequest(request.id)
     }

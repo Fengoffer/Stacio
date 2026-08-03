@@ -8,7 +8,6 @@ private struct InspectorUncheckedSendable<Value>: @unchecked Sendable {
 
 public final class InspectorViewController: NSViewController {
     private static let headerTopMargin: CGFloat = 18
-    private static let headerHorizontalMargin: CGFloat = 12
     private static let maximumCompactToolbarTopInset: CGFloat = 16
 
     private final class CompressibleInspectorRootView: NSView {
@@ -68,39 +67,8 @@ public final class InspectorViewController: NSViewController {
     }
 
     private let sectionControl = NSSegmentedControl(labels: Section.allCases.map(\.label), trackingMode: .selectOne, target: nil, action: nil)
-    private let editorCloseButton = InspectorViewController.makeHeaderButton(
-        symbolName: "xmark.circle",
-        accessibilityDescription: "关闭编辑器",
-        identifier: "Stacio.Inspector.editorClose"
-    )
-    private let editorCollapseButton = InspectorViewController.makeHeaderButton(
-        symbolName: "rectangle.compress.vertical",
-        accessibilityDescription: "收起编辑器",
-        identifier: "Stacio.Inspector.editorCollapse"
-    )
-    private let editorBackupButton = InspectorViewController.makeHeaderButton(
-        symbolName: "externaldrive.badge.plus",
-        accessibilityDescription: "备份当前编辑文件",
-        identifier: "Stacio.Inspector.editorBackup"
-    )
-    private let editorAskAIButton = InspectorViewController.makeHeaderButton(
-        symbolName: "sparkles",
-        accessibilityDescription: "发送当前文件给 AI",
-        identifier: "Stacio.Inspector.editorAskAI"
-    )
-    private let editorRestoreButton = InspectorViewController.makeHeaderButton(
-        symbolName: "clock.arrow.circlepath",
-        accessibilityDescription: "恢复备份文件",
-        identifier: "Stacio.Inspector.editorRestore"
-    )
     private let contentContainer = NSView()
-    private var editorActionRow: NSStackView?
-    private var editorActionLeadingConstraint: NSLayoutConstraint?
-    private var editorActionTrailingConstraint: NSLayoutConstraint?
-    private var headerTopConstraint: NSLayoutConstraint?
-    private weak var headerStackView: NSStackView?
     private var contentContainerTopToRootConstraint: NSLayoutConstraint?
-    private var contentContainerTopToHeaderConstraint: NSLayoutConstraint?
     private var pendingToolbarTopInset: CGFloat = 0
     private let transferHistoryStore: SCPTransferHistoryStoring?
     private let tunnelProfileStore: TunnelProfileStoring?
@@ -140,7 +108,6 @@ public final class InspectorViewController: NSViewController {
     private var currentSection: Section = .files
     private var didFinishInitialSectionSetup = false
     private var isSynchronizingSelectedSectionLayout = false
-    private var isHeaderHorizontalLayoutSynchronizationScheduled = false
     public private(set) var filesViewController: FilesViewController?
     private var filesCoordinator: FilesCoordinator?
     private var remoteFilesBinding: RemoteFilesBinding?
@@ -262,17 +229,6 @@ public final class InspectorViewController: NSViewController {
         }
         sectionControl.frame = NSRect(origin: .zero, size: sectionControlDocumentSize())
 
-        editorCloseButton.target = self
-        editorCloseButton.action = #selector(editorCloseButtonPressed(_:))
-        editorCollapseButton.target = self
-        editorCollapseButton.action = #selector(editorCollapseButtonPressed(_:))
-        editorBackupButton.target = self
-        editorBackupButton.action = #selector(editorBackupButtonPressed(_:))
-        editorAskAIButton.target = self
-        editorAskAIButton.action = #selector(editorAskAIButtonPressed(_:))
-        editorRestoreButton.target = self
-        editorRestoreButton.action = #selector(editorRestoreButtonPressed(_:))
-
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
         contentContainer.setAccessibilityIdentifier("Stacio.Inspector.content")
         contentContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -289,9 +245,6 @@ public final class InspectorViewController: NSViewController {
         filesViewController = files
         files.onSendPathToTerminal = { [remoteFilePathTerminalSender] path in
             remoteFilePathTerminalSender(path)
-        }
-        files.onPaneFrameChanged = { [weak self] in
-            self?.scheduleHeaderHorizontalLayoutSynchronization()
         }
         transferQueueViewController = transferQueue
         diagnosticsViewController = diagnostics
@@ -345,11 +298,8 @@ public final class InspectorViewController: NSViewController {
                 self?.remoteFilesBinding?.runtimeID ?? "inspector"
             }
         )
-        remoteEditorPresentation?.onSnapshotChanged = { [weak self] snapshot in
-            self?.updateEditorActionControls(snapshot)
-        }
-        remoteEditorPresentation?.onAIQuestionRequested = { [weak self] question in
-            self?.showAIAssistantForFileQuestion(question)
+        remoteEditorPresentation?.onAIQuestionRequested = { [weak self] request in
+            self?.showAIAssistantForFileQuestion(request)
         }
         remoteEditorPresentation?.onBackupRequested = { [weak self] in
             self?.filesCoordinator?.performBackupFromInspector()
@@ -438,75 +388,16 @@ public final class InspectorViewController: NSViewController {
             addChild(controller)
         }
 
-        let editorActionRow = NSStackView(views: [
-            editorCloseButton,
-            editorCollapseButton,
-            editorBackupButton,
-            editorAskAIButton,
-            editorRestoreButton,
-            NSView()
-        ])
-        editorActionRow.setAccessibilityIdentifier("Stacio.Inspector.editorActions")
-        editorActionRow.orientation = .horizontal
-        editorActionRow.alignment = .centerY
-        editorActionRow.spacing = 6
-        editorActionRow.translatesAutoresizingMaskIntoConstraints = false
-        self.editorActionRow = editorActionRow
-        editorActionRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        editorActionRow.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        let headerRowContainer = NSView()
-        headerRowContainer.translatesAutoresizingMaskIntoConstraints = false
-        headerRowContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        headerRowContainer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        headerRowContainer.addSubview(editorActionRow)
-
-        let topBar = NSStackView(views: [headerRowContainer])
-        topBar.setAccessibilityIdentifier("Stacio.Inspector.header")
-        topBar.orientation = .vertical
-        topBar.alignment = .width
-        topBar.spacing = 10
-        topBar.translatesAutoresizingMaskIntoConstraints = false
-        topBar.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        topBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        headerStackView = topBar
-
-        container.addSubview(topBar)
         container.addSubview(contentContainer)
 
-        let editorActionLeadingConstraint = editorActionRow.leadingAnchor.constraint(
-            equalTo: headerRowContainer.leadingAnchor
-        )
-        let editorActionTrailingConstraint = editorActionRow.trailingAnchor.constraint(
-            equalTo: headerRowContainer.trailingAnchor
-        )
         let compactTopInset = Self.headerTopMargin + pendingToolbarTopInset
-        let headerTopConstraint = topBar.topAnchor.constraint(
-            equalTo: container.topAnchor,
-            constant: compactTopInset
-        )
         let contentContainerTopToRootConstraint = contentContainer.topAnchor.constraint(
             equalTo: container.topAnchor,
             constant: compactTopInset
         )
-        let contentContainerTopToHeaderConstraint = contentContainer.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 8)
-        self.editorActionLeadingConstraint = editorActionLeadingConstraint
-        self.editorActionTrailingConstraint = editorActionTrailingConstraint
-        self.headerTopConstraint = headerTopConstraint
         self.contentContainerTopToRootConstraint = contentContainerTopToRootConstraint
-        self.contentContainerTopToHeaderConstraint = contentContainerTopToHeaderConstraint
 
         NSLayoutConstraint.activate([
-            topBar.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.headerHorizontalMargin),
-            topBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.headerHorizontalMargin),
-            topBar.heightAnchor.constraint(equalToConstant: 26),
-            headerTopConstraint,
-
-            editorActionLeadingConstraint,
-            editorActionTrailingConstraint,
-            editorActionRow.topAnchor.constraint(equalTo: headerRowContainer.topAnchor),
-            editorActionRow.bottomAnchor.constraint(equalTo: headerRowContainer.bottomAnchor),
-
             contentContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             contentContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             contentContainerTopToRootConstraint,
@@ -514,15 +405,6 @@ public final class InspectorViewController: NSViewController {
         ])
 
         switchToSection(.files)
-        updateEditorActionControls(
-            remoteEditorPresentation?.snapshot
-                ?? RemoteEditorPresentationSnapshot(
-                    mode: .closed,
-                    hasEditor: false,
-                    isTransitioning: false,
-                    detachedFeatureEnabled: false
-                )
-        )
         didFinishInitialSectionSetup = true
         view = container
         refreshWorkspaceCapabilities()
@@ -532,9 +414,6 @@ public final class InspectorViewController: NSViewController {
         super.viewDidLayout()
         synchronizeSectionControlDocumentSize()
         synchronizeSelectedSectionLayout()
-        if synchronizeHeaderHorizontalLayout() {
-            view.needsLayout = true
-        }
     }
 
     public override func viewDidAppear() {
@@ -576,9 +455,6 @@ public final class InspectorViewController: NSViewController {
         if currentSection == .files {
             filesViewController?.synchronizeInspectorColumnLayout()
         }
-        if synchronizeHeaderHorizontalLayout() {
-            view.layoutSubtreeIfNeeded()
-        }
     }
 
     public func synchronizeSelectedSectionFrameAfterSplitLayout(hostView: NSView) {
@@ -600,9 +476,6 @@ public final class InspectorViewController: NSViewController {
         }
         if currentSection == .files {
             filesViewController?.synchronizeInspectorColumnFrameOnly()
-        }
-        if synchronizeHeaderHorizontalLayout() {
-            view.layoutSubtreeIfNeeded()
         }
     }
 
@@ -1070,77 +943,15 @@ public final class InspectorViewController: NSViewController {
         switchToSection(section)
     }
 
-    @objc private func editorCloseButtonPressed(_ sender: Any?) {
-        _ = remoteEditorPresentation?.requestClose(parentWindow: view.window, completion: nil)
-    }
-
-    @objc private func editorCollapseButtonPressed(_ sender: Any?) {
-        if remoteEditorPresentation?.snapshot.mode == .recovery {
-            do {
-                try remoteEditorPresentation?.redockEditor()
-            } catch {
-                return
-            }
-            return
-        }
-        if remoteEditorPresentation?.snapshot.isCollapsed == true {
-            remoteEditorPresentation?.expandDockedEditor()
-        } else {
-            remoteEditorPresentation?.collapseDockedEditor()
-        }
-    }
-
-    @objc private func editorBackupButtonPressed(_ sender: Any?) {
-        filesCoordinator?.performBackupFromInspector()
-    }
-
-    @objc private func editorAskAIButtonPressed(_ sender: Any?) {
-        remoteEditorPresentation?.requestAIForActiveDocument()
-    }
-
-    @objc private func editorRestoreButtonPressed(_ sender: Any?) {
-        filesCoordinator?.performRestoreFromInspector()
-    }
-
-    private func showAIAssistantForFileQuestion(_ question: String) {
+    private func showAIAssistantForFileQuestion(_ request: RemoteTextEditorAIRequest) {
         guard allowsWorkspaceSection(.ai) else { return }
         selectAIAssistantTab()
         aiAssistantViewController?.refreshForCurrentContext()
-        aiAssistantViewController?.prefillQuestion(question)
-        aiAssistantViewController?.focusQuestionField()
-    }
-
-    private func updateEditorActionControls(_ snapshot: RemoteEditorPresentationSnapshot) {
-        editorActionRow?.isHidden = snapshot.mode == .closed || snapshot.mode == .opening
-        editorCloseButton.isHidden = snapshot.isCollapsed
-        editorCollapseButton.isHidden = snapshot.canCollapse == false && snapshot.mode != .recovery
-        editorBackupButton.isHidden = snapshot.isCollapsed
-        editorAskAIButton.isHidden = snapshot.isCollapsed
-        editorRestoreButton.isHidden = snapshot.isCollapsed
-        configureEditorCollapseButtonForCollapsedState(
-            snapshot.isCollapsed,
-            recovery: snapshot.mode == .recovery
+        aiAssistantViewController?.prefillQuestion(
+            request.question,
+            attachments: [request.attachment]
         )
-        updateContentContainerTopConstraint(for: currentSection)
-    }
-
-    private func configureEditorCollapseButtonForCollapsedState(
-        _ collapsed: Bool,
-        recovery: Bool = false
-    ) {
-        let symbolName: String
-        let description: String
-        if recovery {
-            symbolName = "arrow.uturn.backward.circle"
-            description = "重新停靠编辑器"
-        } else {
-            symbolName = collapsed ? "arrow.up.left.and.arrow.down.right" : "rectangle.compress.vertical"
-            description = collapsed ? "展开编辑器" : "收起编辑器"
-        }
-        editorCollapseButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
-            ?? NSImage(size: NSSize(width: 14, height: 14))
-        editorCollapseButton.toolTip = description
-        editorCollapseButton.setAccessibilityLabel(description)
+        aiAssistantViewController?.focusQuestionField()
     }
 
     private func switchToSection(_ section: Section) {
@@ -1153,7 +964,6 @@ public final class InspectorViewController: NSViewController {
         }
         currentSection = section
         sectionControl.selectedSegment = section.rawValue
-        updateContentContainerTopConstraint(for: section)
 
         for subview in contentContainer.subviews {
             subview.removeFromSuperview()
@@ -1174,7 +984,6 @@ public final class InspectorViewController: NSViewController {
         loadDiagnosticsActivityIfNeeded(for: section)
         loadCommandHistoryIfNeeded(for: section)
         refreshDeferredTerminalContextIfNeeded(for: section, wasViewLoaded: wasViewLoaded)
-        synchronizeHeaderHorizontalLayout()
     }
 
     private func allowsWorkspaceSection(_ section: Section) -> Bool {
@@ -1200,14 +1009,6 @@ public final class InspectorViewController: NSViewController {
         default:
             break
         }
-    }
-
-    private func updateContentContainerTopConstraint(for section: Section) {
-        _ = section
-        let shouldShowEditorHeader = editorActionRow?.isHidden == false
-        headerStackView?.isHidden = shouldShowEditorHeader == false
-        contentContainerTopToHeaderConstraint?.isActive = shouldShowEditorHeader
-        contentContainerTopToRootConstraint?.isActive = shouldShowEditorHeader == false
     }
 
     private func synchronizeSelectedSectionLayout() {
@@ -1236,49 +1037,10 @@ public final class InspectorViewController: NSViewController {
             || abs(lhs.height - rhs.height) > 0.5
     }
 
-    private func scheduleHeaderHorizontalLayoutSynchronization() {
-        guard isHeaderHorizontalLayoutSynchronizationScheduled == false else { return }
-        isHeaderHorizontalLayoutSynchronizationScheduled = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.isHeaderHorizontalLayoutSynchronizationScheduled = false
-            if self.synchronizeHeaderHorizontalLayout() {
-                self.view.needsLayout = true
-            }
-        }
-    }
-
-    @discardableResult
-    private func synchronizeHeaderHorizontalLayout() -> Bool {
-        guard isViewLoaded,
-              let editorActionLeadingConstraint,
-              let editorActionTrailingConstraint
-        else {
-            return false
-        }
-
-        var changed = false
-        if abs(editorActionLeadingConstraint.constant) > 0.5 {
-            editorActionLeadingConstraint.constant = 0
-            changed = true
-        }
-        if abs(editorActionTrailingConstraint.constant) > 0.5 {
-            editorActionTrailingConstraint.constant = 0
-            changed = true
-        }
-        if changed {
-            view.needsLayout = true
-        }
-        return changed
-    }
-
     private func applyToolbarTopInsetIfNeeded() {
         guard isViewLoaded else { return }
 
         let nextTopConstant = Self.headerTopMargin + pendingToolbarTopInset
-        if abs((headerTopConstraint?.constant ?? 0) - nextTopConstant) > 0.5 {
-            headerTopConstraint?.constant = nextTopConstant
-        }
         if abs((contentContainerTopToRootConstraint?.constant ?? 0) - nextTopConstant) > 0.5 {
             contentContainerTopToRootConstraint?.constant = nextTopConstant
         }
@@ -1332,15 +1094,7 @@ public final class InspectorViewController: NSViewController {
               view.bounds.height > 0
         else { return }
 
-        let contentTopY: CGFloat
-        if editorActionRow?.isHidden == false,
-           let headerStackView
-        {
-            let headerFrame = headerStackView.convert(headerStackView.bounds, to: view)
-            contentTopY = headerFrame.minY - 8
-        } else {
-            contentTopY = view.bounds.maxY - pendingToolbarTopInset - Self.headerTopMargin
-        }
+        let contentTopY = view.bounds.maxY - pendingToolbarTopInset - Self.headerTopMargin
         let contentHeight = max(0, min(view.bounds.height, contentTopY))
         let targetFrame = NSRect(
             x: 0,

@@ -62,23 +62,21 @@ final class StacioDesignSystemTests: XCTestCase {
 
         XCTAssertEqual(controller.view.accessibilityIdentifier(), "Stacio.Inspector.surface")
         XCTAssertEqual(controller.view.layer?.borderWidth ?? 0, 0)
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.header"))
+        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.content"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.header"))
         XCTAssertNil(controller.sectionControlForTesting.enclosingScrollView)
     }
 
-    func testInspectorHeaderUsesEditorActionToolbarWithoutInspectorTitle() throws {
+    func testInspectorDoesNotDuplicateEditorActionToolbar() throws {
         let controller = InspectorViewController(transferHistoryStore: NoOpSCPTransferHistoryStore())
 
         controller.loadView()
 
-        let header = try XCTUnwrap(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.header") as? NSStackView)
-        XCTAssertEqual(header.orientation, .vertical)
-        XCTAssertEqual(header.spacing, 10)
         XCTAssertNil(controller.view.firstTextField(withString: "检查器"))
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose"))
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse"))
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup"))
-        XCTAssertNotNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorClose"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorCollapse"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorBackup"))
+        XCTAssertNil(controller.view.firstSubview(withIdentifier: "Stacio.Inspector.editorRestore"))
         XCTAssertGreaterThanOrEqual(controller.sectionControlForTesting.segmentCount, 4)
         XCTAssertNil(controller.sectionControlForTesting.enclosingScrollView)
     }

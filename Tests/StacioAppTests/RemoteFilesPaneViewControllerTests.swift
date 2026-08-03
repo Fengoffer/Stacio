@@ -325,8 +325,8 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
             transferScheduler: nil,
             rightCapabilityWidthDefaults: rightCapabilityWidthDefaults
         )
-        var prompts: [String] = []
-        pane.onAIQuestionRequested = { prompts.append($0) }
+        var requests: [RemoteTextEditorAIRequest] = []
+        pane.onAIQuestionRequested = { requests.append($0) }
 
         pane.loadView()
         pane.presentTextEditorForTesting(localURL: fileURL, saveHandler: nil)
@@ -340,9 +340,11 @@ final class RemoteFilesPaneViewControllerTests: XCTestCase {
         })
         editor.requestAIForActiveDocumentForTesting()
 
-        let prompt = try XCTUnwrap(prompts.first)
-        XCTAssertTrue(prompt.contains("nginx.conf"))
-        XCTAssertTrue(prompt.contains("listen 80"))
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertTrue(request.question.contains("nginx.conf"))
+        XCTAssertFalse(request.question.contains("listen 80"))
+        XCTAssertEqual(request.attachment.filename, "nginx.conf")
+        XCTAssertTrue(request.attachment.textPreview?.contains("listen 80") == true)
     }
 
     func testRightWorkspaceDoesNotStoreDefaultWidthBeforeDividerMoves() throws {
