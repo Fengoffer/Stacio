@@ -341,6 +341,7 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
         content.layer?.masksToBounds = true
         content.layer?.borderWidth = 0.5
         content.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        content.maskImage = Self.roundedMaterialMask
         content.setAccessibilityIdentifier("Stacio.Transfers.notificationBubble")
 
         let icon = NSImageView(image: NSImage(
@@ -525,6 +526,29 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
     private static let minimumHeight: CGFloat = 112
     private static let maximumVisibleRows = 4
     private static let cornerRadius: CGFloat = 18
+    private static let roundedMaterialMask: NSImage = {
+        let sideLength = (cornerRadius * 2) + 1
+        let image = NSImage(
+            size: NSSize(width: sideLength, height: sideLength),
+            flipped: false
+        ) { rect in
+            NSColor.white.setFill()
+            NSBezierPath(
+                roundedRect: rect,
+                xRadius: cornerRadius,
+                yRadius: cornerRadius
+            ).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(
+            top: cornerRadius,
+            left: cornerRadius,
+            bottom: cornerRadius,
+            right: cornerRadius
+        )
+        image.resizingMode = .stretch
+        return image
+    }()
 }
 
 @MainActor

@@ -7,6 +7,9 @@ import StacioCoreBindings
 
 @MainActor
 final class WorkbenchWindowControllerTests: XCTestCase {
+    private let toolbarAutosaveDefaultsKey = "NSToolbar Configuration Stacio.Toolbar"
+    private var toolbarAutosaveConfigurationSnapshot: Any?
+
     private func waitUntil(
         timeout: TimeInterval = 3,
         condition: @escaping () -> Bool
@@ -23,6 +26,10 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        toolbarAutosaveConfigurationSnapshot = UserDefaults.standard.object(
+            forKey: toolbarAutosaveDefaultsKey
+        )
+        UserDefaults.standard.removeObject(forKey: toolbarAutosaveDefaultsKey)
         UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(defaultWorkbenchFrameAutosaveName()))
         UserDefaults.standard.removeObject(
             forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "sidebar")
@@ -43,6 +50,14 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         UserDefaults.standard.removeObject(
             forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "inspector")
         )
+        if let toolbarAutosaveConfigurationSnapshot {
+            UserDefaults.standard.set(
+                toolbarAutosaveConfigurationSnapshot,
+                forKey: toolbarAutosaveDefaultsKey
+            )
+        } else {
+            UserDefaults.standard.removeObject(forKey: toolbarAutosaveDefaultsKey)
+        }
         super.tearDown()
     }
 
@@ -58,11 +73,11 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(controller.window?.minSize.height ?? .greatestFiniteMagnitude, 1)
     }
 
-    func testDefaultToolbarIncludesUpdatePromptFallback() {
+    func testDefaultToolbarOmitsUpdatePromptBecauseOTAStatusLivesInSidebar() {
         let controller = WorkbenchWindowController()
         let toolbar = NSToolbar(identifier: "Stacio.Tests.Toolbar")
 
-        XCTAssertTrue(
+        XCTAssertFalse(
             controller.toolbarDefaultItemIdentifiers(toolbar)
                 .contains(NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt"))
         )
@@ -1820,8 +1835,10 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let window = try XCTUnwrap(controller.window)
         let toolbarItems = try XCTUnwrap(window.toolbar?.items)
         XCTAssertEqual(toolbarItems.first?.itemIdentifier.rawValue, "Stacio.Toolbar.sidebar")
-        XCTAssertEqual(toolbarItems.dropFirst().first?.itemIdentifier.rawValue, "Stacio.Toolbar.updatePrompt")
-        XCTAssertEqual(toolbarItems.dropFirst(2).first?.itemIdentifier, .flexibleSpace)
+        XCTAssertEqual(toolbarItems.dropFirst().first?.itemIdentifier, .flexibleSpace)
+        XCTAssertFalse(toolbarItems.contains {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.updatePrompt"
+        })
 
         let sidebarButton = try sidebarToolbarButton(in: controller)
 
@@ -1884,10 +1901,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
         let window = try XCTUnwrap(controller.window)
         let identifiers = window.toolbar?.items.map(\.itemIdentifier.rawValue) ?? []
-        XCTAssertEqual(identifiers.prefix(2), [
-            "Stacio.Toolbar.sidebar",
-            "Stacio.Toolbar.updatePrompt"
-        ])
+        XCTAssertEqual(identifiers.first, "Stacio.Toolbar.sidebar")
+        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.updatePrompt"))
         XCTAssertEqual(updateController.probeCount, 1)
 
         let sidebar = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.first?.viewController as? SessionSidebarViewController)
@@ -1970,10 +1985,10 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         let commandItems = items.filter {
             $0.itemIdentifier != .flexibleSpace && $0.itemIdentifier != .space
         }
-        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "更新", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
+        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "面板", "检查器"])
         XCTAssertEqual(
             commandItems.map(\.toolTip),
-            ["显示或隐藏侧边栏", "Stacio 更新", "新建会话", "从其他终端工具导入会话", "将输入同步执行到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
+            ["显示或隐藏侧边栏", "新建会话", "从其他终端工具导入会话", "将输入同步执行到多个终端", "终端分屏布局", "文件", "浏览器", "隧道", "显示或隐藏当前 SSH 标签页设备看板", "AI 助手", "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI", "检查器"]
         )
         XCTAssertNil(items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.closeTerminal" })
         XCTAssertEqual(
@@ -2410,7 +2425,6 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             identifiers,
             [
                 "Stacio.Toolbar.sidebar",
-                "Stacio.Toolbar.updatePrompt",
                 NSToolbarItem.Identifier.flexibleSpace.rawValue,
                 "Stacio.Toolbar.newSession",
                 "Stacio.Toolbar.importSessions",
@@ -2461,6 +2475,276 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(allowed.count, Set(allowed).count)
         XCTAssertEqual(allowed.filter { $0 == "Stacio.Toolbar.importSessions" }.count, 1)
         XCTAssertEqual(allowed.filter { $0 == NSToolbarItem.Identifier.space.rawValue }.count, 1)
+    }
+
+    func testToolbarDoesNotOfferOrDefaultLegacyUpdatePrompt() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar.Customization.UpdatePrompt.Test"))
+
+        let allowed = controller.toolbarAllowedItemIdentifiers(toolbar).map(\.rawValue)
+
+        XCTAssertFalse(allowed.contains("Stacio.Toolbar.updatePrompt"))
+        XCTAssertFalse(controller.toolbarDefaultItemIdentifiers(toolbar).contains(
+            NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt")
+        ))
+    }
+
+    func testLegacyAutosavedUpdatePromptIsDroppedWithoutDiscardingOtherToolbarItems() throws {
+        UserDefaults.standard.set(
+            [
+                "TB Item Identifiers": [
+                    "Stacio.Toolbar.sidebar",
+                    "Stacio.Toolbar.updatePrompt",
+                    "Stacio.Toolbar.files"
+                ]
+            ],
+            forKey: toolbarAutosaveDefaultsKey
+        )
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let identifiers = try XCTUnwrap(controller.window?.toolbar?.items.map(\.itemIdentifier.rawValue))
+        XCTAssertEqual(identifiers, ["Stacio.Toolbar.sidebar", "Stacio.Toolbar.files"])
+        let storedConfiguration = try XCTUnwrap(
+            UserDefaults.standard.dictionary(forKey: toolbarAutosaveDefaultsKey)
+        )
+        XCTAssertEqual(
+            storedConfiguration["TB Item Identifiers"] as? [String],
+            ["Stacio.Toolbar.sidebar", "Stacio.Toolbar.files"]
+        )
+    }
+
+    func testToolbarCustomizationModelEditsOneItemAtATime() throws {
+        let sidebar = NSToolbarItem.Identifier("Stacio.Toolbar.sidebar")
+        let files = NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        let browser = NSToolbarItem.Identifier("Stacio.Toolbar.browser")
+        var model = WorkbenchToolbarCustomizationModel(
+            currentIdentifiers: [sidebar, files],
+            defaultIdentifiers: [sidebar, files],
+            duplicateIdentifiers: [.space, .flexibleSpace]
+        )
+
+        XCTAssertTrue(model.insert(browser, at: 1))
+        XCTAssertFalse(model.insert(browser, at: 0))
+        XCTAssertEqual(model.identifiers, [sidebar, browser, files])
+
+        let filesEntryID = try XCTUnwrap(model.entries.first { $0.identifier == files }?.id)
+        XCTAssertTrue(model.move(entryID: filesEntryID, to: 0))
+        XCTAssertEqual(model.identifiers, [files, sidebar, browser])
+
+        let sidebarEntryID = try XCTUnwrap(model.entries.first { $0.identifier == sidebar }?.id)
+        XCTAssertTrue(model.remove(entryID: sidebarEntryID))
+        XCTAssertEqual(model.identifiers, [files, browser])
+        XCTAssertTrue(model.insert(.space, at: 2))
+        XCTAssertTrue(model.insert(.space, at: 3))
+        XCTAssertEqual(model.identifiers, [files, browser, .space, .space])
+    }
+
+    func testToolbarCustomizationUsesStacioSheetWithIndividualItemsAndExplicitActions() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        let originalWindows = Set(NSApp.windows.map(ObjectIdentifier.init))
+        defer {
+            if let sheet = controller.window?.attachedSheet {
+                controller.window?.endSheet(sheet)
+                sheet.close()
+            }
+            for window in NSApp.windows where originalWindows.contains(ObjectIdentifier(window)) == false {
+                window.close()
+            }
+            controller.close()
+        }
+
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertFalse(toolbar.customizationPaletteIsRunning)
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.cancel"))
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault"))
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.done"))
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.available.Stacio.Toolbar.updatePrompt"))
+
+        let individualCurrentItems = content.allSubviews(ofType: NSView.self).filter {
+            $0.accessibilityIdentifier().hasPrefix("Stacio.ToolbarCustomization.current.")
+        }
+        XCTAssertGreaterThan(individualCurrentItems.count, 1)
+        let firstCurrentItem = try XCTUnwrap(individualCurrentItems.first)
+        firstCurrentItem.layoutSubtreeIfNeeded()
+        let hitView = firstCurrentItem.hitTest(
+            NSPoint(x: firstCurrentItem.bounds.midX, y: firstCurrentItem.bounds.midY)
+        )
+        XCTAssertTrue(hitView === firstCurrentItem)
+        for itemView in individualCurrentItems {
+            let dragSource = try XCTUnwrap(
+                itemView as? any WorkbenchToolbarCustomizationDragOperationProviding
+            )
+            let operations = dragSource.permittedToolbarCustomizationDragOperations
+            XCTAssertTrue(operations.contains(.move))
+            XCTAssertTrue(operations.contains(.delete))
+        }
+    }
+
+    func testToolbarCustomizationDropHandlersEditSingleItemsAndDoneApplies() throws {
+        let sidebar = NSToolbarItem.Identifier("Stacio.Toolbar.sidebar")
+        let files = NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        let browser = NSToolbarItem.Identifier("Stacio.Toolbar.browser")
+        var appliedIdentifiers: [[NSToolbarItem.Identifier]] = []
+        let controller = WorkbenchToolbarCustomizationWindowController(
+            descriptors: [sidebar, files, browser].map {
+                WorkbenchToolbarCustomizationDescriptor(
+                    identifier: $0,
+                    label: $0.rawValue,
+                    image: NSImage(),
+                    allowsDuplicates: false
+                )
+            },
+            currentIdentifiers: [sidebar, files],
+            defaultIdentifiers: [sidebar, files],
+            onApply: { appliedIdentifiers.append($0) }
+        )
+
+        XCTAssertTrue(controller.dropAvailableItemForTesting(browser, at: 1))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [sidebar, browser, files])
+        XCTAssertTrue(controller.moveCurrentItemForTesting(files, to: 0))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files, sidebar, browser])
+        XCTAssertTrue(controller.dropCurrentItemBackToAvailableForTesting(sidebar))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files, browser])
+        XCTAssertTrue(controller.dragCurrentItemOutsideForTesting(browser))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files])
+        XCTAssertTrue(controller.dropAvailableItemForTesting(browser, at: 1))
+
+        let done = try XCTUnwrap(
+            controller.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        done.performClick(nil)
+
+        XCTAssertEqual(appliedIdentifiers, [[files, browser]])
+    }
+
+    func testToolbarCustomizationDonePersistsLayoutAcrossWorkbenchRecreation() throws {
+        let firstController = WorkbenchWindowController()
+        firstController.showWindow(nil)
+        let firstToolbar = try XCTUnwrap(firstController.window?.toolbar)
+        firstToolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let customizationController = try XCTUnwrap(
+            firstController.window?.attachedSheet?.windowController
+                as? WorkbenchToolbarCustomizationWindowController
+        )
+        XCTAssertTrue(
+            customizationController.dropCurrentItemBackToAvailableForTesting(
+                NSToolbarItem.Identifier("Stacio.Toolbar.files")
+            )
+        )
+        let done = try XCTUnwrap(
+            customizationController.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        done.performClick(nil)
+        let customizedIdentifiers = firstToolbar.items.map(\.itemIdentifier)
+        XCTAssertFalse(customizedIdentifiers.contains(
+            NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        ))
+        firstController.close()
+
+        let recreatedController = WorkbenchWindowController()
+        recreatedController.loadWindow()
+        defer { recreatedController.close() }
+
+        XCTAssertEqual(
+            recreatedController.window?.toolbar?.items.map(\.itemIdentifier),
+            customizedIdentifiers
+        )
+        let storedConfiguration = try XCTUnwrap(
+            UserDefaults.standard.dictionary(forKey: toolbarAutosaveDefaultsKey)
+        )
+        XCTAssertEqual(
+            storedConfiguration["TB Item Identifiers"] as? [String],
+            customizedIdentifiers.map(\.rawValue)
+        )
+    }
+
+    func testToolbarCustomizationCancelDiscardsRestoredPreview() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.autosavesConfiguration = false
+        let originalIdentifiers = toolbar.items.map(\.itemIdentifier)
+        replaceToolbarItemsForTesting(
+            in: toolbar,
+            with: controller.toolbarDefaultItemIdentifiers(toolbar)
+        )
+        defer {
+            replaceToolbarItemsForTesting(in: toolbar, with: originalIdentifiers)
+        }
+        let removedIndex = try XCTUnwrap(toolbar.items.firstIndex {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.files"
+        })
+        toolbar.removeItem(at: removedIndex)
+        let customizedIdentifiers = toolbar.items.map(\.itemIdentifier)
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        let restore = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault") as? NSButton
+        )
+        let cancel = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.cancel") as? NSButton
+        )
+
+        restore.performClick(nil)
+        cancel.performClick(nil)
+
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), customizedIdentifiers)
+        XCTAssertNil(controller.window?.attachedSheet)
+    }
+
+    func testToolbarCustomizationRestoreDefaultAppliesOnlyAfterDone() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.autosavesConfiguration = false
+        let originalIdentifiers = toolbar.items.map(\.itemIdentifier)
+        replaceToolbarItemsForTesting(
+            in: toolbar,
+            with: controller.toolbarDefaultItemIdentifiers(toolbar)
+        )
+        defer {
+            replaceToolbarItemsForTesting(in: toolbar, with: originalIdentifiers)
+        }
+        let removedIndex = try XCTUnwrap(toolbar.items.firstIndex {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.files"
+        })
+        toolbar.removeItem(at: removedIndex)
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        let restore = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault") as? NSButton
+        )
+        let done = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.done") as? NSButton
+        )
+
+        restore.performClick(nil)
+        XCTAssertFalse(toolbar.items.contains { $0.itemIdentifier.rawValue == "Stacio.Toolbar.files" })
+        done.performClick(nil)
+
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), controller.toolbarDefaultItemIdentifiers(toolbar))
+        XCTAssertNil(controller.window?.attachedSheet)
     }
 
     func testDeviceDashboardToolbarTogglesCurrentWorkspaceDashboardWithoutOpeningInspector() throws {
@@ -8466,15 +8750,6 @@ private func sidebarToolbarButton(in controller: WorkbenchWindowController) thro
     )
 }
 
-private func updatePromptToolbarButton(in controller: WorkbenchWindowController) throws -> UpdatePromptTitlebarButton {
-    let window = try XCTUnwrap(controller.window)
-    return try XCTUnwrap(
-        window.toolbar?.items
-            .compactMap { $0.view?.firstSubview(withIdentifier: "Stacio.Toolbar.updatePrompt") as? UpdatePromptTitlebarButton }
-            .first
-    )
-}
-
 private final class RecordingSparkleUpdateButtonController: SparkleUpdateButtonControlling {
     var buttonState: SparkleUpdateButtonState = .hidden
     var onButtonStateChanged: ((SparkleUpdateButtonState) -> Void)?
@@ -9586,6 +9861,23 @@ private func workbenchLiveContext(
         secret: .agent,
         expectedFingerprintSHA256: expectedFingerprintSHA256 ?? "SHA256:\(host)"
     )
+}
+
+@MainActor
+private func replaceToolbarItemsForTesting(
+    in toolbar: NSToolbar,
+    with identifiers: [NSToolbarItem.Identifier]
+) {
+    if #available(macOS 15.0, *) {
+        toolbar.itemIdentifiers = identifiers
+    } else {
+        for index in toolbar.items.indices.reversed() {
+            toolbar.removeItem(at: index)
+        }
+        for identifier in identifiers {
+            toolbar.insertItem(withItemIdentifier: identifier, at: toolbar.items.count)
+        }
+    }
 }
 
 @MainActor

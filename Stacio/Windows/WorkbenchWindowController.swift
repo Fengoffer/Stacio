@@ -44,55 +44,6 @@ public final class SidebarToggleTitlebarButton: NSButton {
     }
 }
 
-public final class UpdatePromptTitlebarButton: NSButton {
-    private var currentTitle = ""
-
-    public func update(state: SparkleUpdateButtonState) {
-        currentTitle = state.title
-        toolTip = state.accessibilityLabel
-        setAccessibilityLabel(state.accessibilityLabel)
-        isHidden = state.isVisible == false
-        let titleColor: NSColor
-        let backgroundColor: NSColor
-        switch state {
-        case .failed:
-            titleColor = .white
-            backgroundColor = StacioDesignSystem.theme.dangerColor
-        case .installing, .extracting, .downloading:
-            titleColor = .white
-            backgroundColor = StacioDesignSystem.theme.warningColor
-        case .available:
-            titleColor = .white
-            backgroundColor = .controlAccentColor
-        case .hidden:
-            titleColor = .clear
-            backgroundColor = .clear
-        }
-        attributedTitle = NSAttributedString(
-            string: currentTitle,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                .foregroundColor: titleColor
-            ]
-        )
-        wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = backgroundColor.cgColor
-        invalidateIntrinsicContentSize()
-        needsDisplay = true
-    }
-
-    public override var intrinsicContentSize: NSSize {
-        guard currentTitle.isEmpty == false else {
-            return NSSize(width: 0, height: 24)
-        }
-        let width = ceil((currentTitle as NSString).size(withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
-        ]).width) + 20
-        return NSSize(width: max(48, width), height: 24)
-    }
-}
-
 private final class WorkbenchRootView: NSView, StacioEffectiveAppearanceRefreshHandling {
     override var fittingSize: NSSize {
         // spec: fix-workbench-window-resize — flag=true 时使用默认 fittingSize，
@@ -320,9 +271,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     public private(set) var remoteEditorPresentationCoordinator: RemoteEditorPresentationCoordinator?
     private weak var sidebarSplitViewItem: NSSplitViewItem?
     private weak var inspectorSplitViewItem: NSSplitViewItem?
-    private weak var updatePromptToolbarItem: NSToolbarItem?
-    private weak var updatePromptButton: UpdatePromptTitlebarButton?
-    private var updatePromptWidthConstraint: NSLayoutConstraint?
+    private var toolbarCustomizationWindowController: WorkbenchToolbarCustomizationWindowController?
     private var workbenchContentWidthStayConstraint: NSLayoutConstraint?
     private var workbenchContentHeightStayConstraint: NSLayoutConstraint?
     private var isSystemZoomingWindow = false
@@ -372,8 +321,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         static let deviceDashboard = NSToolbarItem.Identifier("Stacio.Toolbar.deviceDashboard")
         static let aiAssistant = NSToolbarItem.Identifier("Stacio.Toolbar.aiAssistant")
         static let inspector = NSToolbarItem.Identifier("Stacio.Toolbar.inspector")
-        static let updatePrompt = NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt")
     }
+
+    private static let toolbarIdentifier = NSToolbar.Identifier("Stacio.Toolbar")
+    private static let toolbarAutosaveDefaultsKey = "NSToolbar Configuration Stacio.Toolbar"
+    private static let legacyUpdatePromptToolbarIdentifier = "Stacio.Toolbar.updatePrompt"
 
     public convenience init() {
         self.init(workspaceViewController: WorkspaceViewController())
@@ -621,7 +573,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         allowsUserSplitWidthPersistence = false
         self.window = window
         installSystemAppearanceObserverIfNeeded()
-        bindUpdatePromptControllerIfNeeded()
+        bindUpdateStatusControllerIfNeeded()
         sparkleUpdateController?.probeForAvailableUpdate()
         refreshWorkbenchAppearance()
         refreshToolbarItemAvailability()
@@ -2299,18 +2251,139 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     private func makeToolbar() -> NSToolbar {
-        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar"))
+        migrateLegacyToolbarConfigurationIfNeeded()
+        let toolbar = WorkbenchCustomizationRoutingToolbar(identifier: Self.toolbarIdentifier)
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.sizeMode = .small
         toolbar.allowsUserCustomization = true
         toolbar.autosavesConfiguration = true
+        toolbar.customizationHandler = { [weak self, weak toolbar] _ in
+            guard let self, let toolbar else { return }
+            self.presentToolbarCustomization(for: toolbar)
+        }
 
         for identifier in toolbarDefaultItemIdentifiers(toolbar) {
             toolbar.insertItem(withItemIdentifier: identifier, at: toolbar.items.count)
         }
 
         return toolbar
+    }
+
+    private func presentToolbarCustomization(for toolbar: NSToolbar) {
+        guard let window else { return }
+        if let existing = toolbarCustomizationWindowController {
+            existing.beginSheet(for: window)
+            return
+        }
+
+        let descriptors = toolbarCustomizationDescriptors(for: toolbar)
+        let currentIdentifiers = toolbar.items.map(\.itemIdentifier)
+        let defaultIdentifiers = toolbarDefaultItemIdentifiers(toolbar)
+        let customizationController = WorkbenchToolbarCustomizationWindowController(
+            descriptors: descriptors,
+            currentIdentifiers: currentIdentifiers,
+            defaultIdentifiers: defaultIdentifiers,
+            onApply: { [weak self, weak toolbar] identifiers in
+                guard let self, let toolbar else { return }
+                self.applyToolbarCustomization(identifiers, to: toolbar)
+            }
+        )
+        customizationController.onDismiss = { [weak self, weak customizationController] in
+            guard let self,
+                  self.toolbarCustomizationWindowController === customizationController
+            else { return }
+            self.toolbarCustomizationWindowController = nil
+        }
+        toolbarCustomizationWindowController = customizationController
+        customizationController.beginSheet(for: window)
+    }
+
+    private func toolbarCustomizationDescriptors(
+        for toolbar: NSToolbar
+    ) -> [WorkbenchToolbarCustomizationDescriptor] {
+        toolbarAllowedItemIdentifiers(toolbar).compactMap { identifier in
+            if identifier == .flexibleSpace {
+                return WorkbenchToolbarCustomizationDescriptor(
+                    identifier: identifier,
+                    label: L10n.Workbench.toolbarCustomizationFlexibleSpace,
+                    image: NSImage(
+                        systemSymbolName: "arrow.left.and.right",
+                        accessibilityDescription: L10n.Workbench.toolbarCustomizationFlexibleSpace
+                    ) ?? NSImage(),
+                    allowsDuplicates: true
+                )
+            }
+            if identifier == .space {
+                return WorkbenchToolbarCustomizationDescriptor(
+                    identifier: identifier,
+                    label: L10n.Workbench.toolbarCustomizationSpace,
+                    image: NSImage(
+                        systemSymbolName: "rectangle.compress.vertical",
+                        accessibilityDescription: L10n.Workbench.toolbarCustomizationSpace
+                    ) ?? NSImage(),
+                    allowsDuplicates: true
+                )
+            }
+            guard let item = self.toolbar(
+                      toolbar,
+                      itemForItemIdentifier: identifier,
+                      willBeInsertedIntoToolbar: false
+                  )
+            else { return nil }
+            let image = item.image ?? (item.view as? NSButton)?.image ?? NSImage(
+                systemSymbolName: "square.dashed",
+                accessibilityDescription: item.paletteLabel
+            ) ?? NSImage()
+            return WorkbenchToolbarCustomizationDescriptor(
+                identifier: identifier,
+                label: item.paletteLabel.isEmpty ? item.label : item.paletteLabel,
+                image: image,
+                allowsDuplicates: false
+            )
+        }
+    }
+
+    private func applyToolbarCustomization(
+        _ managedIdentifiers: [NSToolbarItem.Identifier],
+        to toolbar: NSToolbar
+    ) {
+        let identifiers = managedIdentifiers.filter {
+            $0.rawValue != Self.legacyUpdatePromptToolbarIdentifier
+        }
+
+        if #available(macOS 15.0, *) {
+            toolbar.itemIdentifiers = identifiers
+        } else {
+            for index in toolbar.items.indices.reversed() {
+                toolbar.removeItem(at: index)
+            }
+            for identifier in identifiers {
+                toolbar.insertItem(withItemIdentifier: identifier, at: toolbar.items.count)
+            }
+        }
+        persistToolbarItemIdentifiers(identifiers)
+        refreshToolbarItemAvailability()
+    }
+
+    private func migrateLegacyToolbarConfigurationIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard var configuration = defaults.dictionary(forKey: Self.toolbarAutosaveDefaultsKey),
+              let identifiers = configuration["TB Item Identifiers"] as? [String]
+        else { return }
+        let migratedIdentifiers = identifiers.filter {
+            $0 != Self.legacyUpdatePromptToolbarIdentifier
+        }
+        guard migratedIdentifiers != identifiers else { return }
+        configuration["TB Item Identifiers"] = migratedIdentifiers
+        defaults.set(configuration, forKey: Self.toolbarAutosaveDefaultsKey)
+    }
+
+    private func persistToolbarItemIdentifiers(_ identifiers: [NSToolbarItem.Identifier]) {
+        let defaults = UserDefaults.standard
+        var configuration = defaults.dictionary(forKey: Self.toolbarAutosaveDefaultsKey) ?? [:]
+        configuration["TB Item Identifiers"] = identifiers.map(\.rawValue)
+        defaults.set(configuration, forKey: Self.toolbarAutosaveDefaultsKey)
     }
 
     private func makeSidebarToolbarToggleButton() -> SidebarToggleTitlebarButton {
@@ -2353,53 +2426,18 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return button
     }
 
-    private func makeUpdatePromptToolbarButton() -> UpdatePromptTitlebarButton {
-        let button = UpdatePromptTitlebarButton(title: "", target: self, action: #selector(updatePromptButtonPressed(_:)))
-        button.setButtonType(.momentaryChange)
-        button.bezelStyle = .regularSquare
-        button.controlSize = .small
-        button.isBordered = false
-        button.imagePosition = .noImage
-        button.setAccessibilityIdentifier("Stacio.Toolbar.updatePrompt")
-        button.translatesAutoresizingMaskIntoConstraints = false
-        let widthConstraint = button.widthAnchor.constraint(equalToConstant: 0)
-        widthConstraint.identifier = "Stacio.Toolbar.updatePromptWidth"
-        updatePromptWidthConstraint = widthConstraint
-        NSLayoutConstraint.activate([
-            widthConstraint,
-            button.heightAnchor.constraint(equalToConstant: 24)
-        ])
-        updatePromptButton = button
-        refreshUpdatePromptButton(sparkleUpdateController?.buttonState ?? .hidden)
-        return button
-    }
-
-    private func bindUpdatePromptControllerIfNeeded() {
+    private func bindUpdateStatusControllerIfNeeded() {
         guard let sparkleUpdateController else {
             return
         }
         sparkleUpdateController.onButtonStateChanged = { [weak self] state in
-            self?.refreshUpdatePromptButton(state)
+            self?.refreshUpdateStatus(state)
         }
-        refreshUpdatePromptButton(sparkleUpdateController.buttonState)
+        refreshUpdateStatus(sparkleUpdateController.buttonState)
     }
 
-    private func refreshUpdatePromptButton(_ state: SparkleUpdateButtonState) {
+    private func refreshUpdateStatus(_ state: SparkleUpdateButtonState) {
         sessionSidebarViewController?.updateUpdateStatus(state)
-        guard let button = updatePromptButton else {
-            return
-        }
-        button.update(state: state)
-        switch state {
-        case .available, .failed:
-            button.isEnabled = true
-        case .hidden, .downloading, .extracting, .installing:
-            button.isEnabled = false
-        }
-        let size = state.isVisible ? button.intrinsicContentSize : .zero
-        updatePromptWidthConstraint?.constant = size.width
-        updatePromptToolbarItem?.view?.frame = NSRect(origin: .zero, size: size)
-        window?.toolbar?.validateVisibleItems()
     }
 
     private func installSystemAppearanceObserverIfNeeded() {
@@ -2436,9 +2474,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         guard let toolbar = window?.toolbar else { return }
         toolbar.validateVisibleItems()
         for item in toolbar.visibleItems ?? toolbar.items {
-            if item.itemIdentifier == ToolbarItem.updatePrompt {
-                continue
-            }
             if let button = item.view as? NSButton {
                 button.contentTintColor = StacioDesignSystem.resolvedColor(.secondaryLabelColor, for: button)
                 button.needsDisplay = true
@@ -2626,10 +2661,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        var identifiers: [NSToolbarItem.Identifier] = [
-            ToolbarItem.sidebar,
-            ToolbarItem.updatePrompt
-        ]
+        var identifiers: [NSToolbarItem.Identifier] = [ToolbarItem.sidebar]
         identifiers.append(contentsOf: [
             .flexibleSpace,
             ToolbarItem.newSession,
@@ -2652,7 +2684,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     public func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var seen = Set<NSToolbarItem.Identifier>()
-        return toolbarDefaultItemIdentifiers(toolbar).filter { seen.insert($0).inserted }
+        return toolbarDefaultItemIdentifiers(toolbar).filter {
+            seen.insert($0).inserted
+        }
     }
 
     public func toolbar(
@@ -2709,12 +2743,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             item.paletteLabel = L10n.Workbench.sidebar
             item.toolTip = L10n.Workbench.toggleSidebar
             item.view = makeSidebarToolbarToggleButton()
-        case ToolbarItem.updatePrompt:
-            item.label = "更新"
-            item.paletteLabel = "更新"
-            item.toolTip = "Stacio 更新"
-            item.view = makeUpdatePromptToolbarButton()
-            updatePromptToolbarItem = item
         case ToolbarItem.quickConnect:
             item.label = L10n.Workbench.quickConnect
             item.paletteLabel = L10n.Workbench.quickConnect
@@ -2851,11 +2879,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     @objc
     public func openLocalShellFromToolbar(_ sender: Any?) throws {
         try workspaceViewController.openLocalShell()
-    }
-
-    @objc
-    public func updatePromptButtonPressed(_ sender: Any?) {
-        sparkleUpdateController?.installAvailableUpdateFromPrompt()
     }
 
     @objc

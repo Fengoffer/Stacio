@@ -576,6 +576,16 @@ enum L10n {
     }
 
     enum Workbench {
+        static let toolbarCustomizationTitle = "自定义工具栏"
+        static let toolbarCustomizationSubtitle = "拖动单个工具来添加、排序或移出工具栏。更改将在点击“完成”后生效。"
+        static let toolbarCustomizationAvailable = "可用工具"
+        static let toolbarCustomizationCurrent = "当前工具栏"
+        static let toolbarCustomizationRemoveHint = "拖回上方或拖出窗口即可移除"
+        static let toolbarCustomizationRestoreDefault = "恢复默认"
+        static let toolbarCustomizationDone = "完成"
+        static let toolbarCustomizationFlexibleSpace = "可调间距"
+        static let toolbarCustomizationSpace = "间距"
+
         static let quickConnect = "快速连接"
         static let newSession = "新建会话"
         static let split = "分屏"

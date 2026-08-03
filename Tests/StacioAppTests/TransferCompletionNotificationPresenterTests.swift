@@ -68,6 +68,19 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
         XCTAssertLessThanOrEqual(panel.frame.width, 440)
         XCTAssertEqual(bubble.material, .popover)
         XCTAssertEqual(bubble.layer?.cornerRadius, 18)
+        let materialMask = try XCTUnwrap(bubble.maskImage)
+        XCTAssertEqual(materialMask.resizingMode, .stretch)
+        XCTAssertEqual(materialMask.capInsets.top, 18)
+        XCTAssertEqual(materialMask.capInsets.left, 18)
+        XCTAssertEqual(materialMask.capInsets.bottom, 18)
+        XCTAssertEqual(materialMask.capInsets.right, 18)
+        let bitmap = try XCTUnwrap(materialMask.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+        XCTAssertEqual(bitmap.colorAt(x: 0, y: 0)?.alphaComponent ?? 1, 0, accuracy: 0.01)
+        XCTAssertEqual(
+            bitmap.colorAt(x: bitmap.pixelsWide / 2, y: bitmap.pixelsHigh / 2)?.alphaComponent ?? 0,
+            1,
+            accuracy: 0.01
+        )
         XCTAssertNotNil(bubble.firstSubview(withIdentifier: "Stacio.Transfers.notificationClose"))
     }
 

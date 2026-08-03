@@ -1043,6 +1043,43 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertTrue(legacyDeletedSelections.isEmpty)
     }
 
+    func testDeleteKeyRequestsDeletionForAllSelectedRemoteEntries() {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setRemoteEntries([
+            RemoteFileEntry(kind: .directory, path: "/srv/app/logs", size: 0, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil),
+            RemoteFileEntry(kind: .file, path: "/srv/app/readme.md", size: 256, linkTarget: nil)
+        ])
+        var deletedSelections: [[RemoteFileSelection]] = []
+        controller.onDeleteSelections = { deletedSelections.append($0) }
+        controller.tableView.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+
+        controller.tableView.keyDown(with: makeFilesDeleteKeyEvent(keyCode: 51))
+
+        XCTAssertEqual(deletedSelections, [[
+            RemoteFileSelection(path: "/srv/app/logs", size: 0, kind: .directory),
+            RemoteFileSelection(path: "/srv/app/readme.md", size: 256, kind: .file)
+        ]])
+    }
+
+    func testForwardDeleteKeyRequestsDeletionForSelectedRemoteEntry() {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil)
+        ])
+        var deletedSelections: [[RemoteFileSelection]] = []
+        controller.onDeleteSelections = { deletedSelections.append($0) }
+        controller.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+
+        controller.tableView.keyDown(with: makeFilesDeleteKeyEvent(keyCode: 117))
+
+        XCTAssertEqual(deletedSelections, [[
+            RemoteFileSelection(path: "/srv/app/config.json", size: 128, kind: .file)
+        ]])
+    }
+
     func testFolderContextMenuCopiesFullPathAndSendsPathToTerminal() {
         let controller = FilesViewController()
         controller.loadView()
@@ -2900,6 +2937,22 @@ private func performEscapeShortcut(on view: NSView) -> Bool {
         return false
     }
     return view.performKeyEquivalent(with: event)
+}
+
+private func makeFilesDeleteKeyEvent(keyCode: UInt16) -> NSEvent {
+    let characters = keyCode == 117 ? "\u{f728}" : "\u{7f}"
+    return NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: [],
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: characters,
+        isARepeat: false,
+        keyCode: keyCode
+    )!
 }
 
 @MainActor

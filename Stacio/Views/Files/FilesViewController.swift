@@ -519,6 +519,17 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         tableView.rowContextMenuProvider = { [weak self] row in
             self?.contextMenu(forRow: row)
         }
+        tableView.deleteSelectionHandler = { [weak self] in
+            guard let self else {
+                return false
+            }
+            let selections = selectedFileSelections()
+            guard selections.isEmpty == false else {
+                return false
+            }
+            delete(selections: selections)
+            return true
+        }
         tableView.middleClickRowHandler = { [weak self] row in
             self?.sendPathToTerminal(row: row)
         }
@@ -3007,6 +3018,7 @@ private struct FilesTransferMetric {
 public final class RemoteFilesTableView: NSTableView {
     public var rowContextMenuProvider: ((Int) -> NSMenu?)?
     public var middleClickRowHandler: ((Int) -> Void)?
+    var deleteSelectionHandler: (() -> Bool)?
     var localFileDropTargetHandler: (([String], Int) -> Void)? {
         didSet {
             LocalFileDropHandler.register(self)
@@ -3017,6 +3029,14 @@ public final class RemoteFilesTableView: NSTableView {
         didSet {
             LocalFileDropHandler.register(self)
         }
+    }
+
+    public override func keyDown(with event: NSEvent) {
+        if (event.keyCode == 51 || event.keyCode == 117),
+           deleteSelectionHandler?() == true {
+            return
+        }
+        super.keyDown(with: event)
     }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
