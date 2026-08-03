@@ -704,8 +704,8 @@ private enum FileWorkspaceAtomicTransferError: Error {
 }
 
 /// The file-transfer workspace is intentionally separate from the Inspector
-/// Files panel.  It owns both sides of the WinSCP/Xftp-style browser and only
-/// shares the transport bridge and transfer queue with the rest of the app.
+/// Files panel. It owns both sides of the WinSCP/Xftp-style browser and shares
+/// its transport queue only with other standalone SCP/SFTP workspaces.
 @MainActor
 public final class IndependentFileTransferBrowserViewController: NSViewController, NSSplitViewDelegate {
     private enum Layout {

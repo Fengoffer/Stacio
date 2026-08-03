@@ -1476,6 +1476,40 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
     }
 
+    func testDockedEditorAskAIKeepsAssistantFillingInspectorHeight() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+
+        try harness.openLocalDocument(
+            name: "ask-ai-layout.md",
+            contents: "# Inspect this file\n"
+        )
+        harness.layout()
+
+        let contentView = try XCTUnwrap(harness.window.contentView)
+        let inspector = try XCTUnwrap(harness.controller.inspectorViewControllerForTesting)
+        let askAIButton = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Inspector.editorAskAI") as? NSButton
+        )
+
+        askAIButton.performClick(nil as Any?)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        harness.window.layoutIfNeeded()
+
+        let inspectorContent = try XCTUnwrap(
+            inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.content")
+        )
+        let aiView = try XCTUnwrap(inspector.aiAssistantViewController?.view)
+
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertEqual(aiView.frame.minY, inspectorContent.bounds.minY, accuracy: 1)
+        XCTAssertEqual(aiView.frame.height, inspectorContent.bounds.height, accuracy: 1)
+        XCTAssertGreaterThan(aiView.frame.height, inspector.view.bounds.height * 0.75)
+    }
+
     func testEditorOpenCollapseExpandAndCloseNeverChangeInspectorOrFilesWidth() throws {
         let harness = try makeWorkbenchEditorHarness(
             windowWidth: 2_100,
@@ -2416,6 +2450,17 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertTrue(allowed.contains("Stacio.Toolbar.aiAssistant"))
         XCTAssertFalse(allowed.contains("Stacio.Toolbar.quickConnect"))
         XCTAssertTrue(allowed.contains(NSToolbarItem.Identifier.space.rawValue))
+    }
+
+    func testToolbarCustomizationPaletteReceivesUniqueAllowedItemIdentifiers() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar.Customization.Test"))
+
+        let allowed = controller.toolbarAllowedItemIdentifiers(toolbar).map(\.rawValue)
+
+        XCTAssertEqual(allowed.count, Set(allowed).count)
+        XCTAssertEqual(allowed.filter { $0 == "Stacio.Toolbar.importSessions" }.count, 1)
+        XCTAssertEqual(allowed.filter { $0 == NSToolbarItem.Identifier.space.rawValue }.count, 1)
     }
 
     func testDeviceDashboardToolbarTogglesCurrentWorkspaceDashboardWithoutOpeningInspector() throws {
@@ -3705,6 +3750,68 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(row.sourcePath, localFile.path)
         XCTAssertEqual(row.destinationPath, "/srv/releases/release.tar.gz")
         XCTAssertTrue(["queued", "running", "failed"].contains(row.rawStatus))
+    }
+
+    func testWorkbenchKeepsSSHFilesTransferQueueSeparateAndShowsDirectUploads() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioWorkbenchInspectorUploadTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let localFile = temporaryDirectory.appendingPathComponent("inspector-upload.bin")
+        try Data(repeating: 7, count: 64).write(to: localFile)
+
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let context = workbenchLiveContext(host: "files.example.com")
+        let transferBridge = WorkbenchImmediateSCPTransferBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+            transferQueueCoordinatorFactory: { queueView in
+                TransferQueueCoordinator(
+                    bridge: transferBridge,
+                    historyStore: NoOpSCPTransferHistoryStore(),
+                    queueViewController: queueView
+                )
+            }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_files", status: "running", diagnostic: "running"),
+            title: "files.example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let inspectorQueue = try XCTUnwrap(inspector.transferQueueCoordinator)
+        let fileWorkspaceQueue = try XCTUnwrap(controller.fileTransferQueueCoordinatorForTesting)
+        XCTAssertFalse(inspectorQueue === fileWorkspaceQueue)
+
+        fileWorkspaceQueue.enqueueTransfer(
+            runtimeID: "scp_workspace",
+            job: ScpTransferJob(
+                id: "scp_workspace_only",
+                direction: .download,
+                sourcePath: "/srv/workspace-only.bin",
+                destinationPath: "/tmp/workspace-only.bin",
+                bytesTotal: 128
+            )
+        )
+        XCTAssertFalse(inspector.filesViewController?.visibleTextSnapshot.contains("workspace-only.bin") == true)
+
+        inspector.filesViewController?.performDropLocalFilesForTesting([localFile.path])
+
+        XCTAssertTrue(waitUntil {
+            inspector.filesViewController?.visibleTextSnapshot.contains("inspector-upload.bin") == true
+                && inspector.filesViewController?.visibleTextSnapshot.contains("100%") == true
+        })
+        XCTAssertFalse(fileWorkspaceQueue === inspector.transferQueueCoordinator)
     }
 
     func testClosingBoundRemoteTerminalDisconnectsInspectorFilesConnection() throws {

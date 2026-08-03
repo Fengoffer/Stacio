@@ -2020,6 +2020,38 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertTrue(runningJobCompleted)
     }
 
+    func testCoordinatorKeepsNewestCompletedTransferVisibleBesideOlderFailedTransfer() {
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(queueViewController: queue)
+        var latestSnapshot = TransferQueueSnapshot(rows: [])
+        coordinator.onSnapshotChanged = { latestSnapshot = $0 }
+        let failedJob = ScpTransferJob(
+            id: "job_failed_before_new_upload",
+            direction: .upload,
+            sourcePath: "/local/failed.tar",
+            destinationPath: "/srv/failed.tar",
+            bytesTotal: 100
+        )
+        let completedJob = ScpTransferJob(
+            id: "job_new_upload_completed",
+            direction: .upload,
+            sourcePath: "/local/new.tar",
+            destinationPath: "/srv/new.tar",
+            bytesTotal: 200
+        )
+
+        coordinator.enqueueTransfer(job: failedJob)
+        coordinator.replaceProgressForTesting(jobID: failedJob.id, status: "failed", bytesDone: 40)
+        coordinator.enqueueTransfer(job: completedJob)
+        coordinator.replaceProgressForTesting(jobID: completedJob.id, status: "completed", bytesDone: 200)
+
+        XCTAssertEqual(latestSnapshot.rows.map(\.jobID), [failedJob.id, completedJob.id])
+        XCTAssertEqual(latestSnapshot.rows.map(\.rawStatus), ["failed", "completed"])
+        XCTAssertEqual(latestSnapshot.rows.last?.bytesDone, completedJob.bytesTotal)
+        XCTAssertEqual(latestSnapshot.rows.last?.bytesTotal, completedJob.bytesTotal)
+    }
+
     func testCoordinatorPollsLiveTransferProgressWhileBackgroundTransferRuns() async {
         let job = ScpTransferJob(
             id: "job_progress_stream",

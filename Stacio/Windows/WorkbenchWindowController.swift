@@ -305,6 +305,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let databasePathProvider: () throws -> String
     private let transferHistoryStore: SCPTransferHistoryStoring?
     private let transferQueueCoordinatorFactory: ((TransferQueueViewController) -> TransferQueueCoordinator)?
+    private var fileTransferQueueViewController: TransferQueueViewController?
+    private var fileTransferQueueCoordinator: TransferQueueCoordinator?
     private let settingsStore: AppSettingsStore
     private let agentActionConfirmer: AgentActionConfirming
     private let graphicsAdapterPathProvider: (String) -> String?
@@ -1916,7 +1918,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         workspaceViewController.terminalMacroRecorder = terminalMacroRecorder
 
         let inspectorController = InspectorViewController(
-            transferHistoryStore: transferHistoryStore,
+            transferHistoryStore: NoOpSCPTransferHistoryStore(),
             aiAssistantViewController: makeAIAssistantPanelViewController(),
             workspaceSessionProtocolProvider: { [weak workspaceViewController] in
                 workspaceViewController?.currentSessionProtocol ?? .noSession
@@ -2649,9 +2651,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     }
 
     public func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarDefaultItemIdentifiers(toolbar) + [
-            ToolbarItem.importSessions
-        ]
+        var seen = Set<NSToolbarItem.Identifier>()
+        return toolbarDefaultItemIdentifiers(toolbar).filter { seen.insert($0).inserted }
     }
 
     public func toolbar(
@@ -3707,10 +3708,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let paneScheduler: SCPTransferScheduling?
         if normalizedProtocol == "sftp" {
             paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
-            paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
+            paneScheduler = SFTPTransferSchedulerAdapter(
+                scheduler: currentFileTransferSFTPScheduler()
+            )
         } else {
             paneBridge = remoteFilesBridge
-            paneScheduler = currentTransferScheduler()
+            paneScheduler = currentFileTransferScheduler()
         }
         return FileTransferRemotePaneConfiguration(
             sourceRuntimeID: "saved:\(session.id)",
@@ -3768,10 +3771,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let paneScheduler: SCPTransferScheduling?
         if normalizedProtocol == "sftp" {
             paneBridge = SFTPRemoteFilesBridgeAdapter(base: remoteFilesBridge)
-            paneScheduler = currentSFTPTransferScheduler().map(SFTPTransferSchedulerAdapter.init)
+            paneScheduler = SFTPTransferSchedulerAdapter(
+                scheduler: currentFileTransferSFTPScheduler()
+            )
         } else {
             paneBridge = remoteFilesBridge
-            paneScheduler = currentTransferScheduler()
+            paneScheduler = currentFileTransferScheduler()
         }
         return FileTransferRemotePaneConfiguration(
             sourceRuntimeID: "transient:\(normalizedProtocol)_\(UUID().uuidString.lowercased())",
@@ -3857,7 +3862,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 context: primaryContext,
                 title: session.name.isEmpty ? primaryTitle : session.name,
                 bridge: remoteFilesBridge,
-                sftpTransferScheduler: currentSFTPTransferScheduler(),
+                sftpTransferScheduler: currentFileTransferSFTPScheduler(),
                 initialRemotePath: primaryDefinition.path ?? "~",
                 initialLocalDirectory: primaryLocalPath
             )
@@ -3866,7 +3871,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 context: primaryContext,
                 title: session.name.isEmpty ? primaryTitle : session.name,
                 bridge: remoteFilesBridge,
-                transferScheduler: currentTransferScheduler(),
+                transferScheduler: currentFileTransferScheduler(),
                 initialRemotePath: primaryDefinition.path ?? "~",
                 initialLocalDirectory: primaryLocalPath
             )
@@ -4044,7 +4049,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 context: context,
                 title: title,
                 bridge: remoteFilesBridge,
-                transferScheduler: currentTransferScheduler()
+                transferScheduler: currentFileTransferScheduler()
             )
             (workspaceViewController.currentTerminalPane as? RemoteFilesPaneViewController)?
                 .markPrimaryFileTransferRemoteDevice(sessionID: session.id)
@@ -4063,7 +4068,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 context: context,
                 title: title,
                 bridge: remoteFilesBridge,
-                sftpTransferScheduler: currentSFTPTransferScheduler()
+                sftpTransferScheduler: currentFileTransferSFTPScheduler()
             )
             (workspaceViewController.currentTerminalPane as? RemoteFilesPaneViewController)?
                 .markPrimaryFileTransferRemoteDevice(sessionID: session.id)
@@ -4917,7 +4922,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
     }
 
-    private func currentTransferScheduler() -> SCPTransferScheduling? {
+    private func currentInspectorTransferScheduler() -> SCPTransferScheduling? {
         guard let inspectorViewController else {
             return nil
         }
@@ -4925,12 +4930,51 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         return inspectorViewController.transferQueueCoordinator
     }
 
-    private func currentSFTPTransferScheduler() -> SFTPTransferScheduling? {
-        guard let inspectorViewController else {
-            return nil
+    private func currentFileTransferQueueCoordinator() -> TransferQueueCoordinator {
+        if let fileTransferQueueCoordinator {
+            return fileTransferQueueCoordinator
         }
-        _ = inspectorViewController.view
-        return inspectorViewController.transferQueueCoordinator
+
+        let queueViewController = TransferQueueViewController()
+        _ = queueViewController.view
+        let coordinator: TransferQueueCoordinator
+        if let transferQueueCoordinatorFactory {
+            coordinator = transferQueueCoordinatorFactory(queueViewController)
+        } else if let transferHistoryStore {
+            coordinator = TransferQueueCoordinator(
+                historyStore: transferHistoryStore,
+                completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
+                queueViewController: queueViewController
+            )
+            try? coordinator.restoreHistory()
+        } else if let paths = try? StacioPaths() {
+            coordinator = TransferQueueCoordinator(
+                historyStore: CoreBridgeSCPTransferHistoryStore(databasePath: paths.databaseURL.path),
+                completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
+                queueViewController: queueViewController
+            )
+            try? coordinator.restoreHistory()
+        } else {
+            coordinator = TransferQueueCoordinator(
+                completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
+                queueViewController: queueViewController
+            )
+        }
+        fileTransferQueueViewController = queueViewController
+        fileTransferQueueCoordinator = coordinator
+        return coordinator
+    }
+
+    private func currentFileTransferScheduler() -> SCPTransferScheduling {
+        currentFileTransferQueueCoordinator()
+    }
+
+    private func currentFileTransferSFTPScheduler() -> SFTPTransferScheduling {
+        currentFileTransferQueueCoordinator()
+    }
+
+    var fileTransferQueueCoordinatorForTesting: TransferQueueCoordinator {
+        currentFileTransferQueueCoordinator()
     }
 
     private func scheduleTerminalDroppedUploads(
@@ -4947,7 +4991,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
 
         guard let context = pane.liveSessionContext,
-              let transferScheduler = currentTransferScheduler()
+              let transferScheduler = currentInspectorTransferScheduler()
         else {
             return
         }

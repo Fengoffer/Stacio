@@ -499,6 +499,7 @@ public final class InspectorViewController: NSViewController {
         NSLayoutConstraint.activate([
             topBar.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.headerHorizontalMargin),
             topBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.headerHorizontalMargin),
+            topBar.heightAnchor.constraint(equalToConstant: 26),
             headerTopConstraint,
 
             editorActionLeadingConstraint,
@@ -1435,22 +1436,10 @@ public final class InspectorViewController: NSViewController {
             try? coordinator.restoreHistory()
             return coordinator
         }
-
-        do {
-            let paths = try StacioPaths()
-            let coordinator = TransferQueueCoordinator(
-                historyStore: CoreBridgeSCPTransferHistoryStore(databasePath: paths.databaseURL.path),
-                completionNotificationPresenter: transferCompletionNotificationPresenter,
-                queueViewController: transferQueue
-            )
-            try? coordinator.restoreHistory()
-            return coordinator
-        } catch {
-            return TransferQueueCoordinator(
-                completionNotificationPresenter: transferCompletionNotificationPresenter,
-                queueViewController: transferQueue
-            )
-        }
+        return TransferQueueCoordinator(
+            completionNotificationPresenter: transferCompletionNotificationPresenter,
+            queueViewController: transferQueue
+        )
     }
 
     private func makeDefaultAIAssistantViewController() -> AIAssistantPanelViewController {

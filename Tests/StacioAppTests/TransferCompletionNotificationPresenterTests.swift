@@ -43,6 +43,57 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
         XCTAssertTrue(presenter.visibleListRowsForTesting[1].detailText.contains("平均速率 1 KB/s"))
     }
 
+    func testPresenterUsesCompactLiquidGlassBubbleInsteadOfTitledUtilityWindow() throws {
+        let presenter = TransferCompletionNotificationPresenter(
+            notificationDelivery: RecordingStacioUserNotificationDelivery()
+        )
+        defer { presenter.dismissAll() }
+        presenter.present(TransferCompletionNotificationPayload(
+            jobID: "job_bubble",
+            runtimeID: "runtime_one",
+            status: .completed,
+            title: "文件传输完成",
+            body: "上传完成。",
+            itemName: "release.tar"
+        ))
+
+        let panel = try XCTUnwrap(presenter.bubblePanelForTesting)
+        let bubble = try XCTUnwrap(panel.contentView as? NSVisualEffectView)
+
+        XCTAssertFalse(panel.styleMask.contains(.titled))
+        XCTAssertFalse(panel.styleMask.contains(.closable))
+        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertFalse(panel.isOpaque)
+        XCTAssertTrue(panel.hasShadow)
+        XCTAssertLessThanOrEqual(panel.frame.width, 440)
+        XCTAssertEqual(bubble.material, .popover)
+        XCTAssertEqual(bubble.layer?.cornerRadius, 18)
+        XCTAssertNotNil(bubble.firstSubview(withIdentifier: "Stacio.Transfers.notificationClose"))
+    }
+
+    func testBubbleCloseButtonDismissesPanelAndItsDeliveredNotification() throws {
+        let delivery = RecordingStacioUserNotificationDelivery()
+        let presenter = TransferCompletionNotificationPresenter(notificationDelivery: delivery)
+        presenter.present(TransferCompletionNotificationPayload(
+            jobID: "job_close_button",
+            runtimeID: "runtime_one",
+            status: .completed,
+            title: "文件传输完成",
+            body: "上传完成。",
+            itemName: "release.tar"
+        ))
+
+        let panel = try XCTUnwrap(presenter.bubblePanelForTesting)
+        let closeButton = try XCTUnwrap(
+            panel.contentView?.firstSubview(withIdentifier: "Stacio.Transfers.notificationClose") as? NSButton
+        )
+        closeButton.performClick(nil)
+
+        XCTAssertEqual(presenter.visibleNotificationCountForTesting, 0)
+        XCTAssertEqual(presenter.visiblePanelCountForTesting, 0)
+        XCTAssertEqual(delivery.removedIdentifierBatches, [["Stacio.transfer.job_close_button"]])
+    }
+
     func testPresenterRemovesOnlyNotificationsForClosedRuntime() {
         let delivery = RecordingStacioUserNotificationDelivery()
         let presenter = TransferCompletionNotificationPresenter(notificationDelivery: delivery)
@@ -190,7 +241,7 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
         ))
 
         let geometry = try XCTUnwrap(presenter.listGeometryForTesting)
-        XCTAssertGreaterThan(geometry.viewportWidth, 400)
+        XCTAssertGreaterThanOrEqual(geometry.viewportWidth, 380)
         XCTAssertGreaterThanOrEqual(geometry.columnWidth, geometry.viewportWidth * 0.9)
     }
 
@@ -219,6 +270,20 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
             "Stacio.transfer.job_one",
             "Stacio.transfer.job_two"
         ]))
+    }
+}
+
+private extension NSView {
+    func firstSubview(withIdentifier identifier: String) -> NSView? {
+        if self.identifier?.rawValue == identifier {
+            return self
+        }
+        for subview in subviews {
+            if let match = subview.firstSubview(withIdentifier: identifier) {
+                return match
+            }
+        }
+        return nil
     }
 }
 

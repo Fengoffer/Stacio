@@ -2131,7 +2131,17 @@ public final class TransferQueueCoordinator {
                 || Self.retryableStatuses.contains(status)
         }
         if actionableOrActiveJobIDs.isEmpty == false {
-            return makeSnapshot(jobIDs: actionableOrActiveJobIDs)
+            let retryableJobIDs = actionableOrActiveJobIDs.filter { jobID in
+                progressByJobID[jobID]?.last.map { Self.retryableStatuses.contains($0.status) } == true
+            }
+            guard retryableJobIDs.isEmpty == false else {
+                return makeSnapshot(jobIDs: actionableOrActiveJobIDs)
+            }
+            let actionableOrActiveJobIDSet = Set(actionableOrActiveJobIDs)
+            let newestCompletedJobIDs = completedHistoryJobIDs()
+                .suffix(1)
+                .filter { actionableOrActiveJobIDSet.contains($0) == false }
+            return makeSnapshot(jobIDs: actionableOrActiveJobIDs + newestCompletedJobIDs)
         }
         return makeSnapshot(jobIDs: Array(finishedHistoryJobIDs().suffix(1)))
     }

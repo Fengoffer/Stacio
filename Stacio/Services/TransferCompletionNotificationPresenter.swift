@@ -169,6 +169,10 @@ public final class TransferCompletionNotificationPresenter: TransferCompletionNo
         panelController == nil ? 0 : 1
     }
 
+    var bubblePanelForTesting: NSPanel? {
+        panelController?.window as? NSPanel
+    }
+
     public var visibleListRowsForTesting: [TransferCompletionNotificationListRow] {
         orderedPayloads.map(\.listRow)
     }
@@ -206,8 +210,8 @@ public final class TransferCompletionNotificationPresenter: TransferCompletionNo
         )
         let panelController = ensurePanelController()
         panelController.setPayloads(orderedPayloads)
-        panelController.show()
         positionPanel()
+        panelController.show()
     }
 
     public func dismiss(jobID: String) {
@@ -287,6 +291,7 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
     private var isClosingProgrammatically = false
     private var payloads: [TransferCompletionNotificationPayload] = []
     private let countLabel = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
 
@@ -308,24 +313,35 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
                 origin: .zero,
                 size: NSSize(width: Self.panelWidth, height: Self.minimumHeight)
             ),
-            styleMask: [.titled, .closable, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.title = L10n.Transfers.notificationListTitle
-        panel.titleVisibility = .hidden
-        panel.titlebarAppearsTransparent = true
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
         panel.level = .floating
         panel.hidesOnDeactivate = false
         panel.isMovable = false
+        panel.isMovableByWindowBackground = false
         panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.animationBehavior = .utilityWindow
-        panel.backgroundColor = StacioDesignSystem.theme.panelBackgroundColor
+        panel.backgroundColor = .clear
 
-        let content = NSView()
+        let content = NSVisualEffectView()
+        content.material = .popover
+        content.blendingMode = .behindWindow
+        content.state = .active
+        content.wantsLayer = true
+        content.layer?.cornerRadius = Self.cornerRadius
+        content.layer?.cornerCurve = .continuous
+        content.layer?.masksToBounds = true
+        content.layer?.borderWidth = 0.5
+        content.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        content.setAccessibilityIdentifier("Stacio.Transfers.notificationBubble")
 
         let icon = NSImageView(image: NSImage(
             systemSymbolName: "arrow.up.arrow.down.circle.fill",
@@ -345,6 +361,20 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
         countLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         countLabel.alignment = .right
         countLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        closeButton.image = NSImage(
+            systemSymbolName: "xmark",
+            accessibilityDescription: L10n.Common.close
+        )
+        closeButton.imagePosition = .imageOnly
+        closeButton.isBordered = false
+        closeButton.bezelStyle = .accessoryBarAction
+        closeButton.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
+        closeButton.toolTip = L10n.Common.close
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.identifier = NSUserInterfaceItemIdentifier("Stacio.Transfers.notificationClose")
+        closeButton.setAccessibilityIdentifier("Stacio.Transfers.notificationClose")
+        closeButton.setAccessibilityLabel(L10n.Common.close)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("transfer"))
         column.title = L10n.Transfers.notificationListTitle
@@ -373,28 +403,36 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
         content.addSubview(icon)
         content.addSubview(titleLabel)
         content.addSubview(countLabel)
+        content.addSubview(closeButton)
         content.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
-            icon.widthAnchor.constraint(equalToConstant: 24),
-            icon.heightAnchor.constraint(equalToConstant: 24),
+            icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            icon.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
 
-            titleLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
-            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            titleLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
+            titleLabel.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
 
             countLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
-            countLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            countLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
             countLabel.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
 
-            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            scrollView.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 10),
-            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            closeButton.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 24),
+            closeButton.heightAnchor.constraint(equalToConstant: 24),
+
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            scrollView.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 8),
+            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
         ])
 
         panel.contentView = content
         super.init(window: panel)
+        closeButton.target = self
+        closeButton.action = #selector(closeButtonPressed(_:))
         tableView.dataSource = self
         tableView.delegate = self
         panel.delegate = self
@@ -406,7 +444,18 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
     }
 
     func show() {
-        window?.orderFrontRegardless()
+        guard let window else { return }
+        if window.isVisible {
+            window.orderFrontRegardless()
+            return
+        }
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = StacioDesignSystem.theme.fastAnimationDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+        }
     }
 
     func setPayloads(_ payloads: [TransferCompletionNotificationPayload]) {
@@ -458,6 +507,10 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
         window?.close()
     }
 
+    @objc private func closeButtonPressed(_ sender: Any?) {
+        window?.close()
+    }
+
     func windowWillClose(_ notification: Notification) {
         if isClosingProgrammatically {
             isClosingProgrammatically = false
@@ -466,11 +519,12 @@ private final class TransferNotificationPanelController: NSWindowController, NSW
         onManualClose?()
     }
 
-    private static let panelWidth: CGFloat = 520
-    private static let rowHeight: CGFloat = 68
-    private static let headerHeight: CGFloat = 56
-    private static let minimumHeight: CGFloat = 124
-    private static let maximumVisibleRows = 6
+    private static let panelWidth: CGFloat = 420
+    private static let rowHeight: CGFloat = 64
+    private static let headerHeight: CGFloat = 48
+    private static let minimumHeight: CGFloat = 112
+    private static let maximumVisibleRows = 4
+    private static let cornerRadius: CGFloat = 18
 }
 
 @MainActor
