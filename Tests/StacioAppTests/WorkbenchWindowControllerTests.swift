@@ -5404,12 +5404,11 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             pane.runtimeID == "graphics_vnc_password" && graphicsRuntime.requests.count == 1
         })
         XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [[
+            "--password",
+            "vnc-secret",
             "desktop.example.com:5900"
         ]])
-        XCTAssertEqual(
-            graphicsRuntime.requests.map(\.environment),
-            [["STACIO_VNC_PASSWORD": "vnc-secret"]]
-        )
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("<redacted>"))
         XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("vnc-secret"))
         XCTAssertTrue(starter.startedConfigs.isEmpty)
     }
@@ -5483,9 +5482,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
             "prompted-vnc-secret"
         )
         XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
-        let request = try XCTUnwrap(graphicsRuntime.requests.first)
-        XCTAssertEqual(request.arguments, ["desktop.example.com:5900"])
-        XCTAssertEqual(request.environment, ["STACIO_VNC_PASSWORD": "prompted-vnc-secret"])
+        let arguments = try XCTUnwrap(graphicsRuntime.requests.first?.arguments)
+        XCTAssertEqual(Array(arguments.suffix(3)), ["--password", "prompted-vnc-secret", "desktop.example.com:5900"])
     }
 
     func testWorkbenchOpenSavedVNCSessionWithInvalidEndpointShowsEndpointDiagnostic() throws {
