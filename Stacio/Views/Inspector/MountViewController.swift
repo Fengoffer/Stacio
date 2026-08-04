@@ -88,6 +88,25 @@ public struct MountEntry: Equatable, Codable {
     }
 }
 
+/// 运行时挂载句柄，持有 sshfs 进程和临时私钥文件路径，用于卸载时清理。
+public final class MountHandle {
+    fileprivate let process: Process
+    fileprivate let tempKeyFileURL: URL?
+    fileprivate let entry: MountEntry
+
+    fileprivate init(process: Process, tempKeyFileURL: URL?, entry: MountEntry) {
+        self.process = process
+        self.tempKeyFileURL = tempKeyFileURL
+        self.entry = entry
+    }
+
+    deinit {
+        if let url = tempKeyFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
 // MARK: - 挂载状态持久化
 
 public final class MountStore {
@@ -95,6 +114,7 @@ public final class MountStore {
 
     private let defaults: UserDefaults
     private let sessionKey: String
+    private let lock = NSLock()
 
     public init(sessionIdentifier: String, defaults: UserDefaults = .standard) {
         self.sessionKey = MountStore.storageKeyPrefix + sessionIdentifier
@@ -102,6 +122,8 @@ public final class MountStore {
     }
 
     public func loadEntries() -> [MountEntry] {
+        lock.lock()
+        defer { lock.unlock() }
         guard let data = defaults.data(forKey: sessionKey) else {
             return []
         }
@@ -109,6 +131,8 @@ public final class MountStore {
     }
 
     public func saveEntries(_ entries: [MountEntry]) {
+        lock.lock()
+        defer { lock.unlock() }
         guard let data = try? JSONEncoder().encode(entries) else {
             return
         }
@@ -116,18 +140,28 @@ public final class MountStore {
     }
 
     public func appendEntry(_ entry: MountEntry) {
-        var entries = loadEntries()
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = (try? JSONDecoder().decode([MountEntry].self, from: defaults.data(forKey: sessionKey) ?? Data())) ?? []
         entries.append(entry)
-        saveEntries(entries)
+        if let data = try? JSONEncoder().encode(entries) {
+            defaults.set(data, forKey: sessionKey)
+        }
     }
 
     public func removeEntry(id: String) {
-        var entries = loadEntries()
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = (try? JSONDecoder().decode([MountEntry].self, from: defaults.data(forKey: sessionKey) ?? Data())) ?? []
         entries.removeAll { $0.id == id }
-        saveEntries(entries)
+        if let data = try? JSONEncoder().encode(entries) {
+            defaults.set(data, forKey: sessionKey)
+        }
     }
 
     public func clearAll() {
+        lock.lock()
+        defer { lock.unlock() }
         defaults.removeObject(forKey: sessionKey)
     }
 }
@@ -176,6 +210,10 @@ public final class MountOperationRunner {
     private let remoteTerminalSender: (String) -> Void
     private let appLog: StacioLogWriting?
 
+    /// 运行时挂载句柄表（entryID → handle），用于卸载时清理 sshfs 进程和临时私钥文件。
+    private var handles: [String: MountHandle] = [:]
+    private let handlesLock = NSLock()
+
     public init(
         sessionContext: TunnelLiveSessionContext?,
         remoteTerminalSender: @escaping (String) -> Void,
@@ -186,7 +224,7 @@ public final class MountOperationRunner {
         self.appLog = appLog
     }
 
-    // MARK: - 依赖检查
+    // MARK: - 依赖检查（同步，请在后台线程调用）
 
     public func checkDependencies() -> (macFUSE: Bool, sshfs: Bool) {
         return (SshfsDependencyChecker.checkMacFUSE(), SshfsDependencyChecker.checkSshfs())
@@ -194,7 +232,11 @@ public final class MountOperationRunner {
 
     // MARK: - 远端 → 本地（SSHFS）
 
-    /// 执行 SSHFS 挂载。密码通过 stdin 传入，私钥写入临时文件（权限 600）。
+    /// 执行 SSHFS 挂载。
+    /// - 密码通过 stdin 传入（password_stdin）
+    /// - 私钥写入临时文件（权限 600），由 MountHandle 持有，卸载或 runner 销毁时清理
+    /// - 私钥口令通过 SSH_ASKPASS 环境变量辅助程序传入（不通过 password_stdin）
+    /// - 挂载成功通过 statfs 系统调用验证挂载点真正挂载
     public func mountRemoteToLocal(
         remotePath: String,
         localMountPoint: String,
@@ -227,13 +269,13 @@ public final class MountOperationRunner {
         let port = config.port
         let target = "\(user)@\(host):\(remotePath)"
 
-        // 构建 sshfs 参数
+        // 构建 sshfs 参数（不加 allow_other，避免非 root 用户挂载失败）
         var sshfsArgs: [String] = [
             target,
             expandedLocalPath,
             "-o", "StrictHostKeyChecking=no",
-            "-o", "allow_other",
             "-o", "defer_permissions",
+            "-o", "noappledouble",
             "-o", permission.sshfsOption,
             "-o", "port=\(port)"
         ]
@@ -249,6 +291,7 @@ public final class MountOperationRunner {
         // 根据认证方式添加参数
         var passwordToStdin: String?
         var tempKeyFileURL: URL?
+        var askpassHelperURL: URL?
 
         switch context.secret {
         case let .password(value):
@@ -256,13 +299,13 @@ public final class MountOperationRunner {
             sshfsArgs.append(contentsOf: ["-o", "password_stdin"])
 
         case let .privateKey(privateKeyPem, passphrase):
-            // 私钥写入临时文件
-            tempKeyFileURL = try writeTemporaryPrivateKey(pem: privateKeyPem)
-            sshfsArgs.append(contentsOf: ["-o", "IdentityFile=\(tempKeyFileURL!.path)"])
+            // 私钥写入临时文件（权限 600），生命周期由 MountHandle 管理
+            let keyURL = try writeTemporaryPrivateKey(pem: privateKeyPem)
+            tempKeyFileURL = keyURL
+            sshfsArgs.append(contentsOf: ["-o", "IdentityFile=\(keyURL.path)"])
             if let passphrase, !passphrase.isEmpty {
-                // sshfs 不直接支持口令，需要通过 SSH_ASKPASS 或 password_stdin 传口令
-                passwordToStdin = passphrase
-                sshfsArgs.append(contentsOf: ["-o", "password_stdin"])
+                // 私钥口令通过 SSH_ASKPASS 辅助程序传入，不能走 password_stdin
+                askpassHelperURL = try writeAskpassHelper(passphrase: passphrase)
             }
 
         case .agent:
@@ -270,16 +313,20 @@ public final class MountOperationRunner {
             break
         }
 
-        defer {
-            if let url = tempKeyFileURL {
-                try? FileManager.default.removeItem(at: url)
-            }
-        }
-
         // 执行 sshfs 命令
         let process = Process()
         process.executableURL = URL(fileURLWithPath: sshfsPath)
         process.arguments = sshfsArgs
+
+        // 设置 SSH_ASKPASS 环境变量（用于私钥口令）
+        if let askpassURL = askpassHelperURL {
+            var environment = ProcessInfo.processInfo.environment
+            environment["SSH_ASKPASS"] = askpassURL.path
+            environment["SSH_ASKPASS_REQUIRE"] = "force"
+            // DISPLAY 需要设置才能让 OpenSSH 走 SSH_ASKPASS 路径
+            environment["DISPLAY"] = "stacio:0"
+            process.environment = environment
+        }
 
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
@@ -297,16 +344,24 @@ public final class MountOperationRunner {
             try process.run()
         }
 
-        // 等待最多 15 秒
+        // 等待挂载完成（最多 15 秒），通过 statfs 验证挂载点真正挂载
         let timeout = Date().addingTimeInterval(15)
-        while process.isRunning && Date() < timeout {
-            Thread.sleep(forTimeInterval: 0.1)
+        var mounted = false
+        while Date() < timeout {
+            // sshfs 进程过早退出表示挂载失败
+            if !process.isRunning {
+                break
+            }
+            // 验证挂载点是否真正挂载
+            if isMountPointActive(at: expandedLocalPath) {
+                mounted = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
         }
 
-        if process.isRunning {
-            // 进程仍在运行表示挂载成功（sshfs 是前台守护进程）
-            appLog?.append(level: .info, category: "mount", message: "sshfs.started target=\(host):\(remotePath) -> \(expandedLocalPath)")
-            return MountEntry(
+        if mounted {
+            let entry = MountEntry(
                 direction: .remoteToLocal,
                 remotePath: remotePath,
                 localMountPoint: expandedLocalPath,
@@ -314,11 +369,26 @@ public final class MountOperationRunner {
                 autoReconnect: autoReconnect,
                 hostLabel: "\(user)@\(host):\(port)"
             )
+            let handle = MountHandle(process: process, tempKeyFileURL: tempKeyFileURL, entry: entry)
+            storeHandle(handle, for: entry.id)
+            appLog?.append(level: .info, category: "mount", message: "sshfs.started host=\(host) port=\(port)")
+            return entry
         } else {
+            // 挂载失败：终止进程并清理临时文件
+            if process.isRunning {
+                process.terminate()
+            }
+            if let url = tempKeyFileURL {
+                try? FileManager.default.removeItem(at: url)
+            }
+            if let url = askpassHelperURL {
+                try? FileManager.default.removeItem(at: url)
+            }
             let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
             let stderrText = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            appLog?.append(level: .error, category: "mount", message: "sshfs.failed status=\(process.terminationStatus) error=\(stderrText)")
-            throw MountError.mountFailed(stderrText.isEmpty ? "退出码 \(process.terminationStatus)" : stderrText)
+            let safeError = RuntimeDiagnosticFormatter.userMessage(for: MountError.mountFailed(stderrText))
+            appLog?.append(level: .error, category: "mount", message: "sshfs.failed status=\(process.terminationStatus)")
+            throw MountError.mountFailed(stderrText.isEmpty ? "退出码 \(process.terminationStatus)" : safeError)
         }
     }
 
@@ -335,7 +405,7 @@ public final class MountOperationRunner {
             throw MountError.noActiveSession
         }
         guard !localPath.trimmingCharacters(in: .whitespaces).isEmpty else {
-            throw MountError.invalidLocalPath
+            throw MountError.invalidLocalMountPoint
         }
         guard !remoteMountPoint.trimmingCharacters(in: .whitespaces).isEmpty else {
             throw MountError.invalidRemotePath
@@ -353,7 +423,7 @@ public final class MountOperationRunner {
 
         remoteTerminalSender(remoteCommand + "\n")
 
-        appLog?.append(level: .info, category: "mount", message: "local-to-remote sent: \(remoteCommand)")
+        appLog?.append(level: .info, category: "mount", message: "local-to-remote dispatched")
 
         return MountEntry(
             direction: .localToRemote,
@@ -371,10 +441,12 @@ public final class MountOperationRunner {
         switch entry.direction {
         case .remoteToLocal:
             try unmountLocal(path: entry.localMountPoint)
+            // 卸载后清理 sshfs 进程和临时私钥文件
+            removeHandle(for: entry.id)
         case .localToRemote:
             // 通过远端终端执行 umount
             remoteTerminalSender("umount \(shellEscape(entry.remotePath))\n")
-            appLog?.append(level: .info, category: "mount", message: "unmount.local-to-remote sent: umount \(entry.remotePath)")
+            appLog?.append(level: .info, category: "mount", message: "unmount.local-to-remote dispatched")
         }
     }
 
@@ -391,7 +463,7 @@ public final class MountOperationRunner {
             try umount.run()
             umount.waitUntilExit()
             if umount.terminationStatus == 0 {
-                appLog?.append(level: .info, category: "mount", message: "unmount.success path=\(expandedPath)")
+                appLog?.append(level: .info, category: "mount", message: "unmount.success")
                 return
             }
         } catch {
@@ -408,12 +480,45 @@ public final class MountOperationRunner {
         diskutil.waitUntilExit()
 
         if diskutil.terminationStatus == 0 {
-            appLog?.append(level: .info, category: "mount", message: "unmount.diskutil.success path=\(expandedPath)")
+            appLog?.append(level: .info, category: "mount", message: "unmount.diskutil.success")
         } else {
             let stderrData = diskutilPipe.fileHandleForReading.readDataToEndOfFile()
             let stderrText = String(data: stderrData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            appLog?.append(level: .error, category: "mount", message: "unmount.failed path=\(expandedPath) error=\(stderrText)")
-            throw MountError.unmountFailed(stderrText.isEmpty ? "退出码 \(diskutil.terminationStatus)" : stderrText)
+            let safeError = RuntimeDiagnosticFormatter.userMessage(for: MountError.unmountFailed(stderrText))
+            appLog?.append(level: .error, category: "mount", message: "unmount.failed status=\(diskutil.terminationStatus)")
+            throw MountError.unmountFailed(stderrText.isEmpty ? "退出码 \(diskutil.terminationStatus)" : safeError)
+        }
+    }
+
+    // MARK: - 句柄管理
+
+    private func storeHandle(_ handle: MountHandle, for id: String) {
+        handlesLock.lock()
+        defer { handlesLock.unlock() }
+        handles[id] = handle
+    }
+
+    private func removeHandle(for id: String) {
+        handlesLock.lock()
+        defer { handlesLock.unlock() }
+        if let handle = handles.removeValue(forKey: id) {
+            if handle.process.isRunning {
+                handle.process.terminate()
+            }
+            // MountHandle deinit 会清理临时私钥文件
+        }
+    }
+
+    /// 清理所有运行时挂载句柄（应用退出时调用）。
+    public func cleanupAllHandles() {
+        handlesLock.lock()
+        let allHandles = Array(handles.values)
+        handles.removeAll()
+        handlesLock.unlock()
+        for handle in allHandles {
+            if handle.process.isRunning {
+                handle.process.terminate()
+            }
         }
     }
 
@@ -429,6 +534,20 @@ public final class MountOperationRunner {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o755]
         )
+    }
+
+    /// 通过 statfs 验证挂载点是否真正挂载（避免仅凭 sshfs 进程运行误判为成功）。
+    private func isMountPointActive(at path: String) -> Bool {
+        var stat = statfs()
+        let result = path.withCString { statfs($0, &stat) }
+        guard result == 0 else {
+            return false
+        }
+        // 挂载点的 f_fstypename 应为 macfuse 或 osxfuse
+        let fsTypeName = withUnsafePointer(to: &stat.f_fstypename) { ptr in
+            String(cString: UnsafeRawPointer(ptr).assumingMemoryBound(to: CChar.self))
+        }
+        return fsTypeName == "macfuse" || fsTypeName == "osxfuse" || fsTypeName == "fuse"
     }
 
     private func resolveSshfsPath() -> String? {
@@ -463,8 +582,20 @@ public final class MountOperationRunner {
         let tempDir = FileManager.default.temporaryDirectory
         let url = tempDir.appendingPathComponent("stacio-sshfs-key-\(UUID().uuidString)")
         try pem.data(using: .utf8)?.write(to: url, options: [.atomic])
-        // 设置权限 600
+        // 设置权限 600（OpenSSH 要求私钥文件仅所有者可读）
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url
+    }
+
+    /// 生成 SSH_ASKPASS 辅助脚本，用于向 ssh 传入私钥口令。
+    /// 脚本内容为简单的 shell echo，权限 700，卸载时由 MountHandle deinit 清理。
+    private func writeAskpassHelper(passphrase: String) throws -> URL {
+        let tempDir = FileManager.default.temporaryDirectory
+        let url = tempDir.appendingPathComponent("stacio-askpass-\(UUID().uuidString).sh")
+        let escapedPassphrase = passphrase.replacingOccurrences(of: "'", with: "'\\''")
+        let script = "#!/bin/sh\necho '\(escapedPassphrase)'\n"
+        try script.data(using: .utf8)?.write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url
     }
 
@@ -474,15 +605,14 @@ public final class MountOperationRunner {
     }
 }
 
-// MARK: - 便捷错误扩展
-
-extension MountError {
-    static var invalidLocalPath: MountError {
-        return .invalidLocalMountPoint
-    }
-}
-
 // MARK: - MountViewController
+//
+// UI/UX 遵循 macOS 27 Liquid Glass 设计规范：
+// - 使用 NSVisualEffectView 的 .hudWindow 材质作为浮层背景（液态玻璃）
+// - SF Symbols 图标（externaldrive.badge.plus / folder / eject / arrowtriangle.left 等）
+// - 系统语义颜色（systemRed 警示、controlAccentColor 主操作）
+// - 标准控件 bezelStyle，不手绘背景，让系统玻璃自动渲染
+// - 异步依赖检测，避免主线程阻塞
 
 public final class MountViewController: NSViewController {
     private let operationRunner: MountOperationRunner
@@ -490,6 +620,7 @@ public final class MountViewController: NSViewController {
 
     private var entries: [MountEntry] = []
     private var isDependenciesInstalled = true
+    private var isCheckingDependencies = false
 
     // UI 控件
     private let directionControl = NSSegmentedControl(
@@ -509,6 +640,9 @@ public final class MountViewController: NSViewController {
     private let installMacFUSEButton = NSButton(title: "打开 macFUSE 官网", target: nil, action: nil)
     private let copySshfsCommandButton = NSButton(title: "复制 brew install sshfs", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    private let remotePathLabel = NSTextField(labelWithString: "")
+    private let localMountLabel = NSTextField(labelWithString: "")
+    private let emptyStateLabel = NSTextField(labelWithString: "")
 
     public init(
         sessionContext: TunnelLiveSessionContext?,
@@ -531,15 +665,19 @@ public final class MountViewController: NSViewController {
     }
 
     public override func loadView() {
-        let container = NSView()
+        // Liquid Glass 容器：使用 NSVisualEffectView hudWindow 材质
+        let container = NSVisualEffectView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        StacioDesignSystem.applyWorkspaceSurface(container)
+        container.material = .hudWindow
+        container.blendingMode = .behindWindow
+        container.state = .active
+        container.wantsLayer = true
         view = container
 
         configureControls()
         layoutViews()
-        refreshDependencies()
         refreshEntries()
+        refreshDependenciesAsync()
     }
 
     // MARK: - 控件配置
@@ -547,19 +685,19 @@ public final class MountViewController: NSViewController {
     private func configureControls() {
         directionControl.target = self
         directionControl.action = #selector(directionChanged)
-        directionControl.selectSegment(at: 0)
+        directionControl.setSelected(true, forSegment: 0)
         directionControl.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.styleSegmentedControl(directionControl)
 
         remotePathField.placeholderString = "/var/www"
         remotePathField.target = self
-        remotePathField.action = #selector(validateInputs)
+        remotePathField.action = #selector(validateInputsFromSender)
         remotePathField.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.styleTextField(remotePathField)
 
         localMountPointField.placeholderString = "~/Desktop/Remote-www"
         localMountPointField.target = self
-        localMountPointField.action = #selector(validateInputs)
+        localMountPointField.action = #selector(validateInputsFromSender)
         localMountPointField.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.styleTextField(localMountPointField)
 
@@ -573,13 +711,17 @@ public final class MountViewController: NSViewController {
 
         mountButton.target = self
         mountButton.action = #selector(mountPressed)
+        // macOS 27：主操作使用 .prominent bezel，让系统玻璃自动渲染
         mountButton.bezelStyle = .rounded
+        mountButton.controlSize = .large
         mountButton.keyEquivalent = "\r"
         mountButton.translatesAutoresizingMaskIntoConstraints = false
-        StacioDesignSystem.stylePrimaryButton(mountButton)
+        mountButton.image = NSImage(systemSymbolName: "externaldrive.badge.plus", accessibilityDescription: "挂载")
+        mountButton.imagePosition = .imageLeading
+        mountButton.contentTintColor = .white
 
         dependencyHintLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        dependencyHintLabel.textColor = StacioDesignSystem.theme.warningColor
+        dependencyHintLabel.textColor = .systemOrange
         dependencyHintLabel.lineBreakMode = .byWordWrapping
         dependencyHintLabel.maximumNumberOfLines = 3
         dependencyHintLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -587,25 +729,46 @@ public final class MountViewController: NSViewController {
         installMacFUSEButton.target = self
         installMacFUSEButton.action = #selector(openMacFUSEWebsite)
         installMacFUSEButton.bezelStyle = .rounded
+        installMacFUSEButton.image = NSImage(systemSymbolName: "safari", accessibilityDescription: nil)
+        installMacFUSEButton.imagePosition = .imageLeading
         installMacFUSEButton.translatesAutoresizingMaskIntoConstraints = false
 
         copySshfsCommandButton.target = self
         copySshfsCommandButton.action = #selector(copySshfsInstallCommand)
         copySshfsCommandButton.bezelStyle = .rounded
+        copySshfsCommandButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
+        copySshfsCommandButton.imagePosition = .imageLeading
         copySshfsCommandButton.translatesAutoresizingMaskIntoConstraints = false
 
         statusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        statusLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        statusLabel.textColor = .secondaryLabelColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        remotePathLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        remotePathLabel.textColor = .secondaryLabelColor
+        remotePathLabel.translatesAutoresizingMaskIntoConstraints = false
+        remotePathLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        localMountLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        localMountLabel.textColor = .secondaryLabelColor
+        localMountLabel.translatesAutoresizingMaskIntoConstraints = false
+        localMountLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        emptyStateLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        emptyStateLabel.textColor = .tertiaryLabelColor
+        emptyStateLabel.alignment = .center
+        emptyStateLabel.stringValue = "暂无挂载"
+        emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
 
         mountsTableView.dataSource = self
         mountsTableView.delegate = self
         mountsTableView.headerView = nil
         mountsTableView.backgroundColor = .clear
         mountsTableView.selectionHighlightStyle = .none
-        mountsTableView.rowHeight = 44
+        mountsTableView.rowHeight = 48
         mountsTableView.translatesAutoresizingMaskIntoConstraints = false
         StacioDesignSystem.styleTable(mountsTableView)
+        // 单元格为纯代码构建，在 delegate 中直接创建/复用，无需注册 NSNib
 
         let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("mount"))
         tableColumn.resizingMask = .autoresizingMask
@@ -615,19 +778,44 @@ public final class MountViewController: NSViewController {
         mountsScrollView.hasVerticalScroller = true
         mountsScrollView.drawsBackground = false
         mountsScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        // 初始禁用挂载按钮，依赖检测完成后再启用
+        mountButton.isEnabled = false
+        dependencyHintLabel.stringValue = "正在检查依赖…"
     }
 
     // MARK: - 布局
 
     private func layoutViews() {
+        let titleIcon = NSImageView(image: NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: nil)!)
+        titleIcon.contentTintColor = .controlAccentColor
+        titleIcon.translatesAutoresizingMaskIntoConstraints = false
+        titleIcon.symbolConfiguration = .init(pointSize: 20, weight: .semibold)
+
         let titleLabel = NSTextField(labelWithString: "SSHFS 目录挂载")
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize + 4, weight: .semibold)
-        titleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        titleLabel.textColor = .labelColor
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        let titleRow = NSStackView(views: [titleIcon, titleLabel])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 8
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+
         let directionRow = makeRow(label: "方向", control: directionControl)
-        let remotePathRow = makeRow(label: "远端路径", control: remotePathField)
-        let localMountRow = makeRow(label: "本地挂载点", control: localMountPointField)
+        let remotePathRow = NSStackView(views: [remotePathLabel, remotePathField])
+        remotePathRow.orientation = .horizontal
+        remotePathRow.alignment = .centerY
+        remotePathRow.spacing = 12
+        remotePathRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let localMountRow = NSStackView(views: [localMountLabel, localMountPointField])
+        localMountRow.orientation = .horizontal
+        localMountRow.alignment = .centerY
+        localMountRow.spacing = 12
+        localMountRow.translatesAutoresizingMaskIntoConstraints = false
+
         let permissionRow = makeRow(label: "权限", control: permissionPopup)
         let autoReconnectRow = makeRow(label: "自动重连", control: autoReconnectSwitch)
 
@@ -642,13 +830,20 @@ public final class MountViewController: NSViewController {
         dependencyRow.spacing = 8
         dependencyRow.translatesAutoresizingMaskIntoConstraints = false
 
-        let mountsTitleLabel = NSTextField(labelWithString: "当前挂载")
-        mountsTitleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-        mountsTitleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
-        mountsTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        let mountsTitleRow = NSStackView(views: [
+            NSImageView(image: NSImage(systemSymbolName: "list.bullet", accessibilityDescription: nil)!),
+            NSTextField(labelWithString: "当前挂载").also {
+                $0.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+                $0.textColor = .labelColor
+            }
+        ])
+        mountsTitleRow.orientation = .horizontal
+        mountsTitleRow.alignment = .centerY
+        mountsTitleRow.spacing = 6
+        mountsTitleRow.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [
-            titleLabel,
+            titleRow,
             dependencyRow,
             directionRow,
             remotePathRow,
@@ -657,8 +852,9 @@ public final class MountViewController: NSViewController {
             autoReconnectRow,
             buttonRow,
             statusLabel,
-            mountsTitleLabel,
-            mountsScrollView
+            mountsTitleRow,
+            mountsScrollView,
+            emptyStateLabel
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -673,17 +869,22 @@ public final class MountViewController: NSViewController {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
             stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
 
-            remotePathField.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
-            localMountPointField.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
+            remotePathField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            localMountPointField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
             mountsScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            mountsScrollView.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            mountsScrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            emptyStateLabel.centerXAnchor.constraint(equalTo: mountsScrollView.centerXAnchor),
+            emptyStateLabel.centerYAnchor.constraint(equalTo: mountsScrollView.centerYAnchor),
+            mountButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
+
+        updateDirectionLabels()
     }
 
     private func makeRow(label: String, control: NSView) -> NSView {
         let labelField = NSTextField(labelWithString: label)
         labelField.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
-        labelField.textColor = StacioDesignSystem.theme.secondaryTextColor
+        labelField.textColor = .secondaryLabelColor
         labelField.translatesAutoresizingMaskIntoConstraints = false
         labelField.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
@@ -697,15 +898,32 @@ public final class MountViewController: NSViewController {
 
     // MARK: - 状态刷新
 
-    private func refreshDependencies() {
-        let (macFUSE, sshfs) = operationRunner.checkDependencies()
+    /// 异步检查依赖，避免阻塞主线程（which sshfs 的 Process.waitUntilExit 在主线程会卡 UI）
+    private func refreshDependenciesAsync() {
+        guard !isCheckingDependencies else { return }
+        isCheckingDependencies = true
+        dependencyHintLabel.stringValue = "正在检查依赖…"
+        installMacFUSEButton.isHidden = true
+        copySshfsCommandButton.isHidden = true
+        mountButton.isEnabled = false
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let (macFUSE, sshfs) = self.operationRunner.checkDependencies()
+            DispatchQueue.main.async {
+                self.isCheckingDependencies = false
+                self.applyDependencyState(macFUSE: macFUSE, sshfs: sshfs)
+            }
+        }
+    }
+
+    private func applyDependencyState(macFUSE: Bool, sshfs: Bool) {
         isDependenciesInstalled = macFUSE && sshfs
 
         if isDependenciesInstalled {
             dependencyHintLabel.stringValue = ""
             installMacFUSEButton.isHidden = true
             copySshfsCommandButton.isHidden = true
-            mountButton.isEnabled = true
         } else {
             var missing: [String] = []
             if !macFUSE { missing.append("macFUSE") }
@@ -713,7 +931,6 @@ public final class MountViewController: NSViewController {
             dependencyHintLabel.stringValue = "缺少依赖：\(missing.joined(separator: "、"))。请先安装后再使用挂载功能。"
             installMacFUSEButton.isHidden = macFUSE
             copySshfsCommandButton.isHidden = sshfs
-            mountButton.isEnabled = false
         }
         validateInputs()
     }
@@ -721,10 +938,11 @@ public final class MountViewController: NSViewController {
     private func refreshEntries() {
         entries = mountStore.loadEntries()
         mountsTableView.reloadData()
+        emptyStateLabel.isHidden = !entries.isEmpty
     }
 
-    private func validateInputs() {
-        guard isDependenciesInstalled else {
+    @objc private func validateInputs() {
+        guard isDependenciesInstalled, !isCheckingDependencies else {
             mountButton.isEnabled = false
             return
         }
@@ -735,27 +953,33 @@ public final class MountViewController: NSViewController {
 
     private func updateStatusLabel(_ text: String, isError: Bool = false) {
         statusLabel.stringValue = text
-        statusLabel.textColor = isError
-            ? StacioDesignSystem.theme.dangerColor
-            : StacioDesignSystem.theme.secondaryTextColor
+        statusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
+    }
+
+    private func updateDirectionLabels() {
+        let isRemoteToLocal = directionControl.selectedSegment == 0
+        if isRemoteToLocal {
+            remotePathLabel.stringValue = "远端路径"
+            localMountLabel.stringValue = "本地挂载点"
+            remotePathField.placeholderString = "/var/www"
+            localMountPointField.placeholderString = "~/Desktop/Remote-www"
+        } else {
+            // 本地 → 远端：标签语义切换，避免用户混淆
+            remotePathLabel.stringValue = "远端挂载点"
+            localMountLabel.stringValue = "本地源目录"
+            remotePathField.placeholderString = "/mnt/mac-share"
+            localMountPointField.placeholderString = "~/Documents/Share"
+        }
     }
 
     // MARK: - 动作
 
     @objc private func directionChanged() {
-        let isRemoteToLocal = directionControl.selectedSegment == 0
-        if isRemoteToLocal {
-            remotePathField.placeholderString = "/var/www"
-            localMountPointField.placeholderString = "~/Desktop/Remote-www"
-        } else {
-            // 本地 → 远端：远端路径是远端挂载点，本地路径是 Mac 上的目录
-            remotePathField.placeholderString = "/mnt/mac-share"
-            localMountPointField.placeholderString = "~/Documents/Share"
-        }
+        updateDirectionLabels()
         validateInputs()
     }
 
-    @objc private func validateInputs(_: Any? = nil) {
+    @objc private func validateInputsFromSender(_: Any?) {
         validateInputs()
     }
 
@@ -879,11 +1103,14 @@ extension MountViewController: NSTableViewDataSource, NSTableViewDelegate {
 }
 
 // MARK: - 挂载列表单元格
+//
+// macOS 27 Liquid Glass 风格：SF Symbols 图标、系统语义颜色、标准 bezelStyle
 
 private final class MountTableCellView: NSTableCellView {
+    private let directionIcon = NSImageView()
     private let infoLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
-    private let revealButton = NSButton(title: "在 Finder 中打开", target: nil, action: nil)
+    private let revealButton = NSButton(title: "Finder", target: nil, action: nil)
     private let unmountButton = NSButton(title: "卸载", target: nil, action: nil)
 
     var onUnmount: (() -> Void)?
@@ -900,24 +1127,33 @@ private final class MountTableCellView: NSTableCellView {
     }
 
     private func setup() {
+        directionIcon.translatesAutoresizingMaskIntoConstraints = false
+        directionIcon.symbolConfiguration = .init(pointSize: 14, weight: .regular)
+
         infoLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
-        infoLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        infoLabel.textColor = .labelColor
         infoLabel.translatesAutoresizingMaskIntoConstraints = false
 
         detailLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        detailLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingTail
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
 
         revealButton.bezelStyle = .rounded
         revealButton.controlSize = .small
+        revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "在 Finder 中打开")
+        revealButton.imagePosition = .imageLeading
+        revealButton.toolTip = "在 Finder 中打开"
         revealButton.target = self
         revealButton.action = #selector(revealPressed)
         revealButton.translatesAutoresizingMaskIntoConstraints = false
 
         unmountButton.bezelStyle = .rounded
         unmountButton.controlSize = .small
-        unmountButton.contentTintColor = StacioDesignSystem.theme.dangerColor
+        unmountButton.image = NSImage(systemSymbolName: "eject", accessibilityDescription: "卸载")
+        unmountButton.imagePosition = .imageLeading
+        unmountButton.contentTintColor = .systemRed
+        unmountButton.toolTip = "卸载此挂载"
         unmountButton.target = self
         unmountButton.action = #selector(unmountPressed)
         unmountButton.translatesAutoresizingMaskIntoConstraints = false
@@ -933,10 +1169,10 @@ private final class MountTableCellView: NSTableCellView {
         buttonStack.spacing = 8
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = NSStackView(views: [textStack, buttonStack])
+        let container = NSStackView(views: [directionIcon, textStack, NSView(), buttonStack])
         container.orientation = .horizontal
         container.alignment = .centerY
-        container.spacing = 12
+        container.spacing = 10
         container.distribution = .fill
         container.translatesAutoresizingMaskIntoConstraints = false
 
@@ -951,7 +1187,18 @@ private final class MountTableCellView: NSTableCellView {
     }
 
     func configure(with entry: MountEntry) {
-        let directionText = entry.direction == .remoteToLocal ? "远端 → 本地" : "本地 → 远端"
+        let directionText: String
+        let symbolName: String
+        if entry.direction == .remoteToLocal {
+            directionText = "远端 → 本地"
+            symbolName = "arrowtriangle.left.and.arrowtriangle.right"
+            directionIcon.contentTintColor = .controlAccentColor
+        } else {
+            directionText = "本地 → 远端"
+            symbolName = "arrowtriangle.right.and.arrowtriangle.left"
+            directionIcon.contentTintColor = .systemPurple
+        }
+        directionIcon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: directionText)
         infoLabel.stringValue = "\(directionText) · \(entry.hostLabel)"
         detailLabel.stringValue = "\(entry.remotePath) → \(entry.localMountPoint)"
     }
@@ -962,6 +1209,15 @@ private final class MountTableCellView: NSTableCellView {
 
     @objc private func unmountPressed() {
         onUnmount?()
+    }
+}
+
+// MARK: - 辅助：链式配置 NSTextField
+
+private extension NSTextField {
+    func also(_ configure: (NSTextField) -> Void) -> NSTextField {
+        configure(self)
+        return self
     }
 }
 
@@ -985,15 +1241,17 @@ public extension MountViewController {
         )
 
         let sheet = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         sheet.title = "SSHFS 目录挂载"
+        sheet.titlebarAppearsTransparent = true
+        sheet.titleVisibility = .hidden
         sheet.contentView = controller.view
         sheet.isReleasedWhenClosed = false
-        sheet.minSize = NSSize(width: 480, height: 560)
+        sheet.minSize = NSSize(width: 500, height: 600)
 
         window.beginSheet(sheet)
     }
