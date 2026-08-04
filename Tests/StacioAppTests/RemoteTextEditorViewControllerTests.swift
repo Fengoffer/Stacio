@@ -811,7 +811,12 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
             "The native mouseUp must reach WKWebView before stale-state recovery is evaluated"
         )
 
-        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        XCTAssertTrue(
+            waitUntil {
+                editor.editorFunctionCallsForTesting.contains("releaseStalePointerInteraction")
+            },
+            "Timed out waiting for the deferred stale-pointer recovery"
+        )
 
         XCTAssertEqual(
             editor.editorFunctionCallsForTesting.filter { $0 == "releaseStalePointerInteraction" }.count,
