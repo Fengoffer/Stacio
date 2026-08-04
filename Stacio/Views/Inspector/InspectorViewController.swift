@@ -246,6 +246,15 @@ public final class InspectorViewController: NSViewController {
         files.onSendPathToTerminal = { [remoteFilePathTerminalSender] path in
             remoteFilePathTerminalSender(path)
         }
+        files.onExpandEditorRequested = { [weak remoteEditorPresentation] in
+            remoteEditorPresentation?.expandDockedEditor()
+        }
+        if let remoteEditorPresentation {
+            files.setEditorPresentationSnapshot(remoteEditorPresentation.snapshot)
+            remoteEditorPresentation.onSnapshotChanged = { [weak files] snapshot in
+                files?.setEditorPresentationSnapshot(snapshot)
+            }
+        }
         transferQueueViewController = transferQueue
         diagnosticsViewController = diagnostics
         deviceMetricsViewController = nil

@@ -3436,6 +3436,20 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       }
     }
 
+    function pointerCaptureTarget(pointerID, fallbackTarget) {
+      const editorElement = window.document.getElementById('editor');
+      const viewLines = editorElement && editorElement.querySelector('.view-lines');
+      const candidates = [viewLines, fallbackTarget, editorElement].filter(Boolean);
+      return candidates.find(candidate => {
+        try {
+          return typeof candidate.hasPointerCapture === 'function'
+            && candidate.hasPointerCapture(pointerID);
+        } catch (_) {
+          return false;
+        }
+      }) || viewLines || fallbackTarget || editorElement;
+    }
+
     function releaseStalePointerInteraction(payload) {
       const activePointer = activeEditorPrimaryPointer.value;
       if (!activePointer) { return false; }
@@ -3455,11 +3469,14 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         ? activePointer.target
         : fallbackTarget;
       if (!target) { return false; }
+      const releaseTarget = pointerCaptureTarget(activePointer.pointerID, target);
+      if (!releaseTarget) { return false; }
 
       const pointerOptions = {
         bubbles: true,
         cancelable: true,
         composed: true,
+        view: window,
         pointerId: activePointer.pointerID,
         pointerType: activePointer.pointerType,
         isPrimary: true,
@@ -3471,18 +3488,35 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         screenY: activePointer.screenY + (clientY - activePointer.clientY)
       };
       if (window.PointerEvent) {
-        target.dispatchEvent(new PointerEvent('pointerup', pointerOptions));
+        releaseTarget.dispatchEvent(new PointerEvent('pointerup', pointerOptions));
       }
-      target.dispatchEvent(new MouseEvent('mouseup', pointerOptions));
+      releaseTarget.dispatchEvent(new MouseEvent('mouseup', pointerOptions));
       try {
-        if (typeof target.hasPointerCapture === 'function'
-          && target.hasPointerCapture(activePointer.pointerID)) {
-          target.releasePointerCapture(activePointer.pointerID);
+        if (typeof releaseTarget.hasPointerCapture === 'function'
+          && releaseTarget.hasPointerCapture(activePointer.pointerID)) {
+          releaseTarget.releasePointerCapture(activePointer.pointerID);
         }
       } catch (_) {
         // WebKit can discard native capture before the JavaScript bridge runs.
       }
       return true;
+    }
+
+    function stopReleasedEditorPointerBeforeMonaco(event) {
+      const activePointer = activeEditorPrimaryPointer.value;
+      if (!activePointer
+        || event.pointerId !== activePointer.pointerID
+        || (event.buttons & 1) !== 0) {
+        return;
+      }
+      const released = releaseStalePointerInteraction({
+        notAfterEpochMilliseconds: Date.now(),
+        clientX: event.clientX,
+        clientY: event.clientY
+      });
+      if (!released) { return; }
+      event.preventDefault();
+      event.stopImmediatePropagation();
     }
 
     function handleTabsMouseDown(event) {
@@ -3736,6 +3770,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     window.addEventListener('pointerdown', rememberEditorPrimaryPointer, { capture: true });
     window.addEventListener('pointerup', forgetEditorPrimaryPointer, { capture: true });
     window.addEventListener('pointercancel', forgetEditorPrimaryPointer, { capture: true });
+    window.addEventListener('pointermove', stopReleasedEditorPointerBeforeMonaco, { capture: true });
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabDragCandidate, { capture: true });
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabsPointerDown, { capture: true });
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);

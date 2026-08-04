@@ -2100,6 +2100,96 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertNotNil(harness.presentation.onRestoreRequested)
     }
 
+    func testFilesToolbarShowsEditorRestoreFirstOnlyWhileEditorIsCollapsed() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        let toolbar = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.toolbar") as? NSStackView
+        )
+        let restoreButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.expandEditor") as? NSButton
+        )
+        var expansionRequests = 0
+        controller.onExpandEditorRequested = { expansionRequests += 1 }
+
+        XCTAssertTrue(toolbar.arrangedSubviews.first === restoreButton)
+        XCTAssertTrue(restoreButton.isHidden)
+
+        controller.setEditorPresentationSnapshot(.init(
+            mode: .dockedHidden,
+            hasEditor: true,
+            isTransitioning: false,
+            detachedFeatureEnabled: true
+        ))
+
+        XCTAssertFalse(restoreButton.isHidden)
+        XCTAssertTrue(restoreButton.isEnabled)
+        XCTAssertEqual(restoreButton.toolTip, "展开编辑器")
+        restoreButton.performClick(nil as Any?)
+        XCTAssertEqual(expansionRequests, 1)
+
+        controller.setEditorPresentationSnapshot(.init(
+            mode: .dockedHidden,
+            hasEditor: true,
+            isTransitioning: true,
+            detachedFeatureEnabled: true
+        ))
+        XCTAssertFalse(restoreButton.isHidden)
+        XCTAssertFalse(restoreButton.isEnabled)
+
+        controller.setEditorPresentationSnapshot(.init(
+            mode: .docked,
+            hasEditor: true,
+            isTransitioning: false,
+            detachedFeatureEnabled: true
+        ))
+        XCTAssertTrue(restoreButton.isHidden)
+
+        for mode in [
+            RemoteEditorPresentationMode.closed,
+            .opening,
+            .recovery,
+            .floating,
+            .displayMaximized
+        ] {
+            controller.setEditorPresentationSnapshot(.init(
+                mode: mode,
+                hasEditor: mode != .closed,
+                isTransitioning: false,
+                detachedFeatureEnabled: true
+            ))
+            XCTAssertTrue(restoreButton.isHidden, "\(mode) 不应显示编辑器恢复按钮")
+        }
+    }
+
+    func testInspectorCollapsedEditorRestoresSameInstanceFromFilesToolbar() throws {
+        let harness = makeInspectorEditorHarness(testName: #function)
+        openInspectorEditor(
+            presentation: harness.presentation,
+            RemoteTextEditorDocumentDescriptor(
+                remotePath: "/etc/nginx/nginx.conf",
+                fileName: "nginx.conf",
+                content: "server { listen 80; }\n",
+                byteCount: 24
+            )
+        )
+        let originalEditor = try XCTUnwrap(harness.presentation.currentEditor)
+        let restoreButton = try XCTUnwrap(
+            harness.files.view.firstSubview(withIdentifier: "Stacio.Files.expandEditor") as? NSButton
+        )
+        XCTAssertTrue(restoreButton.isHidden)
+
+        harness.presentation.collapseDockedEditor()
+
+        XCTAssertEqual(harness.presentation.snapshot.mode, .dockedHidden)
+        XCTAssertFalse(restoreButton.isHidden)
+        restoreButton.performClick(nil as Any?)
+
+        XCTAssertEqual(harness.presentation.snapshot.mode, .docked)
+        XCTAssertTrue(restoreButton.isHidden)
+        XCTAssertTrue(harness.presentation.currentEditor === originalEditor)
+    }
+
     func testInspectorDoesNotDuplicateEditorToolbarActionsInFilesPanel() throws {
         let harness = makeInspectorEditorHarness(testName: #function)
         openInspectorEditor(

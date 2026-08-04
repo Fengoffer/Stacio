@@ -917,6 +917,35 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertFalse(html.contains("editor.setSelection"))
     }
 
+    func testEditorStalePointerRecoveryTargetsMonacoCaptureContainerBeforeTheClickedTextNode() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        let html = editor.editorHTMLForTesting
+
+        XCTAssertTrue(html.contains("function pointerCaptureTarget(pointerID, fallbackTarget)"))
+        XCTAssertTrue(html.contains("querySelector('.view-lines')"))
+        XCTAssertTrue(html.contains("const releaseTarget = pointerCaptureTarget(activePointer.pointerID, target);"))
+        XCTAssertTrue(html.contains("releaseTarget.dispatchEvent(new PointerEvent('pointerup'"))
+        XCTAssertTrue(html.contains("releaseTarget.releasePointerCapture(activePointer.pointerID)"))
+    }
+
+    func testEditorStopsAButtonlessPointerMoveBeforeMonacoCanExtendAReleasedClick() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        let html = editor.editorHTMLForTesting
+
+        XCTAssertTrue(html.contains("function stopReleasedEditorPointerBeforeMonaco(event)"))
+        XCTAssertTrue(html.contains("(event.buttons & 1) !== 0"))
+        XCTAssertTrue(html.contains("event.stopImmediatePropagation()"))
+        XCTAssertTrue(html.contains("addEventListener('pointermove', stopReleasedEditorPointerBeforeMonaco, { capture: true })"))
+    }
+
     func testEditorStalePointerRecoveryCarriesRequestCutoff() {
         let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
             remotePath: "/etc/app.conf",

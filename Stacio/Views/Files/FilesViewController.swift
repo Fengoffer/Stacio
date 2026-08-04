@@ -218,6 +218,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     public var onSearchRemoteFiles: ((String, String, Int) -> Void)?
     public var onOpenSearchResult: ((RemoteFileSearchResult) -> Void)?
     public var onRemoteSearchClosed: (() -> Void)?
+    public var onExpandEditorRequested: (() -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: L10n.Files.title)
     private let engineLabel = NSTextField(labelWithString: L10n.Files.engine)
@@ -229,6 +230,16 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private let transferStatusRowsStack = FilesTransferStatusRowsStack()
     private let transferStatusTitleLabel = NSTextField(labelWithString: "传输队列")
     private let clearTransferHistoryButton = NSButton()
+    private let expandEditorButton: NSButton = {
+        let button = FilesViewController.makeToolbarButton(
+            title: "展开编辑器",
+            symbolName: "chevron.left.forwardslash.chevron.right",
+            accessibilityDescription: "展开编辑器",
+            identifier: "Stacio.Files.expandEditor"
+        )
+        button.isHidden = true
+        return button
+    }()
     private let parentButton = FilesViewController.makeToolbarButton(
         title: L10n.Files.parentDirectory,
         symbolName: "chevron.up",
@@ -301,6 +312,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var directoryFollowEnabled = true
     private var showHiddenFilesEnabled = false
     private var isSynchronizingTableSortDescriptors = false
+    private var editorPresentationSnapshot: RemoteEditorPresentationSnapshot?
 
     public init(
         settingsStore: AppSettingsStore = .shared,
@@ -383,6 +395,11 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         fileBrowserPaneView
     }
 
+    public func setEditorPresentationSnapshot(_ snapshot: RemoteEditorPresentationSnapshot) {
+        editorPresentationSnapshot = snapshot
+        updateExpandEditorButtonState()
+    }
+
     public override func loadView() {
         let root = FilesShortcutRootView()
         root.onCloseRemoteSearch = { [weak self] in
@@ -425,6 +442,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         pathField.isHidden = true
         stylePathField()
 
+        expandEditorButton.target = self
+        expandEditorButton.action = #selector(expandEditorButtonPressed(_:))
         parentButton.target = self
         parentButton.action = #selector(parentButtonPressed(_:))
         refreshButton.target = self
@@ -446,8 +465,10 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         configureUploadMenu()
         configureMoreMenu()
         updateActionStates()
+        updateExpandEditorButtonState()
 
         let toolbar = NSStackView(views: [
+            expandEditorButton,
             parentButton,
             refreshButton,
             searchButton,
@@ -1536,6 +1557,18 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
 
     @objc private func refreshButtonPressed(_ sender: Any?) {
         onRefresh?(normalizedCurrentPath())
+    }
+
+    @objc private func expandEditorButtonPressed(_ sender: Any?) {
+        onExpandEditorRequested?()
+    }
+
+    private func updateExpandEditorButtonState() {
+        let shouldShow = editorPresentationSnapshot?.isCollapsed == true
+            && editorPresentationSnapshot?.hasEditor == true
+        expandEditorButton.isHidden = shouldShow == false
+        expandEditorButton.isEnabled = shouldShow
+            && editorPresentationSnapshot?.isTransitioning == false
     }
 
     @objc private func searchButtonPressed(_ sender: Any?) {
