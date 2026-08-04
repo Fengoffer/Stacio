@@ -38,6 +38,7 @@ public enum SessionSidebarRemovedProtocolExportNotice: Equatable {
 @MainActor
 public final class SessionSidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private static let sidebarItemPasteboardType = NSPasteboard.PasteboardType("cn.stacio.session-sidebar-item")
+    private static let collapsedFolderKeysDefaultsKey = "Stacio.Sidebar.collapsedFolderKeys.v1"
 
     private let sessionStore: SessionSidebarStoring?
     private let onOpenSession: (SessionRecord) throws -> Void
@@ -57,6 +58,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private let quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore
     private let clipboardDismissalStore: QuickConnectClipboardDismissalStore
     private let settingsStore: AppSettingsStore
+    private let expansionDefaults: UserDefaults
     private let licenseAccess: any LicenseFeatureAccessProviding
     private let diagnosticLogRecorder: FeedbackDiagnosticLogRecording
     private let removedProtocolExportNoticeHandler: (SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void
@@ -68,6 +70,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     private var sessionDisplaySummariesByID: [String: BastionSessionDisplaySummary] = [:]
     private var expandedFolderKeys: Set<String> = []
     private var hasInitializedExpansionState = false
+    private var isApplyingExpansionState = false
     private var searchQuery = ""
     private weak var newGroupButton: NSButton?
     private weak var expandAllButton: NSButton?
@@ -103,6 +106,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         quickConnectPromptPrefillStore: QuickConnectPromptPrefillStore = QuickConnectPromptPrefillStore(),
         clipboardDismissalStore: QuickConnectClipboardDismissalStore = QuickConnectClipboardDismissalStore(),
         settingsStore: AppSettingsStore = .shared,
+        expansionDefaults: UserDefaults = .standard,
         licenseAccess: any LicenseFeatureAccessProviding = UnrestrictedLicenseFeatureAccessProvider(),
         removedProtocolExportNoticeHandler: ((SessionSidebarRemovedProtocolExportNotice, NSWindow?) -> Void)? = nil,
         diagnosticLogRecorder: FeedbackDiagnosticLogRecording = FeedbackDiagnosticLogStore.shared
@@ -125,6 +129,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         self.quickConnectPromptPrefillStore = quickConnectPromptPrefillStore
         self.clipboardDismissalStore = clipboardDismissalStore
         self.settingsStore = settingsStore
+        self.expansionDefaults = expansionDefaults
         self.licenseAccess = licenseAccess
         self.diagnosticLogRecorder = diagnosticLogRecorder
         self.removedProtocolExportNoticeHandler = removedProtocolExportNoticeHandler
@@ -174,14 +179,14 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         addGroupButton.isHidden = true
         newGroupButton = addGroupButton
 
-        let collapseButton = makeManagementButton(
+        let collapseButton = makeExpansionButton(
             symbolName: "chevron.right",
             accessibilityDescription: L10n.Sidebar.collapseAllGroups,
             identifier: "Stacio.Sidebar.collapseAllGroups",
             action: #selector(collapseAllFoldersButtonPressed(_:))
         )
         collapseAllButton = collapseButton
-        let expandButton = makeManagementButton(
+        let expandButton = makeExpansionButton(
             symbolName: "chevron.down",
             accessibilityDescription: L10n.Sidebar.expandAllGroups,
             identifier: "Stacio.Sidebar.expandAllGroups",
@@ -625,6 +630,28 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return !folder.folders.isEmpty || !folder.sessions.isEmpty
     }
 
+    public func outlineViewItemDidExpand(_ notification: Notification) {
+        guard isApplyingExpansionState == false,
+              normalizedSearchQuery.isEmpty,
+              let folder = notification.userInfo?["NSObject"] as? SessionSidebarFolderNode
+        else {
+            return
+        }
+        expandedFolderKeys.insert(folder.expansionKey)
+        persistExpandedFolderState()
+    }
+
+    public func outlineViewItemDidCollapse(_ notification: Notification) {
+        guard isApplyingExpansionState == false,
+              normalizedSearchQuery.isEmpty,
+              let folder = notification.userInfo?["NSObject"] as? SessionSidebarFolderNode
+        else {
+            return
+        }
+        expandedFolderKeys.remove(folder.expansionKey)
+        persistExpandedFolderState()
+    }
+
     public func outlineView(
         _ outlineView: NSOutlineView,
         child index: Int,
@@ -978,11 +1005,13 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
 
     @objc
     private func expandAllFoldersButtonPressed(_ sender: Any?) {
+        (sender as? SessionSidebarPressFeedbackButton)?.animatePressFeedback()
         expandAllFolders()
     }
 
     @objc
     private func collapseAllFoldersButtonPressed(_ sender: Any?) {
+        (sender as? SessionSidebarPressFeedbackButton)?.animatePressFeedback()
         collapseAllFolders()
     }
 
@@ -2152,11 +2181,17 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         expandAllButton?.isEnabled = expansionControlsEnabled
         collapseAllButton?.isEnabled = expansionControlsEnabled
         if normalizedSearchQuery.isEmpty == false {
-            expandFolderNodes(nodes)
+            applyExpansionWithoutCapturingChanges {
+                expandFolderNodes(nodes)
+            }
             return
         }
         if hasInitializedExpansionState == false {
-            expandedFolderKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
+            let availableKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
+            let collapsedKeys = Set(
+                expansionDefaults.stringArray(forKey: Self.collapsedFolderKeysDefaultsKey) ?? []
+            )
+            expandedFolderKeys = availableKeys.subtracting(collapsedKeys)
             hasInitializedExpansionState = true
         }
         restoreExpandedFolderState()
@@ -2417,7 +2452,9 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
     }
 
     private func restoreExpandedFolderState() {
-        restoreExpandedFolderState(in: nodes)
+        applyExpansionWithoutCapturingChanges {
+            restoreExpandedFolderState(in: nodes)
+        }
     }
 
     private func restoreExpandedFolderState(in items: [NSObject]) {
@@ -2443,6 +2480,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
                 .filter { outlineView.isItemExpanded($0) }
                 .map(\.expansionKey)
         )
+        persistExpandedFolderState()
     }
 
     private func expandAllFolders() {
@@ -2451,7 +2489,10 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
         expandedFolderKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
         hasInitializedExpansionState = true
-        expandFolderNodes(nodes)
+        applyExpansionWithoutCapturingChanges {
+            expandFolderNodes(nodes)
+        }
+        persistExpandedFolderState()
     }
 
     private func collapseAllFolders() {
@@ -2460,9 +2501,29 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         }
         expandedFolderKeys = []
         hasInitializedExpansionState = true
-        for folder in allFolderNodes(in: nodes).reversed() {
-            outlineView.collapseItem(folder, collapseChildren: true)
+        applyExpansionWithoutCapturingChanges {
+            for folder in allFolderNodes(in: nodes).reversed() {
+                outlineView.collapseItem(folder, collapseChildren: true)
+            }
         }
+        persistExpandedFolderState()
+    }
+
+    private func applyExpansionWithoutCapturingChanges(_ body: () -> Void) {
+        let wasApplyingExpansionState = isApplyingExpansionState
+        isApplyingExpansionState = true
+        defer { isApplyingExpansionState = wasApplyingExpansionState }
+        body()
+    }
+
+    private func persistExpandedFolderState() {
+        guard hasInitializedExpansionState else { return }
+        let availableKeys = Set(allFolderNodes(in: allNodes).map(\.expansionKey))
+        let collapsedKeys = availableKeys.subtracting(expandedFolderKeys)
+        expansionDefaults.set(
+            collapsedKeys.sorted(),
+            forKey: Self.collapsedFolderKeysDefaultsKey
+        )
     }
 
     private func allFolderNodes(in items: [NSObject]) -> [SessionSidebarFolderNode] {
@@ -2482,6 +2543,7 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
             expandedFolderKeys.insert(folder.expansionKey)
             currentID = record.parentId
         }
+        persistExpandedFolderState()
     }
 
     private func selectPersistedItem(_ key: SessionSidebarPersistedItemKey) {
@@ -2653,6 +2715,33 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         return button
     }
 
+    private func makeExpansionButton(
+        symbolName: String,
+        accessibilityDescription: String,
+        identifier: String,
+        action: Selector
+    ) -> NSButton {
+        let button = SessionSidebarPressFeedbackButton(
+            image: NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: accessibilityDescription
+            ) ?? NSImage(),
+            target: self,
+            action: action
+        )
+        button.bezelStyle = .regularSquare
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.backgroundColor = nil
+        button.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
+        button.setAccessibilityIdentifier(identifier)
+        button.toolTip = accessibilityDescription
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        return button
+    }
+
     private func makeSectionLabel(_ title: String) -> NSTextField {
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
@@ -2669,6 +2758,18 @@ public final class SessionSidebarViewController: NSViewController, NSOutlineView
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
         return separator
+    }
+}
+
+private final class SessionSidebarPressFeedbackButton: NSButton {
+    func animatePressFeedback() {
+        guard let layer else { return }
+        let animation = CAKeyframeAnimation(keyPath: "transform.scale")
+        animation.values = [1.0, 0.82, 1.0]
+        animation.keyTimes = [0, 0.35, 1]
+        animation.duration = 0.18
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(animation, forKey: "Stacio.sidebar.press")
     }
 }
 

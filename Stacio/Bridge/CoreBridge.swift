@@ -1041,6 +1041,16 @@ public enum CoreBridge {
         try StacioCoreBindings.clearFinishedScpTransferJobs(databasePath: databasePath)
     }
 
+    public static func deleteFinishedSCPTransferJob(
+        databasePath: String,
+        jobID: String
+    ) throws -> Bool {
+        try StacioCoreBindings.deleteFinishedScpTransferJob(
+            databasePath: databasePath,
+            jobId: jobID
+        )
+    }
+
     public static func validateTunnelProfile(_ profile: TunnelProfile) throws {
         try StacioCoreBindings.validateTunnelProfile(profile: profile)
     }

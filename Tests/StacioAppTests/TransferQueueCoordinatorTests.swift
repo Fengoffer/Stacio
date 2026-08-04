@@ -3781,6 +3781,104 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertFalse(queue.visibleTextSnapshot.contains("/srv/failed.tar"))
     }
 
+    func testCoordinatorRemovesOnlyRequestedFinishedTransferAndKeepsActiveTransfers() {
+        let history = RecordingTransferHistoryStore()
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            historyStore: history,
+            queueViewController: queue
+        )
+        let completedJob = ScpTransferJob(
+            id: "job_completed_remove_one",
+            direction: .upload,
+            sourcePath: "/local/completed.tar",
+            destinationPath: "/srv/completed.tar",
+            bytesTotal: 100
+        )
+        let failedJob = ScpTransferJob(
+            id: "job_failed_keep",
+            direction: .download,
+            sourcePath: "/srv/failed.tar",
+            destinationPath: "/local/failed.tar",
+            bytesTotal: 100
+        )
+        let runningJob = ScpTransferJob(
+            id: "job_running_keep_after_single_remove",
+            direction: .download,
+            sourcePath: "/srv/running.tar",
+            destinationPath: "/local/running.tar",
+            bytesTotal: 100
+        )
+        coordinator.enqueueTransfer(job: completedJob)
+        coordinator.enqueueTransfer(job: failedJob)
+        coordinator.enqueueTransfer(job: runningJob)
+        coordinator.replaceProgressForTesting(jobID: completedJob.id, status: "completed", bytesDone: 100)
+        coordinator.replaceProgressForTesting(jobID: failedJob.id, status: "failed", bytesDone: 40)
+        coordinator.replaceProgressForTesting(jobID: runningJob.id, status: "running", bytesDone: 25)
+
+        XCTAssertTrue(coordinator.removeFinishedTransfer(jobID: completedJob.id))
+        XCTAssertFalse(coordinator.removeFinishedTransfer(jobID: runningJob.id))
+
+        XCTAssertTrue(history.events.contains("delete-finished:\(completedJob.id)"))
+        XCTAssertFalse(history.events.contains("delete-finished:\(runningJob.id)"))
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [failedJob.id, runningJob.id])
+    }
+
+    func testCoordinatorKeepsFinishedTransferWhenPersistentSingleDeleteIsRejected() {
+        let history = RecordingTransferHistoryStore(deleteFinishedResult: false)
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            historyStore: history,
+            queueViewController: queue
+        )
+        let completedJob = ScpTransferJob(
+            id: "job_completed_delete_rejected",
+            direction: .upload,
+            sourcePath: "/local/completed.tar",
+            destinationPath: "/srv/completed.tar",
+            bytesTotal: 100
+        )
+        coordinator.enqueueTransfer(job: completedJob)
+        coordinator.replaceProgressForTesting(
+            jobID: completedJob.id,
+            status: "completed",
+            bytesDone: 100
+        )
+
+        XCTAssertFalse(coordinator.removeFinishedTransfer(jobID: completedJob.id))
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [completedJob.id])
+        XCTAssertEqual(history.events.last, "delete-finished:\(completedJob.id)")
+    }
+
+    func testCoordinatorKeepsFinishedTransfersWhenPersistentClearFails() {
+        let history = RecordingTransferHistoryStore(clearFinishedShouldThrow: true)
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(
+            historyStore: history,
+            queueViewController: queue
+        )
+        let completedJob = ScpTransferJob(
+            id: "job_completed_clear_failed",
+            direction: .download,
+            sourcePath: "/srv/completed.tar",
+            destinationPath: "/local/completed.tar",
+            bytesTotal: 100
+        )
+        coordinator.enqueueTransfer(job: completedJob)
+        coordinator.replaceProgressForTesting(
+            jobID: completedJob.id,
+            status: "completed",
+            bytesDone: 100
+        )
+
+        XCTAssertEqual(coordinator.clearFinishedTransfers(), 0)
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [completedJob.id])
+        XCTAssertEqual(history.events.last, "clear-finished")
+    }
+
     func testCoordinatorClearFinishedKeepsRemovedWorkerInConcurrencyLimitUntilItFinishes() async {
         let firstJob = ScpTransferJob(
             id: "job_clear_draining_first",
@@ -7237,13 +7335,19 @@ private final class RecordingTransferHistoryStore: SCPTransferHistoryStoring {
     var events: [String] = []
     private let jobs: [ScpTransferJobRecord]
     private let eventsByJobID: [String: [ScpTransferEventRecord]]
+    private let deleteFinishedResult: Bool
+    private let clearFinishedShouldThrow: Bool
 
     init(
         jobs: [ScpTransferJobRecord] = [],
-        eventsByJobID: [String: [ScpTransferEventRecord]] = [:]
+        eventsByJobID: [String: [ScpTransferEventRecord]] = [:],
+        deleteFinishedResult: Bool = true,
+        clearFinishedShouldThrow: Bool = false
     ) {
         self.jobs = jobs
         self.eventsByJobID = eventsByJobID
+        self.deleteFinishedResult = deleteFinishedResult
+        self.clearFinishedShouldThrow = clearFinishedShouldThrow
     }
 
     func recordJob(sessionID: String?, job: ScpTransferJob, status: String, bytesDone: UInt64) throws {
@@ -7279,7 +7383,15 @@ private final class RecordingTransferHistoryStore: SCPTransferHistoryStoring {
 
     func clearFinishedJobs() throws -> UInt32 {
         events.append("clear-finished")
+        if clearFinishedShouldThrow {
+            throw NSError(domain: "RecordingTransferHistoryStore", code: 1)
+        }
         return 0
+    }
+
+    func deleteFinishedJob(jobID: String) throws -> Bool {
+        events.append("delete-finished:\(jobID)")
+        return deleteFinishedResult
     }
 }
 

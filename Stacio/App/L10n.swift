@@ -21,6 +21,8 @@ enum L10n {
         static let scannerConnect = "连接"
         static let scannerBind = "绑定设备"
         static let scannerRecognized = "已识别蓝牙 Console"
+        static let scannerGenericDevice = "蓝牙设备"
+        static let scannerSignalStrength = "蓝牙信号强度"
         static let scannerRSSIUnavailable = "信号强度未知"
         static let scannerProfileMapping = "选择蓝牙 Console 通道"
         static let scannerService = "Service"

@@ -213,6 +213,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     public var onChmodPath: ((RemoteFileSelection) -> Void)?
     public var onSendPathToTerminal: ((String) -> Void)?
     public var onTransferStatusAction: ((TransferQueueAction, String) -> Void)?
+    public var onRemoveTransferHistory: ((String) -> Void)?
+    public var onClearTransferHistory: (() -> Void)?
     public var onSearchRemoteFiles: ((String, String, Int) -> Void)?
     public var onOpenSearchResult: ((RemoteFileSearchResult) -> Void)?
     public var onRemoteSearchClosed: (() -> Void)?
@@ -225,6 +227,8 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private let transferStatusContainer = NSView()
     private let transferStatusScrollView = NSScrollView()
     private let transferStatusRowsStack = FilesTransferStatusRowsStack()
+    private let transferStatusTitleLabel = NSTextField(labelWithString: "传输队列")
+    private let clearTransferHistoryButton = NSButton()
     private let parentButton = FilesViewController.makeToolbarButton(
         title: L10n.Files.parentDirectory,
         symbolName: "chevron.up",
@@ -291,6 +295,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var transferSamplesByJobID: [String: FilesTransferSample] = [:]
     private var transferStatusRowViews: [FilesTransferStatusRowView] = []
     private var supplementalTransferStatusRowView: FilesTransferStatusRowView?
+    private var transferStatusHasFinishedHistory = false
     private let settingsStore: AppSettingsStore
     private let licenseAccess: any LicenseFeatureAccessProviding
     private var directoryFollowEnabled = true
@@ -612,9 +617,16 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             transferStatusContainer.bottomAnchor.constraint(equalTo: fileBrowserPaneView.bottomAnchor, constant: -6),
             transferStatusHeightConstraint ?? transferStatusContainer.heightAnchor.constraint(equalToConstant: 0),
 
+            transferStatusTitleLabel.leadingAnchor.constraint(equalTo: transferStatusContainer.leadingAnchor, constant: 8),
+            transferStatusTitleLabel.centerYAnchor.constraint(equalTo: clearTransferHistoryButton.centerYAnchor),
+            transferStatusTitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: clearTransferHistoryButton.leadingAnchor, constant: -8),
+            clearTransferHistoryButton.trailingAnchor.constraint(equalTo: transferStatusContainer.trailingAnchor, constant: -6),
+            clearTransferHistoryButton.topAnchor.constraint(equalTo: transferStatusContainer.topAnchor, constant: 4),
+            clearTransferHistoryButton.heightAnchor.constraint(equalToConstant: 24),
+
             transferStatusScrollView.leadingAnchor.constraint(equalTo: transferStatusContainer.leadingAnchor, constant: 4),
             transferStatusScrollView.trailingAnchor.constraint(equalTo: transferStatusContainer.trailingAnchor, constant: -4),
-            transferStatusScrollView.topAnchor.constraint(equalTo: transferStatusContainer.topAnchor, constant: 4),
+            transferStatusScrollView.topAnchor.constraint(equalTo: clearTransferHistoryButton.bottomAnchor, constant: 2),
             transferStatusScrollView.bottomAnchor.constraint(equalTo: transferStatusContainer.bottomAnchor, constant: -4),
 
             transferStatusRowsStack.leadingAnchor.constraint(equalTo: transferStatusScrollView.contentView.leadingAnchor),
@@ -895,10 +907,14 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     public func setTransferStatusSnapshot(_ snapshot: TransferQueueSnapshot) {
         guard snapshot.rows.isEmpty == false else {
             transferSamplesByJobID = [:]
+            transferStatusHasFinishedHistory = false
             displayTransferStatusRowViews(jobRows: [])
             return
         }
 
+        transferStatusHasFinishedHistory = snapshot.rows.contains {
+            Self.isFinishedTransferStatus($0.rawStatus)
+        }
         let visibleJobIDs = Set(snapshot.rows.map(\.jobID))
         transferSamplesByJobID = transferSamplesByJobID.filter { visibleJobIDs.contains($0.key) }
         let existingRowsByJobID = Dictionary(uniqueKeysWithValues: transferStatusRowViews.compactMap { rowView in
@@ -920,6 +936,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
                 progressValue: Self.transferProgressValue(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal),
                 primaryAction: Self.primaryTransferStatusAction(for: row.rawStatus),
                 secondaryAction: Self.secondaryTransferStatusAction(for: row.rawStatus),
+                canDelete: Self.isFinishedTransferStatus(row.rawStatus),
                 actionLabel: { Self.transferActionLabel(for: $0) },
                 actionImage: { [weak self] action in
                     self?.transferActionImage(for: action) ?? NSImage()
@@ -927,6 +944,9 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             )
             rowView.onAction = { [weak self] action, jobID in
                 self?.onTransferStatusAction?(action, jobID)
+            }
+            rowView.onDelete = { [weak self] jobID in
+                self?.onRemoveTransferHistory?(jobID)
             }
             return rowView
         }
@@ -950,6 +970,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             progressValue: min(max(progressValue ?? 0, 0), 100),
             primaryAction: nil,
             secondaryAction: nil,
+            canDelete: false,
             actionLabel: { Self.transferActionLabel(for: $0) },
             actionImage: { _ in NSImage() }
         )
@@ -1312,6 +1333,30 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         )
         transferStatusContainer.setAccessibilityIdentifier("Stacio.Files.transferStatusStrip")
 
+        transferStatusTitleLabel.font = .systemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .semibold
+        )
+        transferStatusTitleLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        transferStatusTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        transferStatusTitleLabel.setAccessibilityIdentifier("Stacio.Files.transferStatusTitle")
+
+        clearTransferHistoryButton.title = "清除历史"
+        clearTransferHistoryButton.image = NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: "清除历史"
+        )
+        clearTransferHistoryButton.imagePosition = .imageLeading
+        clearTransferHistoryButton.controlSize = .small
+        clearTransferHistoryButton.bezelStyle = .rounded
+        clearTransferHistoryButton.toolTip = "清除全部已结束的传输记录"
+        clearTransferHistoryButton.setAccessibilityIdentifier("Stacio.Files.transferClearHistory")
+        clearTransferHistoryButton.setAccessibilityLabel("清除历史")
+        clearTransferHistoryButton.target = self
+        clearTransferHistoryButton.action = #selector(clearTransferHistoryPressed)
+        clearTransferHistoryButton.translatesAutoresizingMaskIntoConstraints = false
+        clearTransferHistoryButton.isEnabled = false
+
         transferStatusScrollView.hasVerticalScroller = false
         transferStatusScrollView.hasHorizontalScroller = false
         transferStatusScrollView.autohidesScrollers = true
@@ -1327,7 +1372,14 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         transferStatusRowsStack.translatesAutoresizingMaskIntoConstraints = false
 
         transferStatusScrollView.documentView = transferStatusRowsStack
+        transferStatusContainer.addSubview(transferStatusTitleLabel)
+        transferStatusContainer.addSubview(clearTransferHistoryButton)
         transferStatusContainer.addSubview(transferStatusScrollView)
+    }
+
+    @objc private func clearTransferHistoryPressed() {
+        guard transferStatusHasFinishedHistory else { return }
+        onClearTransferHistory?()
     }
 
     private func replaceTransferStatusRowViews(with rowViews: [FilesTransferStatusRowView]) {
@@ -1375,6 +1427,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
 
         transferStatusContainer.isHidden = rowViews.isEmpty
+        clearTransferHistoryButton.isEnabled = transferStatusHasFinishedHistory
         transferStatusScrollView.hasVerticalScroller = rowViews.count > Self.maxVisibleTransferStatusRows
         transferStatusHeightConstraint?.constant = Self.transferStatusHeight(rowCount: rowViews.count)
         replaceTransferStatusRowViews(with: rowViews)
@@ -2470,6 +2523,15 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
+    private static func isFinishedTransferStatus(_ rawStatus: String?) -> Bool {
+        switch rawStatus {
+        case "completed", "failed", "stopped", "canceled", "cancelled":
+            true
+        default:
+            false
+        }
+    }
+
     private static func transferActionLabel(for action: TransferQueueAction) -> String {
         switch action {
         case .retry:
@@ -2490,7 +2552,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         guard visibleRows > 0 else { return 0 }
         let rowsHeight = CGFloat(visibleRows) * FilesTransferStatusRowView.preferredHeight
         let spacingHeight = CGFloat(max(visibleRows - 1, 0)) * transferStatusRowSpacing
-        return rowsHeight + spacingHeight + 8
+        return transferStatusHeaderHeight + rowsHeight + spacingHeight + 8
     }
 
     private static func formatTransferProgress(bytesDone: UInt64, bytesTotal: UInt64) -> String {
@@ -2541,6 +2603,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     }
 
     private static let maxVisibleTransferStatusRows = 4
+    private static let transferStatusHeaderHeight: CGFloat = 30
     private static let transferStatusRowSpacing: CGFloat = 4
 }
 
@@ -2552,6 +2615,7 @@ private final class FilesTransferStatusRowView: NSView {
     static let preferredHeight: CGFloat = 38
 
     var onAction: ((TransferQueueAction, String) -> Void)?
+    var onDelete: ((String) -> Void)?
     var statusText: String { statusLabel.stringValue }
     private(set) var representedJobID: String?
 
@@ -2560,6 +2624,7 @@ private final class FilesTransferStatusRowView: NSView {
     private let actions = NSStackView()
     private let primaryActionButton = NSButton()
     private let secondaryActionButton = NSButton()
+    private let deleteButton = NSButton()
     private var primaryAction: TransferQueueAction?
     private var secondaryAction: TransferQueueAction?
 
@@ -2589,6 +2654,7 @@ private final class FilesTransferStatusRowView: NSView {
             secondaryActionButton,
             identifier: "Stacio.Files.transferSecondaryAction"
         )
+        configureDeleteButton()
 
         actions.orientation = .horizontal
         actions.alignment = .centerY
@@ -2599,6 +2665,7 @@ private final class FilesTransferStatusRowView: NSView {
         actions.setContentCompressionResistancePriority(.required, for: .horizontal)
         actions.addArrangedSubview(primaryActionButton)
         actions.addArrangedSubview(secondaryActionButton)
+        actions.addArrangedSubview(deleteButton)
 
         addSubview(statusLabel)
         addSubview(progressIndicator)
@@ -2621,7 +2688,9 @@ private final class FilesTransferStatusRowView: NSView {
             primaryActionButton.widthAnchor.constraint(equalToConstant: 26),
             primaryActionButton.heightAnchor.constraint(equalToConstant: 24),
             secondaryActionButton.widthAnchor.constraint(equalToConstant: 26),
-            secondaryActionButton.heightAnchor.constraint(equalToConstant: 24)
+            secondaryActionButton.heightAnchor.constraint(equalToConstant: 24),
+            deleteButton.widthAnchor.constraint(equalToConstant: 26),
+            deleteButton.heightAnchor.constraint(equalToConstant: 24)
         ])
         updateIdentifierIndex(identifierIndex)
     }
@@ -2638,6 +2707,7 @@ private final class FilesTransferStatusRowView: NSView {
         progressIndicator.setAccessibilityIdentifier("Stacio.Files.transferProgress\(suffix)")
         primaryActionButton.setAccessibilityIdentifier("Stacio.Files.transferPrimaryAction\(suffix)")
         secondaryActionButton.setAccessibilityIdentifier("Stacio.Files.transferSecondaryAction\(suffix)")
+        deleteButton.setAccessibilityIdentifier("Stacio.Files.transferDelete\(suffix)")
     }
 
     func configure(
@@ -2646,6 +2716,7 @@ private final class FilesTransferStatusRowView: NSView {
         progressValue: Double,
         primaryAction: TransferQueueAction?,
         secondaryAction: TransferQueueAction?,
+        canDelete: Bool,
         actionLabel: (TransferQueueAction) -> String,
         actionImage: (TransferQueueAction) -> NSImage
     ) {
@@ -2667,7 +2738,9 @@ private final class FilesTransferStatusRowView: NSView {
             actionLabel: actionLabel,
             actionImage: actionImage
         )
-        actions.isHidden = primaryAction == nil && secondaryAction == nil
+        deleteButton.isEnabled = canDelete && jobID != nil
+        deleteButton.isHidden = deleteButton.isEnabled == false
+        actions.isHidden = primaryAction == nil && secondaryAction == nil && canDelete == false
     }
 
     private func configureActionButton(_ button: NSButton, identifier: String) {
@@ -2680,6 +2753,23 @@ private final class FilesTransferStatusRowView: NSView {
         button.isEnabled = false
         button.isHidden = true
         StacioDesignSystem.styleIconButton(button)
+    }
+
+    private func configureDeleteButton() {
+        deleteButton.bezelStyle = .texturedRounded
+        deleteButton.image = NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: "删除任务记录"
+        )
+        deleteButton.imagePosition = .imageOnly
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteButtonPressed)
+        deleteButton.translatesAutoresizingMaskIntoConstraints = false
+        deleteButton.toolTip = "删除任务记录"
+        deleteButton.setAccessibilityLabel("删除任务记录")
+        deleteButton.isEnabled = false
+        deleteButton.isHidden = true
+        StacioDesignSystem.styleIconButton(deleteButton)
     }
 
     private func update(
@@ -2709,6 +2799,11 @@ private final class FilesTransferStatusRowView: NSView {
         let action = sender === primaryActionButton ? primaryAction : secondaryAction
         guard let action else { return }
         onAction?(action, jobID)
+    }
+
+    @objc private func deleteButtonPressed() {
+        guard let jobID = representedJobID, deleteButton.isEnabled else { return }
+        onDelete?(jobID)
     }
 }
 

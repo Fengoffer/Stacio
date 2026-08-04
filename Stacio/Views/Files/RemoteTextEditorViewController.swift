@@ -272,6 +272,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     public var onWindowCloseReady: (() -> Void)?
     public var onPendingCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
     public var onAIQuestionRequested: ((String) -> Void)?
+    public var onBackupRequested: (() -> Void)?
+    public var onRestoreRequested: (() -> Void)?
+    public var onToggleCollapseRequested: (() -> Void)?
+    public var onTogglePresentationRequested: (() -> Void)?
+    public var onPresentationMenuRequested: ((NSView) -> Void)?
+    public var onDragDetachRequested: ((NSEvent) -> Void)?
     var onWindowPresentationChanged: ((String, Bool) -> Void)?
     fileprivate var onStandaloneWindowCloseRequested: (() -> Void)?
     fileprivate var onStandaloneWindowCloseResolved: ((RemoteTextEditorCloseResolution) -> Void)?
@@ -307,6 +313,19 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private weak var lineNumbersButton: NSButton?
     private weak var wordWrapButton: NSButton?
     private weak var minimapButton: NSButton?
+    private weak var collapseButton: NSButton?
+    private weak var presentationControl: NSSegmentedControl?
+    private weak var toolbarDragHandle: RemoteEditorToolbarDragHandleView?
+    private var presentationMainImageNameStorage = "macwindow.badge.plus"
+    private var presentationControlsSnapshot = RemoteEditorPresentationSnapshot(
+        mode: .docked,
+        hasEditor: true,
+        isTransitioning: false,
+        detachedFeatureEnabled: true
+    )
+    private var tabDragMonitor: Any?
+    private var tabDragStartPoint: NSPoint?
+    private var tabDragPageLoadGeneration: Int?
     private var editorFunctionCallsForTestingStorage: [String] = []
     private var editorFunctionScriptsForTestingStorage: [String] = []
     private var monacoPageLoadCountForTestingStorage = 0
@@ -772,6 +791,135 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         Self.editorHTML(pageLoadGeneration: monacoPageLoadGeneration)
     }
 
+    public var presentationMainImageNameForTesting: String? {
+        presentationMainImageNameStorage
+    }
+
+    public var presentationDisplayImageNameForTesting: String {
+        "display"
+    }
+
+    public var presentationMainTooltipForTesting: String? {
+        presentationControl?.toolTip
+    }
+
+    public var toolbarControlFramesForTesting: [NSRect] {
+        toolbarViewForTesting()?.subviews
+            .flatMap { $0.subviews }
+            .filter { $0 is NSButton || $0 is NSSegmentedControl || $0 is RemoteEditorToolbarDragHandleView }
+            .map { $0.frame } ?? []
+    }
+
+    private func toolbarViewForTesting() -> NSView? {
+        func find(_ view: NSView) -> NSView? {
+            if view.accessibilityIdentifier() == "Stacio.Editor.Toolbar" { return view }
+            for child in view.subviews {
+                if let found = find(child) { return found }
+            }
+            return nil
+        }
+        return find(view)
+    }
+
+    public var pageLoadGenerationForTesting: Int { monacoPageLoadGeneration }
+
+    public func updatePresentationControls(_ snapshot: RemoteEditorPresentationSnapshot) {
+        presentationControlsSnapshot = snapshot
+        collapseButton?.isEnabled = snapshot.canCollapse && snapshot.isTransitioning == false
+        guard let control = presentationControl else { return }
+        let isDetached = snapshot.isDetached
+        let locked = snapshot.detachedFeatureEnabled == false && isDetached == false
+        let imageName = locked ? "lock" : (isDetached ? "rectangle.portrait.and.arrow.right" : "macwindow.badge.plus")
+        presentationMainImageNameStorage = imageName
+        control.setImage(NSImage(systemSymbolName: imageName, accessibilityDescription: nil), forSegment: 0)
+        let tooltip = isDetached ? L10n.EditorPresentation.redock
+            : (locked ? L10n.EditorPresentation.detachRequiresLicense : L10n.EditorPresentation.detach)
+        control.toolTip = tooltip
+        control.setAccessibilityLabel(tooltip)
+        control.isEnabled = snapshot.hasEditor && snapshot.isTransitioning == false
+    }
+
+    public func requestTogglePresentationForTesting() { onTogglePresentationRequested?() }
+
+    public func simulateToolbarDragForTesting(buttonNumber: Int, points: [NSPoint]) {
+        guard buttonNumber == 0, let start = points.first, let end = points.last,
+              hypot(end.x - start.x, end.y - start.y) > 8 else { return }
+        guard let event = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: end,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: view.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ) else { return }
+        onDragDetachRequested?(event)
+    }
+
+    public func receiveTabDragCandidateForTesting(pageLoadGeneration: Int, pointInWindow: NSPoint) {
+        beginTabDragCandidate(pageLoadGeneration: pageLoadGeneration, pointInWindow: pointInWindow)
+    }
+
+    private func beginTabDragCandidate(pageLoadGeneration: Int, pointInWindow: NSPoint) {
+        cancelTabDragTracking()
+        guard pageLoadGeneration == monacoPageLoadGeneration else {
+            return
+        }
+        tabDragStartPoint = pointInWindow
+        tabDragPageLoadGeneration = pageLoadGeneration
+        tabDragMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            self?.handleTrackedTabDragEvent(event)
+            return event
+        }
+    }
+
+    public func simulateTrackedTabDragForTesting(to point: NSPoint) {
+        guard let start = tabDragStartPoint,
+              tabDragPageLoadGeneration == monacoPageLoadGeneration,
+              hypot(point.x - start.x, point.y - start.y) > 8 else { return }
+        cancelTabDragTracking()
+        guard let event = NSEvent.mouseEvent(
+            with: .leftMouseDragged,
+            location: point,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: view.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ) else { return }
+        onDragDetachRequested?(event)
+    }
+
+    private func handleTrackedTabDragEvent(_ event: NSEvent) {
+        if event.type == .leftMouseUp {
+            cancelTabDragTracking()
+            return
+        }
+        guard event.type == .leftMouseDragged,
+              event.buttonNumber == 0,
+              let start = tabDragStartPoint,
+              tabDragPageLoadGeneration == monacoPageLoadGeneration,
+              hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) > 8
+        else { return }
+        cancelTabDragTracking()
+        onDragDetachRequested?(event)
+    }
+
+    private func cancelTabDragTracking() {
+        if let tabDragMonitor {
+            NSEvent.removeMonitor(tabDragMonitor)
+            self.tabDragMonitor = nil
+        }
+        tabDragStartPoint = nil
+        tabDragPageLoadGeneration = nil
+    }
+
     public var monacoPageLoadCountForTesting: Int {
         monacoPageLoadCountForTestingStorage
     }
@@ -970,6 +1118,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         parentWindow: NSWindow?,
         closeConfirmer: RemoteTextEditorCloseConfirming
     ) -> RemoteTextEditorCloseDisposition {
+        cancelTabDragTracking()
         if hasPendingWindowClose {
             return .pending
         }
@@ -1041,6 +1190,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     deinit {
+        if let tabDragMonitor { NSEvent.removeMonitor(tabDragMonitor) }
         monacoReadinessWatchdog?.cancel()
         savedCloseHandshakeTimeouts.values.forEach { $0.cancel() }
         for document in documents {
@@ -1490,15 +1640,90 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             action: #selector(replacePressed(_:)),
             isToggle: false
         )
+        let backup = makeToolbarButton(
+            symbolName: "externaldrive.badge.plus",
+            accessibilityLabel: "备份当前编辑文件",
+            identifier: "Stacio.Editor.Toolbar.backup",
+            action: #selector(backupPressed(_:)),
+            isToggle: false
+        )
+        let restore = makeToolbarButton(
+            symbolName: "clock.arrow.circlepath",
+            accessibilityLabel: "恢复备份文件",
+            identifier: "Stacio.Editor.Toolbar.restore",
+            action: #selector(restorePressed(_:)),
+            isToggle: false
+        )
+        let askAI = makeToolbarButton(
+            symbolName: "sparkles",
+            accessibilityLabel: "发送当前文件给 AI",
+            identifier: "Stacio.Editor.Toolbar.askAI",
+            action: #selector(askAIPressed(_:)),
+            isToggle: false
+        )
+        let collapse = makeToolbarButton(
+            symbolName: "rectangle.compress.vertical",
+            accessibilityLabel: "收起编辑器",
+            identifier: "Stacio.Editor.Toolbar.collapse",
+            action: #selector(collapsePressed(_:)),
+            isToggle: false
+        )
+        let close = makeToolbarButton(
+            symbolName: "xmark.circle",
+            accessibilityLabel: "关闭编辑器",
+            identifier: "Stacio.Editor.Toolbar.close",
+            action: #selector(closePressed(_:)),
+            isToggle: false
+        )
         lineNumbersButton = lineNumbers
         wordWrapButton = wordWrap
         minimapButton = minimap
+        collapseButton = collapse
 
         [lineNumbers, wordWrap, minimap].forEach(stack.addArrangedSubview)
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        stack.addArrangedSubview(spacer)
-        [find, replace].forEach(stack.addArrangedSubview)
+
+        let dragHandle = RemoteEditorToolbarDragHandleView(
+            frame: NSRect(x: 0, y: 0, width: 48, height: 24)
+        )
+        dragHandle.translatesAutoresizingMaskIntoConstraints = false
+        dragHandle.toolTip = L10n.EditorPresentation.toolbarDrag
+        dragHandle.setAccessibilityLabel(L10n.EditorPresentation.toolbarDrag)
+        dragHandle.setAccessibilityIdentifier("Stacio.Editor.Toolbar.dragHandle")
+        dragHandle.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        dragHandle.onDrag = { [weak self] event in self?.onDragDetachRequested?(event) }
+        toolbarDragHandle = dragHandle
+        stack.addArrangedSubview(dragHandle)
+        NSLayoutConstraint.activate([
+            dragHandle.widthAnchor.constraint(greaterThanOrEqualToConstant: 40),
+            dragHandle.heightAnchor.constraint(equalToConstant: 24)
+        ])
+        [find, replace, backup, restore, askAI, collapse, close].forEach(stack.addArrangedSubview)
+
+        let presentation = NSSegmentedControl(
+            frame: NSRect(x: 0, y: 0, width: 58, height: 24)
+        )
+        presentation.segmentCount = 2
+        presentation.trackingMode = .momentary
+        presentation.segmentStyle = .texturedRounded
+        presentation.setWidth(30, forSegment: 0)
+        presentation.setWidth(22, forSegment: 1)
+        presentation.translatesAutoresizingMaskIntoConstraints = false
+        presentation.target = self
+        presentation.action = #selector(presentationControlPressed(_:))
+        presentation.setAccessibilityIdentifier("Stacio.Editor.Toolbar.presentation")
+        presentation.setImage(NSImage(systemSymbolName: "macwindow.badge.plus", accessibilityDescription: nil), forSegment: 0)
+        presentation.setImage(
+            NSImage(systemSymbolName: presentationDisplayImageNameForTesting, accessibilityDescription: nil),
+            forSegment: 1
+        )
+        presentation.toolTip = L10n.EditorPresentation.detach
+        presentation.setAccessibilityLabel(L10n.EditorPresentation.detach)
+        presentationControl = presentation
+        stack.addArrangedSubview(presentation)
+        NSLayoutConstraint.activate([
+            presentation.widthAnchor.constraint(equalToConstant: 58),
+            presentation.heightAnchor.constraint(equalToConstant: 24)
+        ])
 
         toolbar.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1508,7 +1733,16 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             stack.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor)
         ])
         updateToolbarButtonStates()
+        updatePresentationControls(presentationControlsSnapshot)
         return toolbar
+    }
+
+    @objc private func presentationControlPressed(_ sender: NSSegmentedControl) {
+        if sender.selectedSegment == 1 {
+            onPresentationMenuRequested?(sender)
+        } else {
+            onTogglePresentationRequested?()
+        }
     }
 
     private func makeToolbarButton(
@@ -1573,6 +1807,30 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     @objc private func replacePressed(_ sender: NSButton) {
         runEditorAction("editor.action.startFindReplaceAction")
+    }
+
+    @objc private func backupPressed(_ sender: NSButton) {
+        onBackupRequested?()
+    }
+
+    @objc private func restorePressed(_ sender: NSButton) {
+        onRestoreRequested?()
+    }
+
+    @objc private func askAIPressed(_ sender: NSButton) {
+        requestAIForActiveDocument()
+    }
+
+    @objc private func collapsePressed(_ sender: NSButton) {
+        onToggleCollapseRequested?()
+    }
+
+    @objc private func closePressed(_ sender: NSButton) {
+        if let onCloseRequested {
+            onCloseRequested()
+        } else {
+            onStandaloneWindowCloseRequested?()
+        }
     }
 
     private func updateDisplayOptions(_ update: (inout RemoteTextEditorDisplayOptions) -> Void) {
@@ -1671,6 +1929,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     }
 
     private func loadMonacoEditorHTML(resetReadinessRecoveryBudget: Bool = false) {
+        cancelTabDragTracking()
         cancelAllSavedCloseHandshakes()
         cancelMonacoReadinessWatchdog()
         if resetReadinessRecoveryBudget {
@@ -1768,6 +2027,24 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         }
         let payload = body["payload"] as? [String: Any]
         switch name {
+        case "tabDragCandidate":
+            guard let x = payload?["x"] as? NSNumber,
+                  let y = payload?["y"] as? NSNumber
+            else { return }
+            let clientPoint = NSPoint(x: x.doubleValue, y: y.doubleValue)
+            let pointInWindow: NSPoint
+            if let webView {
+                pointInWindow = webView.convert(
+                    NSPoint(x: clientPoint.x, y: webView.bounds.height - clientPoint.y),
+                    to: nil
+                )
+            } else {
+                pointInWindow = clientPoint
+            }
+            beginTabDragCandidate(
+                pageLoadGeneration: messagePageLoadGeneration,
+                pointInWindow: pointInWindow
+            )
         case "ready":
             guard isMonacoRuntimeReady == false else { return }
             isMonacoRuntimeReady = true
@@ -2839,6 +3116,18 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       }
     }
 
+    function handleTabDragCandidate(event) {
+      if (event.button !== 0) { return; }
+      if (event.target.closest('.tab-close, .tab-scroll') || event.target.closest('.close')) { return; }
+      const tab = event.target.closest('.tab');
+      if (!tab) { return; }
+      post('tabDragCandidate', {
+        x: event.clientX,
+        y: event.clientY,
+        pointerID: event.pointerId
+      });
+    }
+
     function handleTabsMouseDown(event) {
       if (window.PointerEvent) { return false; }
       return activateTabFromEvent(event);
@@ -3086,6 +3375,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       confirmSavedContentBeforeClose,
       layout: scheduleEditorLayout
     };
+    window.document.getElementById('tabs').addEventListener('pointerdown', handleTabDragCandidate, { capture: true });
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabsPointerDown, { capture: true });
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);
     window.document.getElementById('tabs').addEventListener('click', handleTabsClick);
@@ -3156,6 +3446,45 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 </body>
 </html>
 """#
+}
+
+@MainActor
+private final class RemoteEditorToolbarDragHandleView: NSView {
+    var onDrag: ((NSEvent) -> Void)?
+    private static let threshold: CGFloat = 8
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: nil)
+            ?? NSImage(size: NSSize(width: 16, height: 12))
+        let imageView = NSImageView(image: image)
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
+        addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            imageView.widthAnchor.constraint(equalToConstant: 16),
+            imageView.heightAnchor.constraint(equalToConstant: 12)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.type == .leftMouseDown, event.buttonNumber == 0 else { return }
+        let start = event.locationInWindow
+        while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let point = next.locationInWindow
+            if next.type == .leftMouseDragged,
+               hypot(point.x - start.x, point.y - start.y) > Self.threshold {
+                onDrag?(next)
+                return
+            }
+            if next.type == .leftMouseUp { return }
+        }
+    }
 }
 
 @MainActor

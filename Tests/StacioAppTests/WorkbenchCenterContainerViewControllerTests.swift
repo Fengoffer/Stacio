@@ -199,9 +199,36 @@ final class WorkbenchCenterContainerViewControllerTests: XCTestCase {
         XCTAssertNil(controller.editorContentViewControllerForTesting)
         XCTAssertNil(editor.parent)
         XCTAssertTrue(controller.isEditorSidecarCollapsedForTesting)
+        XCTAssertEqual(controller.editorSidecarWidthForTesting, 0, accuracy: 0.5)
         XCTAssertEqual(controller.splitSubviewCountForTesting, 2)
         XCTAssertEqual(controller.editorTargetWidthForTesting, 710)
         XCTAssertEqual(store.savedSidecarWidths, [])
+    }
+
+    func testRemovingLastEditorImmediatelyRelayoutsExpandedTerminalWorkspace() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        workspace.loadView()
+        try workspace.openLocalShell()
+        let terminalView = try XCTUnwrap(workspace.currentTerminalPane?.view)
+        let controller = WorkbenchCenterContainerViewController(
+            workspaceViewController: workspace,
+            presentationStore: RecordingRemoteEditorPresentationStore(sidecarWidth: 680)
+        )
+        controller.loadView()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 1_400, height: 800)
+        let editor = PlainCenterChildViewController()
+        try controller.installEditorContent(editor)
+        controller.view.layoutSubtreeIfNeeded()
+        XCTAssertLessThan(terminalView.frame.width, controller.view.bounds.width)
+
+        try controller.removeEditorContent(editor)
+
+        XCTAssertEqual(workspace.view.frame.width, controller.view.bounds.width, accuracy: 1)
+        XCTAssertEqual(terminalView.frame.width, workspace.view.bounds.width, accuracy: 1)
     }
 
     func testProgrammaticLifecycleAndPhysicalClampsNeverPersist() throws {

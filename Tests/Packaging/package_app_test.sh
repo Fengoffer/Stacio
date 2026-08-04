@@ -94,6 +94,33 @@ grep -Fq "if bundles.isEmpty" "$SWIFTTERM_PATCH_TEST_SOURCE"
 test ! -e "$SWIFTTERM_PATCH_TEST_SOURCE.orig"
 "$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh" "$SWIFTTERM_PATCH_TEST_CHECKOUT"
 
+SWIFTTERM_UPSTREAM_FIX_CHECKOUT="$TMP_DIR/swiftterm-upstream-fix-checkout"
+SWIFTTERM_UPSTREAM_FIX_SOURCE="$SWIFTTERM_UPSTREAM_FIX_CHECKOUT/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift"
+mkdir -p "$(dirname "$SWIFTTERM_UPSTREAM_FIX_SOURCE")"
+cat >"$SWIFTTERM_UPSTREAM_FIX_SOURCE" <<'EOF'
+private final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
+    private static func candidateBundles() -> [Bundle] {
+        var bundles: [Bundle] = []
+        #if SWIFT_PACKAGE
+        // Deliberately not `Bundle.module`: SwiftPM's generated accessor can abort.
+        let bundleName = "SwiftTerm_SwiftTerm.bundle"
+        if let url = Bundle.main.resourceURL?.appendingPathComponent(bundleName),
+           let resourceBundle = Bundle(url: url) {
+            bundles.append(resourceBundle)
+        }
+        #endif
+        bundles.append(Bundle(for: MetalTerminalRenderer.self))
+        bundles.append(Bundle.main)
+        return bundles
+    }
+}
+EOF
+touch "$SWIFTTERM_UPSTREAM_FIX_SOURCE.orig" "$SWIFTTERM_UPSTREAM_FIX_SOURCE.rej"
+"$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh" "$SWIFTTERM_UPSTREAM_FIX_CHECKOUT"
+grep -Fq 'Deliberately not `Bundle.module`' "$SWIFTTERM_UPSTREAM_FIX_SOURCE"
+test ! -e "$SWIFTTERM_UPSTREAM_FIX_SOURCE.orig"
+test ! -e "$SWIFTTERM_UPSTREAM_FIX_SOURCE.rej"
+
 cat >"$SWIFT_BIN_DIR/Stacio" <<'EOF'
 #!/usr/bin/env bash
 echo "fake Stacio"

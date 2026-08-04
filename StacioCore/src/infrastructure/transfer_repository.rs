@@ -108,7 +108,7 @@ impl TransferRepository {
             "UPDATE transfer_jobs
              SET status = ?2, bytes_done = ?3, updated_at = ?4,
                  started_at = CASE WHEN started_at IS NULL AND ?2 = 'running' THEN ?4 ELSE started_at END,
-                 finished_at = CASE WHEN ?2 IN ('completed', 'failed', 'canceled') THEN ?4 ELSE finished_at END
+                 finished_at = CASE WHEN ?2 IN ('completed', 'failed', 'stopped', 'canceled', 'cancelled') THEN ?4 ELSE finished_at END
              WHERE id = ?1",
             params![
                 progress.job_id,
@@ -160,10 +160,20 @@ impl TransferRepository {
     pub fn delete_finished_jobs(&self) -> Result<u32, rusqlite::Error> {
         let deleted = self.connection.execute(
             "DELETE FROM transfer_jobs
-             WHERE status IN ('completed', 'failed', 'canceled')",
+             WHERE status IN ('completed', 'failed', 'stopped', 'canceled', 'cancelled')",
             [],
         )?;
         Ok(deleted as u32)
+    }
+
+    pub fn delete_finished_job(&self, job_id: &str) -> Result<bool, rusqlite::Error> {
+        let deleted = self.connection.execute(
+            "DELETE FROM transfer_jobs
+             WHERE id = ?1
+               AND status IN ('completed', 'failed', 'stopped', 'canceled', 'cancelled')",
+            params![job_id],
+        )?;
+        Ok(deleted > 0)
     }
 }
 
@@ -409,6 +419,88 @@ mod transfer_repository_tests {
         assert_eq!(jobs[0].job.id, active.id);
         assert!(finished_events.is_empty());
         assert_eq!(active_events.len(), 1);
+    }
+
+    #[test]
+    fn deletes_only_requested_finished_job_and_refuses_active_job() {
+        let repository = TransferRepository::new(migrated_connection());
+        let first_finished = ScpTransferJob {
+            id: "job_finished_delete_one".to_string(),
+            direction: ScpDirection::Upload,
+            source_path: "/Users/alice/first.zip".to_string(),
+            destination_path: "/srv/first.zip".to_string(),
+            bytes_total: 100,
+        };
+        let second_finished = ScpTransferJob {
+            id: "job_finished_keep".to_string(),
+            direction: ScpDirection::Download,
+            source_path: "/srv/second.zip".to_string(),
+            destination_path: "/Users/alice/second.zip".to_string(),
+            bytes_total: 200,
+        };
+        let active = ScpTransferJob {
+            id: "job_active_refuse_delete".to_string(),
+            direction: ScpDirection::Download,
+            source_path: "/srv/active.zip".to_string(),
+            destination_path: "/Users/alice/active.zip".to_string(),
+            bytes_total: 300,
+        };
+        for job in [&first_finished, &second_finished] {
+            repository
+                .upsert_job(None, job, "completed", job.bytes_total)
+                .expect("insert finished");
+            repository
+                .append_progress(&ScpTransferProgress {
+                    job_id: job.id.clone(),
+                    bytes_done: job.bytes_total,
+                    bytes_total: job.bytes_total,
+                    status: "completed".to_string(),
+                })
+                .expect("finish");
+        }
+        repository
+            .upsert_job(None, &active, "running", 50)
+            .expect("insert active");
+
+        assert!(repository
+            .delete_finished_job(&first_finished.id)
+            .expect("delete one"));
+        assert!(!repository
+            .delete_finished_job(&active.id)
+            .expect("refuse active"));
+
+        let jobs = repository.list_recent_jobs().expect("jobs");
+        assert_eq!(
+            jobs.iter().map(|record| record.job.id.as_str()).collect::<Vec<_>>(),
+            vec![second_finished.id.as_str(), active.id.as_str()]
+        );
+        assert!(repository
+            .list_events_for_job(&first_finished.id)
+            .expect("deleted events")
+            .is_empty());
+    }
+
+    #[test]
+    fn clears_stopped_and_cancelled_history_aliases() {
+        let repository = TransferRepository::new(migrated_connection());
+        for (id, status) in [
+            ("job_stopped_clear", "stopped"),
+            ("job_cancelled_clear", "cancelled"),
+        ] {
+            let job = ScpTransferJob {
+                id: id.to_string(),
+                direction: ScpDirection::Upload,
+                source_path: format!("/Users/alice/{id}.zip"),
+                destination_path: format!("/srv/{id}.zip"),
+                bytes_total: 100,
+            };
+            repository
+                .upsert_job(None, &job, status, 50)
+                .expect("insert terminal alias");
+        }
+
+        assert_eq!(repository.delete_finished_jobs().expect("clear history"), 2);
+        assert!(repository.list_recent_jobs().expect("jobs").is_empty());
     }
 
     #[test]

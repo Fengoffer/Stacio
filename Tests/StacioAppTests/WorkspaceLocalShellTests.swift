@@ -1549,6 +1549,7 @@ final class WorkspaceLocalShellTests: XCTestCase {
             destinationDirectory.appendingPathComponent("report.txt").standardizedFileURL
         )
         XCTAssertEqual(scheduler.requests.first?.operation, .copy)
+        XCTAssertEqual(scheduler.requests.first?.notificationPolicy, .silent)
     }
 
     func testLocalFilePaneShowsChineseErrorForUnreadablePath() throws {
@@ -3611,6 +3612,46 @@ final class WorkspaceLocalShellTests: XCTestCase {
         XCTAssertTrue(sink.closedRuntimeIDs.isEmpty)
     }
 
+    func testBatchTabCloseResumesLaterTabsAfterRemoteEditorCloseCompletes() throws {
+        let sink = RecordingWorkspaceRemoteTerminalEventSink()
+        let bridge = RecordingWorkspaceRemoteTerminalBridge()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com"
+        )
+        try workspace.openLocalShell()
+
+        var closeRequests: [String] = []
+        var pendingResolution: ((RemoteTextEditorCloseResolution) -> Void)?
+        workspace.onRemoteTerminalCloseRequested = { pane, completion in
+            closeRequests.append(pane.runtimeID)
+            pendingResolution = completion
+            return .pending
+        }
+
+        try workspace.performTabContextActionForTesting(.closeAllTabs, index: 0)
+
+        XCTAssertEqual(closeRequests, ["term_remote"])
+        XCTAssertEqual(workspace.tabLabelsForTesting, ["deploy@example.com", "本地"])
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+
+        pendingResolution?(.ready)
+
+        XCTAssertEqual(workspace.tabLabelsForTesting, [])
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(bridge.closedRuntimeIDs, ["term_remote"])
+        XCTAssertEqual(sink.closedRuntimeIDs, ["term_remote"])
+    }
+
     func testWorkspaceRoutesFindCopyPasteToCurrentPane() throws {
         let sink = RecordingWorkspaceRemoteTerminalEventSink()
         let defaults = UserDefaults(suiteName: "WorkspaceLocalShellTests.\(UUID().uuidString)")!
@@ -4352,6 +4393,7 @@ private final class RecordingWorkspaceLocalTransferScheduler: LocalFileTransferS
         let sourceURL: URL
         let destinationURL: URL
         let operation: LocalFileTransferOperation
+        let notificationPolicy: TransferCompletionNotificationPolicy
     }
 
     private(set) var requests: [Request] = []
@@ -4368,7 +4410,8 @@ private final class RecordingWorkspaceLocalTransferScheduler: LocalFileTransferS
             runtimeID: runtimeID,
             sourceURL: sourceURL,
             destinationURL: destinationURL,
-            operation: operation
+            operation: operation,
+            notificationPolicy: notificationPolicy
         ))
         completion?(.completed)
         return "local-test-job"

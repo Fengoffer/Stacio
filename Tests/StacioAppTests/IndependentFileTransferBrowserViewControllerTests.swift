@@ -2503,6 +2503,7 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
             "sftp_browser_transfer"
         ])
         XCTAssertEqual(scheduler.jobs.map(\.direction), [.upload, .upload, .download, .download])
+        XCTAssertEqual(scheduler.notificationPolicies, Array(repeating: .silent, count: 4))
         let uploadJob = try XCTUnwrap(scheduler.jobs.first)
         let uploadFolderJob = try XCTUnwrap(scheduler.jobs.dropFirst().first)
         let downloadJob = try XCTUnwrap(scheduler.jobs.dropFirst(2).first)
@@ -2557,6 +2558,7 @@ final class IndependentFileTransferBrowserViewControllerTests: XCTestCase {
         XCTAssertTrue(waitUntil { scheduler.jobs.count == 1 })
 
         XCTAssertEqual(scheduler.runtimeIDs, ["scp_browser_selected_upload"])
+        XCTAssertEqual(scheduler.notificationPolicies, [.silent])
         XCTAssertEqual(scheduler.jobs.map { ($0.sourcePath as NSString).lastPathComponent }, ["package.tar.gz"])
         let uploadJob = try XCTUnwrap(scheduler.jobs.first)
         XCTAssertTrue(FileManager.default.fileExists(atPath: uploadJob.sourcePath))
@@ -3694,6 +3696,7 @@ private final class IndependentBlockingConflictResolver: RemoteFileConflictResol
 private final class IndependentSFTPTransferScheduler: SFTPTransferScheduling {
     private(set) var runtimeIDs: [String] = []
     private(set) var jobs: [ScpTransferJob] = []
+    private(set) var notificationPolicies: [TransferCompletionNotificationPolicy] = []
     private(set) var disconnectedRuntimeIDs: [String] = []
 
     func scheduleLiveSFTPTransfer(
@@ -3704,8 +3707,29 @@ private final class IndependentSFTPTransferScheduler: SFTPTransferScheduling {
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)?
     ) {
+        scheduleLiveSFTPTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: .userVisible,
+            completion: completion
+        )
+    }
+
+    func scheduleLiveSFTPTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
         runtimeIDs.append(runtimeID)
         jobs.append(job)
+        notificationPolicies.append(notificationPolicy)
     }
 
     func disconnectTransfers(runtimeID: String) -> [String] {
@@ -3720,6 +3744,7 @@ private final class IndependentSFTPTransferScheduler: SFTPTransferScheduling {
 private final class IndependentSCPTransferScheduler: SCPTransferScheduling {
     private(set) var runtimeIDs: [String] = []
     private(set) var jobs: [ScpTransferJob] = []
+    private(set) var notificationPolicies: [TransferCompletionNotificationPolicy] = []
     private(set) var disconnectedRuntimeIDs: [String] = []
     var materializesCompletedDownloads = false
     var materializesFailedDownloads = false
@@ -3733,8 +3758,29 @@ private final class IndependentSCPTransferScheduler: SCPTransferScheduling {
         job: ScpTransferJob,
         completion: ((ScpTransferProgress) -> Void)?
     ) {
+        scheduleLiveTransfer(
+            runtimeID: runtimeID,
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            job: job,
+            notificationPolicy: .userVisible,
+            completion: completion
+        )
+    }
+
+    func scheduleLiveTransfer(
+        runtimeID: String,
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob,
+        notificationPolicy: TransferCompletionNotificationPolicy,
+        completion: ((ScpTransferProgress) -> Void)?
+    ) {
         runtimeIDs.append(runtimeID)
         jobs.append(job)
+        notificationPolicies.append(notificationPolicy)
         completions[job.id] = completion
     }
 

@@ -804,7 +804,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         self.crossDeviceTransferCoordinator = crossDeviceTransferCoordinator
             ?? CrossDeviceTransferCoordinator(
                 remoteTransferBridge: CoreBridgeRemoteToRemoteTransferBridge(),
-                completionNotificationPresenter: Self.defaultCompletionNotificationPresenter()
+                completionNotificationPresenter: NoopTransferCompletionNotificationPresenter()
             )
         self.conflictResolver = conflictResolver
         self.localFilesViewController = localFilesViewController
@@ -1259,16 +1259,6 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         remoteProtocolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private static func defaultCompletionNotificationPresenter()
-        -> TransferCompletionNotificationPresenting
-    {
-        let processName = ProcessInfo.processInfo.processName.lowercased()
-        if processName == "xctest" || processName.hasSuffix("xctest") {
-            return NoopTransferCompletionNotificationPresenter()
-        }
-        return TransferCompletionNotificationPresenter.shared
-    }
-
     private func configureAddRemoteDeviceButton() {
         let tooltip = "连接更多远端设备"
         addRemoteDeviceButton.image = NSImage(
@@ -1357,6 +1347,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         }
         contentViewController.onCancelTransfer = { [weak coordinator] jobID in
             _ = coordinator?.cancelTransfer(jobID: jobID)
+        }
+        contentViewController.onRemoveFinishedTransfer = { [weak coordinator] jobID in
+            _ = coordinator?.removeFinishedTransfer(jobID: jobID)
         }
         contentViewController.onClearFinished = { [weak coordinator] in
             _ = coordinator?.clearFinishedTransfers()
@@ -2192,6 +2185,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
                 secret: endpoint.context.secret,
                 expectedFingerprintSHA256: endpoint.context.expectedFingerprintSHA256,
                 job: job,
+                notificationPolicy: .silent,
                 completion: { progress in
                     FileWorkspaceAtomicTransferCommitter.finishDownload(
                         progress,
@@ -2671,6 +2665,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
                             secret: context.secret,
                             expectedFingerprintSHA256: context.expectedFingerprintSHA256,
                             job: plan.job,
+                            notificationPolicy: .silent,
                             completion: { [weak self] progress in
                                 FileWorkspaceAtomicTransferCommitter.finishUpload(
                                     progress,
@@ -2743,6 +2738,7 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
                 secret: sshContext.secret,
                 expectedFingerprintSHA256: sshContext.expectedFingerprintSHA256,
                 job: plan.job,
+                notificationPolicy: .silent,
                 completion: { [weak self] progress in
                     FileWorkspaceAtomicTransferCommitter.finishDownload(
                         progress,
@@ -3198,6 +3194,7 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
                             secret: context.secret,
                             expectedFingerprintSHA256: context.expectedFingerprintSHA256,
                             job: plan.job,
+                            notificationPolicy: .silent,
                             completion: { [weak self] progress in
                                 FileWorkspaceAtomicTransferCommitter.finishUpload(
                                     progress,
@@ -3269,6 +3266,7 @@ public final class IndependentFileTransferRemotePaneViewController: NSViewContro
                 secret: context.secret,
                 expectedFingerprintSHA256: context.expectedFingerprintSHA256,
                 job: plan.job,
+                notificationPolicy: .silent,
                 completion: { [weak self] progress in
                     FileWorkspaceAtomicTransferCommitter.finishDownload(
                         progress,

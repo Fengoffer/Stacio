@@ -25,6 +25,10 @@ import SwiftTerm
         )
         private var controlScrollZoomMonitor: Any?
         private var linkInteractionMonitor: Any?
+        private var selectionAutoCopyGate = TerminalSelectionAutoCopyGate()
+        private var tracksFrameSizeTransitionsForTesting = false
+        private var lastTrackedFrameSizeForTesting: NSSize?
+        private(set) var distinctFrameSizeTransitionsForTesting: [NSSize] = []
 
         public override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
@@ -48,6 +52,24 @@ import SwiftTerm
 
     public override var mouseDownCanMoveWindow: Bool {
         false
+    }
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        if tracksFrameSizeTransitionsForTesting,
+           lastTrackedFrameSizeForTesting.map({
+               abs($0.width - newSize.width) > 0.5 || abs($0.height - newSize.height) > 0.5
+           }) ?? true
+        {
+            distinctFrameSizeTransitionsForTesting.append(newSize)
+            lastTrackedFrameSizeForTesting = newSize
+        }
+        super.setFrameSize(newSize)
+    }
+
+    func beginFrameSizeTransitionTrackingForTesting() {
+        distinctFrameSizeTransitionsForTesting.removeAll(keepingCapacity: true)
+        lastTrackedFrameSizeForTesting = frame.size
+        tracksFrameSizeTransitionsForTesting = true
     }
 
         public func feedRemoteOutput(_ bytes: [UInt8], applySemanticHighlighting: Bool = true) {
@@ -87,6 +109,7 @@ import SwiftTerm
 
     public override func selectionChanged(source: Terminal) {
         super.selectionChanged(source: source)
+        guard selectionAutoCopyGate.shouldCopyAfterSelectionChanged() else { return }
         StacioTerminalMouseBehavior.copySelectionToClipboardIfNeeded(
             from: self,
             settingsStore: fontZoomSettingsStore
@@ -161,15 +184,29 @@ import SwiftTerm
         }
         guard window != nil else { return }
         linkInteractionMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved, .flagsChanged]
+            matching: TerminalLinkInteraction.monitoredEventMask
         ) { [weak self] event in
             guard let self,
                   event.window === self.window
             else {
                 return event
             }
+            if event.type == .leftMouseDown,
+               TerminalLinkInteraction.isEventTargetingTerminalSurface(self, event: event) {
+                self.selectionAutoCopyGate.beginPointerSelection()
+            } else if event.type == .leftMouseUp {
+                self.finishPointerSelectionAutoCopyIfNeeded()
+            }
             return TerminalLinkInteraction.handleEvent(in: self, event: event)
         }
+    }
+
+    private func finishPointerSelectionAutoCopyIfNeeded() {
+        guard selectionAutoCopyGate.shouldCopyAfterMouseUp() else { return }
+        StacioTerminalMouseBehavior.copySelectionToClipboardIfNeeded(
+            from: self,
+            settingsStore: fontZoomSettingsStore
+        )
     }
 
     public func performControlScrollZoomForTesting(deltaY: CGFloat) {

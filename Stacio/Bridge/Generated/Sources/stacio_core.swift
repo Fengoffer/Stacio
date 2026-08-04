@@ -11054,6 +11054,14 @@ public func deleteCredentialRecord(databasePath: String, id: String)throws   {tr
     )
 }
 }
+public func deleteFinishedScpTransferJob(databasePath: String, jobId: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_delete_finished_scp_transfer_job(
+        FfiConverterString.lower(databasePath),
+        FfiConverterString.lower(jobId),$0
+    )
+})
+}
 public func deleteLiveFtpPath(config: FtpConnectionConfig, secret: FtpAuthSecret, remotePath: String, recursive: Bool)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
     uniffi_stacio_core_fn_func_delete_live_ftp_path(
         FfiConverterTypeFtpConnectionConfig_lower(config),
@@ -12126,6 +12134,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_delete_credential_record() != 36980) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_delete_finished_scp_transfer_job() != 46130) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_delete_live_ftp_path() != 2673) {

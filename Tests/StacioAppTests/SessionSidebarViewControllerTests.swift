@@ -3180,6 +3180,59 @@ final class SessionSidebarViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.isFolderExpandedForTesting(folderID: grandchild.id))
     }
 
+    func testManuallyCollapsedFolderPersistsAcrossSidebarInstances() {
+        let suiteName = "StacioSidebarExpansionState-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let folder = SessionFolder(id: "folder_persisted", parentId: nil, name: "Persisted")
+        let store = RecordingSessionSidebarStore(folders: [folder])
+        let settingsStore = makeSettingsStore(showRecentSessions: false)
+        let firstController = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: settingsStore,
+            expansionDefaults: defaults
+        )
+        firstController.loadView()
+        let folderItem = firstController.outlineView(
+            firstController.outlineView,
+            child: 0,
+            ofItem: nil
+        )
+
+        firstController.outlineView.collapseItem(folderItem)
+
+        let restoredController = SessionSidebarViewController(
+            sessionStore: store,
+            settingsStore: settingsStore,
+            expansionDefaults: defaults
+        )
+        restoredController.loadView()
+        XCTAssertFalse(restoredController.isFolderExpandedForTesting(folderID: folder.id))
+    }
+
+    func testExpansionButtonsHaveNoPersistentHighlightAndAnimateWhenClicked() throws {
+        let controller = SessionSidebarViewController(
+            sessionStore: RecordingSessionSidebarStore(
+                folders: [SessionFolder(id: "folder", parentId: nil, name: "Folder")]
+            )
+        )
+        controller.loadView()
+        let collapseButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.collapseAllGroups") as? NSButton
+        )
+        let expandButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Sidebar.expandAllGroups") as? NSButton
+        )
+
+        for button in [collapseButton, expandButton] {
+            XCTAssertFalse(button is StacioHoverButton)
+            XCTAssertFalse(button.isBordered)
+            XCTAssertNil(button.layer?.backgroundColor)
+            button.performClick(nil)
+            XCTAssertTrue(button.layer?.animationKeys()?.contains("Stacio.sidebar.press") == true)
+        }
+    }
+
     func testSearchDisablesExpansionControlsAndRestoresThePreviousExpansionState() throws {
         let root = SessionFolder(id: "folder_root", parentId: nil, name: "Root")
         let child = SessionFolder(id: "folder_child", parentId: root.id, name: "Matching Child")

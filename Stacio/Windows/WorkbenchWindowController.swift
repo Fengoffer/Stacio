@@ -245,6 +245,11 @@ private final class WorkbenchLicensedFeatureMenuDelegate: NSObject, NSMenuDelega
 
 @MainActor
 public final class WorkbenchWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation {
+    private struct RememberedSSHInspectorState {
+        let wasExpanded: Bool
+        let selection: InspectorViewController.SelectionSnapshot
+    }
+
     private static let defaultFrameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.v4")
     private static let legacyFrameAutosaveKeys = [
         "NSWindow Frame Stacio.WorkbenchWindow",
@@ -335,6 +340,8 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var pendingInspectorWidth: CGFloat?
     private var preservedInspectorWidthDuringSidebarMove: CGFloat?
     private var isPendingInspectorWidthRepairScheduled = false
+    private var lastInspectorSessionProtocol: WorkspaceSessionProtocol = .noSession
+    private var rememberedSSHInspectorState: RememberedSSHInspectorState?
     private var interactiveSplitResizeWorkItem: DispatchWorkItem?
     private var splitWidthPersistenceWorkItem: DispatchWorkItem?
     private var isInteractiveSplitResizeActive = false
@@ -345,7 +352,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private let minimumReadableSidebarWidth: CGFloat = 220
     private let minimumWorkspaceWidthWhenOpeningInspector: CGFloat = 248
     private let defaultInspectorPanelWidth: CGFloat = 320
-    private let minimumInspectorWidthBeforeDeferredUncollapse: CGFloat = 420
     private let unrestrictedInspectorPanelWidth: CGFloat = 100_000
     private let splitResizeSettleInterval: TimeInterval = 0.08
 
@@ -2005,12 +2011,17 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 remotePath: pane.currentRemoteDirectory
             )
         }
-        workspaceViewController.onRemoteTerminalClosed = { [weak inspectorController] pane in
-            let canClose = inspectorController?.disconnectFilesBindingIfNeeded(runtimeID: pane.runtimeID) ?? true
-            if canClose {
-                inspectorController?.dismissTransferNotifications(runtimeID: pane.runtimeID)
+        workspaceViewController.onRemoteTerminalCloseRequested = { [weak inspectorController] pane, completion in
+            guard let inspectorController else {
+                completion(.ready)
+                return .ready
             }
-            return canClose
+            return inspectorController.disconnectFilesBindingIfNeeded(runtimeID: pane.runtimeID) { resolution in
+                if resolution == .ready {
+                    inspectorController.dismissTransferNotifications(runtimeID: pane.runtimeID)
+                }
+                completion(resolution)
+            }
         }
         workspaceViewController.onCurrentRemoteTerminalAttached = { [weak self, weak inspectorController] pane in
             guard let context = pane.liveSessionContext else {
@@ -2046,6 +2057,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             )
         }
         workspaceViewController.onCurrentTerminalChanged = { [weak self, weak inspectorController] in
+            self?.synchronizeInspectorVisibilityForCurrentSession()
             inspectorController?.refreshWorkspaceCapabilities()
             inspectorController?.refreshCurrentTerminalContextPanels()
             self?.refreshToolbarItemAvailability()
@@ -4594,21 +4606,21 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             pendingInspectorWidth ?? storedSplitWidth(column: "inspector") ?? defaultWidth,
             maximumInitialWidth
         )
-        let needsTemporaryWidthCap = initialWidth > 0
-            && maximumInitialWidth < minimumInspectorWidthBeforeDeferredUncollapse
+        let shouldPinInitialWidth = initialWidth > 0
         let contentSize = window?.contentView?.bounds.size
         let previousMinimumThickness = inspectorSplitViewItem.minimumThickness
         let previousMaximumThickness = inspectorSplitViewItem.maximumThickness
         performProgrammaticSplitLayout {
             inspectorSplitViewItem.holdingPriority = .defaultLow
-            if needsTemporaryWidthCap {
+            if shouldPinInitialWidth {
+                inspectorSplitViewItem.minimumThickness = initialWidth
                 inspectorSplitViewItem.maximumThickness = initialWidth
                 inspectorSplitViewItem.preferredThicknessFraction = initialWidth / splitView.bounds.width
                 pendingInspectorWidth = initialWidth
             }
             inspectorSplitViewItem.isCollapsed = false
         }
-        guard needsTemporaryWidthCap else { return }
+        guard shouldPinInitialWidth else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self,
@@ -4631,6 +4643,81 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             containerView.needsLayout = true
             containerView.layoutSubtreeIfNeeded()
         }
+    }
+
+    private func synchronizeInspectorVisibilityForCurrentSession() {
+        let currentProtocol = workspaceViewController.currentSessionProtocol
+        let previousProtocol = lastInspectorSessionProtocol
+        lastInspectorSessionProtocol = currentProtocol
+
+        guard let inspectorSplitViewItem,
+              let inspectorViewController
+        else {
+            return
+        }
+
+        if Self.automaticallyCollapsesInspector(for: currentProtocol) {
+            if previousProtocol == .ssh {
+                rememberedSSHInspectorState = RememberedSSHInspectorState(
+                    wasExpanded: inspectorSplitViewItem.isCollapsed == false,
+                    selection: inspectorViewController.selectionSnapshot
+                )
+            }
+            setInspectorExpandedForSessionSwitch(false)
+            return
+        }
+
+        guard currentProtocol == .ssh,
+              let rememberedSSHInspectorState
+        else {
+            return
+        }
+
+        self.rememberedSSHInspectorState = nil
+        inspectorViewController.restoreSelection(rememberedSSHInspectorState.selection)
+        setInspectorExpandedForSessionSwitch(rememberedSSHInspectorState.wasExpanded)
+    }
+
+    private static func automaticallyCollapsesInspector(
+        for sessionProtocol: WorkspaceSessionProtocol
+    ) -> Bool {
+        switch sessionProtocol {
+        case .scp, .sftp, .serial, .console, .telnet, .unsupportedRemote:
+            return true
+        case .ssh, .vnc, .noSession, .local, .browser, .unmanaged:
+            return false
+        }
+    }
+
+    private func setInspectorExpandedForSessionSwitch(_ expanded: Bool) {
+        guard let inspectorSplitViewItem,
+              inspectorSplitViewItem.isCollapsed == expanded
+        else {
+            return
+        }
+
+        let windowFrame = window?.frame
+        preserveProgrammaticWindowFrame(windowFrame)
+        defer {
+            restoreProgrammaticFrameIfNeeded(windowFrame)
+        }
+
+        if expanded {
+            revealInspector()
+            applyDefaultInspectorWidthIfNeeded()
+            scheduleInspectorReadabilityRepair(preserving: windowFrame)
+        } else {
+            if let inspectorWidth = currentInspectorPanelWidth() {
+                pendingInspectorWidth = inspectorWidth
+            }
+            performProgrammaticSplitLayout {
+                inspectorSplitViewItem.isCollapsed = true
+            }
+        }
+        keepSidebarReadableWithoutResizingWindow()
+        layoutWorkbenchContent(in: window)
+        centerContainerViewController?.synchronizeEditorLayout()
+        scheduleSidebarReadabilityRepair(preserving: windowFrame)
     }
 
     private func collapseInspectorIfShowingCurrentSection(_ sectionLabel: String, preserving windowFrame: NSRect?) -> Bool {

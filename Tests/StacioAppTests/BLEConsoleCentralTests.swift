@@ -31,6 +31,25 @@ final class BLEConsoleCentralTests: XCTestCase {
         XCTAssertEqual(scheduler.delays, [10])
     }
 
+    func testActiveScanRestartsOnceWhenBluetoothFirstBecomesPoweredOn() {
+        let controller = RecordingCoreBluetoothController()
+        let driver = CoreBluetoothBLEConsoleCentralDriver(
+            controller: controller,
+            scheduler: RecordingBLEConsoleScheduler(),
+            now: { Date(timeIntervalSince1970: 1_000) }
+        )
+
+        controller.emit(.event(.stateChanged(.unknown)))
+        driver.startScan()
+        XCTAssertEqual(controller.scanRequests.count, 1)
+
+        controller.emit(.event(.stateChanged(.poweredOn)))
+        XCTAssertEqual(controller.scanRequests.count, 2)
+
+        controller.emit(.event(.stateChanged(.poweredOn)))
+        XCTAssertEqual(controller.scanRequests.count, 2)
+    }
+
     func testStopAndRescanCancelAndReplaceTheActiveTimeout() {
         let controller = RecordingCoreBluetoothController()
         let scheduler = RecordingBLEConsoleScheduler()

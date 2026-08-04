@@ -2,6 +2,13 @@ import AppKit
 import SwiftTerm
 
 public enum TerminalLinkInteraction {
+    static let monitoredEventMask: NSEvent.EventTypeMask = [
+        .leftMouseDown,
+        .leftMouseUp,
+        .mouseMoved,
+        .flagsChanged,
+    ]
+
     public enum CursorStyle: Equatable {
         case text
         case link

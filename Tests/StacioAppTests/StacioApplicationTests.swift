@@ -332,6 +332,54 @@ final class StacioApplicationTests: XCTestCase {
         XCTAssertEqual(workbench.prepareForTerminationCount, 1)
     }
 
+    func testApplicationRepliesExactlyOnceAfterDeferredWorkbenchTerminationSucceeds() {
+        let workbench = DeferredTerminationWorkbenchWindowController()
+        var replies: [Bool] = []
+        let delegate = AppDelegate(
+            factory: { workbench },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            sparkleUpdateChecker: RecordingSparkleUpdateChecker(),
+            terminationReply: { _, shouldTerminate in
+                replies.append(shouldTerminate)
+            }
+        )
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateLater)
+        XCTAssertEqual(replies, [])
+
+        workbench.resolveTermination(true)
+        workbench.resolveTermination(false)
+
+        XCTAssertEqual(replies, [true])
+        XCTAssertEqual(workbench.prepareForTerminationCount, 1)
+    }
+
+    func testApplicationRepliesExactlyOnceAfterDeferredWorkbenchTerminationIsCanceled() {
+        let workbench = DeferredTerminationWorkbenchWindowController()
+        var replies: [Bool] = []
+        let delegate = AppDelegate(
+            factory: { workbench },
+            runningTunnelTerminationConfirmation: RecordingRunningTunnelTerminationConfirmation(
+                shouldTerminate: true
+            ),
+            sparkleUpdateChecker: RecordingSparkleUpdateChecker(),
+            terminationReply: { _, shouldTerminate in
+                replies.append(shouldTerminate)
+            }
+        )
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+
+        XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateLater)
+        workbench.resolveTermination(false)
+        workbench.resolveTermination(true)
+
+        XCTAssertEqual(replies, [false])
+        XCTAssertEqual(workbench.prepareForTerminationCount, 1)
+    }
+
     func testStacioOpenSessionURLForwardsDecodedSessionIDToWorkbench() {
         let workbench = FakeWorkbenchWindowController()
         let delegate = AppDelegate(factory: { workbench })
@@ -810,6 +858,37 @@ private final class FakeWorkbenchWindowController: WorkbenchWindowShowing {
     func prepareForApplicationTermination() -> Bool {
         prepareForTerminationCount += 1
         return shouldPrepareForTermination
+    }
+}
+
+@MainActor
+private final class DeferredTerminationWorkbenchWindowController: WorkbenchWindowShowing {
+    var terminationCompletion: ((Bool) -> Void)?
+    private(set) var prepareForTerminationCount = 0
+
+    func showWindow(_ sender: Any?) {}
+    func openSavedSession(id: String) {}
+    func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {}
+    func toggleDeviceDashboardFromMenu(_ sender: Any?) {}
+    func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool { true }
+
+    func prepareForApplicationTermination() -> Bool {
+        prepareForTerminationCount += 1
+        return false
+    }
+
+    @discardableResult
+    func prepareForApplicationTermination(
+        completion: @escaping (Bool) -> Void
+    ) -> RemoteTextEditorCloseDisposition {
+        prepareForTerminationCount += 1
+        terminationCompletion = completion
+        return .pending
+    }
+
+    func resolveTermination(_ shouldTerminate: Bool) {
+        terminationCompletion?(shouldTerminate)
+        terminationCompletion?(shouldTerminate)
     }
 }
 

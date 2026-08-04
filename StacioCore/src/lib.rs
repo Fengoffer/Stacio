@@ -2215,6 +2215,17 @@ pub fn clear_finished_scp_transfer_jobs(database_path: String) -> Result<u32, Ss
 }
 
 #[uniffi::export]
+pub fn delete_finished_scp_transfer_job(
+    database_path: String,
+    job_id: String,
+) -> Result<bool, SshRuntimeError> {
+    let repository = transfer_repository_for_path(database_path)?;
+    repository
+        .delete_finished_job(&job_id)
+        .map_err(transfer_db_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
 pub fn list_live_remote_directory(
     config: SshConnectionConfig,
     secret: SshAuthSecret,

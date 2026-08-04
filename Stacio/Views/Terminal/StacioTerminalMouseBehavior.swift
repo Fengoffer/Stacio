@@ -1,6 +1,30 @@
 import AppKit
 import SwiftTerm
 
+struct TerminalSelectionAutoCopyGate {
+    private var isPointerSelectionActive = false
+    private var didChangeSelectionDuringPointerSelection = false
+
+    mutating func beginPointerSelection() {
+        isPointerSelectionActive = true
+        didChangeSelectionDuringPointerSelection = false
+    }
+
+    mutating func shouldCopyAfterSelectionChanged() -> Bool {
+        guard isPointerSelectionActive else { return true }
+        didChangeSelectionDuringPointerSelection = true
+        return false
+    }
+
+    mutating func shouldCopyAfterMouseUp() -> Bool {
+        defer {
+            isPointerSelectionActive = false
+            didChangeSelectionDuringPointerSelection = false
+        }
+        return isPointerSelectionActive && didChangeSelectionDuringPointerSelection
+    }
+}
+
 public enum StacioTerminalMouseBehavior {
     public static func focusForKeyboardInput(_ terminalView: TerminalView) {
         guard terminalView.acceptsFirstResponder else { return }

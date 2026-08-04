@@ -113,6 +113,17 @@ final class FilesCoordinatorTests: XCTestCase {
         return condition()
     }
 
+    private func completeAsyncRemoteSave(
+        _ handler: RemoteTextEditorAsyncSaveHandler?,
+        text: String
+    ) throws {
+        let handler = try XCTUnwrap(handler)
+        var saveResult: Result<Void, Error>?
+        handler(text) { saveResult = $0 }
+        XCTAssertTrue(waitUntil { saveResult != nil })
+        try XCTUnwrap(saveResult).get()
+    }
+
     func testCoordinatorParsesRemoteListingAndUpdatesFilesView() throws {
         let bridge = RecordingRemoteFilesBridge(entries: [
             RemoteFileEntry(kind: .directory, path: "/var/log", size: 0, linkTarget: nil),
@@ -1345,7 +1356,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertEqual(opener.failedOpenRequestIDs, [opener.preparedRequestIDs[1]])
     }
 
-    func testCoordinatorKeepsTextOnlineAndRoutesRemoteMediaThroughPresentationCacheDownload() throws {
+    func testCoordinatorKeepsTextOnlineAndRoutesRemoteMediaThroughOnlineMediaWindow() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let bridge = RecordingRemoteFilesBridge(
@@ -1366,6 +1377,7 @@ final class FilesCoordinatorTests: XCTestCase {
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
+        defer { coordinator.closeDocumentWindows() }
         files.setRemoteEntries([
             RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 128, linkTarget: nil),
             RemoteFileEntry(kind: .file, path: "/srv/app/screenshot.png", size: 1_024, linkTarget: nil)
@@ -1377,20 +1389,23 @@ final class FilesCoordinatorTests: XCTestCase {
         files.tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         files.openSelectedEntryForTesting()
 
-        let mediaDownload = try XCTUnwrap(
-            scheduler.jobs.first { $0.id.hasPrefix("remote_edit_download_") }
-        )
-        XCTAssertEqual(mediaDownload.sourcePath, "/srv/app/screenshot.png")
-        scheduler.complete(jobID: mediaDownload.id)
+        XCTAssertTrue(waitUntil { coordinator.documentMediaWindowCountForTesting == 1 })
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+        let mediaSourceURL = try XCTUnwrap(coordinator.documentMediaSourceURLsForTesting.first)
+        XCTAssertEqual(mediaSourceURL.scheme, "http")
+        XCTAssertEqual(mediaSourceURL.host, "127.0.0.1")
+        XCTAssertEqual(mediaSourceURL.lastPathComponent, "screenshot.png")
 
-        XCTAssertEqual(bridge.readRequests.map(\.path), ["/srv/app/config.json"])
+        XCTAssertTrue(bridge.readRequests.contains { $0.path == "/srv/app/config.json" })
         let textRequest = try XCTUnwrap(opener.remoteDocumentRequests.first)
         XCTAssertEqual(textRequest.document.content, #"{"enabled":true}"#)
-        try textRequest.saveHandler?(#"{"enabled":false}"#)
-        let mediaRequest = try XCTUnwrap(opener.openRequests.first)
-        XCTAssertEqual(mediaRequest.mode, .mediaPreview)
-        XCTAssertEqual(mediaRequest.url.path, mediaDownload.destinationPath)
-        XCTAssertEqual(opener.localCopyRequestIDs.last, opener.preparedRequestIDs.last)
+        try completeAsyncRemoteSave(
+            textRequest.asyncSaveHandler,
+            text: #"{"enabled":false}"#
+        )
+        XCTAssertTrue(opener.openRequests.isEmpty)
+        XCTAssertTrue(opener.localCopyRequestIDs.isEmpty)
+        XCTAssertEqual(opener.preparedRequestIDs.count, 1)
 
         XCTAssertEqual(bridge.writeRequests.count, 1)
         XCTAssertEqual(bridge.writeRequests.first?.path, "/srv/app/config.json")
@@ -1481,7 +1496,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
-    func testCoordinatorRoutesRemoteImageVideoAndAudioThroughInjectedPresentationOpener() throws {
+    func testCoordinatorRoutesRemoteImageVideoAndAudioThroughOnlineMediaWindows() throws {
         let cacheRoot = try makeTemporaryDirectory()
         let scheduler = RecordingSCPTransferScheduler()
         let opener = RecordingRemoteEditOpener()
@@ -1498,6 +1513,7 @@ final class FilesCoordinatorTests: XCTestCase {
             remoteEditSessionIDProvider: { "session-alpha" }
         )
         XCTAssertNotNil(coordinator)
+        defer { coordinator.closeDocumentWindows() }
         files.setRemoteEntries([
             RemoteFileEntry(kind: .file, path: "/srv/app/files-panel-photo.png", size: 1_024, linkTarget: nil),
             RemoteFileEntry(kind: .file, path: "/srv/app/files-panel-demo.mp4", size: 2_048, linkTarget: nil),
@@ -1509,23 +1525,20 @@ final class FilesCoordinatorTests: XCTestCase {
             files.openSelectedEntryForTesting()
         }
 
-        XCTAssertEqual(scheduler.jobs.count, 3)
-        XCTAssertEqual(Set(scheduler.jobs.map(\.sourcePath)), Set([
-            "/srv/app/files-panel-photo.png",
-            "/srv/app/files-panel-demo.mp4",
-            "/srv/app/files-panel-audio.mp3"
-        ]))
-        XCTAssertEqual(opener.preparedRequestIDs.count, 3)
+        XCTAssertTrue(waitUntil { coordinator.documentMediaWindowCountForTesting == 3 })
+        XCTAssertTrue(scheduler.jobs.isEmpty)
+        XCTAssertTrue(opener.preparedRequestIDs.isEmpty)
         XCTAssertTrue(opener.remoteDocumentRequests.isEmpty)
-
-        for job in scheduler.jobs {
-            scheduler.complete(jobID: job.id)
-        }
-
-        XCTAssertEqual(opener.openRequests.count, 3)
-        XCTAssertTrue(opener.openRequests.allSatisfy { $0.mode == .mediaPreview })
-        XCTAssertEqual(Set(opener.openRequests.map { $0.url.path }), Set(scheduler.jobs.map(\.destinationPath)))
-        XCTAssertEqual(opener.localCopyRequestIDs, opener.preparedRequestIDs)
+        XCTAssertTrue(opener.openRequests.isEmpty)
+        XCTAssertTrue(opener.localCopyRequestIDs.isEmpty)
+        let mediaSourceURLs = coordinator.documentMediaSourceURLsForTesting
+        XCTAssertEqual(mediaSourceURLs.count, 3)
+        XCTAssertTrue(mediaSourceURLs.allSatisfy { $0.scheme == "http" && $0.host == "127.0.0.1" })
+        XCTAssertEqual(Set(mediaSourceURLs.map(\.lastPathComponent)), Set([
+            "files-panel-photo.png",
+            "files-panel-demo.mp4",
+            "files-panel-audio.mp3"
+        ]))
         XCTAssertNil(files.view.firstSubview(withIdentifier: "Stacio.Editor.root"))
     }
 
@@ -2118,12 +2131,39 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
         let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
 
-        try request.saveHandler?(#"{"enabled":false}"#)
+        try completeAsyncRemoteSave(request.asyncSaveHandler, text: #"{"enabled":false}"#)
 
         XCTAssertTrue(scheduler.jobs.isEmpty)
         XCTAssertEqual(bridge.writeRequests.count, 1)
         XCTAssertEqual(bridge.writeRequests.first?.path, "/srv/app/config.json")
         XCTAssertEqual(String(data: try XCTUnwrap(bridge.writeRequests.first?.contents), encoding: .utf8), #"{"enabled":false}"#)
+    }
+
+    func testCoordinatorRemoteDocumentUsesAsyncSaveHandler() throws {
+        let opener = RecordingRemoteEditOpener()
+        let bridge = RecordingRemoteFilesBridge(
+            remoteFileData: ["/srv/app/config.json": Data("{}".utf8)]
+        )
+        let files = FilesViewController()
+        files.loadView()
+        let coordinator = FilesCoordinator(
+            bridge: bridge,
+            filesViewController: files,
+            liveSessionContextProvider: { self.liveContext() },
+            remoteEditOpener: opener
+        )
+        XCTAssertNotNil(coordinator)
+        files.setRemoteEntries([
+            RemoteFileEntry(kind: .file, path: "/srv/app/config.json", size: 2, linkTarget: nil)
+        ])
+
+        files.tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        files.performOpenRemoteEditForTesting()
+        XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
+
+        let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
+        XCTAssertNotNil(request.asyncSaveHandler)
+        XCTAssertNil(request.saveHandler)
     }
 
     func testCoordinatorRemoteDocumentSaveVerifiesRemoteContentsAfterWrite() throws {
@@ -2157,7 +2197,7 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
         let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
 
-        try request.saveHandler?(#"{"enabled":false}"#)
+        try completeAsyncRemoteSave(request.asyncSaveHandler, text: #"{"enabled":false}"#)
 
         XCTAssertEqual(bridge.writeRequests.count, 1)
         XCTAssertEqual(bridge.readRequests.map(\.path), [
@@ -2198,7 +2238,10 @@ final class FilesCoordinatorTests: XCTestCase {
         files.performOpenRemoteEditForTesting()
         XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
 
-        try opener.remoteDocumentRequests[0].saveHandler?(#"{"enabled":false}"#)
+        try completeAsyncRemoteSave(
+            opener.remoteDocumentRequests[0].asyncSaveHandler,
+            text: #"{"enabled":false}"#
+        )
 
         XCTAssertEqual(bridge.sftpWriteRequests.map(\.path), ["/srv/app/config.json"])
         XCTAssertTrue(bridge.writeRequests.isEmpty)
@@ -2237,7 +2280,12 @@ final class FilesCoordinatorTests: XCTestCase {
         files.performOpenRemoteEditForTesting()
         XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
 
-        XCTAssertThrowsError(try opener.remoteDocumentRequests[0].saveHandler?("Port 2222\n")) { error in
+        XCTAssertThrowsError(
+            try completeAsyncRemoteSave(
+                opener.remoteDocumentRequests[0].asyncSaveHandler,
+                text: "Port 2222\n"
+            )
+        ) { error in
             XCTAssertEqual(error as? SshRuntimeError, permissionError)
         }
         XCTAssertTrue(bridge.writeRequests.isEmpty)
@@ -2278,7 +2326,12 @@ final class FilesCoordinatorTests: XCTestCase {
         XCTAssertTrue(waitUntil { opener.remoteDocumentRequests.count == 1 })
         let request = try XCTUnwrap(opener.remoteDocumentRequests.first)
 
-        XCTAssertThrowsError(try request.saveHandler?(#"{"enabled":false}"#)) { error in
+        XCTAssertThrowsError(
+            try completeAsyncRemoteSave(
+                request.asyncSaveHandler,
+                text: #"{"enabled":false}"#
+            )
+        ) { error in
             XCTAssertEqual(error as? RemoteEditCacheError, .remoteWriteVerificationFailed("/srv/app/config.json"))
         }
 
@@ -2336,7 +2389,12 @@ final class FilesCoordinatorTests: XCTestCase {
             )
         ])
 
-        XCTAssertThrowsError(try request.saveHandler?(#"{"enabled":false}"#)) { error in
+        XCTAssertThrowsError(
+            try completeAsyncRemoteSave(
+                request.asyncSaveHandler,
+                text: #"{"enabled":false}"#
+            )
+        ) { error in
             XCTAssertEqual(error as? RemoteEditCacheError, .remoteChanged("/srv/app/config.json"))
         }
 
@@ -5499,6 +5557,7 @@ private final class RecordingRemoteEditOpener: RemoteEditOpening {
         let document: RemoteTextEditorDocumentDescriptor
         let mode: RemoteFileOpenMode
         let saveHandler: ((String) throws -> Void)?
+        let asyncSaveHandler: RemoteTextEditorAsyncSaveHandler?
     }
 
     struct FailedOpenRequest {
@@ -5565,8 +5624,32 @@ private final class RecordingRemoteEditOpener: RemoteEditOpening {
         remoteDocumentRequests.append(RemoteDocumentRequest(
             document: document,
             mode: mode,
-            saveHandler: saveHandler
+            saveHandler: saveHandler,
+            asyncSaveHandler: nil
         ))
+    }
+
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler
+    ) {
+        remoteDocumentRequests.append(RemoteDocumentRequest(
+            document: document,
+            mode: mode,
+            saveHandler: nil,
+            asyncSaveHandler: asyncSaveHandler
+        ))
+    }
+
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler,
+        request: RemoteEditOpenRequest
+    ) {
+        remoteDocumentRequestIDs.append(request.id)
+        openRemoteDocument(document, mode: mode, asyncSaveHandler: asyncSaveHandler)
     }
 
     func openRemoteDocument(

@@ -199,8 +199,12 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             current.removeFromParent()
             hostedEditorContentViewController = nil
             editorSidecarCollapsed = true
+            setPhysicalEditorWidth(0)
             editorHostView.isHidden = true
             splitView.adjustSubviews()
+            splitView.layoutSubtreeIfNeeded()
+            workspaceViewController.view.needsLayout = true
+            workspaceViewController.view.layoutSubtreeIfNeeded()
         }
         scheduleEditorLayoutSynchronization()
     }
@@ -220,9 +224,13 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
 
         performProgrammaticLayout {
             editorSidecarCollapsed = collapsed
-            editorHostView.isHidden = collapsed
-            splitView.adjustSubviews()
-            if collapsed == false {
+            if collapsed {
+                setPhysicalEditorWidth(0)
+                editorHostView.isHidden = true
+                splitView.adjustSubviews()
+            } else {
+                editorHostView.isHidden = false
+                splitView.adjustSubviews()
                 applyEditorTargetWidth()
             }
         }
@@ -250,6 +258,11 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
         guard proposedPosition.isFinite, usableWidth.isFinite else {
             return max(0, splitView.arrangedSubviews[0].frame.width)
         }
+        guard editorSidecarCollapsed == false,
+              hostedEditorContentViewController != nil
+        else {
+            return usableWidth
+        }
 
         let widthNeededForBothMinimums = Self.minimumReadableWorkspaceWidth
             + Self.minimumEditorWidth
@@ -275,6 +288,11 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             return proposedMinimumPosition
         }
         let usableWidth = max(0, splitView.bounds.width - splitView.dividerThickness)
+        guard editorSidecarCollapsed == false,
+              hostedEditorContentViewController != nil
+        else {
+            return usableWidth
+        }
         guard usableWidth >= Self.minimumReadableWorkspaceWidth + Self.minimumEditorWidth else {
             return 0
         }
@@ -293,6 +311,11 @@ public final class WorkbenchCenterContainerViewController: NSViewController,
             return proposedMaximumPosition
         }
         let usableWidth = max(0, splitView.bounds.width - splitView.dividerThickness)
+        guard editorSidecarCollapsed == false,
+              hostedEditorContentViewController != nil
+        else {
+            return usableWidth
+        }
         guard usableWidth >= Self.minimumReadableWorkspaceWidth + Self.minimumEditorWidth else {
             return usableWidth
         }

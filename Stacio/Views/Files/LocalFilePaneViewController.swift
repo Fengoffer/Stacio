@@ -1190,7 +1190,7 @@ public final class LocalFilePaneViewController: NSViewController, NSTableViewDat
                     sourceURL: plan.0,
                     destinationURL: plan.1,
                     operation: operation == .copy ? .copy : .move,
-                    notificationPolicy: .userVisible,
+                    notificationPolicy: .silent,
                     completion: { result in
                         DispatchQueue.main.async {
                             batch.receive(result)

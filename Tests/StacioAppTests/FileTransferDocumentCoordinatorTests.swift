@@ -679,6 +679,36 @@ final class FileTransferDocumentCoordinatorTests: XCTestCase {
         coordinator.closeDocumentWindowsForTesting()
     }
 
+    func testRemoteDocumentPreparationSchedulesSilentCacheTransfer() {
+        let scheduler = QuickLookRecordingTransferScheduler()
+        let source = FileTransferRemoteDocumentSource(
+            runtimeID: "document-silent-cache",
+            context: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "files.example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:files"
+            ),
+            bridge: DirectoryQuickLookRemoteFilesBridge(listings: [:], dataByPath: [:]),
+            transferScheduler: scheduler,
+            setStatus: { _ in }
+        )
+        let coordinator = FileTransferDocumentCoordinator()
+
+        coordinator.openRemoteSelection(
+            RemoteFileSelection(path: "/srv/manual.pdf", size: 2_500_000),
+            source: source
+        )
+
+        XCTAssertEqual(scheduler.notificationPolicies, [.silent])
+        coordinator.closeDocumentWindowsForTesting()
+    }
+
     func testRemoteQuickLookLoadingPanelUsesNativePopoverMaterialInDarkMode() throws {
         let coordinator = FileWorkspaceQuickLookCoordinator()
         coordinator.showLoading(message: "正在准备一项名称较长的远端文件快速预览...")

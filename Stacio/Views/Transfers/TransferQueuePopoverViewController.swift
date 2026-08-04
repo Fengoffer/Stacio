@@ -8,14 +8,19 @@ public struct TransferQueuePopoverRowPresentation: Equatable {
     public let speedText: String
     public let elapsedText: String
     public let remainingText: String
+    public let sizeText: String?
+    public let completionTimeText: String?
+    public let metricsText: String
     public let primaryActionLabel: String?
     public let canCancel: Bool
+    public let canDelete: Bool
 }
 
 @MainActor
 public final class TransferQueuePopoverViewController: NSViewController {
     public var onTransferAction: ((TransferQueueAction, String) -> Void)?
     public var onCancelTransfer: ((String) -> Void)?
+    public var onRemoveFinishedTransfer: ((String) -> Void)?
     public var onClearFinished: (() -> Void)?
     public var onCollapseRequested: (() -> Void)?
 
@@ -223,17 +228,16 @@ public final class TransferQueuePopoverViewController: NSViewController {
         symbolName: String,
         action: Selector
     ) {
-        button.title = ""
+        button.title = title
         button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-        button.imagePosition = .imageOnly
+        button.imagePosition = .imageLeading
         button.target = self
         button.action = action
         button.controlSize = .small
-        button.bezelStyle = .texturedRounded
+        button.bezelStyle = .rounded
         button.setAccessibilityLabel(title)
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 28),
             button.heightAnchor.constraint(equalToConstant: 24)
         ])
     }
@@ -289,6 +293,9 @@ public final class TransferQueuePopoverViewController: NSViewController {
                 self?.onTransferAction?(.stop, jobID)
             }
         }
+        rowView.onDelete = { [weak self] jobID in
+            self?.onRemoveFinishedTransfer?(jobID)
+        }
         return rowView
     }
 
@@ -341,7 +348,8 @@ public final class TransferQueuePopoverViewController: NSViewController {
             summaryLabel.stringValue = "正在传输 \(active) 项 · 历史 \(history) 项"
         }
         backgroundButton.isHidden = activeCount == 0
-        clearFinishedButton.isHidden = completedCount == 0
+        clearFinishedButton.isHidden = false
+        clearFinishedButton.isEnabled = completedCount > 0
     }
 
     private func updateEmptyState() {
@@ -362,6 +370,7 @@ public final class TransferQueuePopoverViewController: NSViewController {
         for row: TransferQueueSnapshot.Row,
         speed: Double
     ) -> TransferQueuePopoverRowPresentation {
+        let isTerminal = isActive(status: row.rawStatus) == false
         let percent: Int?
         if row.bytesTotal > 0 {
             percent = Int(min(100, (Double(row.bytesDone) / Double(row.bytesTotal) * 100).rounded(.down)))
@@ -374,16 +383,58 @@ public final class TransferQueuePopoverViewController: NSViewController {
         } else {
             remainingSeconds = nil
         }
+        let sizeText: String?
+        let completionTimeText: String?
+        let elapsedText: String
+        let displayedSpeedText: String
+        let remainingText: String
+        let metricsText: String
+        if isTerminal {
+            let byteCount: UInt64
+            if isCompleted(status: row.rawStatus), row.bytesDone > 0 {
+                byteCount = row.bytesDone
+            } else if row.bytesTotal > 0 {
+                byteCount = row.bytesTotal
+            } else {
+                byteCount = row.bytesDone
+            }
+            let rateByteCount = row.bytesDone > 0
+                ? row.bytesDone
+                : (isCompleted(status: row.rawStatus) ? byteCount : 0)
+            let averageBytesPerSecond = row.elapsedTime > 0
+                ? Double(rateByteCount) / row.elapsedTime
+                : 0
+            sizeText = "大小 \(byteCountText(byteCount))"
+            elapsedText = "总用时 \(terminalDurationText(row.elapsedTime))"
+            let timeLabel = isCompleted(status: row.rawStatus) ? "完成时间" : "结束时间"
+            completionTimeText = "\(timeLabel) \(row.finishedAt.map(completedAtFormatter.string) ?? "--")"
+            displayedSpeedText = "平均速率 \(formattedSpeed(averageBytesPerSecond))"
+            remainingText = isCompleted(status: row.rawStatus) ? "已完成" : statusText(for: row.rawStatus)
+            metricsText = [
+                [sizeText, elapsedText].compactMap { $0 }.joined(separator: "  ·  "),
+                [completionTimeText, displayedSpeedText].compactMap { $0 }.joined(separator: "  ·  ")
+            ].joined(separator: "\n")
+        } else {
+            sizeText = nil
+            completionTimeText = nil
+            elapsedText = "已用 \(durationText(row.elapsedTime))"
+            displayedSpeedText = speedText(speed, status: row.rawStatus)
+            remainingText = remainingSeconds.map { "剩余 \(durationText($0))" } ?? "剩余 --"
+            metricsText = [displayedSpeedText, elapsedText, remainingText].joined(separator: "  ·  ")
+        }
         return TransferQueuePopoverRowPresentation(
             jobID: row.jobID,
             fileName: displayFileName(for: row),
             percentText: percent.map { "\($0)%" } ?? "--",
-            speedText: speedText(speed, status: row.rawStatus),
-            elapsedText: "已用 \(durationText(row.elapsedTime))",
-            remainingText: remainingSeconds.map { "剩余 \(durationText($0))" }
-                ?? (isCompleted(status: row.rawStatus) ? "已完成" : "剩余 --"),
+            speedText: displayedSpeedText,
+            elapsedText: elapsedText,
+            remainingText: remainingText,
+            sizeText: sizeText,
+            completionTimeText: completionTimeText,
+            metricsText: metricsText,
             primaryActionLabel: primaryAction(for: row.rawStatus).map(actionLabel),
-            canCancel: isActive(status: row.rawStatus)
+            canCancel: isActive(status: row.rawStatus),
+            canDelete: isTerminal
         )
     }
 
@@ -400,8 +451,12 @@ public final class TransferQueuePopoverViewController: NSViewController {
 
     private static func speedText(_ bytesPerSecond: Double, status: String) -> String {
         guard isActive(status: status), bytesPerSecond > 0 else { return "-- B/s" }
+        return formattedSpeed(bytesPerSecond)
+    }
+
+    private static func formattedSpeed(_ bytesPerSecond: Double) -> String {
         let units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
-        var value = bytesPerSecond
+        var value = max(bytesPerSecond, 0)
         var unitIndex = 0
         while value >= 1_024, unitIndex < units.count - 1 {
             value /= 1_024
@@ -415,6 +470,30 @@ public final class TransferQueuePopoverViewController: NSViewController {
             .replacingOccurrences(of: #"(\.\d*[1-9])0+$"#, with: "$1", options: .regularExpression)
         return "\(formatted) \(units[unitIndex])"
     }
+
+    private static func byteCountText(_ byteCount: UInt64) -> String {
+        guard byteCount > 0 else { return "--" }
+        return ByteCountFormatter.string(
+            fromByteCount: Int64(clamping: byteCount),
+            countStyle: .file
+        )
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
+    private static func terminalDurationText(_ interval: TimeInterval) -> String {
+        guard interval.isFinite, interval >= 0 else { return "--" }
+        if interval < 10, interval.rounded(.down) != interval {
+            return String(format: "%.1f 秒", interval)
+        }
+        return durationText(interval)
+    }
+
+    private static let completedAtFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        return formatter
+    }()
 
     private static func durationText(_ interval: TimeInterval) -> String {
         guard interval.isFinite, interval >= 0 else { return "--" }
@@ -484,6 +563,7 @@ private final class TransferQueuePopoverRowView: NSView {
     let jobID: String
     var onPrimaryAction: ((TransferQueueAction, String) -> Void)?
     var onCancel: ((String) -> Void)?
+    var onDelete: ((String) -> Void)?
 
     private let directionImageView = NSImageView()
     private let fileNameLabel = NSTextField(labelWithString: "")
@@ -494,6 +574,7 @@ private final class TransferQueuePopoverRowView: NSView {
     private let primaryButton = NSButton()
     private let cancelButton = NSButton()
     private var primaryAction: TransferQueueAction?
+    private var deletesHistory = false
 
     init(jobID: String) {
         self.jobID = jobID
@@ -519,15 +600,13 @@ private final class TransferQueuePopoverRowView: NSView {
         primaryAction: TransferQueueAction?
     ) {
         self.primaryAction = primaryAction
+        deletesHistory = presentation.canDelete
         fileNameLabel.stringValue = presentation.fileName
         fileNameLabel.toolTip = "\(sourcePath) → \(destinationPath)"
         statusLabel.stringValue = statusText
         percentLabel.stringValue = presentation.percentText
-        metricsLabel.stringValue = [
-            presentation.speedText,
-            presentation.elapsedText,
-            presentation.remainingText
-        ].joined(separator: "  ·  ")
+        metricsLabel.stringValue = presentation.metricsText
+        metricsLabel.toolTip = presentation.metricsText.replacingOccurrences(of: "\n", with: " · ")
 
         directionImageView.image = NSImage(
             systemSymbolName: direction == .upload ? "arrow.up" : "arrow.down",
@@ -547,8 +626,13 @@ private final class TransferQueuePopoverRowView: NSView {
         }
 
         configurePrimaryButton(label: presentation.primaryActionLabel)
-        cancelButton.isHidden = presentation.canCancel == false
-        setAccessibilityLabel("\(presentation.fileName)，\(statusText)，\(presentation.percentText)")
+        configureTerminalButton(
+            canCancel: presentation.canCancel,
+            canDelete: presentation.canDelete
+        )
+        setAccessibilityLabel(
+            "\(presentation.fileName)，\(statusText)，\(presentation.percentText)，\(presentation.metricsText)"
+        )
     }
 
     private func buildView() {
@@ -581,7 +665,7 @@ private final class TransferQueuePopoverRowView: NSView {
         metricsLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         metricsLabel.textColor = .secondaryLabelColor
         metricsLabel.lineBreakMode = .byTruncatingTail
-        metricsLabel.maximumNumberOfLines = 1
+        metricsLabel.maximumNumberOfLines = 2
         metricsLabel.translatesAutoresizingMaskIntoConstraints = false
 
         configureActionButton(
@@ -613,7 +697,7 @@ private final class TransferQueuePopoverRowView: NSView {
 
         NSLayoutConstraint.activate([
             widthAnchor.constraint(greaterThanOrEqualToConstant: 480),
-            heightAnchor.constraint(equalToConstant: 88),
+            heightAnchor.constraint(equalToConstant: 104),
 
             directionImageView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             directionImageView.topAnchor.constraint(equalTo: topAnchor, constant: 13),
@@ -692,13 +776,37 @@ private final class TransferQueuePopoverRowView: NSView {
         primaryButton.toolTip = label
     }
 
+    private func configureTerminalButton(canCancel: Bool, canDelete: Bool) {
+        let label: String
+        let symbolName: String
+        if canDelete {
+            label = "删除任务记录"
+            symbolName = "trash"
+        } else {
+            label = "取消任务"
+            symbolName = "xmark"
+        }
+        cancelButton.image = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: label
+        )
+        cancelButton.setAccessibilityLabel(label)
+        cancelButton.toolTip = label
+        cancelButton.isHidden = canCancel == false && canDelete == false
+        cancelButton.isEnabled = canCancel || canDelete
+    }
+
     @objc private func primaryPressed() {
         guard let primaryAction else { return }
         onPrimaryAction?(primaryAction, jobID)
     }
 
     @objc private func cancelPressed() {
-        onCancel?(jobID)
+        if deletesHistory {
+            onDelete?(jobID)
+        } else {
+            onCancel?(jobID)
+        }
     }
 }
 

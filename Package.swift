@@ -18,7 +18,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle.git", .upToNextMajor(from: "2.7.0")),
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", .upToNextMajor(from: "1.13.0")),
+        .package(
+            url: "https://github.com/migueldeicaza/SwiftTerm.git",
+            revision: "87a7888edc0ae415922174e4e6c0486f3991e0ea"
+        ),
         .package(url: "https://github.com/weichsel/ZIPFoundation.git", from: "0.9.19")
     ],
     targets: [

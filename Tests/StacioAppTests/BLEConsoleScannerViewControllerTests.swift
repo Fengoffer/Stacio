@@ -30,9 +30,11 @@ final class BLEConsoleScannerViewControllerTests: XCTestCase {
         XCTAssertTrue(driver.connectCalls.isEmpty)
         XCTAssertEqual(controller.rowModel(at: 0).leadingSymbolName, "bluetooth")
         XCTAssertEqual(controller.rowModel(at: 0).signalSymbolName, "cellularbars")
-        XCTAssertEqual(controller.rowModel(at: 0).rssiText, "-54 dBm")
+        XCTAssertEqual(controller.rowModel(at: 0).signalStrength, 46.0 / 60.0, accuracy: 0.001)
+        XCTAssertFalse(controller.rowModel(at: 0).detail.contains("dBm"))
         XCTAssertEqual(controller.rowModel(at: 0).recognitionSymbolName, "checkmark.circle.fill")
-        XCTAssertEqual(controller.rowModel(at: 1).rssiText, "-30 dBm")
+        XCTAssertEqual(controller.rowModel(at: 1).signalStrength, 1, accuracy: 0.001)
+        XCTAssertFalse(controller.rowModel(at: 1).detail.contains("dBm"))
 
         controller.selectDeviceForTesting(nbee.identifier)
         XCTAssertTrue(controller.connectButtonForTesting.isEnabled)

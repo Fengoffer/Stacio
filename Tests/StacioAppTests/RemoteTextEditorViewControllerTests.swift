@@ -529,6 +529,215 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.editorFunctionScriptsForTesting[1].contains(#""editor.action.startFindReplaceAction""#))
     }
 
+    func testToolbarAddsStableDragHandleAndTwoSegmentPresentationControl() throws {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        let dragHandle = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.dragHandle")
+        )
+        let control = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.presentation")
+                as? NSSegmentedControl
+        )
+
+        XCTAssertEqual(control.segmentCount, 2)
+        XCTAssertEqual(editor.presentationDisplayImageNameForTesting, "display")
+        XCTAssertEqual(control.toolTip, L10n.EditorPresentation.detach)
+        XCTAssertEqual(control.accessibilityLabel(), L10n.EditorPresentation.detach)
+        XCTAssertGreaterThanOrEqual(dragHandle.frame.width, 40)
+        XCTAssertLessThan(
+            dragHandle.contentHuggingPriority(for: .horizontal),
+            .defaultHigh
+        )
+        XCTAssertEqual(control.frame.height, 24, accuracy: 1)
+    }
+
+    func testToolbarPresentationControlSwitchesDetachRedockAndLockSemantics() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.updatePresentationControls(.init(
+            mode: .docked,
+            hasEditor: true,
+            isTransitioning: false,
+            detachedFeatureEnabled: false
+        ))
+        XCTAssertEqual(editor.presentationMainImageNameForTesting, "lock")
+        XCTAssertTrue((editor.view.firstSubview(
+            withIdentifier: "Stacio.Editor.Toolbar.presentation"
+        ) as? NSSegmentedControl)?.isEnabled == true)
+        XCTAssertEqual(
+            editor.presentationMainTooltipForTesting,
+            L10n.EditorPresentation.detachRequiresLicense
+        )
+
+        editor.updatePresentationControls(.init(
+            mode: .floating,
+            hasEditor: true,
+            isTransitioning: false,
+            detachedFeatureEnabled: true
+        ))
+        XCTAssertEqual(editor.presentationMainTooltipForTesting, L10n.EditorPresentation.redock)
+    }
+
+    func testToolbarControlsFitAtMinimumEditorWidthWithoutOverlap() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        editor.view.frame = NSRect(x: 0, y: 0, width: 480, height: 640)
+        editor.view.layoutSubtreeIfNeeded()
+
+        let controls = editor.toolbarControlFramesForTesting.sorted { $0.minX < $1.minX }
+        for pair in zip(controls, controls.dropFirst()) {
+            XCTAssertLessThanOrEqual(pair.0.maxX, pair.1.minX)
+        }
+        XCTAssertTrue(controls.allSatisfy { editor.view.bounds.contains($0) })
+    }
+
+    func testToolbarRestoresLifecycleAndFileOperationControls() throws {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        for identifier in [
+            "Stacio.Editor.Toolbar.close",
+            "Stacio.Editor.Toolbar.collapse",
+            "Stacio.Editor.Toolbar.backup",
+            "Stacio.Editor.Toolbar.askAI",
+            "Stacio.Editor.Toolbar.restore"
+        ] {
+            XCTAssertNotNil(
+                editor.view.firstSubview(withIdentifier: identifier) as? NSButton,
+                identifier
+            )
+        }
+    }
+
+    func testToolbarLifecycleAndFileOperationControlsInvokeRealCallbacks() throws {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        var closeCount = 0
+        var collapseCount = 0
+        var backupCount = 0
+        var aiCount = 0
+        var restoreCount = 0
+        editor.onCloseRequested = { closeCount += 1 }
+        editor.onToggleCollapseRequested = { collapseCount += 1 }
+        editor.onBackupRequested = { backupCount += 1 }
+        editor.onAIQuestionRequested = { _ in aiCount += 1 }
+        editor.onRestoreRequested = { restoreCount += 1 }
+        editor.loadView()
+
+        for identifier in [
+            "Stacio.Editor.Toolbar.collapse",
+            "Stacio.Editor.Toolbar.backup",
+            "Stacio.Editor.Toolbar.askAI",
+            "Stacio.Editor.Toolbar.restore",
+            "Stacio.Editor.Toolbar.close"
+        ] {
+            let button = try XCTUnwrap(
+                editor.view.firstSubview(withIdentifier: identifier) as? NSButton
+            )
+            button.performClick(nil as Any?)
+        }
+
+        XCTAssertEqual(collapseCount, 1)
+        XCTAssertEqual(backupCount, 1)
+        XCTAssertEqual(aiCount, 1)
+        XCTAssertEqual(restoreCount, 1)
+        XCTAssertEqual(closeCount, 1)
+    }
+
+    func testToolbarCloseUsesStandaloneWindowLifecycleWhenCoordinatorIsAbsent() throws {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        let windowController = RemoteTextEditorWindowController(editorViewController: editor)
+        var closeCount = 0
+        windowController.onClose = { _ in closeCount += 1 }
+        windowController.showWindow(nil)
+        defer { windowController.close() }
+        let closeButton = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.close") as? NSButton
+        )
+
+        closeButton.performClick(nil as Any?)
+
+        XCTAssertEqual(closeCount, 1)
+        XCTAssertFalse(windowController.window?.isVisible ?? true)
+    }
+
+    func testToolbarDragRequiresPrimaryButtonMovementBeyondEightPoints() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        var requests = 0
+        editor.onDragDetachRequested = { _ in requests += 1 }
+
+        editor.simulateToolbarDragForTesting(buttonNumber: 0, points: [.zero, NSPoint(x: 8, y: 0)])
+        editor.simulateToolbarDragForTesting(buttonNumber: 1, points: [.zero, NSPoint(x: 20, y: 0)])
+        XCTAssertEqual(requests, 0)
+
+        editor.simulateToolbarDragForTesting(buttonNumber: 0, points: [.zero, NSPoint(x: 9, y: 0)])
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testMonacoTabDragBridgeExcludesCloseScrollAndNormalClicks() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        let html = editor.editorHTMLForTesting
+
+        XCTAssertTrue(html.contains("tabDragCandidate"))
+        XCTAssertTrue(html.contains("event.target.closest('.tab-close, .tab-scroll')"))
+        XCTAssertTrue(html.contains("event.button !== 0"))
+        XCTAssertTrue(html.contains("pageLoadGeneration"))
+    }
+
+    func testStalePageGenerationCannotStartTabDrag() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        var requests = 0
+        editor.onDragDetachRequested = { _ in requests += 1 }
+
+        editor.receiveTabDragCandidateForTesting(
+            pageLoadGeneration: editor.pageLoadGenerationForTesting,
+            pointInWindow: .zero
+        )
+        editor.receiveTabDragCandidateForTesting(pageLoadGeneration: -1, pointInWindow: .zero)
+        editor.simulateTrackedTabDragForTesting(to: NSPoint(x: 20, y: 0))
+
+        XCTAssertEqual(requests, 0)
+    }
+
     func testEditorExposesSavedDirtySavingAndFailedSaveStates() throws {
         let fileURL = try makeTemporaryEditorFile(name: "app.conf", contents: "enabled=false\n")
         var shouldFail = false

@@ -165,6 +165,7 @@ final class CoreBluetoothBLEConsoleCentralDriver: BLEConsoleCentralDriving, @unc
     private var scanGeneration: UInt64 = 0
     private var activeScanGeneration: UInt64?
     private var scanTimeout: BLEConsoleScheduledAction?
+    private var centralState: BLEConsoleCentralState = .unknown
 
     convenience init() {
         let queue = DispatchQueue(label: "app.stacio.ble-console.corebluetooth")
@@ -304,6 +305,17 @@ final class CoreBluetoothBLEConsoleCentralDriver: BLEConsoleCentralDriving, @unc
             lock.unlock()
             eventHandler?(.discoverySnapshot(nextSnapshot))
         case let .event(event):
+            if case let .stateChanged(state) = event {
+                lock.lock()
+                let shouldRestartActiveScan = state == .poweredOn
+                    && centralState != .poweredOn
+                    && activeScanGeneration != nil
+                centralState = state
+                lock.unlock()
+                if shouldRestartActiveScan {
+                    controller.startScan(serviceUUIDs: nil, allowDuplicates: true)
+                }
+            }
             eventHandler?(event)
         }
     }

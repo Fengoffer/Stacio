@@ -1578,6 +1578,7 @@ final class FileTransferDocumentCoordinator {
                     destinationPath: destination.path,
                     bytesTotal: selection.size
                 ),
+                notificationPolicy: .silent,
                 completion: { [weak self] progress in
                     guard Self.isTerminalTransferStatus(progress.status) else { return }
                     DispatchQueue.main.async { [weak self] in

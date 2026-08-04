@@ -1,6 +1,26 @@
 import XCTest
 
 final class PackageManifestTests: XCTestCase {
+    func testSwiftTermPinsUpstreamCellSpacingFixRevision() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let manifest = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Package.swift"),
+            encoding: .utf8
+        )
+        let resolved = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Package.resolved"),
+            encoding: .utf8
+        )
+        let revision = "87a7888edc0ae415922174e4e6c0486f3991e0ea"
+
+        XCTAssertTrue(manifest.contains("https://github.com/migueldeicaza/SwiftTerm.git"))
+        XCTAssertTrue(manifest.contains("revision: \"\(revision)\""))
+        XCTAssertTrue(resolved.contains("\"revision\" : \"\(revision)\""))
+    }
+
     func testManifestLinksCoreBluetoothForStacioApp() throws {
         let manifestURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

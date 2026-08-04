@@ -30,6 +30,10 @@ public final class InspectorViewController: NSViewController {
         }
     }
 
+    struct SelectionSnapshot: Equatable {
+        fileprivate let sectionRawValue: Int
+    }
+
     private enum Section: Int, CaseIterable {
         case files
         case tunnels
@@ -309,6 +313,12 @@ public final class InspectorViewController: NSViewController {
                 _ = self?.transferQueueCoordinator?.stopTransfer(jobID: jobID)
             }
         }
+        files.onRemoveTransferHistory = { [weak self] jobID in
+            _ = self?.transferQueueCoordinator?.removeFinishedTransfer(jobID: jobID)
+        }
+        files.onClearTransferHistory = { [weak self] in
+            _ = self?.transferQueueCoordinator?.clearFinishedTransfers()
+        }
         transferQueueCoordinator?.onSnapshotChanged = { [weak files] snapshot in
             files?.setTransferStatusSnapshot(snapshot)
         }
@@ -340,6 +350,12 @@ public final class InspectorViewController: NSViewController {
         }
         remoteEditorPresentation?.onAIQuestionRequested = { [weak self] question in
             self?.showAIAssistantForFileQuestion(question)
+        }
+        remoteEditorPresentation?.onBackupRequested = { [weak self] in
+            self?.filesCoordinator?.performBackupFromInspector()
+        }
+        remoteEditorPresentation?.onRestoreRequested = { [weak self] in
+            self?.filesCoordinator?.performRestoreFromInspector()
         }
 
         let tunnels = TunnelsViewController(
@@ -593,6 +609,19 @@ public final class InspectorViewController: NSViewController {
         currentSection.label
     }
 
+    var selectionSnapshot: SelectionSnapshot {
+        SelectionSnapshot(sectionRawValue: currentSection.rawValue)
+    }
+
+    func restoreSelection(_ snapshot: SelectionSnapshot) {
+        guard let section = Section(rawValue: snapshot.sectionRawValue),
+              allowsWorkspaceSection(section)
+        else {
+            return
+        }
+        switchToSection(section)
+    }
+
     public var sectionLabelsForTesting: [String] {
         Section.allCases.map(\.label)
     }
@@ -722,36 +751,57 @@ public final class InspectorViewController: NSViewController {
     }
 
     @discardableResult
-    public func disconnectFilesBindingIfNeeded(runtimeID: String) -> Bool {
+    public func disconnectFilesBindingIfNeeded(
+        runtimeID: String,
+        completion: @escaping (RemoteTextEditorCloseResolution) -> Void
+    ) -> RemoteTextEditorCloseDisposition {
         guard remoteFilesBinding?.runtimeID == runtimeID else {
             _ = transferQueueCoordinator?.disconnectTransfers(runtimeID: runtimeID)
-            return true
+            completion(.ready)
+            return .ready
         }
-        let closeDisposition = remoteEditorPresentation?.requestClose(
+
+        var didResolve = false
+        let cleanup: (RemoteTextEditorCloseResolution) -> Void = { [weak self] resolution in
+            guard didResolve == false else { return }
+            didResolve = true
+            guard let self else { return }
+            guard resolution == .ready else {
+                completion(.cancelled)
+                return
+            }
+            do {
+                try self.filesCoordinator?.cleanupRemoteEdits(runtimeID: runtimeID)
+            } catch {
+                StacioLogStore.shared.append(
+                    level: .warning,
+                    category: "RemoteEditCache",
+                    message: "Failed to clear remote edit cache for closed runtime \(runtimeID): \(error)",
+                    sensitiveValues: [runtimeID]
+                )
+            }
+            _ = self.transferQueueCoordinator?.disconnectTransfers(runtimeID: runtimeID)
+            self.cancelPendingDirectoryFollow()
+            self.remoteFilesBinding = nil
+            self.isRemoteFilesBindingDisconnected = true
+            self.lastRequestedRemoteFilesPath = nil
+            self.filesCoordinator?.disconnectCurrentLiveDirectory(message: "文件连接已断开。请选择一个已连接的远程终端后重新打开文件。")
+            self.remoteBrowserViewController?.stopRemoteBrowserProxy()
+            completion(.ready)
+        }
+        let disposition = remoteEditorPresentation?.requestClose(
             parentWindow: view.window,
-            completion: nil
+            completion: cleanup
         ) ?? .ready
-        guard closeDisposition == .ready else {
-            return false
+        if disposition == .ready {
+            cleanup(.ready)
         }
-        do {
-            try filesCoordinator?.cleanupRemoteEdits(runtimeID: runtimeID)
-        } catch {
-            StacioLogStore.shared.append(
-                level: .warning,
-                category: "RemoteEditCache",
-                message: "Failed to clear remote edit cache for closed runtime \(runtimeID): \(error)",
-                sensitiveValues: [runtimeID]
-            )
-        }
-        _ = transferQueueCoordinator?.disconnectTransfers(runtimeID: runtimeID)
-        cancelPendingDirectoryFollow()
-        remoteFilesBinding = nil
-        isRemoteFilesBindingDisconnected = true
-        lastRequestedRemoteFilesPath = nil
-        filesCoordinator?.disconnectCurrentLiveDirectory(message: "文件连接已断开。请选择一个已连接的远程终端后重新打开文件。")
-        remoteBrowserViewController?.stopRemoteBrowserProxy()
-        return true
+        return disposition
+    }
+
+    @discardableResult
+    public func disconnectFilesBindingIfNeeded(runtimeID: String) -> Bool {
+        disconnectFilesBindingIfNeeded(runtimeID: runtimeID) { _ in } == .ready
     }
 
     public func dismissTransferNotifications(runtimeID: String) {
@@ -1024,6 +1074,14 @@ public final class InspectorViewController: NSViewController {
     }
 
     @objc private func editorCollapseButtonPressed(_ sender: Any?) {
+        if remoteEditorPresentation?.snapshot.mode == .recovery {
+            do {
+                try remoteEditorPresentation?.redockEditor()
+            } catch {
+                return
+            }
+            return
+        }
         if remoteEditorPresentation?.snapshot.isCollapsed == true {
             remoteEditorPresentation?.expandDockedEditor()
         } else {
@@ -1054,17 +1112,30 @@ public final class InspectorViewController: NSViewController {
     private func updateEditorActionControls(_ snapshot: RemoteEditorPresentationSnapshot) {
         editorActionRow?.isHidden = snapshot.mode == .closed || snapshot.mode == .opening
         editorCloseButton.isHidden = snapshot.isCollapsed
-        editorCollapseButton.isHidden = snapshot.canCollapse == false
+        editorCollapseButton.isHidden = snapshot.canCollapse == false && snapshot.mode != .recovery
         editorBackupButton.isHidden = snapshot.isCollapsed
         editorAskAIButton.isHidden = snapshot.isCollapsed
         editorRestoreButton.isHidden = snapshot.isCollapsed
-        configureEditorCollapseButtonForCollapsedState(snapshot.isCollapsed)
+        configureEditorCollapseButtonForCollapsedState(
+            snapshot.isCollapsed,
+            recovery: snapshot.mode == .recovery
+        )
         updateContentContainerTopConstraint(for: currentSection)
     }
 
-    private func configureEditorCollapseButtonForCollapsedState(_ collapsed: Bool) {
-        let symbolName = collapsed ? "arrow.up.left.and.arrow.down.right" : "rectangle.compress.vertical"
-        let description = collapsed ? "展开编辑器" : "收起编辑器"
+    private func configureEditorCollapseButtonForCollapsedState(
+        _ collapsed: Bool,
+        recovery: Bool = false
+    ) {
+        let symbolName: String
+        let description: String
+        if recovery {
+            symbolName = "arrow.uturn.backward.circle"
+            description = "重新停靠编辑器"
+        } else {
+            symbolName = collapsed ? "arrow.up.left.and.arrow.down.right" : "rectangle.compress.vertical"
+            description = collapsed ? "展开编辑器" : "收起编辑器"
+        }
         editorCollapseButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
             ?? NSImage(size: NSSize(width: 14, height: 14))
         editorCollapseButton.toolTip = description

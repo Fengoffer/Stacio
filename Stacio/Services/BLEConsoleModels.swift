@@ -10,6 +10,11 @@ struct BLEConsoleRSSI: Equatable, Hashable, Sendable {
     var displayText: String {
         decibels.map { "\($0) dBm" } ?? "-- dBm"
     }
+
+    var signalStrength: Double? {
+        guard let decibels else { return nil }
+        return min(max(Double(decibels + 100) / 60, 0), 1)
+    }
 }
 
 enum BLEConsoleRecognition: Equatable, Hashable, Sendable {

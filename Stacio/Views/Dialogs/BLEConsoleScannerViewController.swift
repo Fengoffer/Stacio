@@ -13,7 +13,13 @@ struct BLEConsoleScannerRowModel: Equatable, Sendable {
 
     var signalSymbolName: String { "cellularbars" }
 
-    var rssiText: String { device.rssi.displayText }
+    var signalStrength: Double { device.rssi.signalStrength ?? 0 }
+
+    var signalAccessibilityDescription: String {
+        device.rssi.signalStrength == nil
+            ? L10n.BLEConsole.scannerRSSIUnavailable
+            : L10n.BLEConsole.scannerSignalStrength
+    }
 
     var recognitionSymbolName: String? {
         device.recognition == .nbee1103 ? "checkmark.circle.fill" : nil
@@ -23,9 +29,9 @@ struct BLEConsoleScannerRowModel: Equatable, Sendable {
 
     var detail: String {
         if device.advertisedServiceUUIDs.isEmpty {
-            return rssiText
+            return L10n.BLEConsole.scannerGenericDevice
         }
-        return "\(rssiText) · \(device.advertisedServiceUUIDs.joined(separator: ", "))"
+        return device.advertisedServiceUUIDs.joined(separator: ", ")
     }
 }
 
@@ -623,35 +629,64 @@ final class BLEConsoleScannerViewController: NSViewController,
         detail.lineBreakMode = .byTruncatingTail
         detail.translatesAutoresizingMaskIntoConstraints = false
 
-        let recognition = NSImageView()
+        let recognitionIdentifier = NSUserInterfaceItemIdentifier("BLEConsoleScannerRecognition")
+        let recognition = cell.subviews
+            .compactMap { $0 as? NSImageView }
+            .first(where: { $0.identifier == recognitionIdentifier }) ?? NSImageView()
+        recognition.identifier = recognitionIdentifier
         if let symbol = model.recognitionSymbolName {
             recognition.image = NSImage(systemSymbolName: symbol, accessibilityDescription: L10n.BLEConsole.scannerRecognized)
             recognition.symbolConfiguration = .init(pointSize: 12, weight: .semibold)
             recognition.contentTintColor = StacioDesignSystem.theme.successColor
+        } else {
+            recognition.image = nil
         }
         recognition.translatesAutoresizingMaskIntoConstraints = false
 
+        let signalIdentifier = NSUserInterfaceItemIdentifier("BLEConsoleScannerSignal")
+        let signal = cell.subviews
+            .compactMap { $0 as? NSImageView }
+            .first(where: { $0.identifier == signalIdentifier }) ?? NSImageView()
+        signal.identifier = signalIdentifier
+        signal.image = NSImage(
+            systemSymbolName: model.signalSymbolName,
+            variableValue: model.signalStrength,
+            accessibilityDescription: model.signalAccessibilityDescription
+        )
+        signal.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+        signal.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
+        signal.toolTip = model.signalAccessibilityDescription
+        signal.translatesAutoresizingMaskIntoConstraints = false
+
+        let needsConstraintInstallation = signal.superview == nil
         if leading.superview == nil { cell.addSubview(leading) }
         if title.superview == nil { cell.addSubview(title) }
         if detail.superview == nil { cell.addSubview(detail) }
         if recognition.superview == nil { cell.addSubview(recognition) }
-        NSLayoutConstraint.activate([
-            leading.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-            leading.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            leading.widthAnchor.constraint(equalToConstant: 20),
-            leading.heightAnchor.constraint(equalToConstant: 20),
-            title.leadingAnchor.constraint(equalTo: leading.trailingAnchor, constant: 8),
-            title.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: recognition.leadingAnchor, constant: -8),
-            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
-            detail.trailingAnchor.constraint(lessThanOrEqualTo: recognition.leadingAnchor, constant: -8),
-            recognition.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
-            recognition.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            recognition.widthAnchor.constraint(equalToConstant: 16),
-            recognition.heightAnchor.constraint(equalToConstant: 16)
-        ])
-        cell.setAccessibilityLabel(device.displayName)
+        if signal.superview == nil { cell.addSubview(signal) }
+        if needsConstraintInstallation {
+            NSLayoutConstraint.activate([
+                leading.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                leading.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                leading.widthAnchor.constraint(equalToConstant: 20),
+                leading.heightAnchor.constraint(equalToConstant: 20),
+                title.leadingAnchor.constraint(equalTo: leading.trailingAnchor, constant: 8),
+                title.topAnchor.constraint(equalTo: cell.topAnchor, constant: 5),
+                title.trailingAnchor.constraint(lessThanOrEqualTo: recognition.leadingAnchor, constant: -8),
+                detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+                detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+                detail.trailingAnchor.constraint(lessThanOrEqualTo: recognition.leadingAnchor, constant: -8),
+                recognition.trailingAnchor.constraint(equalTo: signal.leadingAnchor, constant: -6),
+                recognition.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                recognition.widthAnchor.constraint(equalToConstant: 16),
+                recognition.heightAnchor.constraint(equalToConstant: 16),
+                signal.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+                signal.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                signal.widthAnchor.constraint(equalToConstant: 18),
+                signal.heightAnchor.constraint(equalToConstant: 18)
+            ])
+        }
+        cell.setAccessibilityLabel("\(device.displayName)，\(model.signalAccessibilityDescription)")
         cell.setAccessibilityIdentifier("Stacio.BLEConsole.Scanner.device.\(device.identifier.uuidString)")
         return cell
     }

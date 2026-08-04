@@ -12,6 +12,7 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
     )
     private var controlScrollZoomMonitor: Any?
     private var linkInteractionMonitor: Any?
+    private var selectionAutoCopyGate = TerminalSelectionAutoCopyGate()
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -81,6 +82,7 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
 
     public override func selectionChanged(source: Terminal) {
         super.selectionChanged(source: source)
+        guard selectionAutoCopyGate.shouldCopyAfterSelectionChanged() else { return }
         StacioTerminalMouseBehavior.copySelectionToClipboardIfNeeded(
             from: self,
             settingsStore: fontZoomSettingsStore
@@ -139,15 +141,29 @@ public final class StacioLocalTerminalView: LocalProcessTerminalView {
         }
         guard window != nil else { return }
         linkInteractionMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved, .flagsChanged]
+            matching: TerminalLinkInteraction.monitoredEventMask
         ) { [weak self] event in
             guard let self,
                   event.window === self.window
             else {
                 return event
             }
+            if event.type == .leftMouseDown,
+               TerminalLinkInteraction.isEventTargetingTerminalSurface(self, event: event) {
+                self.selectionAutoCopyGate.beginPointerSelection()
+            } else if event.type == .leftMouseUp {
+                self.finishPointerSelectionAutoCopyIfNeeded()
+            }
             return TerminalLinkInteraction.handleEvent(in: self, event: event)
         }
+    }
+
+    private func finishPointerSelectionAutoCopyIfNeeded() {
+        guard selectionAutoCopyGate.shouldCopyAfterMouseUp() else { return }
+        StacioTerminalMouseBehavior.copySelectionToClipboardIfNeeded(
+            from: self,
+            settingsStore: fontZoomSettingsStore
+        )
     }
 
     public func performControlScrollZoomForTesting(deltaY: CGFloat) {

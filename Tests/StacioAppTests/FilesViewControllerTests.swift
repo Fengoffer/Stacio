@@ -1805,6 +1805,102 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertEqual(actions.map(\.1), ["upload_release", "download_backup"])
     }
 
+    func testFilesPanelOffersPerFinishedRecordDeleteAndVisibleClearHistory() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        var removedJobIDs: [String] = []
+        var clearHistoryCount = 0
+        controller.onRemoveTransferHistory = { removedJobIDs.append($0) }
+        controller.onClearTransferHistory = { clearHistoryCount += 1 }
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_completed",
+                direction: .upload,
+                sourcePath: "/Users/alice/release.tar",
+                destinationPath: "/srv/release.tar",
+                bytesDone: 100,
+                bytesTotal: 100,
+                rawStatus: "completed",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_failed",
+                direction: .download,
+                sourcePath: "/srv/backup.tar",
+                destinationPath: "/Users/alice/backup.tar",
+                bytesDone: 50,
+                bytesTotal: 100,
+                rawStatus: "failed",
+                diagnostic: nil
+            ),
+            TransferQueueSnapshot.Row(
+                jobID: "download_running",
+                direction: .download,
+                sourcePath: "/srv/current.tar",
+                destinationPath: "/Users/alice/current.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+
+        let firstDelete = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferDelete") as? NSButton
+        )
+        let secondDelete = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferDelete.1") as? NSButton
+        )
+        let activeDelete = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferDelete.2") as? NSButton
+        )
+        let clearHistory = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferClearHistory") as? NSButton
+        )
+
+        XCTAssertEqual(firstDelete.accessibilityLabel(), "删除任务记录")
+        XCTAssertFalse(firstDelete.isHidden)
+        XCTAssertFalse(secondDelete.isHidden)
+        XCTAssertTrue(activeDelete.isHidden)
+        XCTAssertEqual(clearHistory.title, "清除历史")
+        XCTAssertEqual(clearHistory.accessibilityLabel(), "清除历史")
+        XCTAssertTrue(clearHistory.isEnabled)
+
+        firstDelete.performClick(nil as Any?)
+        secondDelete.performClick(nil as Any?)
+        clearHistory.performClick(nil as Any?)
+
+        XCTAssertEqual(removedJobIDs, ["upload_completed", "download_failed"])
+        XCTAssertEqual(clearHistoryCount, 1)
+    }
+
+    func testFilesPanelDisablesHistoryControlsWhenOnlyActiveTransfersExist() throws {
+        let controller = FilesViewController()
+        controller.loadView()
+        controller.setTransferStatusSnapshot(TransferQueueSnapshot(rows: [
+            TransferQueueSnapshot.Row(
+                jobID: "upload_running",
+                direction: .upload,
+                sourcePath: "/Users/alice/current.tar",
+                destinationPath: "/srv/current.tar",
+                bytesDone: 25,
+                bytesTotal: 100,
+                rawStatus: "running",
+                diagnostic: nil
+            )
+        ]))
+
+        let deleteButton = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferDelete") as? NSButton
+        )
+        let clearHistory = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Files.transferClearHistory") as? NSButton
+        )
+
+        XCTAssertTrue(deleteButton.isHidden)
+        XCTAssertFalse(clearHistory.isEnabled)
+    }
+
     func testFilesPanelKeepsResumingTransferVisibleAndControllable() throws {
         let controller = FilesViewController()
         controller.loadView()
@@ -1963,6 +2059,8 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertTrue(
             harness.inspector.filesCoordinatorForTesting.remoteEditOpenerForTesting as AnyObject === harness.presentation
         )
+        XCTAssertNotNil(harness.presentation.onBackupRequested)
+        XCTAssertNotNil(harness.presentation.onRestoreRequested)
     }
 
     func testInspectorEditorControlsRouteThroughPresentationCoordinator() throws {
@@ -2377,6 +2475,96 @@ final class FilesViewControllerTests: XCTestCase {
         XCTAssertTrue(controller.isFilesTabBound(to: binding))
         XCTAssertNotNil(harness.presentation.currentEditor)
         XCTAssertFalse(controller.filesViewController?.visibleTextSnapshot.contains("文件连接已断开") == true)
+    }
+
+    func testDisconnectFilesBindingCompletesCancellationOnlyOnceForDuplicateEditorCallbacks() throws {
+        let bridge = RecordingInspectorRemoteFilesBridge(entries: [])
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "target.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:target"
+        )
+        let binding = InspectorViewController.RemoteFilesBinding(
+            runtimeID: "runtime-target",
+            context: context,
+            remotePath: "/srv/app"
+        )
+        let routing = RecordingPendingEditorCloseRouting()
+        let controller = InspectorViewController(
+            transferHistoryStore: NoOpSCPTransferHistoryStore(),
+            tunnelLiveSessionContextProvider: { context },
+            remoteFilesBridge: bridge,
+            remoteEditorPresentation: routing
+        )
+        controller.loadView()
+        try controller.selectFilesTabAndLoadCurrentDirectory(binding: binding)
+
+        var resolutions: [RemoteTextEditorCloseResolution] = []
+        XCTAssertEqual(
+            controller.disconnectFilesBindingIfNeeded(runtimeID: binding.runtimeID) {
+                resolutions.append($0)
+            },
+            .pending
+        )
+
+        routing.resolve(.cancelled)
+        routing.resolve(.cancelled)
+
+        XCTAssertEqual(resolutions, [.cancelled])
+        XCTAssertTrue(controller.isFilesTabBound(to: binding))
+        XCTAssertFalse(controller.filesViewController?.visibleTextSnapshot.contains("文件连接已断开") == true)
+    }
+}
+
+@MainActor
+private final class RecordingPendingEditorCloseRouting: RemoteEditorPresentationRouting {
+    var currentEditor: RemoteTextEditorViewController?
+    var snapshot = RemoteEditorPresentationSnapshot(
+        mode: .docked,
+        hasEditor: true,
+        isTransitioning: false,
+        detachedFeatureEnabled: true
+    )
+    var onSnapshotChanged: ((RemoteEditorPresentationSnapshot) -> Void)?
+    var onAIQuestionRequested: ((String) -> Void)?
+    var onBackupRequested: (() -> Void)?
+    var onRestoreRequested: (() -> Void)?
+    private var closeCompletion: ((RemoteTextEditorCloseResolution) -> Void)?
+
+    func collapseDockedEditor() {}
+    func expandDockedEditor() {}
+    func detachEditor() throws {}
+    func redockEditor() throws {}
+    func presentEditor(on screen: RemoteEditorScreenIdentity) throws {}
+    func availableScreensDidChange() {}
+    func requestAIForActiveDocument() {}
+
+    func openLocalCopy(
+        at url: URL,
+        mode: RemoteFileOpenMode,
+        applicationURL: URL?,
+        saveHandler: RemoteEditSaveHandler?
+    ) {}
+
+    func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws {}
+
+    @discardableResult
+    func requestClose(
+        parentWindow: NSWindow?,
+        completion: ((RemoteTextEditorCloseResolution) -> Void)?
+    ) -> RemoteTextEditorCloseDisposition {
+        closeCompletion = completion
+        return .pending
+    }
+
+    func resolve(_ resolution: RemoteTextEditorCloseResolution) {
+        closeCompletion?(resolution)
     }
 }
 

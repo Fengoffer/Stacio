@@ -19,6 +19,15 @@ final class BLEConsoleModelsTests: XCTestCase {
         XCTAssertEqual(BLEConsoleRSSI(rawValue: -54).displayText, "-54 dBm")
     }
 
+    func testRSSIMapsToClampedVariableSymbolStrength() throws {
+        XCTAssertNil(BLEConsoleRSSI(rawValue: 127).signalStrength)
+        XCTAssertEqual(try XCTUnwrap(BLEConsoleRSSI(rawValue: -100).signalStrength), 0, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(BLEConsoleRSSI(rawValue: -70).signalStrength), 0.5, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(BLEConsoleRSSI(rawValue: -40).signalStrength), 1, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(BLEConsoleRSSI(rawValue: -120).signalStrength), 0, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(BLEConsoleRSSI(rawValue: -10).signalStrength), 1, accuracy: 0.001)
+    }
+
     func testDeviceDisplayNameAndProbableConsoleDetectionUseAdvertisementMetadata() {
         let unnamed = device(index: 1, name: "   ", services: ["180F"], rssi: -20)
         let shortUUID = device(index: 2, name: "UART", services: ["FFE0"], rssi: -60)

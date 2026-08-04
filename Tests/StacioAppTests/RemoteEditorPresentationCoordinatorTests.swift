@@ -361,6 +361,66 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         XCTAssertNotNil(editor.onActiveDocumentChanged)
         XCTAssertNotNil(editor.onPendingCloseResolved)
         XCTAssertNotNil(editor.onAIQuestionRequested)
+        XCTAssertNotNil(editor.onBackupRequested)
+        XCTAssertNotNil(editor.onRestoreRequested)
+        XCTAssertNotNil(editor.onToggleCollapseRequested)
+    }
+
+    func testEditorToolbarCollapseAndCloseActionsDriveCoordinatorLifecycle() throws {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/app.conf")
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        editor.loadView()
+        let collapseButton = try XCTUnwrap(
+            findEditorSubview(
+                in: editor.view,
+                identifier: "Stacio.Editor.Toolbar.collapse"
+            ) as? NSButton
+        )
+        let closeButton = try XCTUnwrap(
+            findEditorSubview(
+                in: editor.view,
+                identifier: "Stacio.Editor.Toolbar.close"
+            ) as? NSButton
+        )
+
+        collapseButton.performClick(nil as Any?)
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .dockedHidden)
+        XCTAssertTrue(harness.host.isEditorSidecarCollapsed)
+
+        harness.coordinator.expandDockedEditor()
+        closeButton.performClick(nil as Any?)
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .closed)
+        XCTAssertNil(harness.host.editorContentViewController)
+    }
+
+    func testEditorToolbarBackupAndRestoreActionsReachCoordinatorOutputs() throws {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/app.conf")
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        var backupCount = 0
+        var restoreCount = 0
+        harness.coordinator.onBackupRequested = { backupCount += 1 }
+        harness.coordinator.onRestoreRequested = { restoreCount += 1 }
+        editor.loadView()
+
+        let backupButton = try XCTUnwrap(
+            findEditorSubview(
+                in: editor.view,
+                identifier: "Stacio.Editor.Toolbar.backup"
+            ) as? NSButton
+        )
+        let restoreButton = try XCTUnwrap(
+            findEditorSubview(
+                in: editor.view,
+                identifier: "Stacio.Editor.Toolbar.restore"
+            ) as? NSButton
+        )
+        backupButton.performClick(nil as Any?)
+        restoreButton.performClick(nil as Any?)
+
+        XCTAssertEqual(backupCount, 1)
+        XCTAssertEqual(restoreCount, 1)
     }
 
     func testReentrantExpandDuringCollapseIsIgnoredUntilTransitionCompletes() {
@@ -508,6 +568,47 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         XCTAssertNil(detachedWindow.presentationDelegate)
     }
 
+    func testOneHundredDetachRedockCyclesPreserveEditorRuntimeAndWindowOwnership() throws {
+        let harness = makeHarnessWithDockedEditor(path: "/etc/app.conf")
+        defer { harness.windowFactory.closeAll() }
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        editor.loadView()
+        editor.markEditorReadyForTesting()
+        let webView = try XCTUnwrap(editor.editorWebViewForTesting)
+        let pageLoadCount = editor.monacoPageLoadCountForTesting
+        // The generated HTML embeds the page-load generation without exposing mutable runtime state.
+        let pageGenerationHTML = editor.editorHTMLForTesting
+
+        for cycle in 0..<100 {
+            try harness.coordinator.detachEditor()
+
+            XCTAssertEqual(harness.coordinator.snapshot.mode, .floating, "cycle \(cycle)")
+            XCTAssertTrue(harness.coordinator.currentEditor === editor, "cycle \(cycle)")
+            XCTAssertTrue(editor.editorWebViewForTesting === webView, "cycle \(cycle)")
+            XCTAssertEqual(editor.monacoPageLoadCountForTesting, pageLoadCount, "cycle \(cycle)")
+            XCTAssertEqual(editor.editorHTMLForTesting, pageGenerationHTML, "cycle \(cycle)")
+            XCTAssertEqual(harness.windowFactory.visibleWindowCount, 1, "cycle \(cycle)")
+
+            let detachedWindow = try XCTUnwrap(harness.windowFactory.lastWindow)
+            XCTAssertTrue(detachedWindow.installedEditorViewController === editor, "cycle \(cycle)")
+            XCTAssertNotNil(detachedWindow.presentationDelegate, "cycle \(cycle)")
+
+            try harness.coordinator.redockEditor()
+
+            XCTAssertEqual(harness.coordinator.snapshot.mode, .docked, "cycle \(cycle)")
+            XCTAssertTrue(harness.coordinator.currentEditor === editor, "cycle \(cycle)")
+            XCTAssertTrue(harness.host.editorContentViewController === editor, "cycle \(cycle)")
+            XCTAssertEqual(harness.host.hostedControllerCount, 1, "cycle \(cycle)")
+            XCTAssertTrue(editor.editorWebViewForTesting === webView, "cycle \(cycle)")
+            XCTAssertEqual(editor.monacoPageLoadCountForTesting, pageLoadCount, "cycle \(cycle)")
+            XCTAssertEqual(editor.editorHTMLForTesting, pageGenerationHTML, "cycle \(cycle)")
+            XCTAssertEqual(harness.windowFactory.visibleWindowCount, 0, "cycle \(cycle)")
+            XCTAssertFalse(detachedWindow.window?.isVisible ?? true, "cycle \(cycle)")
+            XCTAssertNil(detachedWindow.installedEditorViewController, "cycle \(cycle)")
+            XCTAssertNil(detachedWindow.presentationDelegate, "cycle \(cycle)")
+        }
+    }
+
     func testDetachInstallFailureRollsBackToDockAndPreservesWidth() throws {
         let harness = makeHarness(windowInstallFails: true)
         openDocument(path: "/etc/app.conf", in: harness)
@@ -521,6 +622,64 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.host.isEditorSidecarCollapsed, collapsed)
         XCTAssertEqual(harness.host.hostedControllerCount, 1)
         XCTAssertEqual(harness.windowFactory.visibleWindowCount, 0)
+    }
+
+    func testDetachDualFailureUsesFreshRecoveryWindowWithoutClaimingEmptyShell() throws {
+        let harness = makeHarness()
+        openDocument(path: "/etc/app.conf", in: harness)
+        defer { harness.windowFactory.closeAll() }
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        harness.host.failAllInstalls = true
+        harness.host.onRemoveAttempt = {
+            harness.windowFactory.lastWindow?.window?.contentViewController = NSViewController()
+        }
+
+        XCTAssertThrowsError(try harness.coordinator.detachEditor()) { error in
+            XCTAssertEqual(error as? RemoteEditorPresentationError, .rollbackFailed)
+        }
+
+        XCTAssertEqual(harness.windowFactory.createdWindows.count, 2)
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .floating)
+        XCTAssertTrue(harness.coordinator.currentEditor === editor)
+        XCTAssertEqual(harness.host.hostedControllerCount, 0)
+        XCTAssertEqual(harness.windowFactory.visibleWindowCount, 1)
+        XCTAssertNil(harness.windowFactory.createdWindows[0].installedEditorViewController)
+        XCTAssertTrue(harness.windowFactory.createdWindows[1].installedEditorViewController === editor)
+    }
+
+    func testDetachRecoveryWindowFailureRetainsEditorWithoutClaimingPresentation() throws {
+        let harness = makeHarness()
+        openDocument(path: "/etc/app.conf", in: harness)
+        defer { harness.windowFactory.closeAll() }
+        let editor = try XCTUnwrap(harness.coordinator.currentEditor)
+        harness.host.failAllInstalls = true
+        harness.host.onRemoveAttempt = {
+            harness.windowFactory.lastWindow?.window?.contentViewController = NSViewController()
+        }
+        harness.windowFactory.onWindowCreated = { controller, creationIndex in
+            if creationIndex == 2 {
+                controller.window?.contentViewController = NSViewController()
+            }
+        }
+
+        XCTAssertThrowsError(try harness.coordinator.detachEditor()) { error in
+            XCTAssertEqual(error as? RemoteEditorPresentationError, .rollbackFailed)
+        }
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .recovery)
+        XCTAssertTrue(harness.coordinator.snapshot.hasEditor)
+        XCTAssertTrue(harness.coordinator.currentEditor === editor)
+        XCTAssertEqual(harness.host.hostedControllerCount, 0)
+        XCTAssertEqual(harness.windowFactory.visibleWindowCount, 0)
+        XCTAssertTrue(harness.windowFactory.createdWindows.allSatisfy {
+            $0.installedEditorViewController == nil && $0.window?.contentViewController == nil
+        })
+
+        harness.host.failAllInstalls = false
+        try harness.coordinator.redockEditor()
+
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
+        XCTAssertTrue(harness.host.editorContentViewController === editor)
     }
 
     func testWindowFactoryFailureLeavesDockUntouchedAndSurfacesStableError() throws {
@@ -603,6 +762,151 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
         XCTAssertEqual(harness.authorizer.authorizedFeatures.count, authorizationCount)
+    }
+
+    func testPresentationMenuRefreshesScreensEveryTimeAndMatchesCurrentState() {
+        let builtIn = makeScreen(id: 1, name: "Built-in")
+        let harness = makeHarness(screens: [builtIn])
+        openDocument(path: "/etc/app.conf", in: harness)
+
+        XCTAssertEqual(
+            harness.coordinator.presentationMenuItems().map(\.title),
+            [L10n.EditorPresentation.detach, "Built-in"]
+        )
+
+        harness.screenProvider.screens.append(makeScreen(id: 2, name: "Studio Display"))
+        XCTAssertEqual(
+            harness.coordinator.presentationMenuItems().map(\.title),
+            [L10n.EditorPresentation.detach, "Built-in", "Studio Display"]
+        )
+        XCTAssertEqual(harness.screenProvider.availableScreensCallCount, 2)
+    }
+
+    func testDisplayMenuOnlyListsAvailableScreensWithoutDetachOrRedockActions() throws {
+        let builtIn = makeScreen(id: 1, name: "Built-in")
+        let studio = makeScreen(id: 2, name: "Studio Display")
+        let harness = makeHarness(screens: [builtIn, studio])
+        defer { harness.windowFactory.closeAll() }
+        openDocument(path: "/etc/app.conf", in: harness)
+
+        XCTAssertEqual(
+            harness.coordinator.displayMenuItems(),
+            [
+                .init(title: "Built-in", action: .display(builtIn.identity)),
+                .init(title: "Studio Display", action: .display(studio.identity)),
+            ]
+        )
+
+        try harness.coordinator.detachEditor()
+
+        XCTAssertEqual(
+            harness.coordinator.displayMenuItems().map(\.action),
+            [.display(builtIn.identity), .display(studio.identity)]
+        )
+    }
+
+    func testPresentationMenuUsesStableLabelsForDuplicateScreenNames() {
+        let left = makeScreen(
+            id: 9,
+            name: "Studio Display",
+            frame: NSRect(x: -1_920, y: 0, width: 1_920, height: 1_080)
+        )
+        let right = makeScreen(
+            id: 3,
+            name: "Studio Display",
+            frame: NSRect(x: 0, y: 0, width: 1_920, height: 1_080)
+        )
+        let harness = makeHarness(screens: [right, left])
+        openDocument(path: "/etc/app.conf", in: harness)
+
+        XCTAssertEqual(
+            harness.coordinator.presentationMenuItems().map(\.title),
+            [
+                L10n.EditorPresentation.detach,
+                L10n.EditorPresentation.display("Studio Display", ordinal: 2),
+                L10n.EditorPresentation.display("Studio Display", ordinal: 1),
+            ]
+        )
+    }
+
+    func testDetachedPresentationMenuStartsWithFreeRedockAction() throws {
+        let screen = makeScreen(id: 1, name: "Built-in")
+        let harness = makeHarness(screens: [screen])
+        defer { harness.windowFactory.closeAll() }
+        openDocument(path: "/etc/app.conf", in: harness)
+        try harness.coordinator.detachEditor()
+        harness.licenseAccess.enabledFeatures = []
+
+        XCTAssertEqual(
+            harness.coordinator.presentationMenuItems(),
+            [
+                .init(title: L10n.EditorPresentation.redock, action: .redock),
+                .init(title: "Built-in", action: .display(screen.identity)),
+            ]
+        )
+    }
+
+    func testEveryAdvancedEntryUsesTheSameAuthorizerBeforeMutation() {
+        for entry in RemoteEditorAdvancedEntry.allCases {
+            let harness = makeHarness()
+            openDocument(path: "/etc/app.conf", in: harness)
+            harness.licenseAccess.enabledFeatures = []
+            harness.authorizer.error = LicensedFeatureAccessError.licenseRequired(.detachedFileEditor)
+            let editor = harness.coordinator.currentEditor
+            let parent = editor?.view.superview
+
+            harness.invokeAdvancedEntry(entry)
+
+            XCTAssertEqual(
+                harness.authorizer.authorizedFeatures,
+                [.detachedFileEditor],
+                "entry=\(entry)"
+            )
+            XCTAssertEqual(harness.windowFactory.createdWindows.count, 0, "entry=\(entry)")
+            XCTAssertTrue(editor?.view.superview === parent, "entry=\(entry)")
+            XCTAssertEqual(harness.coordinator.snapshot.mode, .docked, "entry=\(entry)")
+            XCTAssertEqual(harness.upgradePresenter.presentationCount, 1, "entry=\(entry)")
+        }
+    }
+
+    func testLicenseLossDoesNotInterruptDetachedWindowButBlocksNewPlacement() throws {
+        let first = makeScreen(id: 1, name: "Built-in")
+        let second = makeScreen(id: 2, name: "Studio Display")
+        let harness = makeHarness(screens: [first, second])
+        defer { harness.windowFactory.closeAll() }
+        openDocument(path: "/etc/app.conf", in: harness)
+        try harness.coordinator.detachEditor()
+        let window = harness.windowFactory.lastWindow
+
+        harness.licenseAccess.enabledFeatures = []
+        harness.coordinator.refreshLicenseState()
+
+        XCTAssertTrue(window?.window?.isVisible == true)
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .floating)
+        harness.coordinator.performPresentationMenuAction(.display(second.identity))
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .floating)
+        XCTAssertEqual(harness.upgradePresenter.presentationCount, 1)
+        XCTAssertNoThrow(try harness.coordinator.redockEditor())
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
+    }
+
+    func testLicenseNotificationRefreshesDockedToolbarWithoutPresentationMutation() {
+        let harness = makeHarness()
+        openDocument(path: "/etc/app.conf", in: harness)
+        let editor = harness.coordinator.currentEditor
+        editor?.loadView()
+        let parent = editor?.view.superview
+
+        harness.licenseAccess.enabledFeatures = []
+        harness.notificationCenter.post(name: .stacioLicenseAuthorizationDidChange, object: nil)
+
+        XCTAssertEqual(editor?.presentationMainImageNameForTesting, "lock")
+        XCTAssertEqual(
+            editor?.presentationMainTooltipForTesting,
+            L10n.EditorPresentation.detachRequiresLicense
+        )
+        XCTAssertTrue(editor?.view.superview === parent)
+        XCTAssertEqual(harness.coordinator.snapshot.mode, .docked)
     }
 
     func testDisplayMaximizedRedockReturnsSameEditorWithoutAuthorization() throws {
@@ -1057,12 +1361,34 @@ final class RemoteEditorPresentationCoordinatorTests: XCTestCase {
 }
 
 @MainActor
+private func findEditorSubview(in view: NSView, identifier: String) -> NSView? {
+    if view.accessibilityIdentifier() == identifier {
+        return view
+    }
+    for subview in view.subviews {
+        if let match = findEditorSubview(in: subview, identifier: identifier) {
+            return match
+        }
+    }
+    return nil
+}
+
+private enum RemoteEditorAdvancedEntry: CaseIterable {
+    case mainButton
+    case menuDetach
+    case toolbarDrag
+    case webViewTabDrag
+    case targetDisplayMenu
+}
+
+@MainActor
 private final class CoordinatorHarness {
     let host = RecordingCoordinatorDockHost()
     let store: RecordingCoordinatorPresentationStore
     let screenProvider: RecordingCoordinatorScreenProvider
     let licenseAccess = RecordingCoordinatorLicenseAccess()
     let authorizer = RecordingCoordinatorAuthorizer()
+    let upgradePresenter = RecordingRemoteEditorLicenseUpgradePresenter()
     let closeConfirmer: RecordingRemoteTextEditorCloseConfirmer
     let fallback = RecordingCoordinatorFallbackOpener()
     let windowFactory: RecordingCoordinatorWindowFactory
@@ -1107,6 +1433,11 @@ private final class CoordinatorHarness {
             preoccupyCreatedWindow: windowInstallFails,
             creationFails: windowCreationFails
         )
+        authorizer.authorizationErrorProvider = { [licenseAccess] feature in
+            licenseAccess.isEnabled(feature)
+                ? nil
+                : LicensedFeatureAccessError.licenseRequired(feature)
+        }
         var editorSink: ((RemoteTextEditorViewController) -> Void)?
         var progressSink: ((RemoteFileOpenProgressViewController) -> Void)?
         coordinator = RemoteEditorPresentationCoordinator(
@@ -1115,12 +1446,13 @@ private final class CoordinatorHarness {
             screenProvider: screenProvider,
             licenseAccess: licenseAccess,
             authorizer: authorizer,
+            upgradePresenter: upgradePresenter,
             closeConfirmer: closeConfirmer,
             fallbackOpener: fallback,
             windowFactory: { [windowFactory] in
                 try windowFactory.makeWindow()
             },
-            editorFactory: { descriptor, saveHandler in
+            editorFactory: { descriptor, saveHandler, _ in
                 let editor: RemoteTextEditorViewController
                 if let asyncSaveInstaller {
                     editor = RemoteTextEditorViewController(
@@ -1149,6 +1481,30 @@ private final class CoordinatorHarness {
         editorSink = { [weak self] in self?.createdEditors.append($0) }
         progressSink = { [weak self] in self?.createdProgressControllers.append($0) }
     }
+
+    func invokeAdvancedEntry(_ entry: RemoteEditorAdvancedEntry) {
+        guard let editor = coordinator.currentEditor else { return }
+        switch entry {
+        case .mainButton:
+            editor.requestTogglePresentationForTesting()
+        case .menuDetach:
+            coordinator.performPresentationMenuAction(.detach)
+        case .toolbarDrag:
+            editor.simulateToolbarDragForTesting(
+                buttonNumber: 0,
+                points: [.zero, NSPoint(x: 9, y: 0)]
+            )
+        case .webViewTabDrag:
+            editor.receiveTabDragCandidateForTesting(
+                pageLoadGeneration: editor.pageLoadGenerationForTesting,
+                pointInWindow: .zero
+            )
+            editor.simulateTrackedTabDragForTesting(to: NSPoint(x: 9, y: 0))
+        case .targetDisplayMenu:
+            guard let screen = screenProvider.screens.first else { return }
+            coordinator.performPresentationMenuAction(.display(screen.identity))
+        }
+    }
 }
 
 @MainActor
@@ -1162,6 +1518,7 @@ private final class RecordingCoordinatorDockHost: RemoteEditorDockHosting {
     var failAllInstalls = false
     var onCollapsedChanged: ((Bool) -> Void)?
     var onInstallAttempt: (() -> Void)?
+    var onRemoveAttempt: (() -> Void)?
 
     var hostedControllerCount: Int { editorContentViewController == nil ? 0 : 1 }
 
@@ -1179,6 +1536,7 @@ private final class RecordingCoordinatorDockHost: RemoteEditorDockHosting {
     }
 
     func removeEditorContent(_ controller: NSViewController) throws {
+        onRemoveAttempt?()
         guard editorContentViewController === controller else {
             throw RemoteEditorDockHostError.contentMismatch
         }
@@ -1247,7 +1605,22 @@ private final class RecordingCoordinatorScreenProvider: RemoteEditorScreenProvid
 }
 
 private final class RecordingCoordinatorLicenseAccess: LicenseFeatureAccessProviding {
-    func isEnabled(_ feature: StacioLicensedFeature) -> Bool { true }
+    var enabledFeatures = Set(StacioLicensedFeature.allCases)
+
+    func isEnabled(_ feature: StacioLicensedFeature) -> Bool {
+        enabledFeatures.contains(feature)
+    }
+}
+
+@MainActor
+private final class RecordingRemoteEditorLicenseUpgradePresenter:
+    RemoteEditorLicenseUpgradePresenting
+{
+    private(set) var presentationCount = 0
+
+    func presentDetachedEditorLicenseRequired(parentWindow: NSWindow?) {
+        presentationCount += 1
+    }
 }
 
 private struct AllowingCoordinatorAuthorizer: LicensedFeatureAuthorizing {
@@ -1256,13 +1629,14 @@ private struct AllowingCoordinatorAuthorizer: LicensedFeatureAuthorizing {
 
 private final class RecordingCoordinatorAuthorizer: LicensedFeatureAuthorizing {
     var error: Error?
+    var authorizationErrorProvider: ((StacioLicensedFeature) -> Error?)?
     var onAuthorize: (() -> Void)?
     private(set) var authorizedFeatures: [StacioLicensedFeature] = []
 
     func authorize(_ feature: StacioLicensedFeature) throws {
         authorizedFeatures.append(feature)
         onAuthorize?()
-        if let error {
+        if let error = error ?? authorizationErrorProvider?(feature) {
             throw error
         }
     }
@@ -1274,6 +1648,7 @@ private final class RecordingCoordinatorWindowFactory {
     private let creationFails: Bool
     private(set) var createdWindows: [RemoteTextEditorWindowController] = []
     var onMakeWindow: (() -> Void)?
+    var onWindowCreated: ((RemoteTextEditorWindowController, Int) -> Void)?
     var lastWindow: RemoteTextEditorWindowController? { createdWindows.last }
     var visibleWindowCount: Int {
         createdWindows.filter { $0.window?.isVisible == true }.count
@@ -1302,6 +1677,7 @@ private final class RecordingCoordinatorWindowFactory {
             )
         }
         createdWindows.append(controller)
+        onWindowCreated?(controller, createdWindows.count)
         return controller
     }
 

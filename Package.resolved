@@ -1,5 +1,5 @@
 {
-  "originHash" : "95058f45f20e42978c6c265a5da45622e55c900a5fceceb8e6193b3d51cf8585",
+  "originHash" : "5202e7216e80dbd8dafcf811aba85b9531cb570b5f0cf7bb7191e9309055703e",
   "pins" : [
     {
       "identity" : "sparkle",
@@ -24,8 +24,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/migueldeicaza/SwiftTerm.git",
       "state" : {
-        "revision" : "8e7a1e154f470e19c709a00a8768df348ba5fc43",
-        "version" : "1.13.0"
+        "revision" : "87a7888edc0ae415922174e4e6c0486f3991e0ea"
       }
     },
     {

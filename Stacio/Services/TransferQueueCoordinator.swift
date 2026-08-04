@@ -204,6 +204,7 @@ public protocol SCPTransferHistoryStoring {
     func listJobs() throws -> [ScpTransferJobRecord]
     func listEvents(jobID: String) throws -> [ScpTransferEventRecord]
     func clearFinishedJobs() throws -> UInt32
+    func deleteFinishedJob(jobID: String) throws -> Bool
 }
 
 public enum TransferCompletionNotificationPolicy: Equatable, Sendable {
@@ -316,6 +317,10 @@ public final class NoOpSCPTransferHistoryStore: SCPTransferHistoryStoring {
     public func clearFinishedJobs() throws -> UInt32 {
         0
     }
+
+    public func deleteFinishedJob(jobID: String) throws -> Bool {
+        true
+    }
 }
 
 public final class CoreBridgeSCPTransferHistoryStore: SCPTransferHistoryStoring {
@@ -360,6 +365,13 @@ public final class CoreBridgeSCPTransferHistoryStore: SCPTransferHistoryStoring 
 
     public func clearFinishedJobs() throws -> UInt32 {
         try CoreBridge.clearFinishedSCPTransferJobs(databasePath: databasePath)
+    }
+
+    public func deleteFinishedJob(jobID: String) throws -> Bool {
+        try CoreBridge.deleteFinishedSCPTransferJob(
+            databasePath: databasePath,
+            jobID: jobID
+        )
     }
 }
 
@@ -1189,8 +1201,13 @@ public final class TransferQueueCoordinator {
             return 0
         }
 
+        do {
+            _ = try historyStore.clearFinishedJobs()
+        } catch {
+            return 0
+        }
+
         let finished = Set(finishedJobIDs)
-        _ = try? historyStore.clearFinishedJobs()
         orderedJobIDs.removeAll { finished.contains($0) }
         for jobID in finished {
             discardOrchestratedRetry(jobID: jobID)
@@ -1224,6 +1241,30 @@ public final class TransferQueueCoordinator {
         stopProgressPollingIfIdle()
         startNextScheduledTransferIfNeeded()
         return finished.count
+    }
+
+    @discardableResult
+    public func removeFinishedTransfer(jobID: String) -> Bool {
+        guard orderedJobIDs.contains(jobID),
+              let status = progressByJobID[jobID]?.last?.status,
+              Self.finishedStatuses.contains(status)
+        else {
+            return false
+        }
+        do {
+            guard try historyStore.deleteFinishedJob(jobID: jobID) else {
+                return false
+            }
+        } catch {
+            return false
+        }
+
+        moveActiveWorkerToDrainingState(jobID: jobID)
+        removeTransfer(jobID: jobID)
+        refreshQueueView()
+        stopProgressPollingIfIdle()
+        startNextScheduledTransferIfNeeded()
+        return true
     }
 
     public func replaceProgressForTesting(jobID: String, status: String, bytesDone: UInt64) {

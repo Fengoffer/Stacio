@@ -4264,19 +4264,6 @@ public final class FilesCoordinator {
         let fileName = (selection.path as NSString).lastPathComponent
         let contentKind = StacioFileDisplay.contentKind(forFileName: fileName)
         if contentKind.isPreviewableMedia {
-            if let transferScheduler {
-                openRemoteLocalCopy(
-                    selection,
-                    mode: .mediaPreview,
-                    context: context,
-                    transferScheduler: transferScheduler,
-                    applicationURL: nil
-                )
-                return
-            }
-
-            // Keep the legacy direct preview available for transport contexts that do not
-            // provide a transfer scheduler. Workbench SSH sessions take the unified route above.
             documentCoordinator.openRemoteSelection(
                 selection,
                 source: FileTransferRemoteDocumentSource(
@@ -4293,7 +4280,7 @@ public final class FilesCoordinator {
                 )
             )
             logFileOpenEvent(
-                name: "file.open.online.media-window-fallback",
+                name: "file.open.online.media-window",
                 selection: selection,
                 mode: mode,
                 extra: "kind=\(contentKind)"
@@ -5634,6 +5621,14 @@ public final class FilesCoordinator {
 }
 
 extension FilesCoordinator {
+    var documentMediaWindowCountForTesting: Int {
+        documentCoordinator.mediaWindowCountForTesting
+    }
+
+    var documentMediaSourceURLsForTesting: [URL] {
+        documentCoordinator.mediaSourceURLsForTesting
+    }
+
     func registerRemoteEditCacheItemForTesting(
         remotePath: String,
         localURL: URL,

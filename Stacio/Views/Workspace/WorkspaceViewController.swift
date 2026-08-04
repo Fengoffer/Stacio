@@ -29,6 +29,16 @@ private struct MultiExecInteractiveSession {
     var pausedIDs: Set<String>
 }
 
+@MainActor
+private struct DeferredRemoteTerminalClose {
+    let requestID: UUID
+    let panes: [NSViewController]
+    var nextIndex: Int
+    var waitingForResolution = false
+    let commit: @MainActor () -> Void
+    let completion: (@MainActor (Bool) -> Void)?
+}
+
 public enum WorkspaceTabContextAction: Int, CaseIterable {
     case rename
     case setColor
@@ -254,6 +264,7 @@ public final class WorkspaceViewController: NSViewController {
     private var explicitSessionProtocols: [ObjectIdentifier: WorkspaceSessionProtocol] = [:]
     private var detachedTabWindows: [NSWindowController] = []
     private var multiExecSession: MultiExecInteractiveSession?
+    private var deferredRemoteTerminalClose: DeferredRemoteTerminalClose?
     private var terminalSelectionNotificationGeneration: UInt64 = 0
     private weak var pendingTerminalSelectionPane: NSViewController?
     private weak var lastDeliveredTerminalSelectionPane: NSViewController?
@@ -289,6 +300,10 @@ public final class WorkspaceViewController: NSViewController {
     var onRequestCreateFileTransferRemoteDevice: ((RemoteFilesPaneViewController, String) -> Void)?
     public var onRemoteTerminalDirectoryChanged: ((RemoteTerminalPaneViewController, String) -> Void)?
     public var onRemoteTerminalRuntimeReattached: ((RemoteTerminalPaneViewController, String, LiveShellStatus, TunnelLiveSessionContext?) -> Void)?
+    public var onRemoteTerminalCloseRequested: (
+        (RemoteTerminalPaneViewController, @escaping (RemoteTextEditorCloseResolution) -> Void)
+        -> RemoteTextEditorCloseDisposition
+    )?
     public var onRemoteTerminalClosed: ((RemoteTerminalPaneViewController) -> Bool)?
     public var onRemoteTerminalUploadDroppedFiles: ((RemoteTerminalPaneViewController, String, [String]) -> Void)?
     public var onCurrentRemoteTerminalChanged: ((RemoteTerminalPaneViewController?) -> Void)?
@@ -1232,34 +1247,37 @@ public final class WorkspaceViewController: NSViewController {
               workspace.containsPane(currentTerminalPane)
         else { return }
 
-        guard close(pane: currentTerminalPane) else {
-            return
-        }
-        workspace.removePane(currentTerminalPane)
+        _ = beginCloseTransaction(panes: [currentTerminalPane]) { [weak self, weak workspace] in
+            guard let self, let workspace,
+                  workspace.containsPane(currentTerminalPane)
+            else { return }
+            guard self.close(pane: currentTerminalPane, force: true) else { return }
+            workspace.removePane(currentTerminalPane)
 
-        if workspace.panes.isEmpty {
-            tabWorkspaces.removeValue(forKey: selectedItem)
-            tabMetadata.removeValue(forKey: selectedItem)
-            tabDuplicateHandlers.removeValue(forKey: selectedItem)
-            tabViewController.removeTabViewItem(selectedItem)
-            self.currentTerminalPane = currentSelectedWorkspace?.selectedPane
-            rememberCommandTerminalPane(self.currentTerminalPane)
-            notifyCurrentRemoteTerminalChangedIfNeeded(self.currentTerminalPane)
-            focusCurrentTerminalPane()
-            updateEmptyState(animated: true)
-            return
-        }
+            if workspace.panes.isEmpty {
+                self.tabWorkspaces.removeValue(forKey: selectedItem)
+                self.tabMetadata.removeValue(forKey: selectedItem)
+                self.tabDuplicateHandlers.removeValue(forKey: selectedItem)
+                self.tabViewController.removeTabViewItem(selectedItem)
+                self.currentTerminalPane = self.currentSelectedWorkspace?.selectedPane
+                self.rememberCommandTerminalPane(self.currentTerminalPane)
+                self.notifyCurrentRemoteTerminalChangedIfNeeded(self.currentTerminalPane)
+                self.focusCurrentTerminalPane()
+                self.updateEmptyState(animated: true)
+                return
+            }
 
-        if workspace.baseLabel == L10n.MultiExec.title,
-           let remainingPane = workspace.panes.first,
-           workspace.panes.count == 1 {
-            workspace.baseLabel = title(for: remainingPane)
+            if workspace.baseLabel == L10n.MultiExec.title,
+               let remainingPane = workspace.panes.first,
+               workspace.panes.count == 1 {
+                workspace.baseLabel = self.title(for: remainingPane)
+            }
+            self.updateLabel(for: selectedItem)
+            self.currentTerminalPane = workspace.selectedPane
+            self.rememberCommandTerminalPane(self.currentTerminalPane)
+            self.notifyCurrentRemoteTerminalChangedIfNeeded(self.currentTerminalPane)
+            self.focusCurrentTerminalPane()
         }
-        updateLabel(for: selectedItem)
-        self.currentTerminalPane = workspace.selectedPane
-        rememberCommandTerminalPane(self.currentTerminalPane)
-        notifyCurrentRemoteTerminalChangedIfNeeded(self.currentTerminalPane)
-        focusCurrentTerminalPane()
     }
 
     @discardableResult
@@ -1307,26 +1325,30 @@ public final class WorkspaceViewController: NSViewController {
 
     @discardableResult
     public func closeAllTerminals() -> Bool {
-        for workspace in tabWorkspaces.values {
-            for pane in workspace.panes {
-                guard close(pane: pane) else {
-                    return false
-                }
+        closeAllTerminals(completion: nil)
+    }
+
+    @discardableResult
+    public func closeAllTerminals(completion: (@MainActor (Bool) -> Void)?) -> Bool {
+        let panes = tabWorkspaces.values.flatMap(\.panes)
+        return beginCloseTransaction(panes: panes, commit: { [weak self] in
+            guard let self else { return }
+            for pane in panes {
+                _ = self.close(pane: pane, force: true)
             }
-        }
-        tabWorkspaces.removeAll()
-        tabMetadata.removeAll()
-        tabDuplicateHandlers.removeAll()
-        paneTabRestorations.removeAll()
-        explicitSessionProtocols.removeAll()
-        savedSessionIDsByPane.removeAll()
-        lastCommandTerminalPane = nil
-        for item in tabViewController.tabViewItems {
-            tabViewController.removeTabViewItem(item)
-        }
-        currentTerminalPane = nil
-        updateEmptyState(animated: true)
-        return true
+            self.tabWorkspaces.removeAll()
+            self.tabMetadata.removeAll()
+            self.tabDuplicateHandlers.removeAll()
+            self.paneTabRestorations.removeAll()
+            self.explicitSessionProtocols.removeAll()
+            self.savedSessionIDsByPane.removeAll()
+            self.lastCommandTerminalPane = nil
+            for item in self.tabViewController.tabViewItems {
+                self.tabViewController.removeTabViewItem(item)
+            }
+            self.currentTerminalPane = nil
+            self.updateEmptyState(animated: true)
+        }, completion: completion)
     }
 
     public func closeMultiExecSessionKeepingTerminals() {
@@ -1802,7 +1824,9 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     private func closeSplitTabKeepingTerminals(_ item: NSTabViewItem) -> Bool {
-        guard let workspace = tabWorkspaces[item] else { return false }
+        guard deferredRemoteTerminalClose == nil,
+              let workspace = tabWorkspaces[item]
+        else { return false }
         let panes = workspace.panes
         for pane in panes { workspace.removePaneForTransfer(pane) }
         tabWorkspaces.removeValue(forKey: item)
@@ -1840,27 +1864,56 @@ public final class WorkspaceViewController: NSViewController {
     }
 
     private func closeTabs(_ items: [NSTabViewItem]) {
-        for item in items {
-            guard shouldProceedWithClosingWorkspaceGroup(for: item) else {
-                return
-            }
-            let didClose = closeTab(item, closePanes: true)
-            guard didClose else {
-                return
-            }
+        let requestedItems = items.filter { tabViewController.tabViewItems.contains($0) }
+        guard requestedItems.isEmpty == false,
+              deferredRemoteTerminalClose == nil
+        else { return }
+        processCloseTabs(requestedItems, at: 0)
+    }
+
+    private func processCloseTabs(_ items: [NSTabViewItem], at index: Int) {
+        guard index < items.count else { return }
+        let item = items[index]
+        guard tabViewController.tabViewItems.contains(item) else {
+            processCloseTabs(items, at: index + 1)
+            return
+        }
+        guard shouldProceedWithClosingWorkspaceGroup(for: item) else { return }
+
+        _ = closeTab(item, closePanes: true) { [weak self] didClose in
+            guard let self, didClose else { return }
+            self.processCloseTabs(items, at: index + 1)
         }
     }
 
     @discardableResult
-    private func closeTab(_ item: NSTabViewItem, closePanes: Bool) -> Bool {
+    private func closeTab(
+        _ item: NSTabViewItem,
+        closePanes: Bool,
+        completion: (@MainActor (Bool) -> Void)? = nil
+    ) -> Bool {
         if closePanes,
            let workspace = tabWorkspaces[item] {
-            for pane in workspace.panes {
-                guard close(pane: pane) else {
-                    return false
-                }
-            }
+            let panes = workspace.panes
+            return beginCloseTransaction(
+                panes: panes,
+                commit: { [weak self, weak workspace] in
+                    guard let self, let workspace else { return }
+                    for pane in panes {
+                        _ = self.close(pane: pane, force: true)
+                        workspace.removePane(pane)
+                    }
+                    self.removeTab(item, workspace: workspace)
+                },
+                completion: completion
+            )
         }
+        removeTab(item, workspace: tabWorkspaces[item])
+        completion?(true)
+        return true
+    }
+
+    private func removeTab(_ item: NSTabViewItem, workspace: TerminalSplitWorkspace?) {
         tabWorkspaces.removeValue(forKey: item)
         tabMetadata.removeValue(forKey: item)
         tabDuplicateHandlers.removeValue(forKey: item)
@@ -1871,7 +1924,6 @@ public final class WorkspaceViewController: NSViewController {
         rememberCommandTerminalPane(currentTerminalPane)
         updateEmptyState(animated: true)
         focusCurrentTerminalPane()
-        return true
     }
 
     private func closeTab(containing pane: NSViewController) {
@@ -2427,10 +2479,14 @@ public final class WorkspaceViewController: NSViewController {
 
     @discardableResult
     private func close(pane: NSViewController, force: Bool = false) -> Bool {
-        if let remote = pane as? RemoteTerminalPaneViewController,
-           onRemoteTerminalClosed?(remote) == false,
-           force == false {
-            return false
+        if force == false,
+           let remote = pane as? RemoteTerminalPaneViewController {
+            if let request = onRemoteTerminalCloseRequested {
+                let disposition = request(remote) { _ in }
+                guard disposition == .ready else { return false }
+            } else if onRemoteTerminalClosed?(remote) == false {
+                return false
+            }
         }
         let paneRuntimeID = runtimeID(for: pane)
         if multiExecSession?.targetIDs.contains(paneRuntimeID) == true {
@@ -2461,6 +2517,118 @@ public final class WorkspaceViewController: NSViewController {
         }
         aiHistoryScopeIDs[paneRuntimeID] = nil
         return true
+    }
+
+    @discardableResult
+    private func beginCloseTransaction(
+        panes requestedPanes: [NSViewController],
+        commit: @escaping @MainActor () -> Void,
+        completion: (@MainActor (Bool) -> Void)? = nil
+    ) -> Bool {
+        guard deferredRemoteTerminalClose == nil else { return false }
+        let panes = requestedPanes.filter { pane in
+            tabWorkspaces.values.contains { $0.containsPane(pane) }
+        }
+        guard panes.isEmpty == false else {
+            commit()
+            completion?(true)
+            return true
+        }
+
+        let requestID = UUID()
+        deferredRemoteTerminalClose = DeferredRemoteTerminalClose(
+            requestID: requestID,
+            panes: panes,
+            nextIndex: 0,
+            commit: commit,
+            completion: completion
+        )
+        return advanceCloseTransaction(requestID: requestID)
+    }
+
+    @discardableResult
+    private func advanceCloseTransaction(requestID: UUID) -> Bool {
+        guard var transaction = deferredRemoteTerminalClose,
+              transaction.requestID == requestID
+        else { return false }
+
+        while transaction.nextIndex < transaction.panes.count {
+            let pane = transaction.panes[transaction.nextIndex]
+            transaction.nextIndex += 1
+            guard tabWorkspaces.values.contains(where: { $0.containsPane(pane) }) else {
+                continue
+            }
+            guard let remote = pane as? RemoteTerminalPaneViewController else {
+                continue
+            }
+
+            let disposition: RemoteTextEditorCloseDisposition
+            deferredRemoteTerminalClose = transaction
+            if let request = onRemoteTerminalCloseRequested {
+                var synchronousResolution: RemoteTextEditorCloseResolution?
+                var isRequesting = true
+                disposition = request(remote) { [weak self] resolution in
+                    if isRequesting {
+                        synchronousResolution = resolution
+                    } else {
+                        self?.resumeCloseTransaction(requestID: requestID, resolution: resolution)
+                    }
+                }
+                isRequesting = false
+                if disposition == .pending, let synchronousResolution {
+                    guard var pending = deferredRemoteTerminalClose,
+                          pending.requestID == requestID
+                    else { return false }
+                    pending.waitingForResolution = true
+                    deferredRemoteTerminalClose = pending
+                    resumeCloseTransaction(requestID: requestID, resolution: synchronousResolution)
+                } else if disposition == .pending {
+                    guard var pending = deferredRemoteTerminalClose,
+                          pending.requestID == requestID
+                    else { return false }
+                    pending.waitingForResolution = true
+                    deferredRemoteTerminalClose = pending
+                }
+            } else if let legacy = onRemoteTerminalClosed {
+                disposition = legacy(remote) ? .ready : .cancelled
+            } else {
+                disposition = .ready
+            }
+
+            switch disposition {
+            case .ready:
+                continue
+            case .pending:
+                return false
+            case .cancelled:
+                deferredRemoteTerminalClose = nil
+                transaction.completion?(false)
+                return false
+            }
+        }
+
+        deferredRemoteTerminalClose = nil
+        transaction.commit()
+        transaction.completion?(true)
+        return true
+    }
+
+    private func resumeCloseTransaction(
+        requestID: UUID,
+        resolution: RemoteTextEditorCloseResolution
+    ) {
+        guard var transaction = deferredRemoteTerminalClose,
+              transaction.requestID == requestID,
+              transaction.waitingForResolution
+        else { return }
+        transaction.waitingForResolution = false
+        deferredRemoteTerminalClose = transaction
+        guard resolution == .ready else {
+            deferredRemoteTerminalClose = nil
+            transaction.completion?(false)
+            return
+        }
+        _ = advanceCloseTransaction(requestID: requestID)
     }
 
     private func shouldProceedWithClosingWorkspaceGroup(for item: NSTabViewItem) -> Bool {
@@ -2907,23 +3075,25 @@ public final class WorkspaceViewController: NSViewController {
 
     private func closePaneFromPaneHeader(_ pane: NSViewController) {
         guard let item = tabWorkspaces.first(where: { $0.value.containsPane(pane) })?.key,
-              let workspace = tabWorkspaces[item],
-              close(pane: pane)
+              let workspace = tabWorkspaces[item]
         else { return }
-        workspace.removePane(pane)
-        if workspace.panes.isEmpty {
-            tabWorkspaces.removeValue(forKey: item)
-            tabMetadata.removeValue(forKey: item)
-            tabDuplicateHandlers.removeValue(forKey: item)
-            tabViewController.removeTabViewItem(item)
-        } else {
-            updateLabel(for: item)
+        _ = beginCloseTransaction(panes: [pane]) { [weak self, weak workspace] in
+            guard let self, let workspace,
+                  workspace.containsPane(pane)
+            else { return }
+            _ = self.close(pane: pane, force: true)
+            workspace.removePane(pane)
+            if workspace.panes.isEmpty {
+                self.removeTab(item, workspace: workspace)
+            } else {
+                self.updateLabel(for: item)
+                self.currentTerminalPane = self.currentSelectedWorkspace?.selectedPane
+                self.rememberCommandTerminalPane(self.currentTerminalPane)
+                self.notifyCurrentRemoteTerminalChangedIfNeeded(self.currentTerminalPane)
+                self.updateEmptyState(animated: true)
+                self.focusCurrentTerminalPane()
+            }
         }
-        currentTerminalPane = currentSelectedWorkspace?.selectedPane
-        rememberCommandTerminalPane(currentTerminalPane)
-        notifyCurrentRemoteTerminalChangedIfNeeded(currentTerminalPane)
-        updateEmptyState(animated: true)
-        focusCurrentTerminalPane()
     }
 
     private func recordCommandHistory(runtimeID: String, command: String) {
