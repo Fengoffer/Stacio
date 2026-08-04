@@ -9,16 +9,66 @@ protocol WorkbenchWindowShowing: AnyObject {
     func toggleDeviceDashboardFromMenu(_ sender: Any?)
     func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool
     func prepareForApplicationTermination() -> Bool
+    @discardableResult
+    func prepareForApplicationTermination(
+        completion: @escaping (Bool) -> Void
+    ) -> RemoteTextEditorCloseDisposition
 }
 
 extension WorkbenchWindowShowing {
     func openBastionHostConnection(_ request: BastionHostDeepLinkRequest) {}
     func allowsWorkspaceCapability(_ capability: WorkspaceCapability) -> Bool { true }
+
+    @discardableResult
+    func prepareForApplicationTermination(
+        completion: @escaping (Bool) -> Void
+    ) -> RemoteTextEditorCloseDisposition {
+        let result = prepareForApplicationTermination()
+        completion(result)
+        return result ? .ready : .cancelled
+    }
 }
 
 extension WorkbenchWindowController: WorkbenchWindowShowing {
     func prepareForApplicationTermination() -> Bool {
         workspaceViewController.closeAllTerminals()
+    }
+
+    @discardableResult
+    func prepareForApplicationTermination(
+        completion: @escaping (Bool) -> Void
+    ) -> RemoteTextEditorCloseDisposition {
+        if pendingApplicationTerminationCompletion != nil {
+            return .pending
+        }
+        let finish: (RemoteTextEditorCloseResolution) -> Void = { [weak self] resolution in
+            guard let self else {
+                completion(false)
+                return
+            }
+            guard resolution == .ready else {
+                self.pendingApplicationTerminationCompletion = nil
+                completion(false)
+                return
+            }
+            self.pendingApplicationTerminationCompletion = nil
+            completion(self.workspaceViewController.closeAllTerminals())
+        }
+        let disposition = remoteEditorPresentationCoordinator?.requestClose(
+            parentWindow: window,
+            completion: finish
+        ) ?? .ready
+        switch disposition {
+        case .ready:
+            if remoteEditorPresentationCoordinator == nil {
+                completion(workspaceViewController.closeAllTerminals())
+            }
+        case .cancelled:
+            completion(false)
+        case .pending:
+            pendingApplicationTerminationCompletion = completion
+        }
+        return disposition
     }
 }
 
@@ -1534,6 +1584,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var licenseAuthorizationObserver: NSObjectProtocol?
     private var freePlanNoticeEligibilityTask: Task<Void, Never>?
     private var didEvaluateFreePlanNotice = false
+    private let terminationReply: @MainActor (NSApplication, Bool) -> Void
+    private var pendingTerminationReplyID: UUID?
+    private var didReplyToPendingTermination = false
 
     public override init() {
         let updateController = SparkleUpdateController.shared
@@ -1589,6 +1642,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         hasValidLicense = { true }
         freePlanNoticeWindowControllerFactory = { FreePlanNoticeWindowController() }
         loadPersistedLicenseForFreePlanNotice = true
+        terminationReply = { app, shouldTerminate in
+            app.reply(toApplicationShouldTerminate: shouldTerminate)
+        }
         super.init()
         observeLicenseAuthorizationSnapshot()
     }
@@ -1632,6 +1688,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             FreePlanNoticeWindowController()
         },
         loadPersistedLicenseForFreePlanNotice: Bool = false
+        ,terminationReply: @escaping @MainActor (NSApplication, Bool) -> Void = { app, shouldTerminate in
+            app.reply(toApplicationShouldTerminate: shouldTerminate)
+        }
     ) {
         workbenchWindowControllerFactory = factory
         self.feedbackWindowControllerFactory = feedbackWindowControllerFactory ?? {
@@ -1660,6 +1719,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         self.hasValidLicense = hasValidLicense
         self.freePlanNoticeWindowControllerFactory = freePlanNoticeWindowControllerFactory
         self.loadPersistedLicenseForFreePlanNotice = loadPersistedLicenseForFreePlanNotice
+        self.terminationReply = terminationReply
         licenseAccess = LocalLicenseFeatureAccessProvider(
             stateProvider: { licenseStateProvider() }
         )
@@ -1913,6 +1973,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if pendingTerminationReplyID != nil {
+            return .terminateLater
+        }
         if let updateTerminationProtection = sparkleUpdateChecker as? SparkleUpdateTerminationProtecting,
            updateTerminationProtection.prepareForApplicationTermination() == false {
             return .terminateCancel
@@ -1928,12 +1991,39 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
-        guard workbenchWindowController?.prepareForApplicationTermination() ?? true else {
-            return .terminateCancel
+        let requestID = UUID()
+        pendingTerminationReplyID = requestID
+        didReplyToPendingTermination = false
+        var disposition: RemoteTextEditorCloseDisposition = .ready
+        let finish: (Bool) -> Void = { [weak self, weak sender] shouldTerminate in
+            guard let self,
+                  self.pendingTerminationReplyID == requestID,
+                  self.didReplyToPendingTermination == false
+            else { return }
+            self.didReplyToPendingTermination = true
+            if shouldTerminate {
+                self.agentBridgeServer?.stop()
+                self.agentBridgeServer = nil
+            }
+            self.terminationReply(sender ?? NSApplication.shared, shouldTerminate)
+            self.pendingTerminationReplyID = nil
+            self.didReplyToPendingTermination = false
         }
-        agentBridgeServer?.stop()
-        agentBridgeServer = nil
-        return .terminateNow
+        disposition = workbenchWindowController?.prepareForApplicationTermination(completion: finish) ?? .ready
+        switch disposition {
+        case .ready:
+            if pendingTerminationReplyID == requestID {
+                finish(true)
+            }
+            return .terminateNow
+        case .cancelled:
+            if pendingTerminationReplyID == requestID {
+                finish(false)
+            }
+            return .terminateCancel
+        case .pending:
+            return .terminateLater
+        }
     }
 
     @objc
