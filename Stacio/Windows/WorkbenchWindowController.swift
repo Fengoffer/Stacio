@@ -578,6 +578,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         sparkleUpdateController?.probeForAvailableUpdate()
         refreshWorkbenchAppearance()
         refreshToolbarItemAvailability()
+        layoutWorkbenchContent(in: window)
         updateInspectorToolbarTopInset(in: window)
     }
 
