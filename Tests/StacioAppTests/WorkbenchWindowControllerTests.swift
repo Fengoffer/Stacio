@@ -1272,6 +1272,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
         controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
         controller.showAIAssistantFromToolbar(nil)
+        controller.inspectorViewControllerForTesting?.selectAIAssistantTab()
         window.layoutIfNeeded()
         controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
 
@@ -1280,9 +1281,134 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         )
         let splitView = try XCTUnwrap(splitController.splitView as? StacioPinnedSplitView)
         let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        let aiPanel = try XCTUnwrap(
+            controller.inspectorViewControllerForTesting?.aiAssistantViewController
+        )
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.selectedTabLabel, L10n.AI.title)
+        aiPanel.loadTranscriptEntriesForPerformanceTesting(count: 100)
+        inspectorView.layoutSubtreeIfNeeded()
+        let initialAITextWidth = try XCTUnwrap(aiPanel.appliedTranscriptTextWidthForTesting)
         let requestedInspectorWidth: CGFloat = 720
         let proposedPosition = splitView.bounds.width
             - requestedInspectorWidth
+            - splitView.dividerThickness
+
+        let interactiveLayoutStart = CFAbsoluteTimeGetCurrent()
+        splitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = splitController.splitView(
+                splitView,
+                constrainSplitPosition: proposedPosition,
+                ofSubviewAt: 1
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 1)
+
+            XCTAssertEqual(
+                inspectorView.frame.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector width must follow the pointer before the divider drag ends"
+            )
+            XCTAssertEqual(
+                inspectorView.bounds.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector bounds must follow its interactive frame"
+            )
+            let inspectorContentRoot = try? XCTUnwrap(
+                controller.inspectorViewControllerForTesting?.view
+            )
+            XCTAssertTrue(
+                inspectorContentRoot?.superview === inspectorView,
+                "Inspector content hierarchy: root=\(String(describing: inspectorContentRoot?.frame)) "
+                    + "superview=\(String(describing: inspectorContentRoot?.superview?.frame)) "
+                    + "host=\(inspectorView.frame)"
+            )
+            XCTAssertEqual(
+                inspectorContentRoot?.frame.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector content root must follow the resized column"
+            )
+            XCTAssertEqual(
+                inspectorContentRoot?.bounds.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector content bounds must follow the resized column"
+            )
+            XCTAssertEqual(
+                controller.inspectorViewControllerForTesting?.contentContainerFrameForTesting.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector section container frame must follow the resized column"
+            )
+            XCTAssertEqual(
+                controller.inspectorViewControllerForTesting?.contentContainerBoundsForTesting.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector section container bounds must follow the resized column"
+            )
+            XCTAssertEqual(
+                aiPanel.view.frame.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "AI panel must follow its inspector host before the drag ends"
+            )
+            XCTAssertEqual(
+                aiPanel.view.bounds.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "AI panel bounds must follow its interactive frame"
+            )
+            let widthDuringDrag = aiPanel.appliedTranscriptTextWidthForTesting
+            XCTAssertNotNil(widthDuringDrag)
+            XCTAssertGreaterThan(
+                widthDuringDrag ?? 0,
+                initialAITextWidth + 100,
+                "Inspector content must reflow before the divider drag ends"
+            )
+        }
+        let interactiveLayoutDuration = CFAbsoluteTimeGetCurrent() - interactiveLayoutStart
+        print(String(format: "AI_INSPECTOR_DRAG_LAYOUT_PERF %.3fms", interactiveLayoutDuration * 1_000))
+        XCTAssertLessThan(
+            interactiveLayoutDuration,
+            0.016,
+            "A 100-message AI transcript must resize within one 60 Hz display frame"
+        )
+
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
+        XCTAssertFalse(controller.hasPendingInteractiveSplitResizeRepairForTesting)
+        XCTAssertFalse(controller.hasPendingSplitWidthPersistenceForTesting)
+    }
+
+    func testInspectorDividerTracksPointerWhenSidebarIsCollapsed() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showAIAssistantFromToolbar(nil)
+        controller.inspectorViewControllerForTesting?.selectAIAssistantTab()
+        controller.toggleSidebarFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = try XCTUnwrap(splitController.splitView as? StacioPinnedSplitView)
+        let sidebarView = try XCTUnwrap(splitView.arrangedSubviews.first)
+        let workspaceView = splitView.arrangedSubviews[1]
+        let inspectorView = splitView.arrangedSubviews[2]
+        XCTAssertTrue(sidebarView.isHidden)
+
+        let requestedWorkspaceWidth: CGFloat = 180
+        let proposedPosition = requestedWorkspaceWidth
+        let requestedInspectorWidth = splitView.bounds.width
+            - proposedPosition
             - splitView.dividerThickness
 
         splitView.performUserDividerDragTrackingForTesting {
@@ -1292,11 +1418,25 @@ final class WorkbenchWindowControllerTests: XCTestCase {
                 ofSubviewAt: 1
             )
             splitView.setPosition(constrainedPosition, ofDividerAt: 1)
+
+            XCTAssertEqual(constrainedPosition, proposedPosition, accuracy: 1)
+            XCTAssertEqual(workspaceView.frame.minX, 0, accuracy: 1)
+            XCTAssertEqual(workspaceView.frame.width, requestedWorkspaceWidth, accuracy: 2)
+            XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 2)
+            XCTAssertEqual(
+                workspaceView.frame.maxX + splitView.dividerThickness,
+                inspectorView.frame.minX,
+                accuracy: 1
+            )
         }
 
-        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
-        XCTAssertFalse(controller.hasPendingInteractiveSplitResizeRepairForTesting)
-        XCTAssertFalse(controller.hasPendingSplitWidthPersistenceForTesting)
+        XCTAssertEqual(workspaceView.frame.width, requestedWorkspaceWidth, accuracy: 2)
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 2)
+        XCTAssertEqual(
+            workspaceView.frame.maxX + splitView.dividerThickness,
+            inspectorView.frame.minX,
+            accuracy: 1
+        )
     }
 
     func testSwitchingExpandedInspectorPanelDoesNotResetDividerPosition() throws {

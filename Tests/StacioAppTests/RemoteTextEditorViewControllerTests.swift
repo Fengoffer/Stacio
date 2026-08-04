@@ -628,6 +628,27 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         }
     }
 
+    func testToolbarCloseButtonIsTheLeftmostEditorControl() throws {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+        editor.view.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
+        editor.view.layoutSubtreeIfNeeded()
+
+        let closeButton = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.close") as? NSButton
+        )
+        let lineNumbersButton = try XCTUnwrap(
+            editor.view.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.lineNumbers") as? NSButton
+        )
+
+        XCTAssertTrue(closeButton.superview === lineNumbersButton.superview)
+        XCTAssertLessThan(closeButton.frame.minX, lineNumbersButton.frame.minX)
+    }
+
     func testToolbarLifecycleAndFileOperationControlsInvokeRealCallbacks() throws {
         let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
             remotePath: "/etc/app.conf",
@@ -712,6 +733,213 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         ))
 
         XCTAssertTrue(editor.editorHTMLForTesting.contains("dragAndDrop: false"))
+    }
+
+    func testEditorReleasesStaleMonacoPointerInteractionWhenAppKitReportsNoPressedButton() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        XCTAssertTrue(editor.hasActiveEditorPrimaryPointerInteractionForTesting)
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .mouseMoved,
+            isInsideWebView: true,
+            pressedMouseButtons: 0
+        )
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .mouseMoved,
+            isInsideWebView: true,
+            pressedMouseButtons: 0
+        )
+
+        XCTAssertFalse(editor.hasActiveEditorPrimaryPointerInteractionForTesting)
+        XCTAssertEqual(
+            editor.editorFunctionCallsForTesting.filter { $0 == "releaseStalePointerInteraction" }.count,
+            1
+        )
+    }
+
+    func testEditorRestoresWindowMouseMovedEventPolicyAfterDetaching() throws {
+        let windowController = RemoteTextEditorWindowController()
+        defer { windowController.close() }
+        let window = try XCTUnwrap(windowController.window)
+        window.acceptsMouseMovedEvents = false
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+
+        try windowController.installEditor(editor)
+        XCTAssertTrue(window.acceptsMouseMovedEvents)
+
+        try windowController.removeEditorForMigration(editor)
+        XCTAssertFalse(window.acceptsMouseMovedEvents)
+    }
+
+    func testEditorDeliversNativeMouseUpBeforeCheckingForStaleMonacoPointerInteraction() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseUp,
+            isInsideWebView: true,
+            pressedMouseButtons: 0
+        )
+
+        XCTAssertFalse(editor.hasActiveEditorPrimaryPointerInteractionForTesting)
+        XCTAssertFalse(
+            editor.editorFunctionCallsForTesting.contains("releaseStalePointerInteraction"),
+            "The native mouseUp must reach WKWebView before stale-state recovery is evaluated"
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertEqual(
+            editor.editorFunctionCallsForTesting.filter { $0 == "releaseStalePointerInteraction" }.count,
+            1
+        )
+    }
+
+    func testEditorKeepsNativeSelectionDragWhilePrimaryButtonRemainsPressed() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        let consumed = editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDragged,
+            isInsideWebView: true,
+            pressedMouseButtons: 1,
+            pointerClientPoint: NSPoint(x: 240, y: 96)
+        )
+
+        XCTAssertFalse(consumed, "A real pressed-button drag must continue into Monaco")
+        XCTAssertTrue(editor.hasActiveEditorPrimaryPointerInteractionForTesting)
+        XCTAssertFalse(editor.editorFunctionCallsForTesting.contains("releaseStalePointerInteraction"))
+    }
+
+    func testEditorStalePointerRecoveryConsumesMouseMoveAndUsesCurrentClientPoint() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        let consumed = editor.simulateEditorPointerEventForTesting(
+            eventType: .mouseMoved,
+            isInsideWebView: true,
+            pressedMouseButtons: 0,
+            pointerClientPoint: NSPoint(x: 321, y: 123)
+        )
+
+        XCTAssertTrue(consumed, "The stale move must not reach Monaco as another selection update")
+        let script = editor.editorFunctionScriptsForTesting.last
+        XCTAssertTrue(script?.contains("\"clientX\":321") == true)
+        XCTAssertTrue(script?.contains("\"clientY\":123") == true)
+    }
+
+    func testNewEditorPointerDownCancelsPendingMouseUpRecovery() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseUp,
+            isInsideWebView: true,
+            pressedMouseButtons: 0
+        )
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertTrue(editor.hasActiveEditorPrimaryPointerInteractionForTesting)
+        XCTAssertFalse(editor.editorFunctionCallsForTesting.contains("releaseStalePointerInteraction"))
+    }
+
+    func testEditorStalePointerRecoveryPreservesSelectionAndReleasesPointerCapture() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        let html = editor.editorHTMLForTesting
+
+        XCTAssertTrue(html.contains("function releaseStalePointerInteraction(payload)"))
+        XCTAssertTrue(html.contains("releasePointerCapture"))
+        XCTAssertTrue(html.contains("new PointerEvent('pointerup'"))
+        XCTAssertTrue(html.contains("new MouseEvent('mouseup'"))
+        XCTAssertTrue(html.contains("startedAtEpochMilliseconds: Date.now()"))
+        XCTAssertTrue(html.contains("activePointer.startedAtEpochMilliseconds > notAfterEpochMilliseconds"))
+        XCTAssertFalse(html.contains("editor.setSelection"))
+    }
+
+    func testEditorStalePointerRecoveryCarriesRequestCutoff() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+        editor.loadView()
+
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseDown,
+            isInsideWebView: true,
+            pressedMouseButtons: 1
+        )
+        editor.simulateEditorPointerEventForTesting(
+            eventType: .leftMouseUp,
+            isInsideWebView: true,
+            pressedMouseButtons: 0
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        let script = editor.editorFunctionScriptsForTesting.last
+        XCTAssertTrue(script?.contains("notAfterEpochMilliseconds") == true)
     }
 
     func testMonacoTabDragBridgeExcludesCloseScrollAndNormalClicks() {

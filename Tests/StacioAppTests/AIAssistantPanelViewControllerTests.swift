@@ -2533,7 +2533,7 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertLessThan(streaming, 0.005)
     }
 
-    func testAssistantDefersTranscriptReflowUntilInspectorDividerDragEnds() throws {
+    func testAssistantReflowsTranscriptWhileInspectorDividerDragIsActive() throws {
         let panel = makeAssistantPanel()
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: 640),
@@ -2552,17 +2552,14 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
             window.contentView?.layoutSubtreeIfNeeded()
         }
 
-        XCTAssertEqual(
-            try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting),
-            initialWidth,
-            accuracy: 0.5
-        )
+        let widthDuringDrag = try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting)
+        XCTAssertGreaterThan(widthDuringDrag, initialWidth + 100)
 
         panel.setInspectorInteractiveResizeActiveForTesting(false)
         window.contentView?.layoutSubtreeIfNeeded()
 
         let finalWidth = try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting)
-        XCTAssertGreaterThan(finalWidth, initialWidth + 100)
+        XCTAssertEqual(finalWidth, widthDuringDrag, accuracy: 0.5)
     }
 
     func testAssistantTranscriptIncrementalRendererRemovesStaleViewAndCacheEntry() {

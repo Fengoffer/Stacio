@@ -470,7 +470,16 @@ public final class InspectorViewController: NSViewController {
         if view.frame != hostView.bounds {
             view.frame = hostView.bounds
         }
+        if view.bounds.size != hostView.bounds.size {
+            view.bounds = NSRect(origin: view.bounds.origin, size: hostView.bounds.size)
+        }
         layoutContentContainerFrameManuallyIfNeeded()
+        if contentContainer.bounds.size != contentContainer.frame.size {
+            contentContainer.bounds = NSRect(
+                origin: contentContainer.bounds.origin,
+                size: contentContainer.frame.size
+            )
+        }
         guard let childView = sectionViews[currentSection] else { return }
 
         childView.translatesAutoresizingMaskIntoConstraints = true
@@ -478,6 +487,15 @@ public final class InspectorViewController: NSViewController {
         if childView.frame != contentContainer.bounds {
             childView.frame = contentContainer.bounds
         }
+        if childView.bounds.size != contentContainer.bounds.size {
+            childView.bounds = NSRect(
+                origin: childView.bounds.origin,
+                size: contentContainer.bounds.size
+            )
+        }
+        view.needsLayout = true
+        contentContainer.needsLayout = true
+        childView.needsLayout = true
         if currentSection == .files {
             filesViewController?.synchronizeInspectorColumnFrameOnly()
         }
@@ -514,6 +532,14 @@ public final class InspectorViewController: NSViewController {
 
     var maximumCompactToolbarTopInsetForTesting: CGFloat {
         Self.maximumCompactToolbarTopInset
+    }
+
+    var contentContainerFrameForTesting: NSRect {
+        contentContainer.frame
+    }
+
+    var contentContainerBoundsForTesting: NSRect {
+        contentContainer.bounds
     }
 
     var effectiveToolbarTopInsetForTesting: CGFloat {

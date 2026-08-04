@@ -337,6 +337,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     private var tabDragStartPoint: NSPoint?
     private var tabDragPageLoadGeneration: Int?
     private var tabDragPointerID: Int?
+    private var editorPointerEventMonitor: Any?
+    private weak var editorPointerEventWindow: NSWindow?
+    private var editorPointerEventWindowPreviouslyAcceptedMouseMovedEvents = false
+    private var hasActiveEditorPrimaryPointerInteraction = false
+    private var isEditorPointerRecoveryInFlight = false
+    private var editorPointerRecoveryGeneration = 0
     private var editorFunctionCallsForTestingStorage: [String] = []
     private var editorFunctionScriptsForTestingStorage: [String] = []
     private var monacoPageLoadCountForTestingStorage = 0
@@ -517,6 +523,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     private func editorDidMoveToWindow(_ window: NSWindow?) {
         guard let window else {
+            stopEditorPointerMonitoring()
             if hasEditorBeenAttachedToWindow {
                 isEditorDetachedFromWindow = true
             }
@@ -527,6 +534,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             return
         }
 
+        startEditorPointerMonitoring(in: window)
         hasEditorBeenAttachedToWindow = true
         isEditorDetachedFromWindow = false
         if window.inLiveResize {
@@ -873,6 +881,25 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         tabDragStartPoint != nil
     }
 
+    var hasActiveEditorPrimaryPointerInteractionForTesting: Bool {
+        hasActiveEditorPrimaryPointerInteraction
+    }
+
+    @discardableResult
+    func simulateEditorPointerEventForTesting(
+        eventType: NSEvent.EventType,
+        isInsideWebView: Bool,
+        pressedMouseButtons: Int,
+        pointerClientPoint: NSPoint? = nil
+    ) -> Bool {
+        handleEditorPointerEvent(
+            eventType: eventType,
+            isInsideWebView: isInsideWebView,
+            pressedMouseButtons: pressedMouseButtons,
+            pointerClientPoint: pointerClientPoint
+        )
+    }
+
     public func receiveTabDragCandidateForTesting(
         pageLoadGeneration: Int,
         pointInWindow: NSPoint,
@@ -987,6 +1014,141 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         tabDragStartPoint = nil
         tabDragPageLoadGeneration = nil
         tabDragPointerID = nil
+    }
+
+    private func installEditorPointerEventMonitorIfNeeded() {
+        guard editorPointerEventMonitor == nil else { return }
+        editorPointerEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved]
+        ) { [weak self] event in
+            guard let self else { return event }
+            let pointerContext = self.editorPointerContext(for: event)
+            let shouldConsume = self.handleEditorPointerEvent(
+                eventType: event.type,
+                isInsideWebView: pointerContext.isInsideWebView,
+                pressedMouseButtons: NSEvent.pressedMouseButtons,
+                pointerClientPoint: pointerContext.clientPoint
+            )
+            return shouldConsume ? nil : event
+        }
+    }
+
+    private func startEditorPointerMonitoring(in window: NSWindow) {
+        if editorPointerEventWindow !== window {
+            stopEditorPointerMonitoring()
+            editorPointerEventWindow = window
+            editorPointerEventWindowPreviouslyAcceptedMouseMovedEvents = window.acceptsMouseMovedEvents
+        }
+        window.acceptsMouseMovedEvents = true
+        installEditorPointerEventMonitorIfNeeded()
+    }
+
+    private func stopEditorPointerMonitoring() {
+        removeEditorPointerEventMonitor()
+        if let editorPointerEventWindow {
+            editorPointerEventWindow.acceptsMouseMovedEvents =
+                editorPointerEventWindowPreviouslyAcceptedMouseMovedEvents
+        }
+        editorPointerEventWindow = nil
+        editorPointerEventWindowPreviouslyAcceptedMouseMovedEvents = false
+        resetEditorPointerInteractionState()
+    }
+
+    private func removeEditorPointerEventMonitor() {
+        guard let editorPointerEventMonitor else { return }
+        NSEvent.removeMonitor(editorPointerEventMonitor)
+        self.editorPointerEventMonitor = nil
+    }
+
+    private func editorPointerContext(
+        for event: NSEvent
+    ) -> (isInsideWebView: Bool, clientPoint: NSPoint?) {
+        guard let webView,
+              event.window === webView.window
+        else { return (false, nil) }
+        let pointInWebView = webView.convert(event.locationInWindow, from: nil)
+        let clientPoint = NSPoint(
+            x: pointInWebView.x - webView.bounds.minX,
+            y: webView.bounds.maxY - pointInWebView.y
+        )
+        return (webView.bounds.contains(pointInWebView), clientPoint)
+    }
+
+    @discardableResult
+    private func handleEditorPointerEvent(
+        eventType: NSEvent.EventType,
+        isInsideWebView: Bool,
+        pressedMouseButtons: Int,
+        pointerClientPoint: NSPoint? = nil
+    ) -> Bool {
+        switch eventType {
+        case .leftMouseDown:
+            guard isInsideWebView else { return false }
+            editorPointerRecoveryGeneration += 1
+            isEditorPointerRecoveryInFlight = false
+            hasActiveEditorPrimaryPointerInteraction = true
+        case .leftMouseUp:
+            guard hasActiveEditorPrimaryPointerInteraction else { return false }
+            hasActiveEditorPrimaryPointerInteraction = false
+            scheduleStaleEditorPointerCheckAfterNativeMouseUp(at: pointerClientPoint)
+        case .mouseMoved, .leftMouseDragged:
+            if isInsideWebView,
+               isEditorPointerRecoveryInFlight,
+               pressedMouseButtons & 1 == 0
+            {
+                return true
+            }
+            guard isInsideWebView,
+                  hasActiveEditorPrimaryPointerInteraction,
+                  pressedMouseButtons & 1 == 0
+            else { return false }
+            hasActiveEditorPrimaryPointerInteraction = false
+            releaseStaleEditorPointerInteraction(at: pointerClientPoint)
+            return true
+        default:
+            break
+        }
+        return false
+    }
+
+    private func scheduleStaleEditorPointerCheckAfterNativeMouseUp(at pointerClientPoint: NSPoint?) {
+        editorPointerRecoveryGeneration += 1
+        let generation = editorPointerRecoveryGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.editorPointerRecoveryGeneration == generation,
+                  self.hasActiveEditorPrimaryPointerInteraction == false
+            else { return }
+            self.releaseStaleEditorPointerInteraction(at: pointerClientPoint)
+        }
+    }
+
+    private func releaseStaleEditorPointerInteraction(at pointerClientPoint: NSPoint?) {
+        guard isEditorPointerRecoveryInFlight == false else { return }
+        editorPointerRecoveryGeneration += 1
+        let generation = editorPointerRecoveryGeneration
+        let requestedAtEpochMilliseconds = Date().timeIntervalSince1970 * 1_000
+        isEditorPointerRecoveryInFlight = true
+        callEditorFunction(
+            "releaseStalePointerInteraction",
+            payload: EditorPointerReleasePayload(
+                notAfterEpochMilliseconds: requestedAtEpochMilliseconds,
+                clientX: pointerClientPoint.map { Double($0.x) },
+                clientY: pointerClientPoint.map { Double($0.y) }
+            ),
+            requiresFunction: true
+        ) { [weak self] _ in
+            guard let self,
+                  self.editorPointerRecoveryGeneration == generation
+            else { return }
+            self.isEditorPointerRecoveryInFlight = false
+        }
+    }
+
+    private func resetEditorPointerInteractionState() {
+        editorPointerRecoveryGeneration += 1
+        hasActiveEditorPrimaryPointerInteraction = false
+        isEditorPointerRecoveryInFlight = false
     }
 
     public var monacoPageLoadCountForTesting: Int {
@@ -1260,6 +1422,11 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     deinit {
         if let tabDragMonitor { NSEvent.removeMonitor(tabDragMonitor) }
+        if let editorPointerEventMonitor { NSEvent.removeMonitor(editorPointerEventMonitor) }
+        if let editorPointerEventWindow {
+            editorPointerEventWindow.acceptsMouseMovedEvents =
+                editorPointerEventWindowPreviouslyAcceptedMouseMovedEvents
+        }
         monacoReadinessWatchdog?.cancel()
         savedCloseHandshakeTimeouts.values.forEach { $0.cancel() }
         for document in documents {
@@ -1749,6 +1916,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         minimapButton = minimap
         collapseButton = collapse
 
+        stack.addArrangedSubview(close)
         [lineNumbers, wordWrap, minimap].forEach(stack.addArrangedSubview)
 
         let dragHandle = RemoteEditorToolbarDragHandleView(
@@ -1766,7 +1934,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
             dragHandle.widthAnchor.constraint(greaterThanOrEqualToConstant: 40),
             dragHandle.heightAnchor.constraint(equalToConstant: 24)
         ])
-        [find, replace, backup, restore, askAI, collapse, close].forEach(stack.addArrangedSubview)
+        [find, replace, backup, restore, askAI, collapse].forEach(stack.addArrangedSubview)
 
         let presentation = NSSegmentedControl(
             frame: NSRect(x: 0, y: 0, width: 58, height: 24)
@@ -1999,6 +2167,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
 
     private func loadMonacoEditorHTML(resetReadinessRecoveryBudget: Bool = false) {
         cancelTabDragTracking()
+        resetEditorPointerInteractionState()
         cancelAllSavedCloseHandshakes()
         cancelMonacoReadinessWatchdog()
         if resetReadinessRecoveryBudget {
@@ -2856,6 +3025,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
     let pendingEditorLayoutFrame = null;
     let pendingEditorLayoutFallbackTimer = null;
     const editorLayoutFallbackDelay = 200;
+    const activeEditorPrimaryPointer = { value: null };
 
     function escapeHTML(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
@@ -3241,6 +3411,80 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       post('tabDragCancelled', pointerID === null ? {} : { pointerID });
     }
 
+    function rememberEditorPrimaryPointer(event) {
+      const editorElement = window.document.getElementById('editor');
+      const target = event.target instanceof Element ? event.target : null;
+      if (event.button !== 0 || (event.buttons & 1) === 0 || !target || !editorElement.contains(target)) {
+        return;
+      }
+      activeEditorPrimaryPointer.value = {
+        pointerID: event.pointerId,
+        pointerType: event.pointerType || 'mouse',
+        startedAtEpochMilliseconds: Date.now(),
+        target,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        screenX: event.screenX,
+        screenY: event.screenY
+      };
+    }
+
+    function forgetEditorPrimaryPointer(event) {
+      const activePointer = activeEditorPrimaryPointer.value;
+      if (!activePointer || !event || event.pointerId === activePointer.pointerID) {
+        activeEditorPrimaryPointer.value = null;
+      }
+    }
+
+    function releaseStalePointerInteraction(payload) {
+      const activePointer = activeEditorPrimaryPointer.value;
+      if (!activePointer) { return false; }
+      const notAfterEpochMilliseconds = Number(payload && payload.notAfterEpochMilliseconds);
+      if (!Number.isFinite(notAfterEpochMilliseconds)
+        || activePointer.startedAtEpochMilliseconds > notAfterEpochMilliseconds) {
+        return false;
+      }
+      activeEditorPrimaryPointer.value = null;
+      const requestedClientX = Number(payload && payload.clientX);
+      const requestedClientY = Number(payload && payload.clientY);
+      const clientX = Number.isFinite(requestedClientX) ? requestedClientX : activePointer.clientX;
+      const clientY = Number.isFinite(requestedClientY) ? requestedClientY : activePointer.clientY;
+      const fallbackTarget = window.document.elementFromPoint(clientX, clientY)
+        || window.document.getElementById('editor');
+      const target = activePointer.target && activePointer.target.isConnected
+        ? activePointer.target
+        : fallbackTarget;
+      if (!target) { return false; }
+
+      const pointerOptions = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerId: activePointer.pointerID,
+        pointerType: activePointer.pointerType,
+        isPrimary: true,
+        button: 0,
+        buttons: 0,
+        clientX,
+        clientY,
+        screenX: activePointer.screenX + (clientX - activePointer.clientX),
+        screenY: activePointer.screenY + (clientY - activePointer.clientY)
+      };
+      if (window.PointerEvent) {
+        target.dispatchEvent(new PointerEvent('pointerup', pointerOptions));
+      }
+      target.dispatchEvent(new MouseEvent('mouseup', pointerOptions));
+      try {
+        if (typeof target.hasPointerCapture === 'function'
+          && target.hasPointerCapture(activePointer.pointerID)) {
+          target.releasePointerCapture(activePointer.pointerID);
+        }
+      } catch (_) {
+        // WebKit can discard native capture before the JavaScript bridge runs.
+      }
+      return true;
+    }
+
     function handleTabsMouseDown(event) {
       if (window.PointerEvent) { return false; }
       return activateTabFromEvent(event);
@@ -3486,8 +3730,12 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
       runEditorAction,
       saveActiveDocument,
       confirmSavedContentBeforeClose,
+      releaseStalePointerInteraction,
       layout: scheduleEditorLayout
     };
+    window.addEventListener('pointerdown', rememberEditorPrimaryPointer, { capture: true });
+    window.addEventListener('pointerup', forgetEditorPrimaryPointer, { capture: true });
+    window.addEventListener('pointercancel', forgetEditorPrimaryPointer, { capture: true });
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabDragCandidate, { capture: true });
     window.document.getElementById('tabs').addEventListener('pointerdown', handleTabsPointerDown, { capture: true });
     window.document.getElementById('tabs').addEventListener('mousedown', handleTabsMouseDown);
@@ -4143,6 +4391,12 @@ private enum RemoteTextEditorJavaScriptError: Error {
 
 private struct EditorActionPayload: Encodable {
     let actionID: String
+}
+
+private struct EditorPointerReleasePayload: Encodable {
+    let notAfterEpochMilliseconds: Double
+    let clientX: Double?
+    let clientY: Double?
 }
 
 private struct EmptyEditorPayload: Encodable {}

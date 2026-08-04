@@ -24,6 +24,7 @@ private enum AIAssistantSurfaceMode: Int {
 
 public final class AIAssistantPanelViewController: NSViewController, NSTextFieldDelegate {
     private static let defaultMessagePreferredWidth: CGFloat = 260
+    private static let panelHorizontalInset: CGFloat = 14
     private static let compactComposerHeight: CGFloat = 124
     private static let contextComposerHeight: CGFloat = 132
     private static let attachmentComposerHeight: CGFloat = 188
@@ -805,8 +806,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         commandCardsCollapsedHeightConstraint = commandCardsStack.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
-            composer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            composer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            composer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.panelHorizontalInset),
+            composer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.panelHorizontalInset),
             composer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
             composerHeightConstraint!,
 
@@ -843,13 +844,13 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             composerToolbar.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),
             composerToolbar.heightAnchor.constraint(equalToConstant: 32),
 
-            commandCardsStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            commandCardsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            commandCardsStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.panelHorizontalInset),
+            commandCardsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.panelHorizontalInset),
             commandCardsStack.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -10),
             commandCardsCollapsedHeightConstraint!,
 
-            conversationContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            conversationContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            conversationContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.panelHorizontalInset),
+            conversationContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.panelHorizontalInset),
             conversationContainer.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
 
             headerContainer.leadingAnchor.constraint(equalTo: conversationContainer.leadingAnchor),
@@ -940,7 +941,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     public override func viewDidLayout() {
         super.viewDidLayout()
-        guard isInspectorInteractiveResizeActive == false else { return }
         updateLayoutForCurrentWidth()
     }
 
@@ -951,9 +951,38 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         view.needsLayout = true
     }
 
+    func refreshLayoutDuringInspectorInteractiveResize() {
+        guard isViewLoaded,
+              let hostView = view.superview,
+              view.isHidden == false
+        else { return }
+        let targetBounds = hostView.bounds
+        guard targetBounds.width > 0, targetBounds.height > 0 else { return }
+        if view.frame != targetBounds {
+            view.frame = targetBounds
+        }
+        if view.bounds.size != targetBounds.size {
+            view.bounds = NSRect(origin: view.bounds.origin, size: targetBounds.size)
+        }
+        view.needsLayout = true
+        view.needsDisplay = true
+        conversationContainer.needsLayout = true
+        composer.needsLayout = true
+        transcriptScrollView.needsLayout = true
+        transcriptDocumentView.needsLayout = true
+        transcriptContentStack.needsLayout = true
+        let contentWidth = max(80, targetBounds.width - Self.panelHorizontalInset * 2)
+        updateSurfaceModeSegmentWidths(controlWidth: contentWidth)
+        applyTranscriptTextWidth(contentWidth)
+    }
+
     private func updateLayoutForCurrentWidth() {
         updateSurfaceModeSegmentWidths()
         let textWidth = max(80, transcriptContentStack.bounds.width)
+        applyTranscriptTextWidth(textWidth)
+    }
+
+    private func applyTranscriptTextWidth(_ textWidth: CGFloat) {
         guard lastAppliedTranscriptTextWidth.map({ abs($0 - textWidth) > 0.5 }) ?? true else {
             return
         }
@@ -970,9 +999,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
-    private func updateSurfaceModeSegmentWidths() {
+    private func updateSurfaceModeSegmentWidths(controlWidth explicitControlWidth: CGFloat? = nil) {
         let segmentCount = surfaceModeSegmentedControl.segmentCount
-        let controlWidth = surfaceModeSegmentedControl.bounds.width
+        let controlWidth = explicitControlWidth ?? surfaceModeSegmentedControl.bounds.width
         guard segmentCount > 0, controlWidth > 0 else {
             return
         }

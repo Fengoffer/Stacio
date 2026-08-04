@@ -1026,8 +1026,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
 
         let subviews = splitView.arrangedSubviews
-        let sidebarWidth = subviews.first?.isHidden == false ? subviews.first?.frame.width ?? 0 : 0
-        let lowerBound = sidebarWidth + dividerThickness
+        let sidebarIsVisible = subviews.first?.isHidden == false
+        let sidebarWidth = sidebarIsVisible ? subviews.first?.frame.width ?? 0 : 0
+        let leadingDividerThickness = sidebarIsVisible ? dividerThickness : 0
+        let lowerBound = sidebarWidth + leadingDividerThickness
         let upperBound = max(lowerBound, splitView.bounds.width - dividerThickness)
         if let preservedInspectorWidthDuringSidebarMove {
             let targetWidth = clampedInspectorWidth(
@@ -1044,10 +1046,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if splitPositionOverrideDepth == 0 {
             pendingInspectorWidth = max(0, splitView.bounds.width - constrainedPosition - dividerThickness)
             if isInteractiveSplitPositionChange(in: splitView) {
-                // During a mouse drag AppKit already moves the divider and
-                // lays out the columns. Defer the Inspector-wide repair until
-                // the pointer settles so the drag stays on the live layout
-                // path instead of recursively forcing Auto Layout each tick.
                 scheduleInteractiveSplitResizeRepair()
             } else {
                 updatePreferredInspectorFraction(pendingInspectorWidth ?? 0, splitWidth: splitView.bounds.width)
@@ -1169,7 +1167,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         guard dividerIndex == 1 else { return }
 
         if isInteractiveSplitResizeActive || isInteractiveSplitPositionChange(in: splitView) {
-            pendingInspectorWidth = max(0, splitView.bounds.width - position - splitView.dividerThickness)
+            applyInteractiveInspectorDividerFrames(
+                forDividerOnePosition: position,
+                in: splitView
+            )
             scheduleInteractiveSplitResizeRepair()
             return
         }
@@ -1210,9 +1211,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
         let storedInspectorWidth = storedSplitWidth(column: "inspector")
         let storedSidebarWidth = storedSplitWidth(column: "sidebar")
-        let pinnedSidebarWidth = storedSidebarWidth
-            .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
-            ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+        let sidebarIsVisible = splitView.arrangedSubviews.first?.isHidden == false
+            && contentSplitViewController.splitViewItems.first?.isCollapsed == false
+        let pinnedSidebarWidth = sidebarIsVisible
+            ? storedSidebarWidth
+                .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
+                ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+            : 0
         let maximumInspectorWidth = max(
             0,
             splitView.bounds.width
@@ -1275,7 +1280,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 pinsInspectorWidthDuringLayout: true,
                 pinnedSidebarWidth: pinnedSidebarWidth
             )
-            if let storedSidebarWidth {
+            if sidebarIsVisible, let storedSidebarWidth {
                 splitView.setPosition(
                     clampedSidebarWidth(storedSidebarWidth, availableWidth: splitView.bounds.width),
                     ofDividerAt: 0
@@ -1324,9 +1329,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private func currentSidebarWidthForInspectorSizing(splitWidth: CGFloat) -> CGFloat {
         let splitView = contentSplitViewController.splitView
         let subviews = splitView.arrangedSubviews
-        if let sidebarView = subviews.first,
-           sidebarView.isHidden == false,
-           sidebarView.frame.width > 0
+        if contentSplitViewController.splitViewItems.first?.isCollapsed == true {
+            return 0
+        }
+        if let sidebarView = subviews.first, sidebarView.isHidden {
+            return 0
+        }
+        if let sidebarView = subviews.first, sidebarView.frame.width > 0
         {
             let maximumSidebarWidth = sidebarSplitViewItem?.maximumThickness ?? 320
             return min(max(sidebarView.frame.width, minimumReadableSidebarWidth), maximumSidebarWidth)
@@ -1478,13 +1487,18 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         let workspaceView = subviews[1]
         let inspectorView = subviews[2]
         let sidebarWidth = sidebarView.isHidden ? 0 : (targetSidebarWidth ?? sidebarView.frame.width)
+        let leadingDividerThickness = sidebarView.isHidden ? 0 : dividerThickness
         let inspectorWidth = min(
             max(targetInspectorWidth, 0),
-            max(0, splitView.bounds.width - sidebarWidth - dividerThickness * 2)
+            max(0, splitView.bounds.width - sidebarWidth - leadingDividerThickness - dividerThickness)
         )
         let workspaceWidth = max(
             0,
-            splitView.bounds.width - sidebarWidth - inspectorWidth - dividerThickness * 2
+            splitView.bounds.width
+                - sidebarWidth
+                - inspectorWidth
+                - leadingDividerThickness
+                - dividerThickness
         )
         sidebarView.frame = NSRect(
             x: 0,
@@ -1493,17 +1507,52 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             height: splitView.bounds.height
         )
         workspaceView.frame = NSRect(
-            x: sidebarWidth + dividerThickness,
+            x: sidebarWidth + leadingDividerThickness,
             y: 0,
             width: workspaceWidth,
             height: splitView.bounds.height
         )
         inspectorView.frame = NSRect(
-            x: sidebarWidth + dividerThickness + workspaceWidth + dividerThickness,
+            x: sidebarWidth + leadingDividerThickness + workspaceWidth + dividerThickness,
             y: 0,
             width: inspectorWidth,
             height: splitView.bounds.height
         )
+    }
+
+    private func applyInteractiveInspectorDividerFrames(
+        forDividerOnePosition dividerPosition: CGFloat,
+        in splitView: NSSplitView
+    ) {
+        guard splitView.arrangedSubviews.count >= 3 else { return }
+        let sidebarView = splitView.arrangedSubviews[0]
+        let workspaceView = splitView.arrangedSubviews[1]
+        let inspectorView = splitView.arrangedSubviews[2]
+        let dividerThickness = splitView.dividerThickness
+        let requestedWidth = max(
+            0,
+            splitView.bounds.width - dividerPosition - dividerThickness
+        )
+        let sidebarWidth = sidebarView.isHidden ? 0 : sidebarView.frame.width
+        let leadingDividerThickness = sidebarView.isHidden ? 0 : dividerThickness
+        let availableWidth = max(
+            0,
+            splitView.bounds.width - sidebarWidth - leadingDividerThickness - dividerThickness
+        )
+        let targetWidth = min(requestedWidth, availableWidth)
+        pendingInspectorWidth = targetWidth
+        applyPinnedWorkbenchSplitFrames(targetInspectorWidth: targetWidth, in: splitView)
+
+        [workspaceView, inspectorView].forEach { columnView in
+            guard columnView.bounds.size != columnView.frame.size else { return }
+            columnView.bounds = NSRect(origin: columnView.bounds.origin, size: columnView.frame.size)
+        }
+        inspectorViewController?.synchronizeSelectedSectionFrameAfterSplitLayout(hostView: inspectorView)
+        inspectorViewController?.aiAssistantViewController?.refreshLayoutDuringInspectorInteractiveResize()
+        workspaceView.needsLayout = true
+        workspaceView.needsDisplay = true
+        inspectorView.needsDisplay = true
+        splitView.needsDisplay = true
     }
 
     public func setInspectorDividerPositionForTesting(_ position: CGFloat) {
@@ -4613,9 +4662,13 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             for: splitView.bounds.width,
             preferredWidth: defaultInspectorPanelWidth
         )
-        let restoredSidebarWidth = storedSplitWidth(column: "sidebar")
-            .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
-            ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+        let sidebarIsVisible = splitView.arrangedSubviews.first?.isHidden == false
+            && contentSplitViewController.splitViewItems.first?.isCollapsed == false
+        let restoredSidebarWidth = sidebarIsVisible
+            ? storedSplitWidth(column: "sidebar")
+                .map { clampedSidebarWidth($0, availableWidth: splitView.bounds.width) }
+                ?? currentSidebarWidthForInspectorSizing(splitWidth: splitView.bounds.width)
+            : 0
         let maximumInitialWidth = max(
             0,
             splitView.bounds.width
