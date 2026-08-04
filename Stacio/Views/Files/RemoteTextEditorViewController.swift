@@ -3521,6 +3521,7 @@ public final class RemoteTextEditorViewController: NSViewController, WKNavigatio
         minimap: { enabled: true },
         hover: { enabled: false },
         links: false,
+        dragAndDrop: false,
         quickSuggestions: false,
         suggestOnTriggerCharacters: false,
         parameterHints: { enabled: false },

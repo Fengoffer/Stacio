@@ -27,6 +27,39 @@ enum LocalAgentTerminalFont {
         return NSFont(name: bundledPostScriptName, size: size)
     }
 
+    static func font(matchingCellWidthOf baseFont: NSFont) -> NSFont? {
+        _ = registrationResult
+        guard let unitFont = NSFont(name: bundledPostScriptName, size: 1) else {
+            return nil
+        }
+
+        let baseCellWidth = baseFont.advancement(
+            forGlyph: baseFont.glyph(withName: "W")
+        ).width
+        let unitCellWidth = unitFont.advancement(
+            forGlyph: unitFont.glyph(withName: "W")
+        ).width
+        guard baseCellWidth > 0,
+              unitCellWidth > 0,
+              baseFont.pointSize > 0
+        else {
+            return nil
+        }
+
+        let matrix = AffineTransform(
+            m11: baseCellWidth / unitCellWidth,
+            m12: 0,
+            m21: 0,
+            m22: baseFont.pointSize,
+            tX: 0,
+            tY: 0
+        )
+        return NSFont(
+            descriptor: unitFont.fontDescriptor.withMatrix(matrix),
+            size: 0
+        )
+    }
+
     static func apply(settings: AppSettings, to terminalView: TerminalView) {
         guard let font = font(size: CGFloat(settings.terminalFontSize)) else { return }
         terminalView.font = font

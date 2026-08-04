@@ -6,6 +6,73 @@ import XCTest
 
 @MainActor
 final class TerminalPaneViewControllerTests: XCTestCase {
+    func testTerminalAppearanceDoesNotReapplyUnchangedLineSpacing() {
+        let terminal = LineSpacingAssignmentTrackingTerminalView(frame: .zero)
+        let settings = AppSettings()
+
+        TerminalAppearanceApplier.apply(settings: settings, to: terminal)
+        let assignmentsAfterInitialAppearance = terminal.lineSpacingAssignmentCount
+
+        TerminalAppearanceApplier.apply(settings: settings, to: terminal)
+
+        XCTAssertEqual(
+            terminal.lineSpacingAssignmentCount,
+            assignmentsAfterInitialAppearance,
+            "Unchanged line spacing must not trigger another SwiftTerm font reset"
+        )
+    }
+
+    func testDefaultLocalAndRemoteTerminalFontsUseTwoCellsPerChineseGlyph() throws {
+        let settings = AppSettings()
+        let uncorrectedBaseFont = NSFont.monospacedSystemFont(
+            ofSize: CGFloat(settings.terminalFontSize),
+            weight: .regular
+        )
+        let expectedLatinWidth = NSAttributedString(
+            string: "W",
+            attributes: [.font: uncorrectedBaseFont]
+        ).size().width
+        let expectedLineHeight = uncorrectedBaseFont.ascender
+            - uncorrectedBaseFont.descender
+            + uncorrectedBaseFont.leading
+        let terminalFrame = NSRect(x: 0, y: 0, width: 803, height: 607)
+        let baselineTerminal = TerminalView(
+            frame: terminalFrame,
+            font: uncorrectedBaseFont
+        )
+        let baselineDimensions = baselineTerminal.terminal.getDims()
+        let baselineCaretSize = baselineTerminal.caretFrame.size
+        let localTerminal = StacioLocalTerminalView(frame: terminalFrame)
+        let remoteTerminal = StacioRemoteTerminalView(frame: terminalFrame)
+
+        TerminalAppearanceApplier.apply(settings: settings, to: localTerminal)
+        TerminalAppearanceApplier.apply(settings: settings, to: remoteTerminal)
+
+        for terminal in [localTerminal as TerminalView, remoteTerminal as TerminalView] {
+            let latinWidth = NSAttributedString(
+                string: "W",
+                attributes: [.font: terminal.font]
+            ).size().width
+            let chineseWidth = NSAttributedString(
+                string: "中",
+                attributes: [.font: terminal.font]
+            ).size().width
+            let lineHeight = terminal.font.ascender
+                - terminal.font.descender
+                + terminal.font.leading
+
+            XCTAssertEqual(chineseWidth / latinWidth, 2, accuracy: 0.05)
+            XCTAssertEqual(latinWidth, expectedLatinWidth, accuracy: 0.05)
+            XCTAssertEqual(terminal.font.pointSize, CGFloat(settings.terminalFontSize), accuracy: 0.05)
+            XCTAssertEqual(lineHeight * terminal.lineSpacing, expectedLineHeight, accuracy: 0.05)
+            XCTAssertEqual(terminal.terminal.cols, baselineDimensions.cols)
+            XCTAssertEqual(terminal.terminal.rows, baselineDimensions.rows)
+            XCTAssertEqual(terminal.caretFrame.width, baselineCaretSize.width, accuracy: 0.05)
+            XCTAssertEqual(terminal.caretFrame.height, baselineCaretSize.height, accuracy: 0.05)
+        }
+        XCTAssertEqual(localTerminal.font.fontName, remoteTerminal.font.fontName)
+    }
+
     func testCompletedAgentTraceOverlayAutoDismissesAndRunningOverlayRemainsVisible() {
         let completedOverlay = TerminalAgentTraceOverlayView(
             frame: .zero,
@@ -2149,6 +2216,18 @@ final class TerminalPaneViewControllerTests: XCTestCase {
 
         XCTAssertTrue(root.subviews.contains(dashboardOverlay))
         XCTAssertFalse(dashboardOverlay.isHidden)
+    }
+}
+
+private final class LineSpacingAssignmentTrackingTerminalView: TerminalView {
+    private(set) var lineSpacingAssignmentCount = 0
+
+    override var lineSpacing: CGFloat {
+        get { super.lineSpacing }
+        set {
+            lineSpacingAssignmentCount += 1
+            super.lineSpacing = newValue
+        }
     }
 }
 

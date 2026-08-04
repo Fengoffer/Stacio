@@ -1261,6 +1261,78 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         assertWindowFrame(window, equals: userFrame)
     }
 
+    func testInspectorDividerDragFinalizesImmediatelyWithoutDebouncedRepair() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showAIAssistantFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = try XCTUnwrap(splitController.splitView as? StacioPinnedSplitView)
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        let requestedInspectorWidth: CGFloat = 720
+        let proposedPosition = splitView.bounds.width
+            - requestedInspectorWidth
+            - splitView.dividerThickness
+
+        splitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = splitController.splitView(
+                splitView,
+                constrainSplitPosition: proposedPosition,
+                ofSubviewAt: 1
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 1)
+        }
+
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
+        XCTAssertFalse(controller.hasPendingInteractiveSplitResizeRepairForTesting)
+        XCTAssertFalse(controller.hasPendingSplitWidthPersistenceForTesting)
+    }
+
+    func testSwitchingExpandedInspectorPanelDoesNotResetDividerPosition() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = splitController.splitView
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 720 - splitView.dividerThickness
+        )
+        let widthBeforeSwitch = inspectorView.frame.width
+        var setPositionCount = 0
+        splitController.afterPinnedSetPosition = { _, _, _ in
+            setPositionCount += 1
+        }
+
+        controller.showAIAssistantFromToolbar(nil)
+
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.selectedTabLabelForTesting, "AI")
+        XCTAssertEqual(setPositionCount, 0)
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeSwitch, accuracy: 1)
+    }
+
     func testPinnedSplitViewUsesWideDividerHitAreaForDragging() throws {
         let proposedRect = NSRect(x: 596, y: 0, width: 8, height: 600)
 

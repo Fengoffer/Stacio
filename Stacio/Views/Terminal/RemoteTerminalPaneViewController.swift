@@ -304,6 +304,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private let agentTraceController = TerminalTraceController()
     private let commandInputObserver = TerminalCommandInputObserver()
     private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
+    private let sensitiveInputState = TerminalSensitiveInputStateMachine()
     private var commandSuggestionHistoryCommands: [String] = []
     private let commandHintOverlay = TerminalCommandHintOverlayView()
     private let agentTraceOverlay = TerminalAgentTraceOverlayView(frame: .zero)
@@ -746,7 +747,13 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             }
             return
         }
-        transcriptRecorder.append(bytes: visibleBytes)
+        let wasAwaitingSensitiveInput = sensitiveInputState.isAwaitingSensitiveInput
+        sensitiveInputState.ingestOutput(visibleBytes)
+        handleSensitiveInputStateTransition(from: wasAwaitingSensitiveInput)
+        let observableBytes = sensitiveInputState.redactOutputForObservation(visibleBytes)
+        if observableBytes.isEmpty == false {
+            transcriptRecorder.append(bytes: observableBytes)
+        }
         let candidateOSC7Bytes = Array((osc7OutputBuffer + visibleBytes).suffix(4_096))
         remoteFeedCurrentDirectories = Set(TerminalOSC7SequenceParser.currentDirectories(from: candidateOSC7Bytes))
         isFeedingRemoteOutput = true
@@ -769,8 +776,11 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         {
             didFinishCommand = recordRemotePromptDirectoryFromOutput(visibleBytes) || didFinishCommand
         }
-        TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: runtimeID, bytes: visibleBytes)
+        if observableBytes.isEmpty == false {
+            TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: runtimeID, bytes: observableBytes)
+        }
         if didFinishCommand {
+            sensitiveInputState.clearExpiredProtectionAfterCommandCompletion()
             TerminalOutputBroadcastHub.shared.publishCommandFinished(runtimeID: runtimeID)
         }
         terminalSearchController.terminalContentDidChange()
@@ -907,6 +917,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         guard didClose == false else { return }
         let closedEstablishedRuntime = hasEstablishedRuntime
         didClose = true
+        sensitiveInputState.reset()
         terminalView.cancelPendingSemanticOutput()
         reconnectGeneration &+= 1
         cancelAutomaticReconnect()
@@ -920,14 +931,16 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     public func sendInput(_ bytes: [UInt8]) {
-        sendInput(bytes, broadcastUserInput: true)
+        sendOrdinaryInput(bytes, broadcastUserInput: true)
     }
 
     public func sendAgentInput(_ bytes: [UInt8]) {
-        sendInput(bytes, broadcastUserInput: false)
+        guard sensitiveInputState.isSensitiveInputProtectionActive == false else { return }
+        sendOrdinaryInput(bytes, broadcastUserInput: false)
     }
 
-    private func sendInput(_ bytes: [UInt8], broadcastUserInput: Bool) {
+    private func sendOrdinaryInput(_ bytes: [UInt8], broadcastUserInput: Bool) {
+        guard sensitiveInputState.isSensitiveInputProtectionActive == false else { return }
         if agentInteractionLocked && broadcastUserInput { return }
         guard lifecycleState == .running else {
             handleStoppedSessionInput(bytes)
@@ -935,6 +948,22 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         }
         expireSilentInputEchoFiltersIfNeeded()
         sendInputImmediately(bytes, broadcastUserInput: broadcastUserInput)
+    }
+
+    @discardableResult
+    public func sendSensitiveUserInput(_ bytes: [UInt8]) -> Bool {
+        guard lifecycleState == .running,
+              let acceptedBytes = sensitiveInputState.consumeSensitiveInputBytes(bytes)
+        else { return false }
+        do {
+            try eventSink.terminalDidReceiveInput(runtimeID: runtimeID, bytes: acceptedBytes)
+            scheduleImmediateRemoteOutputDrain()
+            return true
+        } catch {
+            stopOutputPolling()
+            displayConnectionFailure(RuntimeDiagnosticFormatter.userMessage(for: error))
+            return false
+        }
     }
 
     public func setAgentInteractionLocked(_ locked: Bool) {
@@ -953,6 +982,18 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public var agentInteractionGlowPreservesTransparentCenterForTesting: Bool {
         agentInteractionGlow.preservesTransparentCenterForTesting
+    }
+
+    public var isAwaitingSensitiveInput: Bool {
+        sensitiveInputState.isAwaitingSensitiveInput
+    }
+
+    public var isSensitiveInputProtectionActive: Bool {
+        sensitiveInputState.isSensitiveInputProtectionActive
+    }
+
+    public var isAwaitingSensitiveInputForTesting: Bool {
+        isAwaitingSensitiveInput
     }
 
     private func sendInputImmediately(_ bytes: [UInt8], broadcastUserInput: Bool) {
@@ -1179,6 +1220,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func resetTerminalOutputForConnectedRuntime() {
+        sensitiveInputState.reset()
         terminalView.cancelPendingSemanticOutput()
         transcriptRecorder.reset()
         terminalView.getTerminal().resetToInitialState()
@@ -1215,6 +1257,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return
         }
 
+        sensitiveInputState.reset()
         let message = RuntimeDiagnosticFormatter.userMessage(diagnostic)
         resetSilentInputEchoRecoveryState()
         let isInitialSSHConnectionFailure = connectionKind == .ssh && hasEstablishedRuntime == false
@@ -1475,10 +1518,16 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             return
         }
         let bytes = Array(data)
+        if sendSensitiveUserInput(bytes) {
+            return
+        }
+        if agentInteractionLocked {
+            return
+        }
         if onUserInput?(self, bytes) == true {
             return
         }
-        sendInput(bytes, broadcastUserInput: true)
+        sendOrdinaryInput(bytes, broadcastUserInput: true)
     }
 
     public func scrolled(source: TerminalView, position: Double) {}
@@ -2381,6 +2430,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func setLifecycle(_ state: RemoteTerminalLifecycleState, message: String) {
+        if state != .running {
+            sensitiveInputState.reset()
+        }
         lifecycleState = state
         lifecycleLabel.stringValue = message
         applyLifecyclePresentation()
@@ -2528,6 +2580,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func recordSubmittedCommands(_ bytes: [UInt8]) {
+        sensitiveInputState.noteOrdinaryInput(bytes)
         for command in commandHistoryInputBuffer.ingest(bytes: bytes) {
             commandSuggestionHistoryCommands.removeAll { $0 == command }
             commandSuggestionHistoryCommands.insert(command, at: 0)
@@ -2536,6 +2589,17 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
             }
             onCommandSubmitted?(self, command)
         }
+    }
+
+    private func handleSensitiveInputStateTransition(from wasAwaitingSensitiveInput: Bool) {
+        guard wasAwaitingSensitiveInput == false,
+              sensitiveInputState.isAwaitingSensitiveInput
+        else { return }
+        commandInputObserver.reset()
+        commandHistoryInputBuffer.reset()
+        commandHintOverlay.clear()
+        resetRemoteInputLineAnchor()
+        lastCompletionSensitiveInputAt = nil
     }
 
     private func renderCommandInputObservation(_ observation: TerminalCommandInputObservation) {

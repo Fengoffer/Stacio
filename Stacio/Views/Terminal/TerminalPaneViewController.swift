@@ -76,6 +76,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     private let agentTraceController = TerminalTraceController()
     private let commandInputObserver = TerminalCommandInputObserver()
     private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
+    private let sensitiveInputState = TerminalSensitiveInputStateMachine()
     private var commandSuggestionHistoryCommands: [String] = []
     private let commandHintOverlay = TerminalCommandHintOverlayView()
     private let agentTraceOverlay = TerminalAgentTraceOverlayView(frame: .zero)
@@ -174,9 +175,14 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         terminalView.processDelegate = self
         terminalView.onOutput = { [weak self] bytes in
             guard let self else { return }
-            self.transcriptRecorder.append(bytes: bytes)
-            TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: self.runtimeID, bytes: bytes)
-            try? self.eventSink.terminalDidProduceOutput(runtimeID: self.runtimeID, bytes: bytes)
+            let wasAwaitingSensitiveInput = self.sensitiveInputState.isAwaitingSensitiveInput
+            self.sensitiveInputState.ingestOutput(bytes)
+            self.handleSensitiveInputStateTransition(from: wasAwaitingSensitiveInput)
+            let observableBytes = self.sensitiveInputState.redactOutputForObservation(bytes)
+            guard observableBytes.isEmpty == false else { return }
+            self.transcriptRecorder.append(bytes: observableBytes)
+            TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: self.runtimeID, bytes: observableBytes)
+            try? self.eventSink.terminalDidProduceOutput(runtimeID: self.runtimeID, bytes: observableBytes)
         }
         terminalView.onUserInput = { [weak self] bytes in
             self?.handleUserInput(bytes) ?? false
@@ -364,6 +370,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             return
         }
         currentLocalDirectory = normalized
+        sensitiveInputState.clearExpiredProtectionAfterCommandCompletion()
         commandCompletionGeneration &+= 1
         onCommandFinished?(self)
     }
@@ -414,20 +421,33 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     public func closeTerminal() {
+        sensitiveInputState.reset()
         terminalView.cancelPendingSemanticOutput()
         processLauncher.terminate(terminalView)
         notifyClosed()
     }
 
     public func sendInput(_ bytes: [UInt8]) {
+        guard sensitiveInputState.isSensitiveInputProtectionActive == false else { return }
+        guard agentInteractionLocked == false else { return }
         TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: bytes)
         processLauncher.sendInput(bytes, to: terminalView)
         recordSubmittedCommands(bytes)
     }
 
     public func sendAgentInput(_ bytes: [UInt8]) {
+        guard sensitiveInputState.isSensitiveInputProtectionActive == false else { return }
         processLauncher.sendInput(bytes, to: terminalView)
         recordSubmittedCommands(bytes)
+    }
+
+    @discardableResult
+    public func sendSensitiveUserInput(_ bytes: [UInt8]) -> Bool {
+        guard let acceptedBytes = sensitiveInputState.consumeSensitiveInputBytes(bytes) else {
+            return false
+        }
+        processLauncher.sendInput(acceptedBytes, to: terminalView)
+        return true
     }
 
     public func performDropLocalFilesForTesting(_ localPaths: [String]) {
@@ -603,6 +623,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     private func notifyClosed() {
         guard didClose == false else { return }
         didClose = true
+        sensitiveInputState.reset()
         try? eventSink.terminalDidClose(runtimeID: runtimeID)
     }
 
@@ -688,6 +709,9 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     private func handleUserInput(_ bytes: [UInt8]) -> Bool {
+        if sendSensitiveUserInput(bytes) {
+            return true
+        }
         if agentInteractionLocked { return true }
         if onUserInput?(self, bytes) == true { return true }
         let observation = commandInputObserver.ingest(
@@ -726,8 +750,20 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
         agentInteractionGlow.setActive(locked)
     }
 
+    public var isAwaitingSensitiveInput: Bool {
+        sensitiveInputState.isAwaitingSensitiveInput
+    }
+
+    public var isSensitiveInputProtectionActive: Bool {
+        sensitiveInputState.isSensitiveInputProtectionActive
+    }
+
+    public var isAwaitingSensitiveInputForTesting: Bool {
+        isAwaitingSensitiveInput
+    }
+
     private var canAcceptLocalFileDrops: Bool {
-        agentInteractionLocked == false
+        agentInteractionLocked == false && sensitiveInputState.isSensitiveInputProtectionActive == false
     }
 
     var canAcceptLocalFileDropsForTesting: Bool {
@@ -736,6 +772,15 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
 
     public var agentInteractionGlowActiveForTesting: Bool {
         agentInteractionGlow.isActiveForTesting
+    }
+
+    private func handleSensitiveInputStateTransition(from wasAwaitingSensitiveInput: Bool) {
+        guard wasAwaitingSensitiveInput == false,
+              sensitiveInputState.isAwaitingSensitiveInput
+        else { return }
+        commandInputObserver.reset()
+        commandHistoryInputBuffer.reset()
+        commandHintOverlay.clear()
     }
 
     private func renderCommandInputObservation(_ observation: TerminalCommandInputObservation) {
@@ -826,6 +871,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     private func recordSubmittedCommands(_ bytes: [UInt8]) {
+        sensitiveInputState.noteOrdinaryInput(bytes)
         for command in commandHistoryInputBuffer.ingest(bytes: bytes) {
             commandSuggestionHistoryCommands.removeAll { $0 == command }
             commandSuggestionHistoryCommands.insert(command, at: 0)

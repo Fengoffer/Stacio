@@ -1417,7 +1417,15 @@ public enum TerminalAppearanceApplier {
         to terminalView: TerminalView,
         colorThemeOverride: TerminalColorTheme? = nil
     ) {
-        terminalView.font = font(for: settings)
+        let resolvedFont = font(for: settings)
+        terminalView.font = resolvedFont
+        let resolvedLineSpacing = lineSpacing(
+            for: settings,
+            resolvedFont: resolvedFont
+        )
+        if abs(terminalView.lineSpacing - resolvedLineSpacing) > 0.0001 {
+            terminalView.lineSpacing = resolvedLineSpacing
+        }
         terminalView.optionAsMetaKey = settings.terminalAltAsMetaEnabled
         terminalView.changeScrollback(settings.terminalScrollbackLines)
         let useMetal = shouldEnableMetal(
@@ -1468,7 +1476,20 @@ public enum TerminalAppearanceApplier {
     public static func font(for settings: AppSettings) -> NSFont {
         let size = CGFloat(settings.terminalFontSize)
         if settings.terminalFontFamily == .sfMono {
-            return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            let baseFont = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            // The system SF Mono falls back to a proportional CJK font whose
+            // full-width glyph is only about 1.6 Latin cells wide. SwiftTerm
+            // must still reserve two cells, which leaves a visible gap between
+            // consecutive Han characters. The bundled terminal face has exact
+            // 1:2 Latin/CJK metrics. Match it to SF Mono's original cell width
+            // and line height so column count, cursor geometry, and row count do
+            // not change while local and remote terminals gain compact CJK text.
+            if let cjkGridFont = LocalAgentTerminalFont.font(
+                matchingCellWidthOf: baseFont
+            ) {
+                return cjkGridFont
+            }
+            return baseFont
         }
         for name in settings.terminalFontFamily.fontNames {
             if let font = NSFont(name: name, size: size) {
@@ -1476,6 +1497,27 @@ public enum TerminalAppearanceApplier {
             }
         }
         return NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    private static func lineSpacing(
+        for settings: AppSettings,
+        resolvedFont: NSFont
+    ) -> CGFloat {
+        guard settings.terminalFontFamily == .sfMono else {
+            return 1
+        }
+        let baseFont = NSFont.monospacedSystemFont(
+            ofSize: CGFloat(settings.terminalFontSize),
+            weight: .regular
+        )
+        let baseLineHeight = baseFont.ascender - baseFont.descender + baseFont.leading
+        let resolvedLineHeight = resolvedFont.ascender
+            - resolvedFont.descender
+            + resolvedFont.leading
+        guard baseLineHeight > 0, resolvedLineHeight > 0 else {
+            return 1
+        }
+        return baseLineHeight / resolvedLineHeight
     }
 
     private static func apply(theme: TerminalColorTheme, to terminalView: TerminalView) {

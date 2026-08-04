@@ -4,6 +4,7 @@ final class StacioPinnedSplitView: NSSplitView {
     var beforeSetPosition: ((NSSplitView, CGFloat, Int) -> Void)?
     var afterSetPosition: ((NSSplitView, CGFloat, Int) -> Void)?
     var afterLayout: ((NSSplitView) -> Void)?
+    var userDividerDragStateDidChange: ((Bool) -> Void)?
     private(set) var isPerformingLayoutForTesting = false
     private(set) var isTrackingUserDividerDrag = false
     var isPerformingLayoutPass: Bool { isPerformingLayoutForTesting }
@@ -33,9 +34,23 @@ final class StacioPinnedSplitView: NSSplitView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        trackUserDividerDrag {
+            super.mouseDown(with: event)
+        }
+    }
+
+    func performUserDividerDragTrackingForTesting(_ body: () -> Void) {
+        trackUserDividerDrag(body)
+    }
+
+    private func trackUserDividerDrag(_ body: () -> Void) {
         isTrackingUserDividerDrag = true
-        defer { isTrackingUserDividerDrag = false }
-        super.mouseDown(with: event)
+        userDividerDragStateDidChange?(true)
+        defer {
+            isTrackingUserDividerDrag = false
+            userDividerDragStateDidChange?(false)
+        }
+        body()
     }
 
     private func scheduleAfterLayoutCallback() {
@@ -84,6 +99,11 @@ final class StacioPinnedSplitViewController: NSSplitViewController {
             (splitView as? StacioPinnedSplitView)?.afterLayout = afterPinnedSplitViewLayout
         }
     }
+    var pinnedUserDividerDragStateDidChange: ((Bool) -> Void)? {
+        didSet {
+            (splitView as? StacioPinnedSplitView)?.userDividerDragStateDidChange = pinnedUserDividerDragStateDidChange
+        }
+    }
     private var isRunningAfterPinnedLayout = false
     private var isAfterPinnedLayoutCallbackScheduled = false
 
@@ -104,6 +124,7 @@ final class StacioPinnedSplitViewController: NSSplitViewController {
         (splitView as? StacioPinnedSplitView)?.beforeSetPosition = beforePinnedSetPosition
         (splitView as? StacioPinnedSplitView)?.afterSetPosition = afterPinnedSetPosition
         (splitView as? StacioPinnedSplitView)?.afterLayout = afterPinnedSplitViewLayout
+        (splitView as? StacioPinnedSplitView)?.userDividerDragStateDidChange = pinnedUserDividerDragStateDidChange
         portDeskPinSplitViewToContainerEdges()
     }
 

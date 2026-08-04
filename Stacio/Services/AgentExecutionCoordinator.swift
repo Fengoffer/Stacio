@@ -13,11 +13,14 @@ public protocol AgentTerminalTarget: AnyObject {
     var agentTerminalOutputTranscript: String { get }
     var agentTerminalDisplaySnapshot: String { get }
     var supportsAgentCompletionMarker: Bool { get }
+    var isAwaitingSensitiveInput: Bool { get }
+    var isSensitiveInputProtectionActive: Bool { get }
     func setAgentInteractionLocked(_ locked: Bool)
     func refreshAgentTerminalOutput()
     func appendAgentTrace(_ event: AgentTraceEvent)
     func sendInput(_ bytes: [UInt8])
     func sendAgentInput(_ bytes: [UInt8])
+    @discardableResult func sendSensitiveUserInput(_ bytes: [UInt8]) -> Bool
 }
 
 public extension AgentTerminalTarget {
@@ -26,9 +29,28 @@ public extension AgentTerminalTarget {
     var agentTerminalOutputTranscript: String { "" }
     var agentTerminalDisplaySnapshot: String { agentTerminalOutputTranscript }
     var supportsAgentCompletionMarker: Bool { false }
+    var isAwaitingSensitiveInput: Bool { false }
+    var isSensitiveInputProtectionActive: Bool { false }
     func setAgentInteractionLocked(_ locked: Bool) {}
     func refreshAgentTerminalOutput() {}
     func sendAgentInput(_ bytes: [UInt8]) { sendInput(bytes) }
+    @discardableResult func sendSensitiveUserInput(_ bytes: [UInt8]) -> Bool { false }
+}
+
+public struct AgentSensitiveInputPrompt: Equatable {
+    public let runtimeID: String
+    public let targetTitle: String
+
+    public init(runtimeID: String, targetTitle: String) {
+        self.runtimeID = runtimeID
+        self.targetTitle = targetTitle
+    }
+}
+
+@MainActor
+public protocol AgentSensitiveInputRouting {
+    func sensitiveInputPrompt(runtimeID: String) -> AgentSensitiveInputPrompt?
+    @discardableResult func submitSensitiveInput(_ bytes: [UInt8], runtimeID: String) -> Bool
 }
 
 @MainActor
@@ -293,6 +315,7 @@ private struct VisibleTerminalObservationResult: Equatable {
 
 private struct VisibleTerminalOutputUpdate: Equatable {
     let summary: String
+    let sensitiveInputRequired: Bool
 }
 
 @MainActor
@@ -329,6 +352,7 @@ private final class VisibleTerminalObservationSession {
     private let terminalOutputTranscript: () -> String
     private let terminalDisplaySnapshot: () -> String
     private let refreshTerminalOutput: () -> Void
+    private let isAwaitingSensitiveInput: () -> Bool
     private let initialCommandCompletionGeneration: UInt64
     private let initialTerminalOutputTranscript: String
     private let initialTerminalDisplaySnapshot: String
@@ -343,7 +367,11 @@ private final class VisibleTerminalObservationSession {
     private var lastTerminalRefreshAt = Date.distantPast
     private var lastOutputUpdateAt = Date.distantPast
     private var lastPublishedOutputSummary: String?
+    private var lastPublishedSensitiveInputRequired: Bool?
     private var subscription: TerminalOutputBroadcastHub.Subscription?
+    private var previouslyAwaitingSensitiveInput = false
+    private var waitingForPostSensitiveOutput = false
+    private var sensitiveInteractionDeadline: Date?
 
     init(
         requestID: String,
@@ -356,6 +384,7 @@ private final class VisibleTerminalObservationSession {
         terminalOutputTranscript: @escaping () -> String,
         terminalDisplaySnapshot: @escaping () -> String,
         refreshTerminalOutput: @escaping () -> Void,
+        isAwaitingSensitiveInput: @escaping () -> Bool,
         completionMarker: [UInt8]?,
         onOutputUpdate: @escaping (VisibleTerminalOutputUpdate) -> Void
     ) {
@@ -369,6 +398,7 @@ private final class VisibleTerminalObservationSession {
         self.terminalOutputTranscript = terminalOutputTranscript
         self.terminalDisplaySnapshot = terminalDisplaySnapshot
         self.refreshTerminalOutput = refreshTerminalOutput
+        self.isAwaitingSensitiveInput = isAwaitingSensitiveInput
         self.completionMarker = completionMarker
         self.initialCommandCompletionGeneration = commandCompletionGeneration()
         self.initialTerminalOutputTranscript = terminalOutputTranscript()
@@ -402,8 +432,12 @@ private final class VisibleTerminalObservationSession {
         }
         let deadline = Date().addingTimeInterval(completion.maximumDuration)
         let outputGraceDeadline = deadline.addingTimeInterval(completion.idleInterval * 2)
-        while Date() < outputGraceDeadline {
+        while shouldContinueWaiting(baseDeadline: outputGraceDeadline) {
+            let awaitingSensitiveInput = refreshSensitiveInputTracking()
             if Date() >= deadline,
+               awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               sensitiveInteractionDeadline.map({ Date() >= $0 }) ?? true,
                (lastOutputAt == nil || outputBytes.isEmpty) {
                 break
             }
@@ -418,28 +452,36 @@ private final class VisibleTerminalObservationSession {
             }
             captureDirectTerminalOutputIfNeeded()
             captureVisibleTerminalDisplayIfNeeded()
-            if let auditCompletionSummary {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let auditCompletionSummary {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: auditCompletionSummary,
                     reason: "auditEndMarker"
                 )
             }
-            if let markerSummary = agentCompletionMarkerSummary() {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let markerSummary = agentCompletionMarkerSummary() {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: markerSummary,
                     reason: "agentCompletionMarker"
                 )
             }
-            if sawShellPrompt {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               sawShellPrompt {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: Self.summary(from: outputBytes),
                     reason: "shellPromptObserved"
                 )
             }
-            if let lastOutputAt,
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let lastOutputAt,
                Date().timeIntervalSince(lastOutputAt) >= completion.idleInterval,
                outputBytes.isEmpty == false {
                 let summary = Self.summary(from: outputBytes)
@@ -460,7 +502,10 @@ private final class VisibleTerminalObservationSession {
     }
 
     func completedResultFromTranscriptIfPromptPresent() -> VisibleTerminalObservationResult? {
-        guard sawUserInput == false else { return nil }
+        guard sawUserInput == false,
+              refreshSensitiveInputTracking() == false,
+              waitingForPostSensitiveOutput == false
+        else { return nil }
         captureDirectTerminalOutputIfNeeded()
         captureVisibleTerminalDisplayIfNeeded()
         guard Self.hasTrailingShellPrompt(in: outputBytes) else { return nil }
@@ -485,7 +530,9 @@ private final class VisibleTerminalObservationSession {
             "generation_current=\(commandCompletionGeneration())",
             "marker_seen=\(markerSeen)",
             "prompt_seen=\(sawShellPrompt)",
-            "user_input=\(sawUserInput)"
+            "user_input=\(sawUserInput)",
+            "sensitive_input=\(isAwaitingSensitiveInput())",
+            "waiting_after_sensitive_input=\(waitingForPostSensitiveOutput)"
         ].joined(separator: " ")
     }
 
@@ -494,6 +541,8 @@ private final class VisibleTerminalObservationSession {
         case .output:
             guard commandOutputCaptureStarted else { return }
             guard sawUserInput == false else { return }
+            _ = refreshSensitiveInputTracking(now: event.createdAt)
+            waitingForPostSensitiveOutput = false
             appendObservedOutput(event.bytes)
             lastOutputAt = event.createdAt
             sawShellPrompt = TerminalOSC7SequenceParser.currentDirectories(from: outputBytes).isEmpty == false
@@ -510,6 +559,8 @@ private final class VisibleTerminalObservationSession {
             }
         case .commandFinished:
             guard commandOutputCaptureStarted, sawUserInput == false else { return }
+            _ = refreshSensitiveInputTracking(now: event.createdAt)
+            waitingForPostSensitiveOutput = false
             sawShellPrompt = true
         }
     }
@@ -518,7 +569,8 @@ private final class VisibleTerminalObservationSession {
         let deadline = Date().addingTimeInterval(
             min(completion.maximumDuration, max(completion.idleInterval * 2, 0.75))
         )
-        while Date() < deadline {
+        while shouldContinueWaiting(baseDeadline: deadline) {
+            let awaitingSensitiveInput = refreshSensitiveInputTracking()
             runResponsiveMainLoopIteration()
             refreshTerminalOutputIfNeeded()
             if sawUserInput {
@@ -530,34 +582,64 @@ private final class VisibleTerminalObservationSession {
             }
             captureDirectTerminalOutputIfNeeded()
             captureVisibleTerminalDisplayIfNeeded()
-            if let auditCompletionSummary {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let auditCompletionSummary {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: auditCompletionSummary,
                     reason: "auditEndMarker"
                 )
             }
-            if let markerSummary = agentCompletionMarkerSummary() {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let markerSummary = agentCompletionMarkerSummary() {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: markerSummary,
                     reason: "agentCompletionMarker"
                 )
             }
-            if sawShellPrompt {
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               sawShellPrompt {
                 return VisibleTerminalObservationResult(
                     outcome: .completed,
                     summary: Self.summary(from: outputBytes),
                     reason: "shellPromptObserved"
                 )
             }
-            if let lastOutputAt,
+            if awaitingSensitiveInput == false,
+               waitingForPostSensitiveOutput == false,
+               let lastOutputAt,
                Date().timeIntervalSince(lastOutputAt) >= completion.idleInterval,
                outputBytes.isEmpty == false {
                 return nil
             }
         }
         return nil
+    }
+
+    private func shouldContinueWaiting(baseDeadline: Date) -> Bool {
+        let now = Date()
+        let awaitingSensitiveInput = refreshSensitiveInputTracking(now: now)
+        return now < baseDeadline
+            || awaitingSensitiveInput
+            || sensitiveInteractionDeadline.map { now < $0 } == true
+    }
+
+    @discardableResult
+    private func refreshSensitiveInputTracking(now: Date = Date()) -> Bool {
+        let awaitingSensitiveInput = isAwaitingSensitiveInput()
+        if awaitingSensitiveInput {
+            previouslyAwaitingSensitiveInput = true
+        } else if previouslyAwaitingSensitiveInput {
+            previouslyAwaitingSensitiveInput = false
+            waitingForPostSensitiveOutput = true
+            lastOutputAt = nil
+            sensitiveInteractionDeadline = now.addingTimeInterval(completion.maximumDuration)
+        }
+        return awaitingSensitiveInput
     }
 
     private func close() {
@@ -700,18 +782,27 @@ private final class VisibleTerminalObservationSession {
 
     private func publishOutputUpdateIfNeeded() {
         let summary = Self.summary(from: outputBytes)
+        let sensitiveInputRequired = isAwaitingSensitiveInput()
+        let summaryChanged = summary != lastPublishedOutputSummary
+        let sensitiveStateChanged = sensitiveInputRequired != lastPublishedSensitiveInputRequired
         guard summary.isEmpty == false,
-              summary != lastPublishedOutputSummary
-        else {
-            return
-        }
+              summaryChanged || sensitiveStateChanged
+        else { return }
         let now = Date()
-        guard now.timeIntervalSince(lastOutputUpdateAt) >= Self.outputUpdateInterval else {
+        guard sensitiveStateChanged
+                || now.timeIntervalSince(lastOutputUpdateAt) >= Self.outputUpdateInterval
+        else {
             return
         }
         lastOutputUpdateAt = now
         lastPublishedOutputSummary = summary
-        onOutputUpdate(VisibleTerminalOutputUpdate(summary: summary))
+        lastPublishedSensitiveInputRequired = sensitiveInputRequired
+        onOutputUpdate(
+            VisibleTerminalOutputUpdate(
+                summary: summary,
+                sensitiveInputRequired: sensitiveInputRequired
+            )
+        )
     }
 
     private static func auditEndMarkerRange(in bytes: [UInt8]) -> Range<Int>? {
@@ -1493,6 +1584,7 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                 terminalOutputTranscript: { target.agentTerminalOutputTranscript },
                 terminalDisplaySnapshot: { target.agentTerminalDisplaySnapshot },
                 refreshTerminalOutput: { target.refreshAgentTerminalOutput() },
+                isAwaitingSensitiveInput: { target.isAwaitingSensitiveInput },
                 completionMarker: usesCompletionMarker
                     ? Self.agentCompletionMarker(requestID: request.id)
                     : nil,
@@ -1502,7 +1594,8 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
                         "终端输出更新：\(update.summary)",
                         metadata: [
                             "terminalOutputSummary": update.summary,
-                            "completionConfidence": "streaming"
+                            "completionConfidence": "streaming",
+                            "sensitiveInputRequired": update.sensitiveInputRequired ? "true" : "false"
                         ],
                         decision: decision
                     )
@@ -1721,7 +1814,11 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
             guard let currentTarget = currentTerminalTarget(for: task) else {
                 return nil
             }
-            currentTarget.sendInput([3])
+            if currentTarget.isSensitiveInputProtectionActive {
+                _ = currentTarget.sendSensitiveUserInput([3])
+            } else {
+                currentTarget.sendInput([3])
+            }
             let event = AgentTraceEvent(
                 requestID: requestID,
                 state: .cancelled,
@@ -2002,7 +2099,24 @@ public final class AgentExecutionCoordinator: AgentCommandStreamingExecuting {
     }
 }
 
-extension AgentExecutionCoordinator: AgentCommandExecuting, AgentTaskControlling {}
+extension AgentExecutionCoordinator: AgentCommandExecuting, AgentTaskControlling, AgentSensitiveInputRouting {
+    public func sensitiveInputPrompt(runtimeID: String) -> AgentSensitiveInputPrompt? {
+        guard let target = try? terminalResolver.resolveTerminalTarget(.runtimeID(runtimeID)),
+              target.runtimeID == runtimeID,
+              target.isSensitiveInputProtectionActive
+        else { return nil }
+        return AgentSensitiveInputPrompt(runtimeID: runtimeID, targetTitle: target.agentTitle)
+    }
+
+    @discardableResult
+    public func submitSensitiveInput(_ bytes: [UInt8], runtimeID: String) -> Bool {
+        guard let target = try? terminalResolver.resolveTerminalTarget(.runtimeID(runtimeID)),
+              target.runtimeID == runtimeID,
+              target.isSensitiveInputProtectionActive
+        else { return false }
+        return target.sendSensitiveUserInput(bytes)
+    }
+}
 
 extension TerminalPaneViewController: AgentTerminalTarget {
     public var agentCommandCompletionGeneration: UInt64 { commandCompletionGeneration }

@@ -2533,6 +2533,38 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertLessThan(streaming, 0.005)
     }
 
+    func testAssistantDefersTranscriptReflowUntilInspectorDividerDragEnds() throws {
+        let panel = makeAssistantPanel()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 640),
+            styleMask: [.titled, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = panel
+        panel.loadTranscriptEntriesForPerformanceTesting(count: 100)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let initialWidth = try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting)
+
+        panel.setInspectorInteractiveResizeActiveForTesting(true)
+        for width in stride(from: CGFloat(440), through: 820, by: 20) {
+            window.setContentSize(NSSize(width: width, height: 640))
+            window.contentView?.layoutSubtreeIfNeeded()
+        }
+
+        XCTAssertEqual(
+            try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting),
+            initialWidth,
+            accuracy: 0.5
+        )
+
+        panel.setInspectorInteractiveResizeActiveForTesting(false)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let finalWidth = try XCTUnwrap(panel.appliedTranscriptTextWidthForTesting)
+        XCTAssertGreaterThan(finalWidth, initialWidth + 100)
+    }
+
     func testAssistantTranscriptIncrementalRendererRemovesStaleViewAndCacheEntry() {
         let panel = makeAssistantPanel()
         panel.loadView()
@@ -4649,6 +4681,39 @@ final class AIAssistantPanelViewControllerTests: XCTestCase {
         XCTAssertTrue(attachment.textPreview?.contains("PORT=3000") == true)
         XCTAssertEqual(provider.requests.first?.question, "这个配置文件有什么问题")
         XCTAssertFalse(panel.transcriptTextForTesting.contains("PORT=3000"))
+    }
+
+    func testSendingAttachmentMovesCardFromComposerIntoUserTranscriptImmediately() throws {
+        let provider = DelayedAIAssistantProvider(
+            response: AIAssistantResponse(message: "已读取附件。", commandProposals: []),
+            delay: 0.25
+        )
+        let panel = makeAssistantPanel(
+            provider: provider,
+            settingsStore: makeSettingsStore(autoRunProposedCommands: false)
+        )
+        panel.loadView()
+        panel.prefillQuestion(
+            "检查这个文件",
+            attachments: [
+                AIAssistantAttachment(
+                    filename: "Windows-Packaging-Guide.md",
+                    mimeType: "text/markdown",
+                    byteCount: 2_048,
+                    textPreview: "ATTACHMENT_BODY_MUST_NOT_APPEAR_IN_TRANSCRIPT"
+                )
+            ]
+        )
+
+        panel.performAskForTesting()
+
+        XCTAssertEqual(panel.composerAttachmentCardCountForTesting, 0)
+        XCTAssertTrue(panel.composerAttachmentStackHiddenForTesting)
+        XCTAssertEqual(
+            panel.transcriptAttachmentCardTitlesForTesting,
+            ["Windows-Packaging-Guide.md"]
+        )
+        XCTAssertFalse(panel.transcriptTextForTesting.contains("ATTACHMENT_BODY_MUST_NOT_APPEAR_IN_TRANSCRIPT"))
     }
 
     func testEditorPrefillAtomicallyReplacesExistingAttachmentsWithLatestContent() throws {

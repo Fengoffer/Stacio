@@ -704,6 +704,16 @@ final class RemoteTextEditorViewControllerTests: XCTestCase {
         XCTAssertEqual(requests, 1)
     }
 
+    func testMonacoDisablesDraggingSelectedTextToPreventAccidentalBlockMoves() {
+        let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
+            remotePath: "/etc/app.conf",
+            fileName: "app.conf",
+            content: "enabled=true\n"
+        ))
+
+        XCTAssertTrue(editor.editorHTMLForTesting.contains("dragAndDrop: false"))
+    }
+
     func testMonacoTabDragBridgeExcludesCloseScrollAndNormalClicks() {
         let editor = RemoteTextEditorViewController(document: RemoteTextEditorDocumentDescriptor(
             remotePath: "/etc/app.conf",

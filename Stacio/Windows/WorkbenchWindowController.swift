@@ -919,6 +919,12 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private func scheduleInteractiveSplitResizeRepair() {
         isInteractiveSplitResizeActive = true
         interactiveSplitResizeWorkItem?.cancel()
+        interactiveSplitResizeWorkItem = nil
+        if let splitView = contentSplitViewController.splitView as? StacioPinnedSplitView,
+           splitView.isTrackingUserDividerDrag
+        {
+            return
+        }
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.interactiveSplitResizeWorkItem = nil
@@ -932,9 +938,38 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         DispatchQueue.main.asyncAfter(deadline: .now() + splitResizeSettleInterval, execute: workItem)
     }
 
+    private func userDividerDragStateDidChange(_ isDragging: Bool) {
+        if isDragging {
+            interactiveSplitResizeWorkItem?.cancel()
+            interactiveSplitResizeWorkItem = nil
+            splitWidthPersistenceWorkItem?.cancel()
+            splitWidthPersistenceWorkItem = nil
+            isInteractiveSplitResizeActive = true
+            inspectorViewController?.setInteractiveColumnResizeActive(true)
+            return
+        }
+
+        interactiveSplitResizeWorkItem?.cancel()
+        interactiveSplitResizeWorkItem = nil
+        splitWidthPersistenceWorkItem?.cancel()
+        splitWidthPersistenceWorkItem = nil
+        isInteractiveSplitResizeActive = false
+        applyPendingInspectorWidthIfNeeded()
+        synchronizeInspectorContentFrameAfterSplitLayout()
+        preservedInspectorWidthDuringSidebarMove = nil
+        saveSplitColumnWidthsIfNeeded()
+        inspectorViewController?.setInteractiveColumnResizeActive(false)
+    }
+
     private func scheduleSplitWidthPersistence() {
         guard allowsUserSplitWidthPersistence else { return }
         splitWidthPersistenceWorkItem?.cancel()
+        splitWidthPersistenceWorkItem = nil
+        if let splitView = contentSplitViewController.splitView as? StacioPinnedSplitView,
+           splitView.isTrackingUserDividerDrag
+        {
+            return
+        }
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.splitWidthPersistenceWorkItem = nil
@@ -1482,6 +1517,14 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         )
     }
 
+    var hasPendingInteractiveSplitResizeRepairForTesting: Bool {
+        interactiveSplitResizeWorkItem != nil
+    }
+
+    var hasPendingSplitWidthPersistenceForTesting: Bool {
+        splitWidthPersistenceWorkItem != nil
+    }
+
     private func applyPendingInspectorWidthIfNeeded() {
         guard let pendingInspectorWidth,
               contentSplitViewController.splitViewItems.count >= 3,
@@ -1773,6 +1816,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         }
         split.afterPinnedSplitViewLayout = { [weak self] _ in
             self?.schedulePendingInspectorWidthRepair()
+        }
+        split.pinnedUserDividerDragStateDidChange = { [weak self] isDragging in
+            self?.userDividerDragStateDidChange(isDragging)
         }
         split.constrainPinnedSplitPosition = { [weak self] splitView, proposedPosition, dividerIndex in
             self?.constrainWorkbenchSplitPosition(
@@ -2181,27 +2227,16 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
     private func showAIAssistantInspector(prefilling text: String? = nil) {
         guard allowsWorkspaceCapability(.ai) else { return }
-        guard let inspectorSplitViewItem,
-              let inspectorViewController
-        else {
+        guard let inspectorViewController else {
             return
         }
         let preservedWindowFrame = window?.frame
         defer {
             restoreProgrammaticFrameIfNeeded(preservedWindowFrame)
         }
-        performProgrammaticSplitLayout {
-            inspectorSplitViewItem.isCollapsed = false
-        }
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController.selectAIAssistantTab()
-        scheduleInspectorReadabilityRepair(
-            preserving: preservedWindowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleSidebarReadabilityRepair(preserving: preservedWindowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: preservedWindowFrame)
         inspectorViewController.aiAssistantViewController?.refreshForCurrentContext()
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmed, trimmed.isEmpty == false {
@@ -2972,9 +3007,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             _ = try? workspaceViewController.openFileSession(path: localPath, title: L10n.Workspace.localFiles)
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
-        keepSidebarReadableWithoutResizingWindow()
+        let didRevealInspector = revealInspectorForPanelSelection()
         do {
             if let binding = currentRemoteFilesBinding {
                 _ = try inspectorViewController?.selectFilesTabAndLoadCurrentDirectory(binding: binding)
@@ -2985,12 +3018,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         } catch {
             inspectorViewController?.showFilesInitialLoadError(error)
         }
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -3005,16 +3033,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if collapseInspectorIfShowingCurrentSection(L10n.Inspector.tunnels, preserving: windowFrame) {
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController?.selectTunnelsTab()
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -3028,16 +3049,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if collapseInspectorIfShowingCurrentSection(L10n.Inspector.browser, preserving: windowFrame) {
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController?.selectBrowserTab()
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -3051,16 +3065,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if collapseInspectorIfShowingCurrentSection(L10n.Inspector.logs, preserving: windowFrame) {
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController?.selectDiagnosticsTab()
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -3073,17 +3080,10 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if collapseInspectorIfShowingCurrentSection(L10n.Inspector.macros, preserving: windowFrame) {
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController?.reloadTerminalMacros()
         inspectorViewController?.selectTerminalMacrosTab()
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -3096,16 +3096,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         if collapseInspectorIfShowingCurrentSection(L10n.Inspector.commandHistory, preserving: windowFrame) {
             return
         }
-        revealInspector()
-        applyDefaultInspectorWidthIfNeeded(force: true, preferredDefaultWidth: defaultInspectorPanelWidth)
+        let didRevealInspector = revealInspectorForPanelSelection()
         inspectorViewController?.selectCommandHistoryTab()
-        keepSidebarReadableWithoutResizingWindow()
-        scheduleInspectorReadabilityRepair(
-            preserving: windowFrame,
-            preferredDefaultWidth: defaultInspectorPanelWidth,
-            force: true
-        )
-        scheduleSidebarReadabilityRepair(preserving: windowFrame)
+        finishInspectorPanelRevealIfNeeded(didRevealInspector, preserving: windowFrame)
     }
 
     @objc
@@ -4671,6 +4664,33 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             containerView.needsLayout = true
             containerView.layoutSubtreeIfNeeded()
         }
+    }
+
+    private func revealInspectorForPanelSelection() -> Bool {
+        guard let inspectorSplitViewItem else { return false }
+        let wasCollapsed = inspectorSplitViewItem.isCollapsed
+        if wasCollapsed {
+            revealInspector()
+        }
+        return wasCollapsed
+    }
+
+    private func finishInspectorPanelRevealIfNeeded(
+        _ didRevealInspector: Bool,
+        preserving windowFrame: NSRect?
+    ) {
+        guard didRevealInspector else { return }
+        applyDefaultInspectorWidthIfNeeded(
+            force: true,
+            preferredDefaultWidth: defaultInspectorPanelWidth
+        )
+        keepSidebarReadableWithoutResizingWindow()
+        scheduleInspectorReadabilityRepair(
+            preserving: windowFrame,
+            preferredDefaultWidth: defaultInspectorPanelWidth,
+            force: true
+        )
+        scheduleSidebarReadabilityRepair(preserving: windowFrame)
     }
 
     private func synchronizeInspectorVisibilityForCurrentSession() {

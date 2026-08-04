@@ -108,6 +108,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let taskConfirmCompleteButton = NSButton(title: L10n.AI.confirmTaskComplete, target: nil, action: nil)
     private let taskContinueButton = NSButton(title: L10n.AI.continueTask, target: nil, action: nil)
     private let taskControlDismissButton = NSButton(title: L10n.AI.dismissTaskControl, target: nil, action: nil)
+    private let sensitiveInputContainer = NSStackView()
+    private let sensitiveInputLabel = NSTextField(labelWithString: "")
+    private let sensitiveInputField = NSSecureTextField()
+    private let sensitiveInputSubmitButton = NSButton()
     private let taskHistoryContainer = NSStackView()
     private let taskHistoryHeaderLabel = NSTextField(labelWithString: L10n.AI.recentTasks)
     private let taskHistoryBodyLabel = NSTextField(labelWithString: "")
@@ -120,6 +124,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var transcriptProcessGroupViewsByID: [UUID: AITranscriptProcessGroupView] = [:]
     private var transcriptWidthConstraintsByViewID: [ObjectIdentifier: NSLayoutConstraint] = [:]
     private var streamingTranscriptRenderTimer: Timer?
+    private var sensitiveInputRefreshTimer: Timer?
     private var traceEventsByRequestID: [String: [AgentTraceEvent]] = [:]
     private var traceActorKindsByRequest: [AgentTraceOwnershipKey: AgentActorKind] = [:]
     private var traceRuntimeTitlesByRequestID: [String: String] = [:]
@@ -139,6 +144,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var taskControlRequestIDsByRequestID: [String: [String]] = [:]
     private var taskControlStatusesByRequestID: [String: String] = [:]
     private var taskControlText = ""
+    private var sensitiveInputRuntimeID: String?
     private var taskHistoryText = ""
     private var recentTaskRecords: [AgentTaskSessionRecord] = []
     private var currentProposalTaskRequestID: String?
@@ -182,6 +188,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var isAsking = false
     private var isExecuting = false
     private var lastAppliedTranscriptTextWidth: CGFloat?
+    private var isInspectorInteractiveResizeActive = false
 
     public init(
         coordinator: AIAssistantCoordinator,
@@ -240,6 +247,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     deinit {
         streamingTranscriptRenderTimer?.invalidate()
+        sensitiveInputRefreshTimer?.invalidate()
         if let traceObserver {
             NotificationCenter.default.removeObserver(traceObserver)
         }
@@ -537,6 +545,51 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         taskContinueButton.setAccessibilityIdentifier("Stacio.AI.taskControl.continue")
         taskContinueButton.isHidden = true
         configureTaskControlButton(taskControlDismissButton, action: #selector(taskControlDismissPressed(_:)))
+        sensitiveInputContainer.orientation = .vertical
+        sensitiveInputContainer.spacing = 8
+        sensitiveInputContainer.alignment = .leading
+        sensitiveInputContainer.distribution = .fill
+        sensitiveInputContainer.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        sensitiveInputContainer.translatesAutoresizingMaskIntoConstraints = false
+        sensitiveInputContainer.setAccessibilityIdentifier("Stacio.AI.sensitiveInput")
+        sensitiveInputContainer.isHidden = true
+        sensitiveInputContainer.wantsLayer = true
+        sensitiveInputContainer.layer?.cornerRadius = 12
+        sensitiveInputContainer.layer?.cornerCurve = .continuous
+        sensitiveInputContainer.layer?.borderWidth = 1
+        StacioDesignSystem.setLayerBackgroundColor(
+            sensitiveInputContainer,
+            color: StacioDesignSystem.theme.elevatedPanelColor.withAlphaComponent(0.92)
+        )
+        StacioDesignSystem.setLayerBorderColor(
+            sensitiveInputContainer,
+            color: StacioDesignSystem.theme.warningColor.withAlphaComponent(0.42)
+        )
+        sensitiveInputLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        sensitiveInputLabel.textColor = StacioDesignSystem.theme.primaryTextColor
+        sensitiveInputLabel.maximumNumberOfLines = 2
+        sensitiveInputLabel.lineBreakMode = .byWordWrapping
+        sensitiveInputLabel.cell?.wraps = true
+        sensitiveInputLabel.cell?.usesSingleLineMode = false
+        sensitiveInputLabel.translatesAutoresizingMaskIntoConstraints = false
+        sensitiveInputField.placeholderString = "输入密码（不会发送给 AI）"
+        sensitiveInputField.font = .systemFont(ofSize: 13)
+        sensitiveInputField.focusRingType = .default
+        sensitiveInputField.target = self
+        sensitiveInputField.action = #selector(sensitiveInputSubmitPressed(_:))
+        sensitiveInputField.setAccessibilityIdentifier("Stacio.AI.sensitiveInput.field")
+        sensitiveInputField.setAccessibilityLabel("终端密码安全输入")
+        sensitiveInputField.translatesAutoresizingMaskIntoConstraints = false
+        sensitiveInputSubmitButton.target = self
+        sensitiveInputSubmitButton.action = #selector(sensitiveInputSubmitPressed(_:))
+        sensitiveInputSubmitButton.setAccessibilityIdentifier("Stacio.AI.sensitiveInput.submit")
+        sensitiveInputSubmitButton.translatesAutoresizingMaskIntoConstraints = false
+        configureIconButton(
+            sensitiveInputSubmitButton,
+            symbolName: "arrow.up",
+            accessibilityLabel: "仅发送给终端",
+            emphasized: true
+        )
         taskHistoryContainer.orientation = .vertical
         taskHistoryContainer.spacing = 5
         taskHistoryContainer.alignment = .leading
@@ -641,6 +694,27 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         taskControlContainer.addArrangedSubview(taskControlButtonsStack)
         taskControlButtonsStack.leadingAnchor.constraint(equalTo: taskControlContainer.leadingAnchor, constant: 12).isActive = true
         taskControlButtonsStack.trailingAnchor.constraint(equalTo: taskControlContainer.trailingAnchor, constant: -12).isActive = true
+        let sensitiveInputControlsStack = NSStackView()
+        sensitiveInputControlsStack.orientation = .horizontal
+        sensitiveInputControlsStack.spacing = 8
+        sensitiveInputControlsStack.alignment = .centerY
+        sensitiveInputControlsStack.distribution = .fill
+        sensitiveInputControlsStack.translatesAutoresizingMaskIntoConstraints = false
+        sensitiveInputControlsStack.addArrangedSubview(sensitiveInputField)
+        sensitiveInputControlsStack.addArrangedSubview(sensitiveInputSubmitButton)
+        sensitiveInputContainer.addArrangedSubview(sensitiveInputLabel)
+        sensitiveInputContainer.addArrangedSubview(sensitiveInputControlsStack)
+        sensitiveInputLabel.widthAnchor.constraint(
+            equalTo: sensitiveInputContainer.widthAnchor,
+            constant: -24
+        ).isActive = true
+        sensitiveInputControlsStack.widthAnchor.constraint(
+            equalTo: sensitiveInputContainer.widthAnchor,
+            constant: -24
+        ).isActive = true
+        sensitiveInputField.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        sensitiveInputSubmitButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        sensitiveInputSubmitButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
         [taskHistoryHeaderLabel, taskHistoryBodyLabel, taskHistoryButtonsStack].forEach { view in
             taskHistoryContainer.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: taskHistoryContainer.widthAnchor).isActive = true
@@ -670,7 +744,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             taskControlContainer,
             taskHistoryContainer,
             transcriptStack,
-            statusLabel
+            statusLabel,
+            sensitiveInputContainer
         ].forEach { view in
             transcriptContentStack.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: transcriptContentStack.widthAnchor).isActive = true
@@ -865,6 +940,18 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     public override func viewDidLayout() {
         super.viewDidLayout()
+        guard isInspectorInteractiveResizeActive == false else { return }
+        updateLayoutForCurrentWidth()
+    }
+
+    func setInspectorInteractiveResizeActive(_ isActive: Bool) {
+        guard isInspectorInteractiveResizeActive != isActive else { return }
+        isInspectorInteractiveResizeActive = isActive
+        guard isActive == false, isViewLoaded else { return }
+        view.needsLayout = true
+    }
+
+    private func updateLayoutForCurrentWidth() {
         updateSurfaceModeSegmentWidths()
         let textWidth = max(80, transcriptContentStack.bounds.width)
         guard lastAppliedTranscriptTextWidth.map({ abs($0 - textWidth) > 0.5 }) ?? true else {
@@ -930,6 +1017,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
         loadRecentTaskHistory(for: context)
         refreshLocalAgentBridgeTargets()
+        reconcileSensitiveInputPresentation()
     }
 
     public func followCurrentTerminalContext() {
@@ -972,6 +1060,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func updateSurfaceMode() {
         surfaceModeSegmentedControl.selectedSegment = surfaceMode.rawValue
         let showsLocalAgent = surfaceMode == .localAgent
+        if showsLocalAgent {
+            sensitiveInputField.stringValue = ""
+        }
         conversationControlsStack.isHidden = showsLocalAgent
         contextLabel.isHidden = showsLocalAgent
         transcriptScrollView.isHidden = showsLocalAgent
@@ -1222,6 +1313,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             endTaskModelSelectionCapture()
         }
         let requestConversationHistory = assistantConversationContext()
+        let requestQuestion = composerAugmentedQuestion(for: question)
+        let requestAttachments = composerAttachments
         questionField.stringValue = ""
         questionField.currentEditor()?.string = ""
         isAsking = true
@@ -1232,15 +1325,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             question,
             conversationContent: userConversationContent(
                 question: question,
-                attachments: composerAttachments
-            )
+                attachments: requestAttachments
+            ),
+            attachments: requestAttachments
         )
+        clearComposerAttachmentsAfterSend()
         messageLabel.stringValue = ""
         setCommandProposals([])
         updateQuestionControlState()
 
-        let requestQuestion = composerAugmentedQuestion(for: question)
-        let requestAttachments = composerAttachments
         activeStreamingAssistantIndex = nil
         if planModeEnabled {
             startPlanMode(
@@ -2180,6 +2273,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     @objc
     private func collapseButtonPressed(_ sender: Any?) {
+        sensitiveInputField.stringValue = ""
         onCollapse?()
     }
 
@@ -3393,6 +3487,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         refreshComposerControls()
     }
 
+    private func clearComposerAttachmentsAfterSend() {
+        guard composerAttachments.isEmpty == false else { return }
+        composerAttachments = []
+        refreshComposerControls()
+    }
+
     private func showComposerAddPicker(from button: NSButton) {
         let picker = makeComposerAddPicker()
         let popover = NSPopover()
@@ -3853,6 +3953,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         runtimeTitle: String?,
         allEvents: [AgentTraceEvent]?
     ) {
+        refreshSensitiveInputPresentation(for: event)
         let key = traceEntryKey(for: event)
         guard appendedTraceEntryKeys.insert(key).inserted else {
             return
@@ -4140,6 +4241,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         _ role: AITranscriptRole,
         _ text: String,
         conversationContent: String? = nil,
+        attachments: [AIAssistantAttachment] = [],
         requestID: String? = nil,
         persistHistory: Bool = true,
         isProcessEntry: Bool? = nil
@@ -4152,6 +4254,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             role: role,
             text: trimmed,
             conversationContent: conversationContent,
+            attachments: attachments.map(AITranscriptAttachment.init),
             requestID: requestID,
             isProcessEntry: processEntry,
             processGroupID: processEntry ? activeProcessGroupID : nil,
@@ -4691,6 +4794,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             taskConfirmCompleteButton,
             taskContinueButton,
             taskControlDismissButton,
+            sensitiveInputContainer,
+            sensitiveInputLabel,
+            sensitiveInputField,
+            sensitiveInputSubmitButton,
             taskHistoryContainer,
             taskHistoryHeaderLabel,
             taskHistoryBodyLabel,
@@ -4724,6 +4831,100 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         askButton.toolTip = isActive ? "停止当前 AI 请求" : L10n.AI.ask
         composerModelButton.isEnabled = hasActiveAIActivity == false && capturedTaskModelSelection == nil
         refreshContextUsageRing()
+    }
+
+    private func refreshSensitiveInputPresentation(for event: AgentTraceEvent) {
+        guard let runtimeID = event.metadata?["sourceRuntimeID"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              runtimeID.isEmpty == false
+        else { return }
+
+        let metadataContainsSensitiveState = event.metadata?["sensitiveInputRequired"] != nil
+        let sensitiveInputRequired = event.metadata?["sensitiveInputRequired"] == "true"
+        if sensitiveInputRequired,
+           shouldDisplayTrace(forRuntimeID: runtimeID),
+           let prompt = coordinator.sensitiveInputPrompt(runtimeID: runtimeID) {
+            presentSensitiveInput(prompt)
+            return
+        }
+
+        if sensitiveInputRuntimeID == runtimeID,
+           (metadataContainsSensitiveState || isTerminalTraceState(event.state)) {
+            clearSensitiveInputPresentation()
+        }
+    }
+
+    private func presentSensitiveInput(_ prompt: AgentSensitiveInputPrompt) {
+        let shouldRevealInput = sensitiveInputContainer.isHidden
+            || sensitiveInputRuntimeID != prompt.runtimeID
+        if sensitiveInputRuntimeID != prompt.runtimeID {
+            sensitiveInputField.stringValue = ""
+        }
+        sensitiveInputRuntimeID = prompt.runtimeID
+        let title = prompt.targetTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = title.isEmpty ? "当前终端" : title
+        sensitiveInputLabel.stringValue = "\(target) 正在等待密码。内容只发送到终端，不会加入 AI 对话或历史。"
+        sensitiveInputContainer.isHidden = false
+        startSensitiveInputRefreshTimerIfNeeded()
+        if shouldRevealInput {
+            scrollTranscriptToBottom()
+        }
+    }
+
+    private func reconcileSensitiveInputPresentation() {
+        let visibleRuntimeIDs = resolvedTargetContexts().map(\.runtimeID)
+        var candidateRuntimeIDs = visibleRuntimeIDs
+        if let sensitiveInputRuntimeID,
+           let currentIndex = candidateRuntimeIDs.firstIndex(of: sensitiveInputRuntimeID),
+           currentIndex != candidateRuntimeIDs.startIndex {
+            candidateRuntimeIDs.remove(at: currentIndex)
+            candidateRuntimeIDs.insert(sensitiveInputRuntimeID, at: 0)
+        }
+        for runtimeID in candidateRuntimeIDs {
+            if let prompt = coordinator.sensitiveInputPrompt(runtimeID: runtimeID) {
+                presentSensitiveInput(prompt)
+                return
+            }
+        }
+        clearSensitiveInputPresentation()
+    }
+
+    private func startSensitiveInputRefreshTimerIfNeeded() {
+        guard sensitiveInputRefreshTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.reconcileSensitiveInputPresentation()
+        }
+        sensitiveInputRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func clearSensitiveInputPresentation() {
+        sensitiveInputField.stringValue = ""
+        sensitiveInputContainer.isHidden = true
+        sensitiveInputRuntimeID = nil
+        sensitiveInputRefreshTimer?.invalidate()
+        sensitiveInputRefreshTimer = nil
+    }
+
+    @objc
+    private func sensitiveInputSubmitPressed(_ sender: Any?) {
+        guard let runtimeID = sensitiveInputRuntimeID else {
+            clearSensitiveInputPresentation()
+            return
+        }
+        var bytes = Array(sensitiveInputField.stringValue.utf8)
+        sensitiveInputField.stringValue = ""
+        guard bytes.isEmpty == false else { return }
+        bytes.append(13)
+        let didSubmit = coordinator.submitSensitiveInput(bytes, runtimeID: runtimeID)
+        for index in bytes.indices {
+            bytes[index] = 0
+        }
+        if didSubmit {
+            clearSensitiveInputPresentation()
+        } else {
+            reconcileSensitiveInputPresentation()
+        }
     }
 
     private var hasActiveAIActivity: Bool {
@@ -4764,6 +4965,14 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     var transcriptTextForTesting: String {
         transcriptEntries.map(\.displayText).joined(separator: "\n")
+    }
+
+    var appliedTranscriptTextWidthForTesting: CGFloat? {
+        lastAppliedTranscriptTextWidth
+    }
+
+    func setInspectorInteractiveResizeActiveForTesting(_ isActive: Bool) {
+        setInspectorInteractiveResizeActive(isActive)
     }
 
     @discardableResult
@@ -4956,6 +5165,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             if view === taskControlContainer {
                 return "taskControl"
             }
+            if view === sensitiveInputContainer {
+                return "sensitiveInput"
+            }
             if view === taskHistoryContainer {
                 return "taskHistory"
             }
@@ -5025,6 +5237,26 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     var taskHistoryHiddenForTesting: Bool {
         taskHistoryContainer.isHidden
+    }
+
+    var sensitiveInputVisibleForTesting: Bool {
+        sensitiveInputContainer.isHidden == false
+    }
+
+    var sensitiveInputUsesSecureTextFieldForTesting: Bool {
+        sensitiveInputField.cell is NSSecureTextFieldCell
+    }
+
+    var sensitiveInputValueForTesting: String {
+        sensitiveInputField.stringValue
+    }
+
+    func setSensitiveInputForTesting(_ value: String) {
+        sensitiveInputField.stringValue = value
+    }
+
+    func submitSensitiveInputForTesting() {
+        sensitiveInputSubmitPressed(nil)
     }
 
     func switchSurfaceModeForTesting(_ mode: String) {
@@ -5125,6 +5357,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     var composerAttachmentStackHiddenForTesting: Bool {
         composerAttachmentStack.isHidden
+    }
+
+    var transcriptAttachmentCardTitlesForTesting: [String] {
+        transcriptEntries.flatMap { entry in
+            transcriptViewsByEntryID[entry.id]?.attachmentTitlesForTesting ?? []
+        }
     }
 
     var composerPreviewWindowTitleForTesting: String? {
@@ -5617,6 +5855,7 @@ private final class AITranscriptBubbleView: NSView {
     private let onToggle: () -> Void
     private let bubbleView = NSView()
     private let label = AITranscriptLinkLabel(frame: .zero)
+    private let attachmentStack = NSStackView()
     private let disclosureButton = NSButton()
     private var renderedAssistantString: NSAttributedString?
     private var bubbleWidthConstraint: NSLayoutConstraint?
@@ -5655,10 +5894,17 @@ private final class AITranscriptBubbleView: NSView {
         label.attributedStringValue
     }
 
+    var attachmentTitlesForTesting: [String] {
+        attachmentStack.arrangedSubviews.compactMap {
+            ($0 as? AITranscriptAttachmentCardView)?.titleForTesting
+        }
+    }
+
     @discardableResult
     func update(entry newEntry: AITranscriptEntry) -> Bool {
         guard entry.role == newEntry.role,
-              entry.isProcessEntry == newEntry.isProcessEntry
+              entry.isProcessEntry == newEntry.isProcessEntry,
+              entry.attachments == newEntry.attachments
         else {
             return false
         }
@@ -5753,6 +5999,21 @@ private final class AITranscriptBubbleView: NSView {
 
         addSubview(bubbleView)
         bubbleView.addSubview(label)
+        if entry.attachments.isEmpty == false {
+            attachmentStack.orientation = .vertical
+            attachmentStack.spacing = 6
+            attachmentStack.alignment = .leading
+            attachmentStack.distribution = .fill
+            attachmentStack.translatesAutoresizingMaskIntoConstraints = false
+            attachmentStack.setAccessibilityIdentifier("Stacio.AI.transcript.attachments")
+            bubbleView.addSubview(attachmentStack)
+            for (index, attachment) in entry.attachments.enumerated() {
+                let card = AITranscriptAttachmentCardView(attachment: attachment, index: index)
+                attachmentStack.addArrangedSubview(card)
+                card.widthAnchor.constraint(equalTo: attachmentStack.widthAnchor).isActive = true
+                card.heightAnchor.constraint(equalToConstant: 50).isActive = true
+            }
+        }
         if entry.isProcessEntry {
             disclosureButton.title = ""
             disclosureButton.isBordered = false
@@ -5772,9 +6033,29 @@ private final class AITranscriptBubbleView: NSView {
             bubbleView.topAnchor.constraint(equalTo: topAnchor, constant: entry.verticalInset),
             bubbleView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -entry.verticalInset),
             label.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: entry.horizontalPadding),
-            label.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: entry.verticalPadding),
             label.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -entry.verticalPadding)
         ]
+        if entry.attachments.isEmpty {
+            constraints.append(
+                label.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: entry.verticalPadding)
+            )
+        } else {
+            constraints += [
+                attachmentStack.leadingAnchor.constraint(
+                    equalTo: bubbleView.leadingAnchor,
+                    constant: entry.horizontalPadding
+                ),
+                attachmentStack.trailingAnchor.constraint(
+                    equalTo: bubbleView.trailingAnchor,
+                    constant: -entry.horizontalPadding
+                ),
+                attachmentStack.topAnchor.constraint(
+                    equalTo: bubbleView.topAnchor,
+                    constant: entry.verticalPadding
+                ),
+                label.topAnchor.constraint(equalTo: attachmentStack.bottomAnchor, constant: 8)
+            ]
+        }
         if entry.isProcessEntry {
             constraints += [
                 disclosureButton.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -8),
@@ -5865,6 +6146,73 @@ private final class AITranscriptBubbleView: NSView {
             label.preferredMaxLayoutWidth = labelWidth
             lastAppliedLabelWidth = labelWidth
         }
+    }
+}
+
+private final class AITranscriptAttachmentCardView: NSView {
+    private let attachment: AITranscriptAttachment
+
+    init(attachment: AITranscriptAttachment, index: Int) {
+        self.attachment = attachment
+        super.init(frame: .zero)
+        configure(index: index)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    var titleForTesting: String {
+        attachment.filename
+    }
+
+    private func configure(index: Int) {
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1
+        StacioDesignSystem.setLayerBackgroundColor(self, color: NSColor.white.withAlphaComponent(0.13))
+        StacioDesignSystem.setLayerBorderColor(self, color: NSColor.white.withAlphaComponent(0.18))
+        setAccessibilityIdentifier("Stacio.AI.transcript.attachment.\(index)")
+        setAccessibilityLabel("附件：\(attachment.filename)，\(attachment.metadataText)")
+
+        let icon = NSImageView()
+        icon.image = NSImage(
+            systemSymbolName: attachment.isImage ? "photo" : "doc.text",
+            accessibilityDescription: attachment.filename
+        )
+        icon.contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        icon.imageScaling = .scaleProportionallyDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: attachment.filename)
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.textColor = .white
+        title.lineBreakMode = .byTruncatingMiddle
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let metadata = NSTextField(labelWithString: attachment.metadataText)
+        metadata.font = .systemFont(ofSize: 10, weight: .medium)
+        metadata.textColor = NSColor.white.withAlphaComponent(0.72)
+        metadata.lineBreakMode = .byTruncatingTail
+        metadata.translatesAutoresizingMaskIntoConstraints = false
+
+        [icon, title, metadata].forEach(addSubview)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            metadata.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            metadata.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            metadata.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2)
+        ])
     }
 }
 
@@ -7254,11 +7602,31 @@ private enum AITranscriptRole {
     }
 }
 
+private struct AITranscriptAttachment: Equatable {
+    let filename: String
+    let displayKind: String
+    let byteCount: Int
+    let isImage: Bool
+
+    init(_ attachment: AIAssistantAttachment) {
+        filename = attachment.filename
+        displayKind = attachment.displayKind
+        byteCount = attachment.byteCount
+        isImage = attachment.isImage
+    }
+
+    var metadataText: String {
+        let size = ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
+        return "\(displayKind) · \(size)"
+    }
+}
+
 private struct AITranscriptEntry {
     let id: UUID = UUID()
     let role: AITranscriptRole
     var text: String
     var conversationContent: String? = nil
+    var attachments: [AITranscriptAttachment] = []
     let requestID: String?
     var isProcessEntry: Bool = false
     var processGroupID: UUID? = nil

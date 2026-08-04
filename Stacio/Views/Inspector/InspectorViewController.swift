@@ -457,6 +457,10 @@ public final class InspectorViewController: NSViewController {
         }
     }
 
+    public func setInteractiveColumnResizeActive(_ isActive: Bool) {
+        aiAssistantViewController?.setInspectorInteractiveResizeActive(isActive)
+    }
+
     public func synchronizeSelectedSectionFrameAfterSplitLayout(hostView: NSView) {
         guard view.superview === hostView else { return }
 

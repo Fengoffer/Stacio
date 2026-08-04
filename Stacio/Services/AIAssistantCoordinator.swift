@@ -572,6 +572,19 @@ public final class AIAssistantCoordinator {
     public func confirmTaskComplete(requestID: String) -> AgentTraceEvent? {
         (executionCoordinator as? AgentTaskControlling)?.confirmTaskComplete(requestID: requestID)
     }
+
+    @MainActor
+    public func sensitiveInputPrompt(runtimeID: String) -> AgentSensitiveInputPrompt? {
+        (executionCoordinator as? AgentSensitiveInputRouting)?
+            .sensitiveInputPrompt(runtimeID: runtimeID)
+    }
+
+    @MainActor
+    @discardableResult
+    public func submitSensitiveInput(_ bytes: [UInt8], runtimeID: String) -> Bool {
+        (executionCoordinator as? AgentSensitiveInputRouting)?
+            .submitSensitiveInput(bytes, runtimeID: runtimeID) ?? false
+    }
 }
 
 private final class UncheckedAIAssistantProviderBox: @unchecked Sendable {
