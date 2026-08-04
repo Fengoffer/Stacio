@@ -2,6 +2,9 @@
 name = "stacio_core"
 version = "0.1.0"
 edition = "2021"
+description = "Stacio core runtime: SSH/SCP/SFTP, tunnels, sessions, credentials, and device metrics for the native macOS SSH client."
+license-file = "../LICENSE"
+repository = "https://github.com/Fengoffer/Stacio"
 
 [lib]
 name = "stacio_core"

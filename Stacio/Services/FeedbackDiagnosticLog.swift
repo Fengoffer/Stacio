@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Security
 
 public enum FeedbackDiagnosticLogLevel: String, Codable, CaseIterable, Sendable {
     case debug
@@ -541,7 +542,12 @@ private struct FeedbackDiagnosticLogHasher {
 
 private final class FeedbackDiagnosticLogSecretStore {
     static let shared = FeedbackDiagnosticLogSecretStore()
-    private static let defaultsKey = "Stacio.ProductOps.diagnosticLogHashSecretV1"
+
+    private static let keychainService = "cn.stacio.product-ops.diagnostics"
+    private static let keychainAccount = "hmacHashKey"
+    /// 旧版本将 HMAC 密钥存储在 UserDefaults 中，存在明文落盘风险。
+    /// 迁移到 Keychain 后保留此 key 用于一次性迁移读取，迁移成功后从 UserDefaults 删除。
+    private static let legacyDefaultsKey = "Stacio.ProductOps.diagnosticLogHashSecretV1"
 
     private let lock = NSLock()
     private var cachedKeyData: Data?
@@ -550,14 +556,76 @@ private final class FeedbackDiagnosticLogSecretStore {
         lock.lock()
         defer { lock.unlock() }
         if let cachedKeyData { return cachedKeyData }
-        if let stored = defaults.data(forKey: Self.defaultsKey), stored.count == 32 {
-            cachedKeyData = stored
-            return stored
+
+        // 1. 优先从 Keychain 读取
+        if let keychainData = readFromKeychain() {
+            cachedKeyData = keychainData
+            return keychainData
         }
+
+        // 2. 迁移：如果 Keychain 中没有但 UserDefaults 中有，迁移到 Keychain 并清除旧值。
+        // 只有当 Keychain 写入成功后才删除 UserDefaults 旧值，避免密钥永久丢失。
+        if let legacyData = defaults.data(forKey: Self.legacyDefaultsKey), legacyData.count == 32 {
+            if saveToKeychain(legacyData) {
+                defaults.removeObject(forKey: Self.legacyDefaultsKey)
+                cachedKeyData = legacyData
+                return legacyData
+            }
+            // Keychain 写入失败（被锁定/权限问题）：回退使用 UserDefaults 旧值，
+            // 下次调用时再尝试迁移，避免密钥丢失。
+            cachedKeyData = legacyData
+            return legacyData
+        }
+
+        // 3. 生成新密钥并存入 Keychain
         var generator = SystemRandomNumberGenerator()
         let generated = Data((0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
-        defaults.set(generated, forKey: Self.defaultsKey)
+        // 即使 Keychain 写入失败也缓存到内存，进程内可用；下次启动会重新生成。
+        // 这属于降级：HMAC 哈希在进程重启后无法保持一致，但不影响当前进程功能。
+        _ = saveToKeychain(generated)
         cachedKeyData = generated
         return generated
+    }
+
+    private func readFromKeychain() -> Data? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: Self.keychainService as CFString,
+            kSecAttrAccount: Self.keychainAccount as CFString,
+            kSecReturnData: kCFBooleanTrue,
+            kSecMatchLimit: kSecMatchLimitOne,
+            kSecAttrSynchronizable: kCFBooleanFalse as Any
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    /// 将密钥写入 Keychain，返回是否成功。
+    /// 失败原因通常是 Keychain 被锁定或应用无钥匙串权限。
+    private func saveToKeychain(_ data: Data) -> Bool {
+        let baseQuery: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: Self.keychainService as CFString,
+            kSecAttrAccount: Self.keychainAccount as CFString,
+            kSecAttrSynchronizable: kCFBooleanFalse as Any
+        ]
+        let updateAttributes: [CFString: Any] = [
+            kSecValueData: data,
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        // 先尝试更新，不存在则新增
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updateAttributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        if updateStatus == errSecItemNotFound {
+            var addQuery = baseQuery
+            updateAttributes.forEach { addQuery[$0.key] = $0.value }
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            return addStatus == errSecSuccess
+        }
+        return false
     }
 }

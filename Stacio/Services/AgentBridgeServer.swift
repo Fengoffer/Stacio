@@ -160,6 +160,9 @@ public final class AgentBridgeServer {
         guard result == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        // 限制 socket 文件权限为 0600（仅属主可读写），防止同机其他用户连接。
+        // 使用 chmod 按路径操作，比 fchmod 在 socket fd 上更可靠跨平台。
+        chmod(socketPath, 0o600)
     }
 
     private static func readAll(from fd: Int32) -> Data {

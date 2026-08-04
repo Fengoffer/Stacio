@@ -165,13 +165,51 @@ private final class BLEConsoleSessionOwner: @unchecked Sendable {
             return try MainActor.assumeIsolated(operation)
         }
 
-        var result: Result<T, Error>!
-        DispatchQueue.main.sync {
-            result = Result {
+        // 使用 async + 信号量替代 DispatchQueue.main.sync，避免主线程被占用时死锁。
+        // 超时后抛错而非永久阻塞，让调用方有机会降级处理。
+        // 注意：必须用 box 包裹 result，避免超时后闭包写入已回收的栈变量（use-after-free）。
+        let semaphore = DispatchSemaphore(value: 0)
+        let resultBox = LockedResultBox<T>()
+        DispatchQueue.main.async {
+            resultBox.store(Result {
                 try MainActor.assumeIsolated(operation)
-            }
+            })
+            semaphore.signal()
         }
-        return try result.get()
+        if semaphore.wait(timeout: .now() + 5) == .timedOut {
+            // 超时后闭包仍可能在稍后执行并写入 resultBox（堆内存，安全），
+            // 但我们已不再读取它，直接抛错。
+            throw NSError(
+                domain: "Stacio.ConsoleSession",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "主线程在 5 秒内未响应，BLE 控制台操作已取消。"]
+            )
+        }
+        return try resultBox.load().get()
+    }
+
+    /// 堆分配的结果容器，避免超时后闭包写入栈变量导致 use-after-free。
+    private final class LockedResultBox<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var inner: Result<T, Error>?
+
+        func store(_ result: Result<T, Error>) {
+            lock.lock()
+            inner = result
+            lock.unlock()
+        }
+
+        func load() -> Result<T, Error> {
+            lock.lock()
+            defer { lock.unlock() }
+            // 理论上 load 只在 signal 之后调用，inner 必非 nil；
+            // 但防御性兜底以防极端时序。
+            return inner ?? .failure(NSError(
+                domain: "Stacio.ConsoleSession",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "主线程操作结果未就绪。"]
+            ))
+        }
     }
 }
 

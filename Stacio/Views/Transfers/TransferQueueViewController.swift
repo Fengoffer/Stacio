@@ -309,17 +309,32 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
     }
 
     public func setProgressEvents(_ progressEvents: [ScpTransferProgress]) {
+        // 保留已有 job 元数据：如果 rows 中已有相同 jobID 的记录，复用其 direction/paths，
+        // 避免仅凭 progress 事件重建 job 时丢失正确的方向和路径信息。
+        let existingJobsByIDs = Dictionary(rows.map { ($0.jobID, $0) }, uniquingKeysWith: { first, _ in first })
         var seenJobIDs = Set<String>()
         let jobs = progressEvents.reversed().compactMap { progress -> ScpTransferJob? in
             guard seenJobIDs.insert(progress.jobId).inserted else {
                 return nil
             }
 
+            if let existing = existingJobsByIDs[progress.jobId] {
+                return ScpTransferJob(
+                    id: progress.jobId,
+                    direction: existing.direction == L10n.Transfers.upload ? .upload : .download,
+                    sourcePath: existing.sourcePath,
+                    destinationPath: existing.destinationPath,
+                    bytesTotal: progress.bytesTotal
+                )
+            }
+
+            // 无已有元数据时，用 jobID 作为回退显示文本（同时填充 source/destination，
+            // 使 displayPath 在任意方向下都能展示有意义的标识）。
             return ScpTransferJob(
                 id: progress.jobId,
                 direction: .upload,
                 sourcePath: progress.jobId,
-                destinationPath: "",
+                destinationPath: progress.jobId,
                 bytesTotal: progress.bytesTotal
             )
         }

@@ -106,7 +106,7 @@ pub enum SshRuntimeError {
     #[error("SSH 连接超时")]
     Timeout,
     #[error("SSH 主机密钥已变更")]
-    HostKeyChanged,
+    HostKeyChanged { previous_fingerprint_sha256: String },
     #[error("SSH 主机密钥未知")]
     UnknownHostKey,
     #[error("SSH 传输错误：{message}")]
@@ -311,7 +311,9 @@ pub fn verify_host_key(
         Some(record) if record.fingerprint_sha256 == fingerprint => {
             Ok(HostKeyVerification::Trusted)
         }
-        Some(_) => Err(SshRuntimeError::HostKeyChanged),
+        Some(record) => Err(SshRuntimeError::HostKeyChanged {
+            previous_fingerprint_sha256: record.fingerprint_sha256.clone(),
+        }),
         None => Ok(HostKeyVerification::Unknown { fingerprint }),
     }
 }
@@ -469,7 +471,10 @@ mod ssh_config_tests {
         assert_eq!(SshRuntimeError::AuthFailed.to_string(), "SSH 认证失败");
         assert_eq!(SshRuntimeError::Timeout.to_string(), "SSH 连接超时");
         assert_eq!(
-            SshRuntimeError::HostKeyChanged.to_string(),
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: "SHA256:test".to_string()
+            }
+            .to_string(),
             "SSH 主机密钥已变更"
         );
         assert_eq!(
@@ -529,7 +534,12 @@ mod host_key_tests {
         let error = verify_host_key("example.com", 22, b"new-key", &known)
             .expect_err("changed key rejected");
 
-        assert_eq!(error, SshRuntimeError::HostKeyChanged);
+        assert_eq!(
+            error,
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: fingerprint_sha256(b"old-key")
+            }
+        );
     }
 
     #[test]

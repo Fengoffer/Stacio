@@ -483,7 +483,9 @@ impl Libssh2Transport {
         if observed.fingerprint_sha256 == expected_fingerprint_sha256 {
             Ok(())
         } else {
-            Err(SshRuntimeError::HostKeyChanged)
+            Err(SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: expected_fingerprint_sha256.to_string(),
+            })
         }
     }
 
@@ -1030,7 +1032,7 @@ fn phase_error(phase: &str, error: SshRuntimeError) -> SshRuntimeError {
         SshRuntimeError::InvalidConfig => "SSH 配置无效".to_string(),
         SshRuntimeError::AuthFailed => "SSH 认证失败".to_string(),
         SshRuntimeError::Timeout => "SSH 连接超时".to_string(),
-        SshRuntimeError::HostKeyChanged => "SSH 主机密钥已变更".to_string(),
+        SshRuntimeError::HostKeyChanged { .. } => "SSH 主机密钥已变更".to_string(),
         SshRuntimeError::UnknownHostKey => "SSH 主机密钥未知".to_string(),
         SshRuntimeError::Transport { message } => message,
     };
@@ -1441,7 +1443,12 @@ mod libssh2_transport_tests {
         )
         .expect_err("changed host key");
 
-        assert_eq!(error, SshRuntimeError::HostKeyChanged);
+        assert_eq!(
+            error,
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: fingerprint_sha256(b"old-key")
+            }
+        );
     }
 
     #[test]

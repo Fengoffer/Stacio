@@ -152,7 +152,9 @@ pub fn apply_host_key_decision<S: KnownHostStore>(
             return Ok(HostKeyVerification::Trusted);
         }
         if decision != HostKeyTrustDecision::TrustAndSave {
-            return Err(SshRuntimeError::HostKeyChanged);
+            return Err(SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: record.fingerprint_sha256.clone(),
+            });
         }
     } else if decision == HostKeyTrustDecision::Reject {
         return Err(SshRuntimeError::UnknownHostKey);
@@ -313,7 +315,12 @@ mod host_key_decision_service_tests {
         )
         .expect_err("trust once cannot bypass changed key");
 
-        assert_eq!(error, SshRuntimeError::HostKeyChanged);
+        assert_eq!(
+            error,
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: old_fingerprint.clone()
+            }
+        );
         assert_eq!(
             store.records.borrow()[0].fingerprint_sha256,
             old_fingerprint

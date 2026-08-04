@@ -1,6 +1,10 @@
 import CryptoKit
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#endif
+
 public struct KeychainCredential: CustomStringConvertible, Equatable {
     public let id: String
     public let account: String
@@ -116,6 +120,7 @@ public final class StacioFileCredentialBackend: KeychainBackend {
     public let directoryURL: URL
     public let vaultURL: URL
     public let keyURL: URL
+    public let lockFileURL: URL
     private let legacyDirectoryURL: URL?
     private let legacyVaultURL: URL?
     private let legacyKeyURL: URL?
@@ -133,6 +138,7 @@ public final class StacioFileCredentialBackend: KeychainBackend {
         self.directoryURL = directoryURL
         self.vaultURL = directoryURL.appendingPathComponent("credentials.vault.json")
         self.keyURL = directoryURL.appendingPathComponent("credentials.vault.key")
+        self.lockFileURL = directoryURL.appendingPathComponent("credentials.vault.lock")
         self.legacyDirectoryURL = legacyDirectoryURL
         self.legacyVaultURL = legacyDirectoryURL?.appendingPathComponent("credentials.vault.json")
         self.legacyKeyURL = legacyDirectoryURL?.appendingPathComponent("credentials.vault.key")
@@ -229,7 +235,27 @@ public final class StacioFileCredentialBackend: KeychainBackend {
     private func locked<T>(_ body: () throws -> T) throws -> T {
         lock.lock()
         defer { lock.unlock() }
+        // 先确保目录存在，否则无法创建锁文件
+        try ensureDirectory()
+        return try withFileLock(body)
+    }
+
+    /// 使用 flock 对锁文件加排他锁，防止多个 Stacio 实例同时读写 vault 导致丢失更新。
+    /// flock 在进程退出或 fd 关闭时自动释放，不会因崩溃留下死锁。
+    private func withFileLock<T>(_ body: () throws -> T) throws -> T {
+        #if canImport(Darwin)
+        let fd = open(lockFileURL.path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            throw KeychainCredentialError.storageUnavailable("无法创建凭据库锁文件")
+        }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else {
+            throw KeychainCredentialError.storageUnavailable("无法获取凭据库文件锁")
+        }
         return try body()
+        #else
+        return try body()
+        #endif
     }
 
     private func loadOrCreateVaultKey() throws -> SymmetricKey {

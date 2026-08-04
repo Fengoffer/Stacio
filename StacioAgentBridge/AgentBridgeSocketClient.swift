@@ -6,7 +6,6 @@ import Darwin
 
 public enum AgentBridgeSocketPath {
     public static let environmentKey = "STACIO_AGENT_SOCKET"
-    private static let legacyEnvironmentKey = "STACIO_AGENT_SOCKET"
 
     public static var defaultPath: String {
         let support = FileManager.default.urls(
@@ -29,9 +28,6 @@ public enum AgentBridgeSocketPath {
         if let environmentPath = trimmedNonEmpty(environment[environmentKey]) {
             return environmentPath
         }
-        if let legacyEnvironmentPath = trimmedNonEmpty(environment[legacyEnvironmentKey]) {
-            return legacyEnvironmentPath
-        }
         return defaultPath
     }
 
@@ -51,11 +47,19 @@ public struct AgentBridgeSocketClient {
 
     public func send(request: AgentBridgeRequest, onLine: (String) -> Void) throws {
         #if canImport(Darwin)
+        // C3: 连接前校验 socket 文件属主为当前用户且 group/other 无权限
+        try validateSocketOwnership(socketPath)
+
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw POSIXError(.EIO)
         }
         defer { close(fd) }
+
+        // H15: 设置读取超时（30 秒），防止服务端无响应时 CLI 永久挂起
+        var timeout = timeval(tv_sec: 30, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -118,6 +122,34 @@ public struct AgentBridgeSocketClient {
         }
         #else
         throw POSIXError(.ENOTSUP)
+        #endif
+    }
+    /// 校验 Unix socket 文件属主为当前用户，且 group/other 无读写权限。
+    /// 防止同机其他用户通过权限宽松的 socket 执行任意 Agent Bridge 命令。
+    private func validateSocketOwnership(_ path: String) throws {
+        #if canImport(Darwin)
+        var statBuffer = stat()
+        guard stat(path, &statBuffer) == 0 else {
+            throw AgentBridgeSocketClientError.bridgeUnavailable(
+                socketPath: path,
+                code: POSIXErrorCode(rawValue: errno) ?? .ENOENT
+            )
+        }
+        // 属主必须为当前用户
+        guard statBuffer.st_uid == getuid() else {
+            throw AgentBridgeSocketClientError.bridgeUnavailable(
+                socketPath: path,
+                code: .EACCES
+            )
+        }
+        // group/other 不得有读写权限
+        let groupOtherPermissions = statBuffer.st_mode & 0o077
+        guard groupOtherPermissions == 0 else {
+            throw AgentBridgeSocketClientError.bridgeUnavailable(
+                socketPath: path,
+                code: .EACCES
+            )
+        }
         #endif
     }
 }

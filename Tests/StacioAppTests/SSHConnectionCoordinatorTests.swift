@@ -73,7 +73,7 @@ final class SSHConnectionCoordinatorTests: XCTestCase {
         let connector = RecordingSSHLiveConnector(
             probeResult: liveHostKey(raw: "new-key"),
             trustResults: [.unknown(fingerprint: CoreBridge.fingerprintHostKey(Array("new-key".utf8)))],
-            trustError: SshRuntimeError.HostKeyChanged,
+            trustError: SshRuntimeError.HostKeyChanged(previousFingerprintSha256: "SHA256:old-key"),
             connectStatus: connectedStatus()
         )
         let credentialResolver = RecordingSSHCredentialResolving(
@@ -101,7 +101,7 @@ final class SSHConnectionCoordinatorTests: XCTestCase {
         let connector = RecordingSSHLiveConnector(
             probeResult: liveHostKey(raw: "new-key"),
             trustResults: [.trusted],
-            trustErrors: [SshRuntimeError.HostKeyChanged, nil],
+            trustErrors: [SshRuntimeError.HostKeyChanged(previousFingerprintSha256: "SHA256:old-key"), nil],
             connectStatus: connectedStatus()
         )
         let credentialResolver = RecordingSSHCredentialResolving(
@@ -128,7 +128,7 @@ final class SSHConnectionCoordinatorTests: XCTestCase {
             "connect"
         ])
         XCTAssertEqual(confirmer.confirmations.count, 1)
-        XCTAssertEqual(confirmer.confirmations.first?.reason, .changed(previousFingerprintSHA256: ""))
+        XCTAssertEqual(confirmer.confirmations.first?.reason, .changed(previousFingerprintSHA256: "SHA256:old-key"))
         XCTAssertEqual(credentialResolver.resolveCount, 1)
     }
 

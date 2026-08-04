@@ -237,6 +237,8 @@ public final class SSHConnectionCoordinator {
                 hostKey: Array(hostKey.rawKey),
                 decision: .reject
             )
+            // 防御性兜底：applyHostKeyDecision 传 .reject 时，未知主机抛出 UnknownHostKey
+            // 错误而非返回 .unknown，此分支理论上不会到达。保留以防后端语义变化。
             if case .unknown = verification {
                 return try confirmAndApplyHostKeyDecision(
                     config: config,
@@ -253,12 +255,12 @@ public final class SSHConnectionCoordinator {
                 hostKey: hostKey,
                 reason: .unknown
             )
-        } catch SshRuntimeError.HostKeyChanged {
+        } catch SshRuntimeError.HostKeyChanged(let previousFingerprintSha256) {
             return try confirmAndApplyHostKeyDecision(
                 config: config,
                 databasePath: databasePath,
                 hostKey: hostKey,
-                reason: .changed(previousFingerprintSHA256: "")
+                reason: .changed(previousFingerprintSHA256: previousFingerprintSha256)
             )
         }
     }

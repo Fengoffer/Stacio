@@ -34,6 +34,8 @@ public enum AgentActionClassifier {
                 return false
             }
             let value = token.text
+            // 仅 stdout 重定向（>、>>、1>、1>>、&>）视为写操作；
+            // stderr 重定向（2>、2>>）通常用于静默错误输出（如 2>/dev/null），不算写。
             if [">", ">>", "1>", "1>>", "&>"].contains(value) {
                 return true
             }
@@ -156,8 +158,26 @@ public enum AgentActionClassifier {
         case "az":
             return riskForAzureCLI(words)
         default:
+            // 未显式枚举的可执行程序：检测已知危险命令模式，避免被默认判定为只读
+            if isKnownDangerousExecutable(command) {
+                return .destructive
+            }
             return .readOnly
         }
+    }
+
+    /// 检测未在 switch 中显式枚举但具有破坏性的可执行程序。
+    private static func isKnownDangerousExecutable(_ command: String) -> Bool {
+        // mkfs 系列变体：mkfs.ext2/3/4, mkfs.btrfs, mkfs.xfs, mkfs.ntfs, mkfs.vfat 等
+        if command.hasPrefix("mkfs.") || command == "mke2fs" || command == "mkfs" {
+            return true
+        }
+        let dangerousCommands: Set<String> = [
+            "shred", "wipe", "truncate", "init", "telinit",
+            "ddrescue", "badblocks", "blkdiscard", "shred-uwipe",
+            "nvme-format", "sg_format", "hdparm"
+        ]
+        return dangerousCommands.contains(command)
     }
 
     private static func shellScriptRisk(
@@ -173,7 +193,8 @@ public enum AgentActionClassifier {
             if ShellCommandTokenizer.redirectionOperators.contains(word) {
                 break
             }
-            if word == "-c" || (word.hasPrefix("-") && word.dropFirst().contains("c")) {
+            if word == "-c" || (word.hasPrefix("-") && word.hasPrefix("--") == false && word.contains("c")) {
+                // -c 显式指定，或组合短旗标（如 -lc、-sc）中含 c：均表示执行后续脚本
                 let scriptIndex = arguments.index(after: index)
                 guard arguments.indices.contains(scriptIndex) else {
                     return .readOnly
@@ -232,7 +253,8 @@ public enum AgentActionClassifier {
             if optionCharacters.contains("r") {
                 return .destructive
             }
-            if optionCharacters.contains("s") && optionCharacters.contains("q") == false {
+            if optionCharacters.contains("s") {
+                // -s (sync) 触发网络安装；-q (quiet) 仅减少输出，不改变安装行为
                 return .network
             }
             if optionCharacters.contains("u") {
@@ -822,6 +844,11 @@ private enum ShellCommandTokenizer {
                 quote = character
                 currentIsQuoted = true
                 continue
+            }
+            if character == "#" && quote == nil && current.isEmpty {
+                // Shell 注释：非引号/非转义状态下，# 处于词起始位置时，
+                // 从 # 到行尾的内容均为注释，直接丢弃。
+                break
             }
             if character.isWhitespace {
                 flush()

@@ -1545,7 +1545,7 @@ fn map_ssh_runtime_error(error: SshRuntimeError) -> String {
         SshRuntimeError::InvalidConfig => "FILES_INVALID_REMOTE_CONFIG",
         SshRuntimeError::AuthFailed => "FILES_REMOTE_AUTH_FAILED",
         SshRuntimeError::Timeout => "FILES_TRANSFER_TIMEOUT",
-        SshRuntimeError::HostKeyChanged => "FILES_REMOTE_HOST_KEY_CHANGED",
+        SshRuntimeError::HostKeyChanged { .. } => "FILES_REMOTE_HOST_KEY_CHANGED",
         SshRuntimeError::UnknownHostKey => "FILES_REMOTE_HOST_KEY_UNKNOWN",
         SshRuntimeError::Transport { .. } => "FILES_REMOTE_COMMAND_FAILED",
     }

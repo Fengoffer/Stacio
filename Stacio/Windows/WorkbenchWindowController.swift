@@ -4134,12 +4134,19 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                     session: session,
                     launchArguments: launchConfig.arguments
                 )
+                // 密码通过环境变量传递，避免命令行参数被 ps 读取
+                var environment: [String: String] = [:]
+                if normalizedProtocol == "vnc" && optionalTrimmed(session.credentialId) != nil {
+                    let password = try savedSessionGraphicsPassword(for: session)
+                    environment["STACIO_VNC_PASSWORD"] = password
+                }
                 let request = GraphicsRuntimeStartRequest(
                     protocolName: protocolName,
                     adapterPath: launchConfig.adapterPath,
                     arguments: runtimeArguments,
                     host: session.host,
-                    port: port
+                    port: port,
+                    environment: environment
                 )
                 let redactedArguments = redactedGraphicsLaunchArguments(runtimeArguments)
                 let pane = workspaceViewController.openConnectingGraphicsSession(
@@ -4453,13 +4460,9 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         session: SessionRecord,
         launchArguments: [String]
     ) throws -> [String] {
-        guard normalizedProtocol == "vnc",
-              optionalTrimmed(session.credentialId) != nil
-        else {
-            return launchArguments
-        }
-        let password = try savedSessionGraphicsPassword(for: session)
-        return argumentsByAddingPassword(password, toGraphicsArguments: launchArguments)
+        // 密码不再通过 --password 命令行参数传递（避免通过 ps 泄漏），
+        // 改为通过环境变量 STACIO_VNC_PASSWORD 传递（见调用方构造 GraphicsRuntimeStartRequest）
+        return launchArguments
     }
 
     private func savedSessionGraphicsPassword(for session: SessionRecord) throws -> String {
@@ -4493,7 +4496,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 continue
             }
             redacted.append(argument)
-            if argument == "--password" || argument == "-p" || argument == "--gw-pass" {
+            if argument == "--password" || argument == "--gw-pass" {
                 shouldRedactNext = true
             }
         }

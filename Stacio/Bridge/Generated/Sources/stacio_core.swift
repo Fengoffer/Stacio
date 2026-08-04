@@ -9375,7 +9375,8 @@ public enum SshRuntimeError: Swift.Error {
     case InvalidConfig
     case AuthFailed
     case Timeout
-    case HostKeyChanged
+    case HostKeyChanged(previousFingerprintSha256: String
+    )
     case UnknownHostKey
     case Transport(message: String
     )
@@ -9398,7 +9399,9 @@ public struct FfiConverterTypeSshRuntimeError: FfiConverterRustBuffer {
         case 1: return .InvalidConfig
         case 2: return .AuthFailed
         case 3: return .Timeout
-        case 4: return .HostKeyChanged
+        case 4: return .HostKeyChanged(
+            previousFingerprintSha256: try FfiConverterString.read(from: &buf)
+            )
         case 5: return .UnknownHostKey
         case 6: return .Transport(
             message: try FfiConverterString.read(from: &buf)
@@ -9427,8 +9430,9 @@ public struct FfiConverterTypeSshRuntimeError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
 
 
-        case .HostKeyChanged:
+        case let .HostKeyChanged(previousFingerprintSha256):
             writeInt(&buf, Int32(4))
+            FfiConverterString.write(previousFingerprintSha256, into: &buf)
 
 
         case .UnknownHostKey:

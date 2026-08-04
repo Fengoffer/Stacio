@@ -10,22 +10,16 @@ public protocol TunnelProfileStoring {
 }
 
 public extension TunnelProfileStoring {
+    /// 便利默认实现：从 record 列表提取 profile。
+    /// 遵循类型应实现 listProfileRecords()，此方法自动可用。
     func listProfiles() throws -> [TunnelProfile] {
         try listProfileRecords().map(\.profile)
     }
 
+    /// 便利默认实现：将 profile 包装为 record 后保存。
+    /// 遵循类型应实现 saveProfileRecord(_:)，此方法自动可用。
     func saveProfile(_ profile: TunnelProfile) throws {
         try saveProfileRecord(TunnelProfileRecord(profile: profile, sessionId: nil, endpointSessionId: nil))
-    }
-
-    func listProfileRecords() throws -> [TunnelProfileRecord] {
-        try listProfiles().map { profile in
-            TunnelProfileRecord(profile: profile, sessionId: nil, endpointSessionId: nil)
-        }
-    }
-
-    func saveProfileRecord(_ record: TunnelProfileRecord) throws {
-        try saveProfile(record.profile)
     }
 }
 

@@ -66,6 +66,11 @@ mod ssh_transport_tests {
         let error =
             connect_with_transport(config(), &known_hosts, &transport).expect_err("changed key");
 
-        assert_eq!(error, SshRuntimeError::HostKeyChanged);
+        assert_eq!(
+            error,
+            SshRuntimeError::HostKeyChanged {
+                previous_fingerprint_sha256: fingerprint_sha256(b"old-key")
+            }
+        );
     }
 }
