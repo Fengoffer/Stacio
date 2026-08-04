@@ -296,6 +296,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
     private var interactiveSplitResizeWorkItem: DispatchWorkItem?
     private var splitWidthPersistenceWorkItem: DispatchWorkItem?
     private var isInteractiveSplitResizeActive = false
+    var pendingApplicationTerminationCompletion: ((Bool) -> Void)?
     private var allowsUserSplitWidthPersistence = false
     private var isSidebarTemporarilyExpanded = false
     private var pendingProgrammaticWindowFrameRestore: NSRect?
