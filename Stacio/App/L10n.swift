@@ -1,6 +1,20 @@
 import Foundation
 
 enum L10n {
+    enum EditorPresentation {
+        static let detach = "独立窗口"
+        static let redock = "重新停靠"
+        static let displays = "显示器"
+        static let detachRequiresLicense = "独立窗口和显示器投放需要专业版或更高版本 License"
+        static let transitionFailedTitle = "无法切换编辑器窗口"
+        static let openLicense = "查看授权"
+        static let toolbarDrag = "拖动编辑器工作区"
+
+        static func display(_ name: String, ordinal: Int?) -> String {
+            ordinal.map { "显示器 \($0) - \(name)" } ?? name
+        }
+    }
+
     enum Common {
         static let ok = "确定"
         static let cancel = "取消"
@@ -576,16 +590,6 @@ enum L10n {
     }
 
     enum Workbench {
-        static let toolbarCustomizationTitle = "自定义工具栏"
-        static let toolbarCustomizationSubtitle = "拖动单个工具来添加、排序或移出工具栏。更改将在点击“完成”后生效。"
-        static let toolbarCustomizationAvailable = "可用工具"
-        static let toolbarCustomizationCurrent = "当前工具栏"
-        static let toolbarCustomizationRemoveHint = "拖回上方或拖出窗口即可移除"
-        static let toolbarCustomizationRestoreDefault = "恢复默认"
-        static let toolbarCustomizationDone = "完成"
-        static let toolbarCustomizationFlexibleSpace = "可调间距"
-        static let toolbarCustomizationSpace = "间距"
-
         static let quickConnect = "快速连接"
         static let newSession = "新建会话"
         static let split = "分屏"

@@ -2103,6 +2103,12 @@ public protocol RemoteEditOpening: AnyObject {
         saveHandler: ((String) throws -> Void)?
     )
     @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler
+    )
+    @MainActor
     func remoteOpenDidFail(selection: RemoteFileSelection, mode: RemoteFileOpenMode, message: String)
     @MainActor
     func compareLocalCopies(_ urls: [URL], parentWindow: NSWindow?) throws
@@ -2125,6 +2131,13 @@ public protocol RemoteEditOpening: AnyObject {
         _ document: RemoteTextEditorDocumentDescriptor,
         mode: RemoteFileOpenMode,
         saveHandler: ((String) throws -> Void)?,
+        request: RemoteEditOpenRequest
+    )
+    @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler,
         request: RemoteEditOpenRequest
     )
     @MainActor
@@ -2170,6 +2183,15 @@ public extension RemoteEditOpening {
     }
 
     @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler
+    ) {
+        openRemoteDocument(document, mode: mode, saveHandler: nil)
+    }
+
+    @MainActor
     func openLocalCopy(
         at url: URL,
         mode: RemoteFileOpenMode,
@@ -2193,6 +2215,16 @@ public extension RemoteEditOpening {
         request: RemoteEditOpenRequest
     ) {
         openRemoteDocument(document, mode: mode, saveHandler: saveHandler)
+    }
+
+    @MainActor
+    func openRemoteDocument(
+        _ document: RemoteTextEditorDocumentDescriptor,
+        mode: RemoteFileOpenMode,
+        asyncSaveHandler: @escaping RemoteTextEditorAsyncSaveHandler,
+        request: RemoteEditOpenRequest
+    ) {
+        openRemoteDocument(document, mode: mode, asyncSaveHandler: asyncSaveHandler)
     }
 
     @MainActor
@@ -4354,8 +4386,34 @@ public final class FilesCoordinator {
                     openerBox.value.openRemoteDocument(
                         descriptor,
                         mode: mode,
-                        saveHandler: { [weak self] updatedText in
-                            try self?.writeRemoteEditText(updatedText, selection: selection, context: context)
+                        asyncSaveHandler: { [weak self] updatedText, completion in
+                            guard let self else {
+                                completion(.failure(FilesCoordinatorError.missingLiveSSHContext))
+                                return
+                            }
+                            do {
+                                try self.validateRemoteEditNotStale(
+                                    remotePath: selection.path,
+                                    openedRemoteModifiedAt: self.parsedRemoteModifiedDate(
+                                        from: selection.modifiedTime
+                                    )
+                                )
+                            } catch {
+                                completion(.failure(error))
+                                return
+                            }
+                            let writeBridge = UncheckedSendableBox(self.bridge)
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = Result {
+                                    try Self.writeRemoteEditText(
+                                        updatedText,
+                                        selection: selection,
+                                        context: context,
+                                        bridge: writeBridge.value
+                                    )
+                                }
+                                DispatchQueue.main.async { completion(result) }
+                            }
                         },
                         request: openRequest
                     )
@@ -4706,15 +4764,12 @@ public final class FilesCoordinator {
         return normalizedStatus
     }
 
-    private func writeRemoteEditText(
+    nonisolated private static func writeRemoteEditText(
         _ text: String,
         selection: RemoteFileSelection,
-        context: TunnelLiveSessionContext
+        context: TunnelLiveSessionContext,
+        bridge: RemoteFilesBridging
     ) throws {
-        try validateRemoteEditNotStale(
-            remotePath: selection.path,
-            openedRemoteModifiedAt: parsedRemoteModifiedDate(from: selection.modifiedTime)
-        )
         let data = Data(text.utf8)
         let verificationLength = UInt64(data.count) + 1
         let verificationData: Data
@@ -4765,7 +4820,7 @@ public final class FilesCoordinator {
         }
     }
 
-    private static func isRemotePermissionDenied(_ error: Error) -> Bool {
+    nonisolated private static func isRemotePermissionDenied(_ error: Error) -> Bool {
         if let sshError = error as? SshRuntimeError,
            case .Transport(let message) = sshError,
            message.uppercased().contains("FILES_PERMISSION_DENIED")
