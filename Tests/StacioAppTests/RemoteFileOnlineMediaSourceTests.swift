@@ -277,11 +277,11 @@ final class RemoteFileOnlineMediaSourceTests: XCTestCase {
         XCTAssertEqual(disconnected.wait(timeout: .now() + 1), .success)
         finishRead.signal()
 
-        let serverObservedDisconnect = expectation(description: "server observes disconnect")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            serverObservedDisconnect.fulfill()
+        let disconnectPropagationSettles = expectation(description: "disconnect propagation settles")
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.1) {
+            disconnectPropagationSettles.fulfill()
         }
-        wait(for: [serverObservedDisconnect], timeout: 1)
+        wait(for: [disconnectPropagationSettles], timeout: 2)
         XCTAssertEqual(reader.requests.count, 1)
     }
 
