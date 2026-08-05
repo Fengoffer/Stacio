@@ -8,7 +8,7 @@
 
 Terminal · SCP/SFTP · Remote Files · SSH Tunnels · Device Metrics · AI Agent
 
-[![Version](https://img.shields.io/badge/version-0.14.2%20Stable-2dd4bf)](https://www.stacio.cn/)
+[![Version](https://img.shields.io/badge/version-0.14.3%20Stable-2dd4bf)](https://www.stacio.cn/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-000000)](https://www.stacio.cn/)
 [![License](https://img.shields.io/badge/license-Source%20Available%20NC-blue)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-5-F05138)](https://www.swift.org/)
@@ -153,14 +153,14 @@ Each platform uses its native UI (macOS: Swift/AppKit, Windows: WinUI 3, Linux: 
 
 | Platform | Status | Tech Stack |
 |----------|--------|------------|
-| macOS | Available now (0.14.2) | Swift + AppKit + Rust Core |
+| macOS | Available now (0.14.3) | Swift + AppKit + Rust Core |
 | Windows | In development | WinUI 3 / .NET 8 + Rust Core |
 | Linux | Architecture baseline ready | GTK4 / libadwaita + Rust Core |
 | Domestic OS | Planned | UOS · Deepin · Kylin · openEuler · HarmonyOS |
 
 ## Quick Facts
 
-- **Current Version:** Stacio 0.14.2 Stable (Build 333)
+- **Current Version:** Stacio 0.14.3 Stable (Build 388)
 - **System Requirements:** macOS 14 or later
 - **Installer:** Separate downloads for Apple Silicon and Intel Macs
 - **First Launch:** Installer is not yet notarized. If macOS blocks first launch, right-click `Stacio.app` in Finder → Open

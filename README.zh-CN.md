@@ -8,7 +8,7 @@
 
 终端 · SCP/SFTP · 远程文件 · SSH 隧道 · 设备看板 · AI Agent
 
-[![版本](https://img.shields.io/badge/版本-0.14.2%20Stable-2dd4bf)](https://www.stacio.cn/)
+[![版本](https://img.shields.io/badge/版本-0.14.3%20Stable-2dd4bf)](https://www.stacio.cn/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-000000)](https://www.stacio.cn/)
 [![许可证](https://img.shields.io/badge/许可证-Source%20Available%20NC-blue)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-5-F05138)](https://www.swift.org/)
@@ -153,14 +153,14 @@ UI 层各平台原生（macOS: Swift/AppKit, Windows: WinUI 3, Linux: GTK4），
 
 | 平台 | 状态 | 技术栈 |
 |------|------|--------|
-| macOS | 当前可用（0.14.2） | Swift + AppKit + Rust Core |
+| macOS | 当前可用（0.14.3） | Swift + AppKit + Rust Core |
 | Windows | 适配开发中 | WinUI 3 / .NET 8 + Rust Core |
 | Linux | 架构基线已定 | GTK4 / libadwaita + Rust Core |
 | 国产操作系统 | 规划中 | 统信 UOS · 深度 · 麒麟 · 欧拉 · 鸿蒙 |
 
 ## 快速事实
 
-- **当前版本：** Stacio 0.14.2 Stable（构建号 333）
+- **当前版本：** Stacio 0.14.3 Stable（构建号 388）
 - **系统要求：** macOS 14 及以上
 - **安装包：** 下载页分别提供 Apple Silicon 与 Intel Mac 版本
 - **首次打开：** 当前安装包尚未公证。若 macOS 拦截首次启动，请在 Finder 中右键 `Stacio.app`，选择"打开"
