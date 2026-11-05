@@ -858,8 +858,21 @@ final class TerminalThemeImportTests: XCTestCase {
                 originalChunk
             )
         }
-        XCTAssertNotEqual(deliveredStrings.first, chunks.first)
-        XCTAssertEqual(deliveredStrings.last, chunks.last)
+        // TerminalSemanticOutputProcessor 在积压超过 512 KiB 时会主动关闭高亮
+        // （bypassHighlightingUntilDrained），保证能追平。因此「第一块带高亮、
+        // 最后一块不带」取决于 worker 的调度时机，属于竞态，不能作为断言——
+        // 曾经在机器负载高时偶发失败。高亮注入本身由其他用例覆盖。
+        // 本用例只断言它承诺的契约：不丢块、不乱序。
+        let joined = deliveredStrings.joined()
+        var searchStart = joined.startIndex
+        for index in 0..<chunks.count {
+            let marker = "BACKLOG-END-\(index)"
+            guard let range = joined.range(of: marker, range: searchStart..<joined.endIndex) else {
+                XCTFail("背压排空后缺少或乱序：\(marker)")
+                return
+            }
+            searchStart = range.upperBound
+        }
     }
 
     func testSmallSemanticOutputStaysWithinMainThreadFeedBudget() {
