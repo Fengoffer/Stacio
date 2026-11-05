@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "description": "公开仓库（GitHub / Gitee）的推送边界。任何要推到公开仓库的提交，都不得包含下列路径。竞品分析、内部文档、内部截图、运营后台与官网源码只保留在本地。",
+  "publicRepositories": [
+    "https://github.com/Fengoffer/Stacio.git",
+    "https://gitee.com/fengoffer/Stacio.git"
+  ],
+  "privateRepositories": [
+    "https://gitee.com/fengoffer/stacio-private.git"
+  ],
+  "notes": [
+    "路径按仓库根目录的相对前缀匹配，末尾带 / 表示目录。",
+    "allowedExceptions 用于放行已确认可公开的同类内容（例如 README 引用的产品截图）。",
+    "如需调整，只改本文件；scripts/verify-public-repo-boundary.py 与预推送钩子都读这里。"
+  ],
+  "forbiddenPaths": [
+    "docs/",
+    "竞品截图/",
+    "Stacio应用截图/",
+    "mobaxterm资源监控截图/",
+    "操作系统图标/",
+    "2026开源大赛提交材料/",
+    "stacio-promotion/",
+    "stacio-promotion-plan/",
+    "stacio-strategy/",
+    "stacio-doc-audit/",
+    "ops-platform/",
+    "website/",
+    "官网/",
+    "后台/",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "tmp/",
+    ".claude/",
+    ".codex/",
+    ".trae/",
+    ".reasonix/",
+    ".zcode/",
+    ".ohmyagent/",
+    ".superpowers/",
+    ".writing/",
+    ".coaligne/",
+    "SOURCE_OF_TRUTH.md"
+  ],
+  "allowedExceptions": [
+    {
+      "path": "assets/screenshots/",
+      "reason": "公共 README 引用的产品截图，历史上已在公开仓库中，属于对外展示素材而非内部截图。"
+    }
+  ],
+  "secretPatterns": [
+    "-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+    "ghp_[A-Za-z0-9]{36}",
+    "github_pat_[A-Za-z0-9_]{22,}",
+    "gho_[A-Za-z0-9]{36}",
+    "AKIA[0-9A-Z]{16}",
+    "sk-[A-Za-z0-9]{32,}",
+    "xox[baprs]-[A-Za-z0-9-]{10,}"
+  ],
+  "secretAllowlist": [
+    {
+      "path": "Tests/StacioAppTests/ProductOpsCompletionTests.swift",
+      "reason": "测试用占位字符串（长度不符合真实 GitHub token 格式）。"
+    },
+    {
+      "path": "Tests/StacioAppTests/SecureSessionTransferTests.swift",
+      "reason": "测试用假私钥片段，非可用密钥。"
+    },
+    {
+      "path": "Stacio/Resources/OhMyZsh/",
+      "reason": "上游 oh-my-zsh 快照，其中 dotenv 插件文档包含示例环境变量。"
+    },
+    {
+      "path": "assets/oh-my-zsh/",
+      "reason": "同上，上游快照文档。"
+    }
+  ]
+}

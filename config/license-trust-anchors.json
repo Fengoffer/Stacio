@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "productID": "stacio",
+  "apiBaseURL": "https://ops.stacio.cn",
+  "onlineAuthorization": {
+    "algorithm": "Ed25519",
+    "signatureKeyID": "online-license-signing-2026-01",
+    "publicKeyBase64": "vDKaOq0LGT5s3km7DzuPXxjmJPOnGrXbGRBDrlQ/Glg="
+  },
+  "offlineLicense": {
+    "exchangeURL": "https://ops.stacio.cn/api/v1/public/products/stacio/offline-license/exchange",
+    "request": {
+      "protocol": "stacio-offline-request",
+      "version": 1,
+      "keyID": "offline-encryption-2026-01",
+      "publicKeyBase64": "EKuNUsbkqkkRJ3B5Q69RQ2UWdjirgMyMKxfB9KO0fFQ="
+    },
+    "authorization": {
+      "algorithm": "Ed25519",
+      "signatureKeyID": "offline-signing-2026-01",
+      "publicKeyBase64": "yGh4lpWhGxrhjFKGBjtNGy1+trm9yOOxwF3+LUmzbWc="
+    }
+  },
+  "storage": {
+    "contractID": "stacio-license-vault-v1",
+    "schemaVersion": 1,
+    "directory": "~/Library/Application Support/Stacio/LicenseVault",
+    "vaultFile": "credentials.vault.json",
+    "keyFile": "credentials.vault.key"
+  }
+}

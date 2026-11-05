@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+STACIO_PORT_CHECK_DIR="$(mktemp -d /tmp/stacio-port-check-build.XXXXXX)"
+trap 'rm -rf "$STACIO_PORT_CHECK_DIR"' EXIT
+STACIO_PORT_CHECK_SDK="${STACIO_MACOS_SDK_PATH:-$(xcrun --sdk macosx --show-sdk-path)}"
+swiftc -parse-as-library -sdk "$STACIO_PORT_CHECK_SDK" -o "$STACIO_PORT_CHECK_DIR/check" \
+  "$ROOT/Stacio/Services/DeviceMetricsInventoryManager.swift" \
+  "$ROOT/Tests/DeviceMetrics/PortCommandChecks.swift"
+"$STACIO_PORT_CHECK_DIR/check"

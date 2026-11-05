@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 1,
+  "description": "Stacio 应用包内容的唯一真源。package-app.sh 的拷贝动作与 verify-bundle-contents.py 的检查都从这里生成/读取。新增资源只改这个文件，然后运行 ./scripts/bundle-resources.sh --write 重新生成脚本片段。",
+  "notes": [
+    "kind=tree-contents: mkdir -p 目标目录; cp -R 源/. 目标/（把目录内容铺进目标）",
+    "kind=tree: cp -R 源 目标（目标本身就是最终路径）",
+    "kind=file: cp 源 目标",
+    "kind=build-product: 由构建流程产出，不在源码资源里；只做存在性校验，不生成拷贝命令",
+    "shipped=false: 有意不打包进 app（例如按需下载的资源），校验器会要求它不存在",
+    "sourceOptional=true: 源目录缺失时跳过拷贝，不算错误"
+  ],
+  "entries": [
+    {
+      "id": "runtime-catalog",
+      "container": "Resources",
+      "source": "Stacio/Resources/RuntimeCatalog",
+      "destination": "RuntimeCatalog",
+      "kind": "tree-contents",
+      "required": true,
+      "xattrClean": true
+    },
+    {
+      "id": "about",
+      "container": "Resources",
+      "source": "Stacio/Resources/About",
+      "destination": "About",
+      "kind": "tree-contents",
+      "required": true,
+      "sourceOptional": true
+    },
+    {
+      "id": "license-certificate",
+      "container": "Resources",
+      "source": "Stacio/Resources/LicenseCertificate",
+      "destination": "LicenseCertificate",
+      "kind": "tree-contents",
+      "required": true,
+      "xattrClean": true
+    },
+    {
+      "id": "github-icon",
+      "container": "Resources",
+      "source": "Stacio/Resources/github.svg",
+      "destination": "github.svg",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "gitee-icon",
+      "container": "Resources",
+      "source": "Stacio/Resources/gitee.svg",
+      "destination": "gitee.svg",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "session-icons",
+      "container": "Resources",
+      "source": "Stacio/Resources/SessionIcons",
+      "destination": "SessionIcons",
+      "kind": "tree-contents",
+      "required": true,
+      "xattrClean": true
+    },
+    {
+      "id": "import-source-icons",
+      "container": "Resources",
+      "source": "Stacio/Resources/ImportSourceIcons",
+      "destination": "ImportSourceIcons",
+      "kind": "tree-contents",
+      "required": true,
+      "xattrClean": true
+    },
+    {
+      "id": "font-sarasa-regular",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf",
+      "destination": "Fonts/SarasaTermSC-Regular.ttf",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "font-sarasa-bold",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/SarasaTermSC-Bold.ttf",
+      "destination": "Fonts/SarasaTermSC-Bold.ttf",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "font-sarasa-license",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/LICENSE.txt",
+      "destination": "Fonts/LICENSE.txt",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "font-history-brand",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/lack-regular-2.otf",
+      "destination": "Fonts/lack-regular-2.otf",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "monaco-editor",
+      "container": "Resources",
+      "source": "node_modules/monaco-editor/min/vs",
+      "sourceExpression": "${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}",
+      "destination": "MonacoEditor/vs",
+      "kind": "tree",
+      "required": true,
+      "sourceExternal": true
+    },
+    {
+      "id": "app-icon",
+      "container": "Resources",
+      "source": "logo/icon-legacy.icns",
+      "destination": "Stacio.icns",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "app-logo",
+      "container": "Resources",
+      "source": "Stacio/Resources/stacio-logo.png",
+      "destination": "stacio-logo.png",
+      "kind": "file",
+      "required": true
+    },
+    {
+      "id": "nerd-font",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/JetBrainsMonoNLNerdFont-Regular.ttf",
+      "destination": "Fonts/JetBrainsMonoNLNerdFont-Regular.ttf",
+      "kind": "file",
+      "required": false,
+      "shipped": false,
+      "note": "P0-4 已定为 B：走 oh-my-zsh 快照按需下载，不内置进 app 包。源码文件仅供 sync-ohmyzsh-resources.sh 生成快照。"
+    },
+    {
+      "id": "nerd-font-license",
+      "container": "Resources",
+      "source": "Stacio/Resources/Fonts/NerdFonts-OFL.txt",
+      "destination": "Fonts/NerdFonts-OFL.txt",
+      "kind": "file",
+      "required": false,
+      "shipped": false,
+      "note": "P0-4 已定为 B：走 oh-my-zsh 快照按需下载，不内置进 app 包。源码文件仅供 sync-ohmyzsh-resources.sh 生成快照。"
+    },
+    {
+      "id": "main-executable",
+      "container": "MacOS",
+      "destination": "Stacio",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "core-dylib",
+      "container": "Frameworks",
+      "destination": "libstacio_core.dylib",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "sparkle-framework",
+      "container": "Frameworks",
+      "destination": "Sparkle.framework",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "cli-helper",
+      "container": "Helpers",
+      "destination": "stacio",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "vnc-adapter",
+      "container": "Adapters",
+      "destination": "vnc",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "swiftterm-resources",
+      "container": "Resources",
+      "destination": "SwiftTerm_SwiftTerm.bundle",
+      "kind": "build-product",
+      "required": true
+    },
+    {
+      "id": "source-provenance",
+      "container": "Resources",
+      "destination": "SourceProvenance.json",
+      "kind": "build-product",
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    { "id": "openai-native", "provider": "provider.openai", "steps": ["saveDraft", "saveCredentialAndFetchModels", "connectTest", "activate", "createTurn", "streamAndStop"], "cleanup": ["keychain-zero", "config-dir-empty", "no-residual-cli-process"] },
+    { "id": "deepseek-native", "provider": "provider.deepseek", "steps": ["saveDraft", "saveCredentialAndFetchModels", "activate"], "cleanup": ["keychain-zero", "config-dir-empty"] },
+    { "id": "ollama-loopback", "provider": "provider.ollama", "steps": ["saveDraft", "noCredentialFetch", "activate"], "cleanup": ["config-dir-empty"] },
+    { "id": "kimi-code-native", "provider": "provider.kimi-api", "steps": ["saveDraft", "saveCredentialAndFetchModels", "activate", "createTurn"], "cleanup": ["keychain-zero", "config-dir-empty"] }
+  ]
+}

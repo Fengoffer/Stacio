@@ -1,0 +1,4 @@
+[
+  { "pricingEntryID": "pricing.openai.gpt-4o.2026-01", "providerID": "openai.com", "modelID": "gpt-4o", "effectiveFrom": "2026-01-01T00:00:00Z", "effectiveUntil": null, "inputPerMillion": 2.5, "outputPerMillion": 10.0 },
+  { "pricingEntryID": "pricing.anthropic.claude-sonnet.2026-01", "providerID": "anthropic.com", "modelID": "claude-sonnet-4", "effectiveFrom": "2026-01-01T00:00:00Z", "effectiveUntil": null, "inputPerMillion": 3.0, "outputPerMillion": 15.0 }
+]

@@ -1,0 +1,11891 @@
+import AppKit
+import StacioAgentBridge
+import SwiftTerm
+import XCTest
+@testable import StacioApp
+import StacioCoreBindings
+
+@MainActor
+final class WorkbenchWindowControllerTests: XCTestCase {
+    private let toolbarAutosaveDefaultsKey = "NSToolbar Configuration Stacio.Toolbar"
+    private let toolbarShowsLabelsDefaultsKey = "Stacio.Toolbar.showsLabels"
+    private var toolbarAutosaveConfigurationSnapshot: Any?
+    private var toolbarShowsLabelsSnapshot: Any?
+
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        condition: @escaping () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        return condition()
+    }
+
+    func testRemoteZshInstallPromptAppearsOnlyOncePerRemoteTarget() {
+        var state = RemoteZshInstallPromptState()
+        let target = "root@192.168.124.100:22"
+
+        XCTAssertTrue(state.beginFlow(target))
+        XCTAssertFalse(state.beginFlow(target), "并发重试不应启动第二条安装提示流程")
+        XCTAssertTrue(state.beginPrompt(target))
+        XCTAssertFalse(state.beginPrompt(target), "同一条流程只能展示一次确认弹窗")
+
+        state.finishFlow(target)
+
+        XCTAssertFalse(state.beginFlow(target), "弹窗关闭后，同一远端也不应再次提示")
+        XCTAssertTrue(state.beginFlow("root@192.168.124.101:22"), "不同远端仍应各自提示一次")
+    }
+
+    override func setUp() {
+        super.setUp()
+        toolbarAutosaveConfigurationSnapshot = UserDefaults.standard.object(
+            forKey: toolbarAutosaveDefaultsKey
+        )
+        toolbarShowsLabelsSnapshot = UserDefaults.standard.object(
+            forKey: toolbarShowsLabelsDefaultsKey
+        )
+        UserDefaults.standard.removeObject(forKey: toolbarAutosaveDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: toolbarShowsLabelsDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(defaultWorkbenchFrameAutosaveName()))
+        UserDefaults.standard.removeObject(
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "sidebar")
+        )
+        UserDefaults.standard.removeObject(
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "inspector")
+        )
+    }
+
+    override func tearDown() {
+        NSApplication.shared.windows
+            .filter { $0.title == "Stacio" }
+            .forEach { $0.close() }
+        UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(defaultWorkbenchFrameAutosaveName()))
+        UserDefaults.standard.removeObject(
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "sidebar")
+        )
+        UserDefaults.standard.removeObject(
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(defaultWorkbenchFrameAutosaveName(), column: "inspector")
+        )
+        if let toolbarAutosaveConfigurationSnapshot {
+            UserDefaults.standard.set(
+                toolbarAutosaveConfigurationSnapshot,
+                forKey: toolbarAutosaveDefaultsKey
+            )
+        } else {
+            UserDefaults.standard.removeObject(forKey: toolbarAutosaveDefaultsKey)
+        }
+        if let toolbarShowsLabelsSnapshot {
+            UserDefaults.standard.set(toolbarShowsLabelsSnapshot, forKey: toolbarShowsLabelsDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: toolbarShowsLabelsDefaultsKey)
+        }
+        super.tearDown()
+    }
+
+    func testWorkbenchWindowHasNativeThreeColumnLayout() {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let splitController = controller.contentSplitViewController
+        XCTAssertEqual(splitController.splitViewItems.count, 3)
+        XCTAssertEqual(controller.window?.title, "Stacio")
+        XCTAssertLessThanOrEqual(controller.window?.minSize.width ?? .greatestFiniteMagnitude, 1)
+        XCTAssertLessThanOrEqual(controller.window?.minSize.height ?? .greatestFiniteMagnitude, 1)
+    }
+
+    func testDefaultToolbarOmitsUpdatePromptBecauseOTAStatusLivesInSidebar() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: "Stacio.Tests.Toolbar")
+
+        XCTAssertFalse(
+            controller.toolbarDefaultItemIdentifiers(toolbar)
+                .contains(NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt"))
+        )
+    }
+
+    func testWorkbenchInspectorIncludesAIAssistantPanel() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        _ = inspector.view
+        XCTAssertTrue(inspector.sectionLabelsForTesting.contains(L10n.AI.title))
+        guard let aiIndex = inspector.sectionLabelsForTesting.firstIndex(of: L10n.AI.title) else {
+            return XCTFail("expected AI inspector section")
+        }
+        inspector.selectSectionForTesting(aiIndex)
+        XCTAssertTrue(inspector.selectedContentViewControllerForTesting === inspector.aiAssistantViewController)
+    }
+
+    func testWorkbenchInspectorCommandHistoryFollowsCurrentTerminalAndPastesSelection() throws {
+        let sink = RecordingWorkbenchTerminalEventSink()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "first@example.com",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "second@example.com",
+            connectionKind: .ssh
+        )
+        let firstPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_first"))
+        let secondPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_second"))
+        firstPane.send(source: firstPane.terminalView, data: ArraySlice(Array("docker ps\n".utf8)))
+        secondPane.send(source: secondPane.terminalView, data: ArraySlice(Array("uptime\n".utf8)))
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        _ = inspector.view
+        inspector.selectCommandHistoryTab()
+        XCTAssertEqual(inspector.commandHistoryViewController?.commandsForTesting, ["uptime"])
+
+        workspace.selectTabForTesting(0)
+        XCTAssertEqual(inspector.commandHistoryViewController?.commandsForTesting, ["docker ps"])
+
+        inspector.commandHistoryViewController?.selectHistoryRowForTesting(0)
+        inspector.commandHistoryViewController?.pasteSelectedCommandForTesting()
+
+        XCTAssertEqual(sink.userInputEvents.suffix(1), [
+            TerminalInputEvent(runtimeID: "term_first", bytes: Array("docker ps".utf8))
+        ])
+    }
+
+    func testWorkbenchAIAssistantInspectorFollowsCurrentTerminalSelection() throws {
+        let suffix = UUID().uuidString
+        let firstRuntimeID = "term-first-\(suffix)"
+        let secondRuntimeID = "term-second-\(suffix)"
+        let suiteName = "StacioWorkbenchAIFollow-\(suffix)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: firstRuntimeID, status: "running", diagnostic: "running"),
+            title: "first@example.com",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: secondRuntimeID, status: "running", diagnostic: "running"),
+            title: "second@example.com",
+            connectionKind: .ssh
+        )
+        controller.showAIAssistantFromToolbar(nil)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let panel = try XCTUnwrap(inspector.aiAssistantViewController)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertTrue(panel.contextTextForTesting.contains("second@example.com"))
+
+        workspace.selectTabForTesting(0)
+
+        XCTAssertTrue(waitUntil {
+            panel.contextTextForTesting.contains("first@example.com")
+                && panel.conversationRuntimeReadyForTesting
+        })
+    }
+
+    func testInspectorAISectionKeepsFullHeightAfterColumnFrameSync() throws {
+        let inspector = InspectorViewController()
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 900))
+
+        inspector.loadView()
+        host.addSubview(inspector.view)
+        inspector.view.frame = host.bounds
+        inspector.view.autoresizingMask = [.width, .height]
+        host.layoutSubtreeIfNeeded()
+
+        let aiIndex = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.AI.title))
+        inspector.selectSectionForTesting(aiIndex)
+        inspector.synchronizeSelectedSectionLayoutAfterColumnResize(hostView: host)
+        host.layoutSubtreeIfNeeded()
+
+        let aiView = try XCTUnwrap(inspector.aiAssistantViewController?.view)
+        let conversation = try XCTUnwrap(aiView.firstSubview(withIdentifier: "Stacio.AI.conversation"))
+        let composer = try XCTUnwrap(aiView.firstSubview(withIdentifier: "Stacio.AI.composer"))
+
+        XCTAssertGreaterThan(aiView.frame.height, 760)
+        XCTAssertGreaterThan(conversation.frame.height, 560)
+        XCTAssertEqual(composer.frame.minY, 14, accuracy: 1)
+    }
+
+    func testWorkbenchWindowKeepsWorkbenchContentOutOfAppKitContentSizeNegotiation() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertNil(window.contentViewController)
+        XCTAssertTrue(controller.contentSplitViewController.view.isDescendant(of: try XCTUnwrap(window.contentView)))
+    }
+
+    func testWorkbenchWindowAllowsVerticalResizingForCompactDisplays() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertTrue(window.styleMask.contains(.resizable))
+        XCTAssertLessThanOrEqual(window.minSize.width, 1)
+        XCTAssertLessThanOrEqual(window.minSize.height, 1)
+        XCTAssertEqual(window.contentMinSize.width, 0, accuracy: 1)
+        XCTAssertEqual(window.contentMinSize.height, 0, accuracy: 1)
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+        XCTAssertGreaterThan(window.maxSize.height, 10_000)
+        let proposedSize = NSSize(width: 900, height: 235)
+        let acceptedSize = controller.windowWillResize(
+            window,
+            to: proposedSize
+        )
+        XCTAssertEqual(acceptedSize.width, proposedSize.width, accuracy: 1)
+        XCTAssertEqual(acceptedSize.height, proposedSize.height, accuracy: 1)
+    }
+
+    func testWorkbenchWindowCanShrinkAfterManualResizeWithoutPinnedContentConstraints() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let expandedFrame = NSRect(
+            x: window.frame.minX,
+            y: window.frame.minY - 320,
+            width: window.frame.width + 420,
+            height: window.frame.height + 320
+        )
+
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        _ = controller.windowWillResize(window, to: expandedFrame.size)
+        window.setFrame(expandedFrame, display: false)
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+
+        let shrinkTarget = NSRect(
+            x: expandedFrame.minX,
+            y: expandedFrame.maxY - 430,
+            width: 760,
+            height: 430
+        )
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        let acceptedSize = controller.windowWillResize(window, to: shrinkTarget.size)
+        window.setFrame(NSRect(origin: shrinkTarget.origin, size: acceptedSize), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+
+        XCTAssertLessThan(window.frame.width, expandedFrame.width - 100)
+        XCTAssertLessThan(window.frame.height, expandedFrame.height - 100)
+        XCTAssertEqual(window.frame.width, shrinkTarget.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, shrinkTarget.height, accuracy: 1)
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+    }
+
+    func testWorkbenchWindowKeepsSystemZoomResizeInsteadOfRestoringManagedFrame() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let zoomedFrame = NSRect(
+            x: window.frame.minX - 80,
+            y: window.frame.minY - 180,
+            width: window.frame.width + 360,
+            height: window.frame.height + 260
+        )
+
+        window.setFrame(zoomedFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+
+        XCTAssertEqual(window.frame.width, zoomedFrame.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, zoomedFrame.height, accuracy: 1)
+    }
+
+    func testWorkbenchWindowAcceptsSystemZoomTargetWithoutManagedRestore() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let startingFrame = NSRect(
+            x: window.frame.minX + 80,
+            y: window.frame.minY + 80,
+            width: 1280,
+            height: 680
+        )
+        window.setFrame(startingFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        let zoomTarget = NSRect(
+            x: startingFrame.minX - 40,
+            y: startingFrame.minY - 120,
+            width: startingFrame.width + 280,
+            height: startingFrame.height + 220
+        )
+        XCTAssertTrue(controller.windowShouldZoom(window, toFrame: zoomTarget))
+        window.setFrame(zoomTarget, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(window.frame.width, zoomTarget.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, zoomTarget.height, accuracy: 1)
+    }
+
+    func testWorkbenchContentFillsWindowAfterManualVerticalResize() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let expandedFrame = NSRect(
+            x: window.frame.minX,
+            y: window.frame.minY - 360,
+            width: window.frame.width + 420,
+            height: window.frame.height + 360
+        )
+
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        window.setFrame(expandedFrame, display: false)
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let contentBounds = try XCTUnwrap(window.contentView).bounds
+        let splitFrame = controller.contentSplitViewController.view.frame
+        XCTAssertEqual(splitFrame.origin.x, contentBounds.origin.x, accuracy: 1)
+        XCTAssertEqual(splitFrame.origin.y, contentBounds.origin.y, accuracy: 1)
+        XCTAssertEqual(splitFrame.width, contentBounds.width, accuracy: 1)
+        XCTAssertEqual(splitFrame.height, contentBounds.height, accuracy: 1)
+
+        let splitSubviews = controller.contentSplitViewController.splitView.arrangedSubviews
+        XCTAssertGreaterThanOrEqual(splitSubviews.count, 2)
+        for subview in splitSubviews where subview.isHidden == false {
+            XCTAssertEqual(subview.frame.origin.y, contentBounds.origin.y, accuracy: 1)
+            XCTAssertEqual(subview.frame.height, contentBounds.height, accuracy: 1)
+        }
+    }
+
+    func testWorkbenchWindowStillAllowsVerticalResizingAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "172.16.10.250",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let workbenchWindowCountBefore = NSApplication.shared.windows.filter { $0.title == "Stacio" }.count
+        let frameBeforeStart = window.frame
+        let minSizeBeforeStart = window.minSize
+        let contentMinSizeBeforeStart = window.contentMinSize
+
+        try controller.startRemoteSession(config: context.config, title: "root@172.16.10.250")
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+
+        XCTAssertTrue(workspace.currentTerminalPane is RemoteTerminalPaneViewController)
+        XCTAssertEqual(NSApplication.shared.windows.filter { $0.title == "Stacio" }.count, workbenchWindowCountBefore)
+        XCTAssertIdentical(controller.window, window)
+        XCTAssertEqual(window.minSize.width, minSizeBeforeStart.width, accuracy: 1)
+        XCTAssertEqual(window.minSize.height, minSizeBeforeStart.height, accuracy: 1)
+        XCTAssertEqual(window.contentMinSize.width, contentMinSizeBeforeStart.width, accuracy: 1)
+        XCTAssertEqual(window.contentMinSize.height, contentMinSizeBeforeStart.height, accuracy: 1)
+        XCTAssertEqual(window.frame.width, frameBeforeStart.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, frameBeforeStart.height, accuracy: 1)
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+        XCTAssertTrue(window.styleMask.contains(.resizable))
+        XCTAssertLessThanOrEqual(window.minSize.height, 1)
+        XCTAssertGreaterThan(window.maxSize.height, 10_000)
+
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        let proposedSize = NSSize(width: 820, height: 420)
+        let acceptedSize = controller.windowWillResize(
+            window,
+            to: proposedSize
+        )
+        XCTAssertEqual(acceptedSize.width, proposedSize.width, accuracy: 1)
+        XCTAssertEqual(acceptedSize.height, proposedSize.height, accuracy: 1)
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+    }
+
+    func testWorkbenchWindowActuallyShrinksVerticallyAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "172.16.10.250",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let expandedFrameBeforeStart = NSRect(
+            x: window.frame.minX,
+            y: window.frame.maxY - 720,
+            width: max(window.frame.width, 1120),
+            height: 720
+        )
+        window.setFrame(expandedFrameBeforeStart, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        try controller.startRemoteSession(config: context.config, title: "root@172.16.10.250")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+        let frameBeforeResize = window.frame
+        let targetHeight = max(window.minSize.height + 40, frameBeforeResize.height - 180)
+        let targetWidth = max(window.minSize.width + 40, frameBeforeResize.width - 80)
+        XCTAssertLessThan(targetHeight, frameBeforeResize.height)
+        XCTAssertLessThan(targetWidth, frameBeforeResize.width)
+        let proposedSize = NSSize(width: targetWidth, height: targetHeight)
+
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        let acceptedSize = controller.windowWillResize(window, to: proposedSize)
+        let resizedFrame = NSRect(
+            x: frameBeforeResize.minX,
+            y: frameBeforeResize.maxY - acceptedSize.height,
+            width: acceptedSize.width,
+            height: acceptedSize.height
+        )
+        window.setFrame(resizedFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertLessThan(window.frame.height, frameBeforeResize.height - 100)
+        XCTAssertLessThan(window.frame.width, frameBeforeResize.width - 40)
+        XCTAssertEqual(window.frame.width, acceptedSize.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, acceptedSize.height, accuracy: 1)
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+    }
+
+    func testWorkbenchWindowAcceptsSystemZoomTargetAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "172.16.10.250",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        let frameBeforeZoom = window.frame
+        try controller.startRemoteSession(config: context.config, title: "root@172.16.10.250")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        let zoomFrame = NSRect(
+            x: window.frame.minX - 60,
+            y: window.frame.minY - 120,
+            width: window.frame.width + 240,
+            height: window.frame.height + 220
+        )
+
+        XCTAssertTrue(controller.windowShouldZoom(window, toFrame: zoomFrame))
+        window.setFrame(zoomFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(window.frame.width, zoomFrame.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, zoomFrame.height, accuracy: 1)
+
+        XCTAssertTrue(controller.windowShouldZoom(window, toFrame: frameBeforeZoom))
+        window.setFrame(frameBeforeZoom, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(window.frame.width, frameBeforeZoom.width, accuracy: 1)
+        XCTAssertEqual(window.frame.height, frameBeforeZoom.height, accuracy: 1)
+    }
+
+    func testWorkbenchTitlebarDoubleClickZoomUsesVisibleDesktopAreaAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "192.168.124.100",
+                port: 22,
+                username: "FengLee",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        try controller.startRemoteSession(config: context.config, title: "192.168.124.100")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        let visibleFrame = try XCTUnwrap((window.screen ?? NSScreen.main)?.visibleFrame)
+        let preZoomFrame = visibleFrame.insetBy(
+            dx: min(80, visibleFrame.width * 0.08),
+            dy: min(120, visibleFrame.height * 0.16)
+        )
+        window.setFrame(preZoomFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let acceptedPreZoomFrame = window.frame
+
+        window.performZoom(nil)
+
+        XCTAssertTrue(waitUntil { window.isZoomed })
+        assertWindowFrame(window, equals: visibleFrame)
+        let contentBounds = try XCTUnwrap(window.contentView).bounds
+        XCTAssertEqual(controller.contentSplitViewController.view.frame.width, contentBounds.width, accuracy: 1)
+        XCTAssertEqual(controller.contentSplitViewController.view.frame.height, contentBounds.height, accuracy: 1)
+
+        window.performZoom(nil)
+
+        XCTAssertTrue(waitUntil { window.isZoomed == false })
+        assertWindowFrame(window, equals: acceptedPreZoomFrame)
+    }
+
+    func testWorkbenchContentFillsWindowAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "172.16.10.250",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+
+        _ = try controller.startRemoteSession(config: context.config, title: "root@172.16.10.250")
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+
+        let contentBounds = try XCTUnwrap(window.contentView).bounds
+        let splitFrame = controller.contentSplitViewController.view.frame
+        XCTAssertEqual(splitFrame.origin.x, contentBounds.origin.x, accuracy: 1)
+        XCTAssertEqual(splitFrame.origin.y, contentBounds.origin.y, accuracy: 1)
+        XCTAssertEqual(splitFrame.width, contentBounds.width, accuracy: 1)
+        XCTAssertEqual(splitFrame.height, contentBounds.height, accuracy: 1)
+
+        let internalSplitFrame = controller.contentSplitViewController.splitView.frame
+        XCTAssertEqual(internalSplitFrame.width, contentBounds.width, accuracy: 1)
+        XCTAssertEqual(internalSplitFrame.height, contentBounds.height, accuracy: 1)
+
+        let remotePane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertNotNil(window.contentView?.firstSubview(withIdentifier: "Stacio.Metrics.dashboard.\(remotePane.runtimeID)"))
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+    }
+
+    func testWorkbenchWindowFrameStaysUserControlledAcrossSSHInspectorFilesTunnelsAndMetricsStates() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FrameStability.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "172.16.10.250",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/root/app.log", size: 64, linkTarget: nil)
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            remoteSessionStarter: starter,
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 220, y: 240, width: 900, height: 430)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        try controller.startRemoteSession(config: context.config, title: "root@172.16.10.250")
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        assertWindowFrame(window, equals: userFrame)
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        assertWindowFrame(window, equals: userFrame)
+
+        controller.showTunnelsFromToolbar(nil)
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        assertWindowFrame(window, equals: userFrame)
+
+        controller.toggleDeviceDashboardFromToolbar(nil)
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testWorkbenchWindowClampsStaleShortManagedFrame() throws {
+        let autosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.\(UUID().uuidString)")
+        let defaultsKey = managedWorkbenchFrameDefaultsKey(autosaveName)
+        UserDefaults.standard.set("283 677 1100 235 0 0 1800 1130 ", forKey: defaultsKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            frameAutosaveName: autosaveName
+        )
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertGreaterThanOrEqual(window.frame.height, window.minSize.height)
+        XCTAssertLessThanOrEqual(window.minSize.height, 1)
+    }
+
+    func testWorkbenchWindowClampsStaleOversizedManagedFrameToVisibleScreen() throws {
+        let autosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.\(UUID().uuidString)")
+        let defaultsKey = managedWorkbenchFrameDefaultsKey(autosaveName)
+        UserDefaults.standard.set("0 0 5000 4000 0 0 1800 1130 ", forKey: defaultsKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            frameAutosaveName: autosaveName
+        )
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let visibleFrame = try XCTUnwrap((window.screen ?? NSScreen.main)?.visibleFrame)
+        XCTAssertLessThanOrEqual(window.frame.width, max(window.minSize.width, visibleFrame.width) + 1)
+        XCTAssertLessThanOrEqual(window.frame.height, max(window.minSize.height, visibleFrame.height) + 1)
+    }
+
+    func testWorkbenchWindowRewritesOffscreenManagedFrameAfterClamping() throws {
+        let autosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.\(UUID().uuidString)")
+        let defaultsKey = managedWorkbenchFrameDefaultsKey(autosaveName)
+        let visibleFrame = try XCTUnwrap(NSScreen.main?.visibleFrame)
+        let staleFrame = NSRect(
+            x: visibleFrame.maxX + 120,
+            y: visibleFrame.maxY + 120,
+            width: visibleFrame.width + 760,
+            height: visibleFrame.height + 480
+        )
+        UserDefaults.standard.set(NSStringFromRect(staleFrame), forKey: defaultsKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            frameAutosaveName: autosaveName
+        )
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let rewrittenFrame = NSRectFromString(try XCTUnwrap(UserDefaults.standard.string(forKey: defaultsKey)))
+        XCTAssertFalse(rewrittenFrame.equalTo(staleFrame))
+        assertWindowFrame(window, equals: rewrittenFrame)
+    }
+
+    func testWorkbenchWindowDefaultManagedFrameIgnoresLegacyNativeAutosave() throws {
+        let legacyDefaultsKey = "NSWindow Frame Stacio.WorkbenchWindow"
+        let legacyV2DefaultsKey = "NSWindow Frame Stacio.WorkbenchWindow.v2"
+        UserDefaults.standard.set("283 677 1100 235 0 0 1800 1130 ", forKey: legacyDefaultsKey)
+        UserDefaults.standard.set("283 677 1100 235 0 0 1800 1130 ", forKey: legacyV2DefaultsKey)
+        defer {
+            UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
+            UserDefaults.standard.removeObject(forKey: legacyV2DefaultsKey)
+        }
+        let controller = WorkbenchWindowController(workspaceViewController: WorkspaceViewController())
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertGreaterThanOrEqual(window.frame.height, window.minSize.height)
+        XCTAssertNil(UserDefaults.standard.object(forKey: legacyDefaultsKey))
+        XCTAssertNil(UserDefaults.standard.object(forKey: legacyV2DefaultsKey))
+    }
+
+    func testWorkbenchWindowUsesFullSizeContentForUnifiedMacToolbar() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        XCTAssertTrue(window.titlebarAppearsTransparent)
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        XCTAssertEqual(window.toolbarStyle, .unifiedCompact)
+    }
+
+    func testWorkbenchWindowPersistsManagedFrameOnlyAfterUserResize() throws {
+        let autosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.\(UUID().uuidString)")
+        let defaultsKey = managedWorkbenchFrameDefaultsKey(autosaveName)
+        defer {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            frameAutosaveName: autosaveName
+        )
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertFalse(window.isRestorable)
+        XCTAssertNil(UserDefaults.standard.object(forKey: defaultsKey))
+
+        controller.windowWillStartLiveResize(Notification(name: NSWindow.willStartLiveResizeNotification, object: window))
+        let userFrame = NSRect(
+            x: window.frame.minX,
+            y: window.frame.maxY - 650,
+            width: 1200,
+            height: 650
+        )
+        window.setFrame(userFrame, display: false)
+        controller.windowDidEndLiveResize(Notification(name: NSWindow.didEndLiveResizeNotification, object: window))
+
+        let storedValue = try XCTUnwrap(UserDefaults.standard.string(forKey: defaultsKey))
+        let storedFrame = NSRectFromString(storedValue)
+        XCTAssertEqual(storedFrame.width, userFrame.width, accuracy: 1)
+        XCTAssertEqual(storedFrame.height, userFrame.height, accuracy: 1)
+    }
+
+    func testWorkbenchWindowDoesNotFocusSidebarSearchOnLaunch() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let window = try XCTUnwrap(controller.window)
+        let searchField = try XCTUnwrap(
+            window.contentView?.firstSubview(withIdentifier: "Stacio.Sidebar.search") as? NSSearchField
+        )
+
+        window.makeKeyAndOrderFront(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertNotIdentical(window.initialFirstResponder, searchField)
+        XCTAssertNotEqual(searchField.currentEditor(), window.firstResponder)
+    }
+
+    func testWorkbenchSplitViewUsesFlushDocumentPaneSpacing() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let splitView = controller.contentSplitViewController.splitView
+        let sidebarItem = controller.contentSplitViewController.splitViewItems[0]
+        XCTAssertEqual(splitView.dividerStyle, .thin)
+        XCTAssertLessThanOrEqual(splitView.dividerThickness, 8)
+        XCTAssertEqual(sidebarItem.behavior, .default)
+        XCTAssertTrue(sidebarItem.canCollapse)
+        XCTAssertEqual(sidebarItem.minimumThickness, 220)
+        XCTAssertEqual(sidebarItem.maximumThickness, 320)
+        XCTAssertEqual(sidebarItem.preferredThicknessFraction, 0.20)
+    }
+
+    func testWorkbenchSidebarKeepsReadableDefaultWidthWithoutLockingWindowSize() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let window = try XCTUnwrap(controller.window)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let sidebarView = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.first)
+        XCTAssertFalse(sidebarView.isHidden)
+        XCTAssertGreaterThanOrEqual(sidebarView.frame.width, 220)
+        XCTAssertLessThanOrEqual(window.minSize.width, 1)
+        XCTAssertLessThanOrEqual(window.minSize.height, 1)
+        XCTAssertEqual(rootMinimumConstraintCount(in: window), 0)
+
+        let proposedSize = NSSize(width: 520, height: 300)
+        let acceptedSize = controller.windowWillResize(window, to: proposedSize)
+        XCTAssertEqual(acceptedSize.width, proposedSize.width, accuracy: 1)
+        XCTAssertEqual(acceptedSize.height, proposedSize.height, accuracy: 1)
+    }
+
+    func testWorkbenchSidebarStaysReadableAfterOpeningSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "192.168.124.100",
+                port: 22,
+                username: "FengLee",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let frameBeforeStart = window.frame
+
+        try controller.startRemoteSession(config: context.config, title: "192.168.124.100")
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let sidebarView = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.first)
+        XCTAssertFalse(sidebarView.isHidden)
+        XCTAssertGreaterThanOrEqual(sidebarView.frame.width, 220)
+        assertWindowFrame(window, equals: frameBeforeStart)
+    }
+
+    func testWorkbenchSidebarStaysReadableWhenInspectorOpensAndClosesAfterSSHSession() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "192.168.124.100",
+                port: 22,
+                username: "FengLee",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RemoteSSHSessionCoordinator(
+            contextBuilder: RecordingWorkbenchTunnelContextBuilder(context: context),
+            liveShellStarter: HostRuntimeLiveShellStarter(),
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-tests.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteSessionStarter: starter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        try controller.startRemoteSession(config: context.config, title: "192.168.124.100")
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let frameAfterSessionStart = window.frame
+        let terminalView = try XCTUnwrap(
+            (workspace.currentTerminalPane as? RemoteTerminalPaneViewController)?.terminalView
+        )
+        workspace.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        terminalView.beginFrameSizeTransitionTrackingForTesting()
+
+        controller.toggleInspectorFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let sidebarView = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.first)
+        XCTAssertFalse(sidebarView.isHidden)
+        XCTAssertGreaterThanOrEqual(sidebarView.frame.width, 220)
+        assertWindowFrame(window, equals: frameAfterSessionStart)
+        XCTAssertEqual(
+            terminalView.distinctFrameSizeTransitionsForTesting.count,
+            1,
+            "sizes=\(terminalView.distinctFrameSizeTransitionsForTesting)"
+        )
+
+        terminalView.beginFrameSizeTransitionTrackingForTesting()
+        controller.toggleInspectorFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertGreaterThanOrEqual(sidebarView.frame.width, 220)
+        assertWindowFrame(window, equals: frameAfterSessionStart)
+        XCTAssertEqual(
+            terminalView.distinctFrameSizeTransitionsForTesting.count,
+            1,
+            "sizes=\(terminalView.distinctFrameSizeTransitionsForTesting)"
+        )
+    }
+
+    func testWorkbenchSidebarDragKeepsWidthAfterLayoutAndRestoresIt() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.SidebarDragTest.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+
+        let firstController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        firstController.showWindow(nil)
+        defer { firstController.close() }
+        let firstWindow = try XCTUnwrap(firstController.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 1_400, height: 860)
+        firstWindow.setFrame(userFrame, display: false)
+        firstController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: firstWindow))
+        firstWindow.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let firstSplitView = firstController.contentSplitViewController.splitView
+        let firstPinnedSplitView = try XCTUnwrap(firstSplitView as? StacioPinnedSplitView)
+        firstPinnedSplitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = firstController.contentSplitViewController.splitView(
+                firstSplitView,
+                constrainSplitPosition: 300,
+                ofSubviewAt: 0
+            )
+            firstSplitView.setPosition(constrainedPosition, ofDividerAt: 0)
+        }
+        firstWindow.layoutIfNeeded()
+        firstSplitView.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let firstDraggedWidth = try XCTUnwrap(firstSplitView.arrangedSubviews.first).frame.width
+        XCTAssertEqual(firstDraggedWidth, 300, accuracy: 3)
+
+        firstPinnedSplitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = firstController.contentSplitViewController.splitView(
+                firstSplitView,
+                constrainSplitPosition: 280,
+                ofSubviewAt: 0
+            )
+            firstSplitView.setPosition(constrainedPosition, ofDividerAt: 0)
+        }
+        firstWindow.layoutIfNeeded()
+        firstSplitView.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let draggedWidth = try XCTUnwrap(firstSplitView.arrangedSubviews.first).frame.width
+        XCTAssertEqual(draggedWidth, 280, accuracy: 3)
+        firstController.saveSplitColumnWidthsForTesting()
+        XCTAssertEqual(
+            UserDefaults.standard.double(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar")),
+            draggedWidth,
+            accuracy: 3
+        )
+
+        let secondController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        secondController.showWindow(nil)
+        defer { secondController.close() }
+        let secondWindow = try XCTUnwrap(secondController.window)
+        secondWindow.setFrame(userFrame, display: false)
+        secondController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: secondWindow))
+        secondWindow.layoutIfNeeded()
+        secondController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let restoredWidth = try XCTUnwrap(secondController.contentSplitViewController.splitView.arrangedSubviews.first).frame.width
+        XCTAssertEqual(restoredWidth, draggedWidth, accuracy: 3)
+    }
+
+    func testWorkbenchSidebarDragClampsToReadableBounds() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 80, y: 120, width: 1_400, height: 860), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let pinnedSplitView = try XCTUnwrap(splitView as? StacioPinnedSplitView)
+        pinnedSplitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = controller.contentSplitViewController.splitView(
+                splitView,
+                constrainSplitPosition: -100,
+                ofSubviewAt: 0
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 0)
+        }
+        splitView.layoutSubtreeIfNeeded()
+        let minimumClampedWidth = splitView.arrangedSubviews.first?.frame.width ?? 0
+        XCTAssertGreaterThanOrEqual(minimumClampedWidth, 220)
+        XCTAssertLessThanOrEqual(minimumClampedWidth, 320)
+
+        pinnedSplitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = controller.contentSplitViewController.splitView(
+                splitView,
+                constrainSplitPosition: 1_000,
+                ofSubviewAt: 0
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 0)
+        }
+        splitView.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThanOrEqual(splitView.arrangedSubviews.first?.frame.width ?? 0, 220)
+    }
+
+    func testWorkbenchSidebarDragPreservesMinimumWorkspaceWhenInspectorIsWide() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.SidebarInspectorDragTest.\(UUID().uuidString)")
+        defer { clearWorkbenchEditorDefaults(frameAutosaveName: frameAutosaveName) }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 80, y: 120, width: 1_400, height: 860), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let pinnedSplitView = try XCTUnwrap(splitView as? StacioPinnedSplitView)
+        let inspectorWidth: CGFloat = 1_000
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - inspectorWidth - splitView.dividerThickness
+        )
+        pinnedSplitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = controller.contentSplitViewController.splitView(
+                splitView,
+                constrainSplitPosition: 320,
+                ofSubviewAt: 0
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 0)
+        }
+        splitView.layoutSubtreeIfNeeded()
+
+        let sidebarWidth = try XCTUnwrap(splitView.arrangedSubviews.first).frame.width
+        let workspaceWidth = try XCTUnwrap(splitView.arrangedSubviews[1]).frame.width
+        let restoredInspectorWidth = try XCTUnwrap(splitView.arrangedSubviews[2]).frame.width
+        XCTAssertGreaterThanOrEqual(sidebarWidth, 220)
+        XCTAssertGreaterThan(workspaceWidth, 0, "sidebar drag must preserve workspace content")
+        XCTAssertLessThanOrEqual(
+            restoredInspectorWidth,
+            splitView.bounds.width - sidebarWidth - splitView.dividerThickness * 2 + 3
+        )
+    }
+
+    func testWorkbenchSidebarDragDoesNotExceedNarrowSplitViewWidth() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 80, y: 120, width: 180, height: 600), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        let splitView = controller.contentSplitViewController.splitView
+        splitView.setPosition(1_000, ofDividerAt: 0)
+        splitView.layoutSubtreeIfNeeded()
+
+        let sidebarWidth = try XCTUnwrap(splitView.arrangedSubviews.first).frame.width
+        XCTAssertLessThanOrEqual(sidebarWidth, splitView.bounds.width + 3)
+    }
+
+    func testWorkbenchInspectorOpensToCompactFilesWidthOnWideWindowWithoutChangingFrame() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 1600, height: 880)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.last)
+        XCTAssertFalse(inspectorView.isHidden)
+        XCTAssertGreaterThanOrEqual(inspectorView.frame.width, 300)
+        XCTAssertLessThanOrEqual(inspectorView.frame.width, 420)
+        XCTAssertLessThanOrEqual(controller.contentSplitViewController.splitViewItems[2].minimumThickness, 340)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testInspectorToolbarPanelsShareFilesDefaultWidth() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.SharedInspectorDefault.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 1600, height: 880)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let filesWidth = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.last).frame.width
+
+        controller.showFilesFromToolbar(nil)
+        controller.showTunnelsFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let tunnelsWidth = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.last).frame.width
+
+        controller.showTunnelsFromToolbar(nil)
+        controller.showAIAssistantFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let aiWidth = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.last).frame.width
+
+        XCTAssertEqual(filesWidth, tunnelsWidth, accuracy: 3)
+        XCTAssertEqual(filesWidth, aiWidth, accuracy: 3)
+        XCTAssertLessThanOrEqual(filesWidth, 420)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testInspectorToolbarPanelsDoNotLoopWindowLayoutOnFullDisplayCycle() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.InspectorDisplayCycle.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 0, y: 62, width: 1_800, height: 1_068)
+        window.setFrame(userFrame, display: true)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        let acceptedUserFrame = window.frame
+
+        controller.showFilesFromToolbar(nil)
+        controller.showAIAssistantFromToolbar(nil)
+        controller.showTunnelsFromToolbar(nil)
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+
+        let inspectorView = try XCTUnwrap(controller.contentSplitViewController.splitView.arrangedSubviews.last)
+        XCTAssertFalse(inspectorView.isHidden)
+        XCTAssertGreaterThan(inspectorView.frame.width, 0)
+        assertWindowFrame(window, equals: acceptedUserFrame)
+    }
+
+    func testWorkbenchInspectorOpensToUsableWidthOnMediumWindowWithoutChangingFrame() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 1020, height: 760)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        XCTAssertFalse(inspectorView.isHidden)
+        XCTAssertGreaterThanOrEqual(inspectorView.frame.width, 300)
+        XCTAssertLessThanOrEqual(inspectorView.frame.width, 360)
+
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 460 - splitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertGreaterThanOrEqual(inspectorView.frame.width, 430)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testFilesInspectorCanBeManuallyNarrowedAfterOpeningAndAfterBeingWidenedWithoutResizingWindow() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 40, y: 80, width: 2_048, height: 900)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let initialInspectorWidth = try XCTUnwrap(splitView.arrangedSubviews.last).frame.width
+        XCTAssertLessThanOrEqual(initialInspectorWidth, 420)
+
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - max(initialInspectorWidth + 260, 640) - splitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let widenedInspectorWidth = try XCTUnwrap(splitView.arrangedSubviews.last).frame.width
+        XCTAssertGreaterThan(widenedInspectorWidth, initialInspectorWidth + 180)
+        XCTAssertLessThanOrEqual(controller.contentSplitViewController.splitViewItems[2].minimumThickness, 340)
+
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 460 - splitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        XCTAssertLessThanOrEqual(inspectorView.frame.width, 520)
+
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 340 - splitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertLessThanOrEqual(inspectorView.frame.width, 520)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testInspectorDividerDragPathUpdatesPanelWidthBeforePinnedLayoutRefresh() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 40, y: 80, width: 2_048, height: 900)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        XCTAssertLessThanOrEqual(inspectorView.frame.width, 420)
+
+        let requestedInspectorWidth: CGFloat = 720
+        let proposedPosition = splitView.bounds.width - requestedInspectorWidth - splitView.dividerThickness
+        let constrainedPosition = controller.contentSplitViewController.splitView(
+            splitView,
+            constrainSplitPosition: proposedPosition,
+            ofSubviewAt: 1
+        )
+        XCTAssertEqual(constrainedPosition, proposedPosition, accuracy: 1)
+
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testInspectorDividerDragFinalizesImmediatelyWithoutDebouncedRepair() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showAIAssistantFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = try XCTUnwrap(splitController.splitView as? StacioPinnedSplitView)
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        let aiPanel = try XCTUnwrap(
+            controller.inspectorViewControllerForTesting?.aiAssistantViewController
+        )
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.selectedTabLabel, L10n.AI.title)
+        aiPanel.loadTranscriptEntriesForPerformanceTesting(count: 100)
+        inspectorView.layoutSubtreeIfNeeded()
+        let initialAITextWidth = try XCTUnwrap(aiPanel.appliedTranscriptTextWidthForTesting)
+        let requestedInspectorWidth: CGFloat = 720
+        let proposedPosition = splitView.bounds.width
+            - requestedInspectorWidth
+            - splitView.dividerThickness
+
+        let interactiveLayoutStart = CFAbsoluteTimeGetCurrent()
+        splitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = splitController.splitView(
+                splitView,
+                constrainSplitPosition: proposedPosition,
+                ofSubviewAt: 1
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 1)
+
+            XCTAssertEqual(
+                inspectorView.frame.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector width must follow the pointer before the divider drag ends"
+            )
+            XCTAssertEqual(
+                inspectorView.bounds.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector bounds must follow its interactive frame"
+            )
+            let inspectorContentRoot = try? XCTUnwrap(
+                controller.inspectorViewControllerForTesting?.view
+            )
+            XCTAssertTrue(
+                inspectorContentRoot?.superview === inspectorView,
+                "Inspector content hierarchy: root=\(String(describing: inspectorContentRoot?.frame)) "
+                    + "superview=\(String(describing: inspectorContentRoot?.superview?.frame)) "
+                    + "host=\(inspectorView.frame)"
+            )
+            XCTAssertEqual(
+                inspectorContentRoot?.frame.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector content root must follow the resized column"
+            )
+            XCTAssertEqual(
+                inspectorContentRoot?.bounds.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector content bounds must follow the resized column"
+            )
+            XCTAssertEqual(
+                controller.inspectorViewControllerForTesting?.contentContainerFrameForTesting.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector section container frame must follow the resized column"
+            )
+            XCTAssertEqual(
+                controller.inspectorViewControllerForTesting?.contentContainerBoundsForTesting.width ?? 0,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "Inspector section container bounds must follow the resized column"
+            )
+            XCTAssertEqual(
+                aiPanel.view.frame.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "AI panel must follow its inspector host before the drag ends"
+            )
+            XCTAssertEqual(
+                aiPanel.view.bounds.width,
+                requestedInspectorWidth,
+                accuracy: 3,
+                "AI panel bounds must follow its interactive frame"
+            )
+            let widthDuringDrag = aiPanel.appliedTranscriptTextWidthForTesting
+            XCTAssertNotNil(widthDuringDrag)
+            XCTAssertGreaterThan(
+                widthDuringDrag ?? 0,
+                initialAITextWidth + 100,
+                "Inspector content must reflow before the divider drag ends"
+            )
+        }
+        let interactiveLayoutDuration = CFAbsoluteTimeGetCurrent() - interactiveLayoutStart
+        print(String(format: "AI_INSPECTOR_DRAG_LAYOUT_PERF %.3fms", interactiveLayoutDuration * 1_000))
+        XCTAssertLessThan(
+            interactiveLayoutDuration,
+            0.016,
+            "A 100-message AI transcript must resize within one 60 Hz display frame"
+        )
+
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
+        XCTAssertFalse(controller.hasPendingInteractiveSplitResizeRepairForTesting)
+        XCTAssertFalse(controller.hasPendingSplitWidthPersistenceForTesting)
+    }
+
+    func testInspectorDividerTracksPointerWhenSidebarIsCollapsed() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showAIAssistantFromToolbar(nil)
+        controller.inspectorViewControllerForTesting?.selectAIAssistantTab()
+        controller.toggleSidebarFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = try XCTUnwrap(splitController.splitView as? StacioPinnedSplitView)
+        let sidebarView = try XCTUnwrap(splitView.arrangedSubviews.first)
+        let workspaceView = splitView.arrangedSubviews[1]
+        let inspectorView = splitView.arrangedSubviews[2]
+        XCTAssertTrue(sidebarView.isHidden)
+
+        let requestedWorkspaceWidth: CGFloat = 180
+        let proposedPosition = requestedWorkspaceWidth
+        let requestedInspectorWidth = splitView.bounds.width
+            - proposedPosition
+            - splitView.dividerThickness
+
+        splitView.performUserDividerDragTrackingForTesting {
+            let constrainedPosition = splitController.splitView(
+                splitView,
+                constrainSplitPosition: proposedPosition,
+                ofSubviewAt: 1
+            )
+            splitView.setPosition(constrainedPosition, ofDividerAt: 1)
+
+            XCTAssertEqual(constrainedPosition, proposedPosition, accuracy: 1)
+            XCTAssertEqual(workspaceView.frame.minX, 0, accuracy: 1)
+            XCTAssertEqual(workspaceView.frame.width, requestedWorkspaceWidth, accuracy: 2)
+            XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 2)
+            XCTAssertEqual(
+                workspaceView.frame.maxX + splitView.dividerThickness,
+                inspectorView.frame.minX,
+                accuracy: 1
+            )
+        }
+
+        XCTAssertEqual(workspaceView.frame.width, requestedWorkspaceWidth, accuracy: 2)
+        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 2)
+        XCTAssertEqual(
+            workspaceView.frame.maxX + splitView.dividerThickness,
+            inspectorView.frame.minX,
+            accuracy: 1
+        )
+    }
+
+    func testSwitchingExpandedInspectorPanelDoesNotResetDividerPosition() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 2_048, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        controller.showFilesFromToolbar(nil)
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+
+        let splitController = try XCTUnwrap(
+            controller.contentSplitViewController as? StacioPinnedSplitViewController
+        )
+        let splitView = splitController.splitView
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 720 - splitView.dividerThickness
+        )
+        let widthBeforeSwitch = inspectorView.frame.width
+        var setPositionCount = 0
+        splitController.afterPinnedSetPosition = { _, _, _ in
+            setPositionCount += 1
+        }
+
+        controller.showAIAssistantFromToolbar(nil)
+
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.selectedTabLabelForTesting, "AI")
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertEqual(setPositionCount, 0)
+        XCTAssertEqual(inspectorView.frame.width, widthBeforeSwitch, accuracy: 1)
+    }
+
+    func testPinnedSplitViewUsesWideDividerHitAreaForDragging() throws {
+        let proposedRect = NSRect(x: 596, y: 0, width: 8, height: 600)
+
+        let effectiveRect = StacioPinnedSplitViewController.expandedDividerEffectiveRect(
+            proposedRect,
+            isVertical: true
+        )
+
+        XCTAssertLessThanOrEqual(effectiveRect.minX, proposedRect.minX - 6)
+        XCTAssertGreaterThanOrEqual(effectiveRect.maxX, proposedRect.maxX + 6)
+        XCTAssertEqual(effectiveRect.minY, proposedRect.minY)
+        XCTAssertEqual(effectiveRect.maxY, proposedRect.maxY)
+    }
+
+    func testPinnedSplitViewRefreshDoesNotScheduleLayoutWhenFrameAlreadyMatchesContainer() throws {
+        let controller = StacioPinnedSplitViewController()
+        _ = controller.view
+        let container = try XCTUnwrap(controller.splitView.superview)
+        container.frame = NSRect(x: 0, y: 0, width: 960, height: 640)
+        controller.splitView.frame = container.bounds
+
+        let didRefresh = controller.portDeskRefreshPinnedSplitViewLayout()
+
+        XCTAssertFalse(didRefresh)
+        XCTAssertEqual(controller.splitView.frame, container.bounds)
+    }
+
+    func testPinnedSplitViewRunsAfterLayoutCallbackOutsideSplitViewLayoutPass() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+        controller.loadWindow()
+        let splitController = controller.contentSplitViewController as? StacioPinnedSplitViewController
+        let pinnedSplitController = try XCTUnwrap(splitController)
+        let splitView = try XCTUnwrap(pinnedSplitController.splitView as? StacioPinnedSplitView)
+        var callbackRanInsideLayout = false
+        var callbackCount = 0
+        pinnedSplitController.afterPinnedSplitViewLayout = { splitView in
+            callbackCount += 1
+            callbackRanInsideLayout = (splitView as? StacioPinnedSplitView)?.isPerformingLayoutPass == true
+        }
+
+        XCTAssertEqual(callbackCount, 0)
+        splitView.needsLayout = true
+        splitView.layoutSubtreeIfNeeded()
+        XCTAssertEqual(callbackCount, 0)
+
+        XCTAssertTrue(waitUntil { callbackCount == 1 })
+        XCTAssertFalse(callbackRanInsideLayout)
+    }
+
+    func testWorkbenchDoesNotInstallSeparateOverlayResizeHandleForInspectorDivider() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 1_640, height: 880), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertNil(window.contentView?.firstSubview(withIdentifier: "Stacio.Workbench.inspectorResizeHandle"))
+
+        controller.showTunnelsFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertNil(window.contentView?.firstSubview(withIdentifier: "Stacio.Workbench.inspectorResizeHandle"))
+
+        controller.showAIAssistantFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertNil(window.contentView?.firstSubview(withIdentifier: "Stacio.Workbench.inspectorResizeHandle"))
+    }
+
+    func testFilesInspectorContentFillsInspectorColumnAfterPanelIsWidened() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 40, y: 80, width: 2_048, height: 900)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 760 - splitView.dividerThickness
+        )
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        let filesFrame = files.view.convert(files.view.bounds, to: inspectorView)
+        let browserFrame = files.fileBrowserPaneViewForTesting.convert(
+            files.fileBrowserPaneViewForTesting.bounds,
+            to: inspectorView
+        )
+
+        XCTAssertEqual(filesFrame.minX, 0, accuracy: 1)
+        XCTAssertEqual(filesFrame.width, inspectorView.bounds.width, accuracy: 1)
+        XCTAssertEqual(browserFrame.minX, 0, accuracy: 1)
+        XCTAssertEqual(browserFrame.width, inspectorView.bounds.width, accuracy: 1)
+    }
+
+    func testInspectorRestoresUserAdjustedWidthForAllToolbarPanels() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.SharedInspectorStored.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+        let firstController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+
+        firstController.showWindow(nil)
+        defer { firstController.close() }
+        let firstWindow = try XCTUnwrap(firstController.window)
+        let userFrame = NSRect(x: 40, y: 80, width: 1_600, height: 860)
+        firstWindow.setFrame(userFrame, display: false)
+        firstController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: firstWindow))
+        firstController.showFilesFromToolbar(nil)
+        firstWindow.layoutIfNeeded()
+        firstController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let firstSplitView = firstController.contentSplitViewController.splitView
+        firstController.setInspectorDividerPositionForTesting(
+            firstSplitView.bounds.width - 460 - firstSplitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let savedInspectorWidth = try XCTUnwrap(firstSplitView.arrangedSubviews.last).frame.width
+        XCTAssertEqual(savedInspectorWidth, 460, accuracy: 3)
+        firstController.saveSplitColumnWidthsForTesting()
+
+        let secondController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        secondController.showWindow(nil)
+        defer { secondController.close() }
+        let secondWindow = try XCTUnwrap(secondController.window)
+        secondWindow.setFrame(userFrame, display: false)
+        secondController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: secondWindow))
+
+        secondController.showFilesFromToolbar(nil)
+        secondWindow.layoutIfNeeded()
+        secondController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let restoredInspectorWidth = try XCTUnwrap(secondController.contentSplitViewController.splitView.arrangedSubviews.last).frame.width
+        XCTAssertEqual(restoredInspectorWidth, savedInspectorWidth, accuracy: 3)
+        XCTAssertEqual(secondController.inspectorViewControllerForTesting?.selectedTabLabelForTesting, "文件")
+
+        secondController.showAIAssistantFromToolbar(nil)
+        secondWindow.layoutIfNeeded()
+        secondController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let widthAfterOpeningAI = try XCTUnwrap(
+            secondController.contentSplitViewController.splitView.arrangedSubviews.last
+        ).frame.width
+        XCTAssertEqual(widthAfterOpeningAI, restoredInspectorWidth, accuracy: 3)
+        XCTAssertNil(secondController.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertEqual(secondController.inspectorViewControllerForTesting?.selectedTabLabelForTesting, "AI")
+    }
+
+    func testWorkbenchInspectorDividerAllowsUserToWidenPanelWithoutResizingWindow() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let userFrame = NSRect(x: 40, y: 80, width: 2_048, height: 900)
+        window.setFrame(userFrame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+
+        controller.showFilesFromToolbar(nil)
+        window.layoutIfNeeded()
+        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let splitView = controller.contentSplitViewController.splitView
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - 1_420 - splitView.dividerThickness
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
+        XCTAssertGreaterThanOrEqual(inspectorView.frame.width, 1_380)
+        assertWindowFrame(window, equals: userFrame)
+    }
+
+    func testDockedEditorToolbarStaysBelowUnifiedWindowToolbar() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+
+        try harness.openLocalDocument(
+            name: "toolbar-safe-area.md",
+            contents: "# Ready\n"
+        )
+        harness.layout()
+
+        let contentView = try XCTUnwrap(harness.window.contentView)
+        let editorToolbar = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Editor.Toolbar")
+        )
+        let editorToolbarFrame = editorToolbar.convert(editorToolbar.bounds, to: contentView)
+        let contentLayoutFrame = contentView.convert(
+            harness.window.contentLayoutRect,
+            from: nil
+        )
+
+        XCTAssertLessThanOrEqual(
+            editorToolbarFrame.maxY,
+            contentLayoutFrame.maxY + 1,
+            "Docked editor controls must stay below the unified window toolbar"
+        )
+    }
+
+#if STACIO_AI_V2_UI_LEGACY_TESTS
+    func testDockedEditorAskAIKeepsAssistantFillingInspectorHeight() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+
+        let documentContents = "# Inspect this file\nattachment-only-marker\n"
+        try harness.openLocalDocument(
+            name: "ask-ai-layout.md",
+            contents: documentContents
+        )
+        harness.layout()
+
+        let contentView = try XCTUnwrap(harness.window.contentView)
+        let inspector = try XCTUnwrap(harness.controller.inspectorViewControllerForTesting)
+        let askAIButton = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Editor.Toolbar.askAI") as? NSButton
+        )
+
+        askAIButton.performClick(nil as Any?)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        harness.window.layoutIfNeeded()
+
+        let inspectorContent = try XCTUnwrap(
+            inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.content")
+        )
+        let aiView = try XCTUnwrap(inspector.aiAssistantViewController?.view)
+
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertEqual(aiView.frame.minY, inspectorContent.bounds.minY, accuracy: 1)
+        XCTAssertEqual(aiView.frame.height, inspectorContent.bounds.height, accuracy: 1)
+        XCTAssertGreaterThan(aiView.frame.height, inspector.view.bounds.height * 0.75)
+        XCTAssertEqual(
+            inspector.aiAssistantViewController?.composerAttachmentCardCountForTesting,
+            0
+        )
+        XCTAssertTrue(
+            inspector.aiAssistantViewController?.questionTextForTesting.contains("ask-ai-layout.md") == true
+        )
+        XCTAssertTrue(
+            inspector.aiAssistantViewController?.messageTextForTesting.contains("文件内容未附加") == true,
+            "message=\(inspector.aiAssistantViewController?.messageTextForTesting ?? "nil")"
+        )
+        XCTAssertFalse(
+            inspector.aiAssistantViewController?.questionTextForTesting.contains("attachment-only-marker") == true,
+            "编辑器正文不应作为可见问题文本进入 AI 对话流"
+        )
+    }
+#endif
+
+    func testEditorOpenCollapseExpandAndCloseNeverChangeInspectorOrFilesWidth() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+        let inspectorWidth = harness.inspectorWidth
+        let filesWidth = harness.filesWidth
+
+        try harness.openLocalDocument(name: "service.conf", contents: "enabled=true\n")
+        harness.layout()
+        let openWorkspaceWidth = harness.center.workspaceViewController.view.frame.width
+        let openEditorWidth = harness.center.editorSidecarWidthForTesting
+
+        XCTAssertEqual(openEditorWidth, 680, accuracy: 2)
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+
+        harness.presentation.collapseDockedEditor()
+        harness.layout()
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+
+        harness.presentation.expandDockedEditor()
+        harness.layout()
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+
+        XCTAssertEqual(
+            harness.presentation.requestClose(parentWindow: harness.window, completion: nil),
+            .ready
+        )
+        harness.layout()
+        XCTAssertTrue(harness.center.isEditorSidecarCollapsedForTesting)
+        XCTAssertEqual(harness.center.editorSidecarWidthForTesting, 0, accuracy: 0.5)
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+        XCTAssertGreaterThan(
+            harness.center.workspaceViewController.view.frame.width,
+            openWorkspaceWidth + openEditorWidth - 4
+        )
+    }
+
+    func testClosingOnlyEditorTabRemovesSidecarAndRestoresTerminalWidth() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_100,
+            inspectorWidth: 520
+        )
+        defer { harness.closeAndClearDefaults() }
+        try harness.openLocalDocument(name: "only.conf", contents: "enabled=true\n")
+        let editor = try XCTUnwrap(harness.presentation.currentEditor)
+
+        editor.closeDocumentForTesting(fileName: "only.conf")
+        harness.layout()
+
+        XCTAssertEqual(harness.presentation.snapshot.mode, .closed)
+        XCTAssertNil(harness.center.editorContentViewControllerForTesting)
+        XCTAssertTrue(harness.center.isEditorSidecarCollapsedForTesting)
+        XCTAssertEqual(harness.center.editorSidecarWidthForTesting, 0, accuracy: 0.5)
+        XCTAssertEqual(
+            harness.center.workspaceViewController.view.frame.width,
+            harness.center.view.bounds.width,
+            accuracy: 1
+        )
+    }
+
+    func testRepeatedDetachRedockKeepsWorkbenchAndSidecarWidthsStable() throws {
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 2_200,
+            inspectorWidth: 540
+        )
+        defer { harness.closeAndClearDefaults() }
+        try harness.openLocalDocument(name: "detach.conf", contents: "enabled=true\n")
+        harness.center.setEditorSidecarWidthForTesting(740, userInitiated: true)
+        harness.layout()
+
+        let editor = try XCTUnwrap(harness.presentation.currentEditor)
+        let inspectorWidth = harness.inspectorWidth
+        let filesWidth = harness.filesWidth
+        let sidecarTargetWidth = try XCTUnwrap(harness.presentationStore.sidecarTargetWidth())
+        XCTAssertEqual(sidecarTargetWidth, 740, accuracy: 2)
+        XCTAssertEqual(harness.center.editorSidecarWidthForTesting, sidecarTargetWidth, accuracy: 2)
+
+        for cycle in 0..<10 {
+            try harness.presentation.detachEditor()
+            harness.layout()
+
+            XCTAssertEqual(harness.presentation.snapshot.mode, .floating, "cycle \(cycle)")
+            XCTAssertTrue(harness.presentation.currentEditor === editor, "cycle \(cycle)")
+            XCTAssertTrue(harness.center.isEditorSidecarCollapsedForTesting, "cycle \(cycle)")
+            XCTAssertEqual(
+                harness.center.editorSidecarWidthForTesting,
+                0,
+                accuracy: 0.5,
+                "cycle \(cycle)"
+            )
+            XCTAssertEqual(
+                harness.center.workspaceViewController.view.frame.width,
+                harness.center.view.bounds.width,
+                accuracy: 1,
+                "cycle \(cycle)"
+            )
+            XCTAssertEqual(
+                harness.presentationStore.sidecarTargetWidth(),
+                sidecarTargetWidth,
+                "cycle \(cycle)"
+            )
+            assertWorkbenchEditorWidths(
+                harness,
+                inspector: inspectorWidth,
+                files: filesWidth,
+                message: "cycle \(cycle)"
+            )
+
+            try harness.presentation.redockEditor()
+            harness.layout()
+
+            XCTAssertEqual(harness.presentation.snapshot.mode, .docked, "cycle \(cycle)")
+            XCTAssertTrue(harness.presentation.currentEditor === editor, "cycle \(cycle)")
+            XCTAssertEqual(
+                harness.presentationStore.sidecarTargetWidth(),
+                sidecarTargetWidth,
+                "cycle \(cycle)"
+            )
+            XCTAssertEqual(
+                harness.center.editorSidecarWidthForTesting,
+                sidecarTargetWidth,
+                accuracy: 2,
+                "cycle \(cycle)"
+            )
+            assertWorkbenchEditorWidths(
+                harness,
+                inspector: inspectorWidth,
+                files: filesWidth,
+                message: "cycle \(cycle)"
+            )
+        }
+    }
+
+    func testFilesAndEditorWidthsUseIndependentKeysAcrossWorkbenchRecreation() throws {
+        let autosaveName = NSWindow.FrameAutosaveName(
+            "Stacio.Workbench.EditorIsolation.\(UUID().uuidString)"
+        )
+        let suiteName = "Stacio.Workbench.EditorIsolation.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            clearWorkbenchEditorDefaults(frameAutosaveName: autosaveName)
+        }
+
+        let first = try makeWorkbenchEditorHarness(
+            frameAutosaveName: autosaveName,
+            defaults: defaults,
+            windowWidth: 2_200,
+            inspectorWidth: 540
+        )
+        try first.openLocalDocument(name: "first.conf", contents: "a=1\n")
+        first.center.setEditorSidecarWidthForTesting(790, userInitiated: true)
+        XCTAssertEqual(first.center.editorSidecarWidthForTesting, 790, accuracy: 3)
+        XCTAssertEqual(first.presentationStore.sidecarTargetWidth(), 790)
+        first.controller.saveSplitColumnWidthsForTesting()
+        first.close()
+        XCTAssertEqual(first.presentationStore.sidecarTargetWidth(), 790)
+
+        let second = try makeWorkbenchEditorHarness(
+            frameAutosaveName: autosaveName,
+            defaults: defaults,
+            windowWidth: 2_200
+        )
+        defer { second.close() }
+        try second.openLocalDocument(name: "second.conf", contents: "b=2\n")
+        second.layout()
+
+        XCTAssertEqual(second.inspectorWidth, 540, accuracy: 3)
+        XCTAssertEqual(second.center.editorSidecarWidthForTesting, 790, accuracy: 3)
+        XCTAssertEqual(second.presentationStore.sidecarTargetWidth(), 790)
+    }
+
+    func testSmallScreenClampDoesNotOverwriteFilesOrEditorTargets() throws {
+        let visibleFrame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 900,
+            inspectorWidth: 420,
+            visibleFrame: visibleFrame,
+            savedEditorWidth: 760
+        )
+        defer { harness.closeAndClearDefaults() }
+
+        try harness.openLocalDocument(name: "small.conf", contents: "x=1\n")
+        harness.layout()
+
+        XCTAssertEqual(harness.presentationStore.sidecarTargetWidth(), 760)
+        XCTAssertEqual(harness.storedInspectorWidth, 420, accuracy: 3)
+        XCTAssertLessThan(harness.center.editorSidecarWidthForTesting, 760)
+
+        harness.resizeWindow(width: 1_900)
+
+        XCTAssertEqual(harness.center.editorSidecarWidthForTesting, 760, accuracy: 2)
+        XCTAssertEqual(harness.inspectorWidth, 420, accuracy: 2)
+        XCTAssertEqual(harness.presentationStore.sidecarTargetWidth(), 760)
+    }
+
+    func testWorkbenchGrowsOnlyForMissingDockedWidthAndDoesNotShrinkOnClose() throws {
+        let visibleFrame = NSRect(x: 0, y: 0, width: 2_000, height: 1_100)
+        let harness = try makeWorkbenchEditorHarness(
+            windowWidth: 1_200,
+            inspectorWidth: 420,
+            visibleFrame: visibleFrame,
+            savedEditorWidth: 760
+        )
+        defer { harness.closeAndClearDefaults() }
+        let inspectorWidth = harness.inspectorWidth
+        let filesWidth = harness.filesWidth
+        let windowWidthBeforeOpen = harness.window.frame.width
+
+        try harness.openLocalDocument(name: "growth.conf", contents: "x=1\n")
+        harness.layout()
+        let expandedWindowWidth = harness.window.frame.width
+
+        XCTAssertGreaterThan(expandedWindowWidth, windowWidthBeforeOpen)
+        XCTAssertLessThanOrEqual(expandedWindowWidth, visibleFrame.width)
+        XCTAssertEqual(harness.center.editorSidecarWidthForTesting, 760, accuracy: 2)
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+
+        XCTAssertEqual(
+            harness.presentation.requestClose(parentWindow: harness.window, completion: nil),
+            .ready
+        )
+        harness.layout()
+
+        XCTAssertEqual(harness.window.frame.width, expandedWindowWidth, accuracy: 1)
+        assertWorkbenchEditorWidths(
+            harness,
+            inspector: inspectorWidth,
+            files: filesWidth
+        )
+    }
+
+    func testWorkbenchRestoresManuallyAdjustedSidebarAndInspectorWidths() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.SplitWidthTest.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+
+        let firstController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        firstController.showWindow(nil as Any?)
+        defer { firstController.close() }
+        let firstWindow = try XCTUnwrap(firstController.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 1680, height: 860)
+        firstWindow.setFrame(userFrame, display: false)
+        firstController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: firstWindow))
+        firstController.showFilesFromToolbar(nil as Any?)
+        firstWindow.layoutIfNeeded()
+        firstController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let firstSplitView = firstController.contentSplitViewController.splitView
+        firstController.setInspectorDividerPositionForTesting(
+            firstSplitView.bounds.width - 640 - firstSplitView.dividerThickness
+        )
+        firstSplitView.setPosition(300, ofDividerAt: 0)
+        firstSplitView.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let savedSidebarWidth = firstSplitView.arrangedSubviews.first?.frame.width ?? 0
+        let savedInspectorWidth = firstSplitView.arrangedSubviews.last?.frame.width ?? 0
+        XCTAssertGreaterThan(savedSidebarWidth, 250)
+        XCTAssertGreaterThan(savedInspectorWidth, 580)
+        firstController.saveSplitColumnWidthsForTesting()
+
+        let secondController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        secondController.showWindow(nil as Any?)
+        defer { secondController.close() }
+        let secondWindow = try XCTUnwrap(secondController.window)
+        secondWindow.setFrame(userFrame, display: false)
+        secondController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: secondWindow))
+        secondController.showFilesFromToolbar(nil as Any?)
+        secondWindow.layoutIfNeeded()
+        secondController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let restoredSubviews = secondController.contentSplitViewController.splitView.arrangedSubviews
+        XCTAssertEqual(restoredSubviews.first?.frame.width ?? 0, savedSidebarWidth, accuracy: 3)
+        XCTAssertEqual(restoredSubviews.last?.frame.width ?? 0, savedInspectorWidth, accuracy: 3)
+    }
+
+    func testWorkbenchInspectorAllowsAndRestoresUserChosenExtremeWidth() throws {
+        let frameAutosaveName = NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.FreeInspectorWidthTest.\(UUID().uuidString)")
+        defer {
+            UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar"))
+            UserDefaults.standard.removeObject(forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector"))
+        }
+
+        let firstController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        firstController.showWindow(nil as Any?)
+        defer { firstController.close() }
+        let firstWindow = try XCTUnwrap(firstController.window)
+        let userFrame = NSRect(x: 80, y: 120, width: 2_400, height: 860)
+        firstWindow.setFrame(userFrame, display: false)
+        firstController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: firstWindow))
+        firstController.showFilesFromToolbar(nil as Any?)
+        firstWindow.layoutIfNeeded()
+        firstController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let realizedWindowFrame = firstWindow.frame
+
+        let firstSplitView = firstController.contentSplitViewController.splitView
+        let requestedInspectorWidth = min(1_900, max(0, firstSplitView.bounds.width - 500))
+        XCTAssertGreaterThan(requestedInspectorWidth, 1_500)
+        firstController.setInspectorDividerPositionForTesting(
+            firstSplitView.bounds.width - requestedInspectorWidth - firstSplitView.dividerThickness
+        )
+        firstSplitView.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let savedInspectorWidth = firstSplitView.arrangedSubviews.last?.frame.width ?? 0
+        XCTAssertEqual(savedInspectorWidth, requestedInspectorWidth, accuracy: 3)
+        firstController.saveSplitColumnWidthsForTesting()
+        XCTAssertEqual(
+            UserDefaults.standard.double(
+                forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector")
+            ),
+            Double(savedInspectorWidth),
+            accuracy: 3
+        )
+
+        let secondController = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            frameAutosaveName: frameAutosaveName
+        )
+        secondController.showWindow(nil as Any?)
+        defer { secondController.close() }
+        let secondWindow = try XCTUnwrap(secondController.window)
+        secondWindow.setFrame(realizedWindowFrame, display: false)
+        secondController.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: secondWindow))
+        secondController.showFilesFromToolbar(nil as Any?)
+        secondWindow.layoutIfNeeded()
+        secondController.contentSplitViewController.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let secondSplitView = secondController.contentSplitViewController.splitView
+        let restoredInspectorWidth = secondSplitView.arrangedSubviews.last?.frame.width ?? 0
+        let restoredSidebarWidth = secondSplitView.arrangedSubviews.first?.frame.width ?? 0
+        let maximumRestorableInspectorWidth = max(
+            0,
+            secondSplitView.bounds.width
+                - restoredSidebarWidth
+                - 248
+                - secondSplitView.dividerThickness * 2
+        )
+        XCTAssertEqual(
+            restoredInspectorWidth,
+            min(savedInspectorWidth, maximumRestorableInspectorWidth),
+            accuracy: 3
+        )
+    }
+
+    func testSidebarToolbarItemTogglesSourceListPane() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+
+        controller.toggleSidebarFromToolbar(nil)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+
+        controller.toggleSidebarFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+    }
+
+    func testSidebarToggleLivesAsFirstVisibleToolbarItemAndTogglesPane() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let toolbarItems = try XCTUnwrap(window.toolbar?.items)
+        XCTAssertEqual(toolbarItems.first?.itemIdentifier.rawValue, "Stacio.Toolbar.sidebar")
+        XCTAssertEqual(toolbarItems.dropFirst().first?.itemIdentifier, .flexibleSpace)
+        XCTAssertFalse(toolbarItems.contains {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.updatePrompt"
+        })
+
+        let sidebarButton = try sidebarToolbarButton(in: controller)
+
+        XCTAssertEqual(sidebarButton.toolTip, "显示或隐藏侧边栏\n快捷键：⌥⌘B")
+        XCTAssertEqual(sidebarButton.action, #selector(WorkbenchWindowController.toggleSidebarFromToolbar(_:)))
+        XCTAssertFalse(sidebarButton.isHidden)
+        XCTAssertEqual(sidebarButton.alphaValue, 1)
+        XCTAssertFalse(sidebarButton.isBordered)
+        XCTAssertNotNil(sidebarButton.image)
+        XCTAssertLessThanOrEqual(sidebarButton.frame.width, 26)
+        XCTAssertLessThanOrEqual(sidebarButton.frame.height, 26)
+        XCTAssertNil(sidebarButton.layer?.backgroundColor)
+        XCTAssertEqual(sidebarButton.layer?.borderWidth, 0)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+
+        sidebarButton.performClick(nil as Any?)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+
+        sidebarButton.performClick(nil as Any?)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[0].isCollapsed)
+    }
+
+    func testCollapsedSidebarTemporarilyExpandsWhilePointerHoversLeadingToggle() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let sidebarButton = try sidebarToolbarButton(in: controller)
+        let sidebarItem = controller.contentSplitViewController.splitViewItems[0]
+
+        sidebarButton.performClick(nil as Any?)
+        XCTAssertTrue(sidebarItem.isCollapsed)
+
+        sidebarButton.simulateTitlebarSidebarPointerExitedForTesting()
+        sidebarButton.simulateTitlebarSidebarPointerEnteredForTesting()
+
+        XCTAssertFalse(sidebarItem.isCollapsed)
+
+        sidebarButton.simulateTitlebarSidebarPointerExitedForTesting()
+
+        XCTAssertTrue(sidebarItem.isCollapsed)
+
+        sidebarButton.simulateTitlebarSidebarPointerEnteredForTesting()
+        sidebarButton.performClick(nil as Any?)
+        sidebarButton.simulateTitlebarSidebarPointerExitedForTesting()
+
+        XCTAssertFalse(sidebarItem.isCollapsed)
+    }
+
+    func testUpdateStatusAppearsAtSidebarBottomAndTracksDownloadProgress() throws {
+        let updateController = RecordingSparkleUpdateButtonController()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            sparkleUpdateController: updateController
+        )
+
+        controller.loadWindow()
+
+        let window = try XCTUnwrap(controller.window)
+        let identifiers = window.toolbar?.items.map(\.itemIdentifier.rawValue) ?? []
+        XCTAssertEqual(identifiers.first, "Stacio.Toolbar.sidebar")
+        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.updatePrompt"))
+        XCTAssertEqual(updateController.probeCount, 1)
+
+        let sidebar = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.first?.viewController as? SessionSidebarViewController)
+        let updateStatus = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatus"))
+        let updateStatusLabel = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatusLabel") as? NSTextField)
+        XCTAssertTrue(updateStatus.isHidden)
+
+        updateController.publish(.available(SparkleUpdatePromptInfo(version: "0.14.0", build: "50")))
+
+        XCTAssertFalse(updateStatus.isHidden)
+        XCTAssertEqual(updateStatusLabel.stringValue, "发现更新 0.14.0")
+        let clickEvent = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: controller.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
+        updateStatus.mouseDown(with: clickEvent)
+        XCTAssertEqual(updateController.installCount, 1)
+
+        updateController.publish(.downloading(progress: 0.12))
+
+        XCTAssertFalse(updateStatus.isHidden)
+        XCTAssertEqual(updateStatusLabel.stringValue, "正在下载 12%")
+
+        updateController.publish(.installing)
+
+        XCTAssertEqual(updateStatusLabel.stringValue, "正在安装")
+        XCTAssertFalse(updateStatus.isHidden)
+
+        updateController.publish(.hidden)
+        XCTAssertTrue(updateStatus.isHidden)
+        updateStatus.mouseDown(with: clickEvent)
+        XCTAssertEqual(updateController.installCount, 1)
+    }
+
+    func testSidebarUpdateStatusRemainsVisibleWhileUpdateIsInProgress() throws {
+        let updateController = RecordingSparkleUpdateButtonController()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            sparkleUpdateController: updateController
+        )
+
+        controller.loadWindow()
+
+        let sidebar = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.first?.viewController as? SessionSidebarViewController)
+        let updateStatus = try XCTUnwrap(sidebar.view.firstSubview(withIdentifier: "Stacio.Sidebar.updateStatus"))
+
+        updateController.publish(.downloading(progress: 0.42))
+        XCTAssertFalse(updateStatus.isHidden)
+
+        updateController.publish(.extracting(progress: 0.7))
+        XCTAssertFalse(updateStatus.isHidden)
+
+        updateController.publish(.installing)
+        XCTAssertFalse(updateStatus.isHidden)
+    }
+
+    func testShowWindowCreatesProgrammaticMainWindow() {
+        let controller = WorkbenchWindowController()
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        XCTAssertEqual(controller.window?.title, "Stacio")
+        XCTAssertTrue(controller.window?.isVisible ?? false)
+    }
+
+    func testToolbarContainsCoreCommands() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        XCTAssertEqual(controller.window?.toolbar?.displayMode, .iconOnly)
+        let items = controller.window?.toolbar?.items ?? []
+        let identifiers = items.map { $0.itemIdentifier.rawValue }
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.sidebar"))
+        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.quickConnect"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.newSession"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.split"))
+        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.closeTerminal"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.panels"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.files"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.browser"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.tunnels"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.deviceDashboard"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.aiAssistant"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.inspector"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.importSessions"))
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.multiExec"))
+        let commandItems = items.filter {
+            $0.itemIdentifier != .flexibleSpace && $0.itemIdentifier != .space
+        }
+        XCTAssertEqual(commandItems.map(\.label), ["侧边栏", "新建会话", "导入会话", "多执行", "分屏", "文件", "浏览器", "隧道", "设备看板", "AI", "更多", "检查器"])
+        XCTAssertEqual(
+            commandItems.map(\.toolTip),
+            [
+                "显示或隐藏侧边栏\n快捷键：⌥⌘B",
+                "新建会话\n快捷键：⇧⌘N",
+                "从其他终端工具导入会话",
+                "将输入同步执行到多个终端\n快捷键：⌘D",
+                "终端分屏布局\n快捷键：⌘1 / ⌘2 / ⌘3 / ⌘4",
+                "文件\n快捷键：⇧⌘F",
+                "浏览器\n快捷键：⇧⌘B",
+                "隧道\n快捷键：⇧⌘T",
+                "显示或隐藏当前 SSH 标签页设备看板\n快捷键：⇧⌘D",
+                "AI 助手\n快捷键：⇧⌘A",
+                "打开文件、浏览器、隧道、诊断、宏、历史命令、设备看板或 AI\n快捷键：⇧⌘F / ⇧⌘B / ⇧⌘T / ⇧⌘D / ⇧⌘L / ⇧⌘M / ⇧⌘H / ⇧⌘A",
+                "检查器"
+            ]
+        )
+        XCTAssertNil(items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.closeTerminal" })
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.files" }?.action,
+            #selector(WorkbenchWindowController.showFilesFromToolbar(_:))
+        )
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.browser" }?.action,
+            #selector(WorkbenchWindowController.showBrowserFromToolbar(_:))
+        )
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.tunnels" }?.action,
+            #selector(WorkbenchWindowController.showTunnelsFromToolbar(_:))
+        )
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.deviceDashboard" }?.action,
+            #selector(WorkbenchWindowController.toggleDeviceDashboardFromToolbar(_:))
+        )
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.aiAssistant" }?.action,
+            #selector(WorkbenchWindowController.showAIAssistantFromToolbar(_:))
+        )
+        let importItem = try XCTUnwrap(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.importSessions" } as? NSMenuToolbarItem
+        )
+        XCTAssertEqual(importItem.menu.items.map(\.title), [
+            "Stacio", "Xshell", "XTerminal", "MobaXterm", "WindTerm", "SecureCRT",
+            "FinalShell", "Termius", "Electerm", "JSON", "堡垒机"
+        ])
+        XCTAssertFalse(importItem.menu.autoenablesItems)
+        XCTAssertTrue(importItem.menu.delegate === SessionImportMenuAvailabilityDelegate.shared)
+        XCTAssertEqual(importItem.image?.accessibilityDescription, "导入外部会话")
+        XCTAssertFalse(importItem.showsIndicator)
+        let panelsItem = try XCTUnwrap(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem
+        )
+        let panelsMenu = try XCTUnwrap(panelsItem.menu)
+        let panelMenuItems = panelsMenu.items.filter { $0.isSeparatorItem == false }
+        XCTAssertEqual(panelMenuItems.map(\.title), ["文件", "浏览器", "隧道", "设备看板", "诊断", "宏", "历史命令", "AI"])
+        XCTAssertEqual(panelMenuItems.map(\.action), [
+            #selector(WorkbenchWindowController.showFilesFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showBrowserFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showTunnelsFromToolbar(_:)),
+            #selector(WorkbenchWindowController.toggleDeviceDashboardFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showDiagnosticsFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showTerminalMacrosFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showCommandHistoryFromToolbar(_:)),
+            #selector(WorkbenchWindowController.showAIAssistantFromToolbar(_:))
+        ])
+        XCTAssertEqual(
+            items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.inspector" }?.action,
+            #selector(WorkbenchWindowController.toggleInspectorFromToolbar(_:))
+        )
+    }
+
+    func testToolbarTooltipsAndMenusFollowShortcutChanges() throws {
+        let store = StacioShortcutStore.shared
+        let original = store.binding(for: .newSession)
+        defer { _ = store.set(original, for: .newSession) }
+
+        let controller = WorkbenchWindowController()
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        let newSession = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.newSession" }
+        )
+
+        XCTAssertTrue(newSession.toolTip?.contains(original.displayString) == true)
+        XCTAssertEqual(
+            store.set(.init(key: "k", modifiers: [.command, .option]), for: .newSession),
+            .none
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        XCTAssertTrue(newSession.toolTip?.contains("⌥⌘K") == true)
+
+        let split = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.split" }
+                as? NSMenuToolbarItem
+        )
+        let splitItems = split.menu.items.filter { $0.isSeparatorItem == false }
+        XCTAssertEqual(splitItems.map(\.keyEquivalent), ["1", "2", "3", "4"])
+        XCTAssertTrue(splitItems.allSatisfy { $0.keyEquivalentModifierMask == [.command] })
+        XCTAssertTrue(splitItems.allSatisfy { $0.toolTip?.contains("快捷键：") == true })
+    }
+
+    func testLicensedToolbarAndPanelItemsAreDisabledWithoutEntitlements() throws {
+        let access = MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            licenseAccess: access
+        )
+
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.validateVisibleItems()
+        for identifier in [
+            "Stacio.Toolbar.multiExec",
+            "Stacio.Toolbar.tunnels",
+            "Stacio.Toolbar.deviceDashboard",
+            "Stacio.Toolbar.aiAssistant"
+        ] {
+            let item = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == identifier })
+            XCTAssertFalse(item.isEnabled)
+            XCTAssertEqual(item.toolTip, L10n.Import.licenseUnavailableTooltip)
+        }
+
+        let panels = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem
+        )
+        let menu = try XCTUnwrap(panels.menu)
+        menu.delegate?.menuWillOpen?(menu)
+        for title in [L10n.Workbench.tunnels, L10n.Workbench.deviceDashboard, L10n.AI.title] {
+            let item = try XCTUnwrap(menu.item(withTitle: title))
+            XCTAssertFalse(item.isEnabled)
+            XCTAssertEqual(item.toolTip, L10n.Import.licenseUnavailableTooltip)
+        }
+    }
+
+    func testLicenseChangeImmediatelyEnablesLicensedToolbarItems() throws {
+        let access = MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(),
+            licenseAccess: access
+        )
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.validateVisibleItems()
+        let multiExec = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.multiExec" }
+        )
+        XCTAssertFalse(multiExec.isEnabled)
+
+        access.enabledFeatures = Set(StacioLicensedFeature.allCases)
+        NotificationCenter.default.post(name: .stacioLicenseAuthorizationDidChange, object: nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+        XCTAssertTrue(multiExec.isEnabled)
+        XCTAssertEqual(multiExec.toolTip, "\(L10n.Workbench.multiExecTooltip)\n快捷键：⌘D")
+    }
+
+    func testWorkspaceCapabilityToolbarAndPanelItemsFollowCurrentSessionProtocol() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+
+        controller.loadWindow()
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        let capabilityIdentifiers = [
+            "Stacio.Toolbar.files",
+            "Stacio.Toolbar.browser",
+            "Stacio.Toolbar.tunnels",
+            "Stacio.Toolbar.deviceDashboard",
+            "Stacio.Toolbar.aiAssistant"
+        ]
+        let enabledTooltips = [
+            "Stacio.Toolbar.files": "文件\n快捷键：⇧⌘F",
+            "Stacio.Toolbar.browser": "浏览器\n快捷键：⇧⌘B",
+            "Stacio.Toolbar.tunnels": "隧道\n快捷键：⇧⌘T",
+            "Stacio.Toolbar.deviceDashboard": "显示或隐藏当前 SSH 标签页设备看板\n快捷键：⇧⌘D",
+            "Stacio.Toolbar.aiAssistant": "AI 助手\n快捷键：⇧⌘A"
+        ]
+
+        func assertCapabilityItems(enabled: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+            toolbar.validateVisibleItems()
+            for identifier in capabilityIdentifiers {
+                let item = try XCTUnwrap(
+                    toolbar.items.first { $0.itemIdentifier.rawValue == identifier },
+                    file: file,
+                    line: line
+                )
+                XCTAssertEqual(item.isEnabled, enabled, identifier, file: file, line: line)
+                XCTAssertEqual(
+                    item.toolTip,
+                    enabled ? enabledTooltips[identifier] : L10n.Workbench.sshSessionRequiredTooltip,
+                    identifier,
+                    file: file,
+                    line: line
+                )
+            }
+
+            let panelsItem = try XCTUnwrap(
+                toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.panels" } as? NSMenuToolbarItem,
+                file: file,
+                line: line
+            )
+            let menu = try XCTUnwrap(panelsItem.menu, file: file, line: line)
+            menu.delegate?.menuWillOpen?(menu)
+            for title in [
+                L10n.Inspector.files,
+                L10n.Inspector.browser,
+                L10n.Workbench.tunnels,
+                L10n.Workbench.deviceDashboard,
+                L10n.Inspector.logs,
+                L10n.AI.title
+            ] {
+                let item = try XCTUnwrap(menu.item(withTitle: title), file: file, line: line)
+                XCTAssertEqual(item.isEnabled, enabled, title, file: file, line: line)
+                if enabled {
+                    XCTAssertTrue(item.toolTip?.contains("快捷键：") == true, title, file: file, line: line)
+                } else {
+                    XCTAssertEqual(item.toolTip, L10n.Workbench.sshSessionRequiredTooltip, title, file: file, line: line)
+                }
+            }
+        }
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_serial", status: "running", diagnostic: "running"),
+            title: "串口",
+            connectionKind: .serial
+        )
+        try assertCapabilityItems(enabled: false)
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_telnet", status: "running", diagnostic: "running"),
+            title: "Telnet",
+            connectionKind: .telnet
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = try workspace.openRemoteFilesSession(
+            context: workbenchLiveContext(host: "scp.example.com"),
+            title: "SCP",
+            bridge: filesBridge,
+            transferScheduler: nil
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = try workspace.openSFTPFilesSession(
+            context: workbenchLiveContext(host: "sftp.example.com"),
+            title: "SFTP",
+            bridge: filesBridge
+        )
+        try assertCapabilityItems(enabled: false)
+
+        _ = workspace.openConnectingGraphicsSession(
+            title: "VNC",
+            protocolName: "VNC",
+            host: "vnc.example.com",
+            port: 5900
+        )
+        try assertCapabilityItems(enabled: false)
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ssh", status: "running", diagnostic: "running"),
+            title: "SSH",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "ssh.example.com")
+        )
+        try assertCapabilityItems(enabled: true)
+    }
+
+    func testMixedProtocolPaneFocusImmediatelyRefreshesToolbarAndInspectorCapabilities() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_ssh", status: "running", diagnostic: "running"),
+            title: "生产 SSH",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_focus_serial", status: "running", diagnostic: "running"),
+            title: "串口控制台",
+            connectionKind: .serial
+        )
+        try workspace.startMultiExecSession(targetIDs: ["term_focus_ssh", "term_focus_serial"])
+        let sshPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_ssh"))
+        let serialPane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: "term_focus_serial"))
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let aiItem = try XCTUnwrap(
+            toolbar.items.first { $0.itemIdentifier.rawValue == "Stacio.Toolbar.aiAssistant" }
+        )
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let aiSegment = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.AI.title))
+        window.contentView?.layoutSubtreeIfNeeded()
+        func focus(_ pane: RemoteTerminalPaneViewController) throws {
+            let container = try XCTUnwrap(pane.view as? TerminalFocusContainerView)
+            container.layoutSubtreeIfNeeded()
+            let point = pane.terminalView.convert(NSPoint(x: 1, y: 1), to: container)
+            XCTAssertNotNil(container.hitTest(point))
+            XCTAssertIdentical(window.firstResponder, pane.terminalView)
+        }
+
+        try focus(serialPane)
+        XCTAssertFalse(aiItem.isEnabled)
+        XCTAssertEqual(aiItem.toolTip, L10n.Workbench.sshSessionRequiredTooltip)
+        XCTAssertFalse(inspector.sectionControlForTesting.isEnabled(forSegment: aiSegment))
+        XCTAssertEqual(
+            inspector.sectionControlForTesting.toolTip(forSegment: aiSegment),
+            L10n.Workbench.sshSessionRequiredTooltip
+        )
+
+        try focus(sshPane)
+        XCTAssertTrue(aiItem.isEnabled)
+        XCTAssertEqual(aiItem.toolTip, "AI 助手\n快捷键：⇧⌘A")
+        XCTAssertTrue(inspector.sectionControlForTesting.isEnabled(forSegment: aiSegment))
+        XCTAssertEqual(inspector.sectionControlForTesting.toolTip(forSegment: aiSegment), L10n.AI.title)
+    }
+
+    func testRestrictedSessionSwitchCollapsesInspectorAndReturningToSSHRestoresItsVisibility() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_inspector_ssh", status: "running", diagnostic: "running"),
+            title: "SSH",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "ssh.example.com")
+        )
+        controller.showDiagnosticsFromToolbar(nil)
+
+        let inspectorItem = try XCTUnwrap(controller.contentSplitViewController.splitViewItems.last)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertFalse(inspectorItem.isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabel, L10n.Inspector.logs)
+
+        func assertRestrictedSessionCollapsesAndSSHRestores(
+            _ name: String,
+            open: () throws -> Void,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws {
+            try open()
+            XCTAssertTrue(inspectorItem.isCollapsed, name, file: file, line: line)
+
+            workspace.selectTabForTesting(0)
+
+            XCTAssertFalse(inspectorItem.isCollapsed, name, file: file, line: line)
+            XCTAssertEqual(inspector.selectedTabLabel, L10n.Inspector.logs, name, file: file, line: line)
+        }
+
+        try assertRestrictedSessionCollapsesAndSSHRestores("SCP") {
+            _ = try workspace.openRemoteFilesSession(
+                context: workbenchLiveContext(host: "scp.example.com"),
+                title: "SCP",
+                bridge: filesBridge,
+                transferScheduler: nil
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("SFTP") {
+            _ = try workspace.openSFTPFilesSession(
+                context: workbenchLiveContext(host: "sftp.example.com"),
+                title: "SFTP",
+                bridge: filesBridge
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("VNC") {
+            _ = workspace.openConnectingGraphicsSession(
+                title: "VNC",
+                protocolName: "VNC",
+                host: "vnc.example.com",
+                port: 5900
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("RDP") {
+            _ = workspace.openConnectingGraphicsSession(
+                title: "RDP",
+                protocolName: "RDP",
+                host: "rdp.example.com",
+                port: 3389
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("串口") {
+            workspace.openRemoteShell(
+                status: LiveShellStatus(runtimeId: "term_inspector_serial", status: "running", diagnostic: "running"),
+                title: "串口",
+                connectionKind: .serial
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("Telnet") {
+            workspace.openRemoteShell(
+                status: LiveShellStatus(runtimeId: "term_inspector_telnet", status: "running", diagnostic: "running"),
+                title: "Telnet",
+                connectionKind: .telnet
+            )
+        }
+        try assertRestrictedSessionCollapsesAndSSHRestores("蓝牙 Console") {
+            workspace.openRemoteShell(
+                status: LiveShellStatus(runtimeId: "term_inspector_console", status: "running", diagnostic: "running"),
+                title: "蓝牙 Console",
+                connectionKind: .console
+            )
+        }
+
+        controller.toggleInspectorFromToolbar(nil)
+        XCTAssertTrue(inspectorItem.isCollapsed)
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_inspector_serial_collapsed", status: "running", diagnostic: "running"),
+            title: "串口 2",
+            connectionKind: .serial
+        )
+        workspace.selectTabForTesting(0)
+
+        XCTAssertTrue(inspectorItem.isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabel, L10n.Inspector.logs)
+    }
+
+    func testUnsupportedRemoteSessionActionsAndInspectorSectionsCannotBypassCapabilityPolicy() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let restrictedSections = [
+            L10n.Inspector.files,
+            L10n.Inspector.tunnels,
+            L10n.Inspector.browser,
+            L10n.Inspector.logs,
+            L10n.AI.title
+        ]
+
+        func assertRestrictedCapabilitiesBlocked(
+            _ sessionProtocol: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) throws {
+            inspector.selectTerminalMacrosTab()
+            let dashboardState = workspace.isDeviceMetricsDashboardEnabled
+
+            controller.showFilesFromToolbar(nil)
+            controller.showBrowserFromToolbar(nil)
+            controller.showTunnelsFromToolbar(nil)
+            controller.toggleDeviceDashboardFromToolbar(nil)
+            controller.showDiagnosticsFromToolbar(nil)
+            controller.showAIAssistantFromToolbar(nil)
+            workspace.toggleDeviceMetricsDashboardVisibility()
+            workspace.requestAIForCurrentTerminalForTesting(selectedText: "blocked")
+
+            XCTAssertTrue(
+                controller.contentSplitViewController.splitViewItems[2].isCollapsed,
+                sessionProtocol,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                workspace.isDeviceMetricsDashboardEnabled,
+                dashboardState,
+                sessionProtocol,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(inspector.selectedTabLabel, L10n.Inspector.macros, sessionProtocol, file: file, line: line)
+
+            for label in restrictedSections {
+                let index = try XCTUnwrap(
+                    inspector.sectionLabelsForTesting.firstIndex(of: label),
+                    file: file,
+                    line: line
+                )
+                XCTAssertFalse(
+                    inspector.sectionControlForTesting.isEnabled(forSegment: index),
+                    "\(sessionProtocol): \(label)",
+                    file: file,
+                    line: line
+                )
+                inspector.selectSectionForTesting(index)
+                XCTAssertEqual(
+                    inspector.selectedTabLabel,
+                    L10n.Inspector.macros,
+                    "\(sessionProtocol): \(label)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_serial_guard", status: "running", diagnostic: "running"),
+            title: "Serial",
+            connectionKind: .serial
+        )
+        try assertRestrictedCapabilitiesBlocked("serial")
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_telnet_guard", status: "running", diagnostic: "running"),
+            title: "Telnet",
+            connectionKind: .telnet
+        )
+        try assertRestrictedCapabilitiesBlocked("telnet")
+
+        _ = try workspace.openRemoteFilesSession(
+            context: workbenchLiveContext(host: "scp-guard.example.com"),
+            title: "SCP",
+            bridge: filesBridge,
+            transferScheduler: nil
+        )
+        try assertRestrictedCapabilitiesBlocked("scp")
+
+        _ = try workspace.openSFTPFilesSession(
+            context: workbenchLiveContext(host: "sftp-guard.example.com"),
+            title: "SFTP",
+            bridge: filesBridge
+        )
+        try assertRestrictedCapabilitiesBlocked("sftp")
+
+        _ = workspace.openConnectingGraphicsSession(
+            title: "VNC",
+            protocolName: "VNC",
+            host: "vnc-guard.example.com",
+            port: 5900
+        )
+        try assertRestrictedCapabilitiesBlocked("vnc")
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_ssh_guard", status: "running", diagnostic: "running"),
+            title: "SSH",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "ssh-guard.example.com")
+        )
+        for label in restrictedSections {
+            let index = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: label))
+            XCTAssertTrue(inspector.sectionControlForTesting.isEnabled(forSegment: index), label)
+            inspector.selectSectionForTesting(index)
+            XCTAssertEqual(inspector.selectedTabLabel, label)
+        }
+    }
+
+    func testLicensedActionsCannotBeInvokedWithoutEntitlements() throws {
+        let workspace = WorkspaceViewController()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            licenseAccess: MutableWorkbenchLicenseAccessProvider(enabledFeatures: [])
+        )
+        controller.loadWindow()
+
+        XCTAssertThrowsError(try controller.startMultiExecFromToolbar(nil)) { error in
+            XCTAssertEqual(error as? LicensedFeatureAccessError, .licenseRequired(.multiExec))
+        }
+        controller.showTunnelsFromToolbar(nil)
+        controller.showAIAssistantFromToolbar(nil)
+        controller.toggleDeviceDashboardFromToolbar(nil)
+    }
+
+    func testToolbarDefaultItemsUseHIGStyleGroupingWithoutOverflowCommands() {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        XCTAssertEqual(controller.window?.toolbar?.autosavesConfiguration, true)
+        let identifiers = controller.window?.toolbar?.items.map(\.itemIdentifier.rawValue) ?? []
+        XCTAssertEqual(
+            identifiers,
+            [
+                "Stacio.Toolbar.sidebar",
+                NSToolbarItem.Identifier.flexibleSpace.rawValue,
+                "Stacio.Toolbar.newSession",
+                "Stacio.Toolbar.importSessions",
+                NSToolbarItem.Identifier.space.rawValue,
+                "Stacio.Toolbar.multiExec",
+                "Stacio.Toolbar.split",
+                NSToolbarItem.Identifier.space.rawValue,
+                "Stacio.Toolbar.files",
+                "Stacio.Toolbar.browser",
+                "Stacio.Toolbar.tunnels",
+                "Stacio.Toolbar.deviceDashboard",
+                "Stacio.Toolbar.aiAssistant",
+                "Stacio.Toolbar.panels",
+                NSToolbarItem.Identifier.space.rawValue,
+                "Stacio.Toolbar.inspector"
+            ]
+        )
+        XCTAssertTrue(identifiers.contains("Stacio.Toolbar.importSessions"))
+        XCTAssertFalse(identifiers.contains("Stacio.Toolbar.closeTerminal"))
+    }
+
+    func testToolbarAllowsSecondaryCommandsWithoutShowingThemByDefault() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar.Test"))
+
+        let allowed = controller.toolbarAllowedItemIdentifiers(toolbar).map(\.rawValue)
+
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.sidebar"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.importSessions"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.split"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.panels"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.files"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.browser"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.tunnels"))
+        XCTAssertFalse(allowed.contains("Stacio.Toolbar.closeTerminal"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.deviceDashboard"))
+        XCTAssertTrue(allowed.contains("Stacio.Toolbar.aiAssistant"))
+        XCTAssertFalse(allowed.contains("Stacio.Toolbar.quickConnect"))
+        XCTAssertTrue(allowed.contains(NSToolbarItem.Identifier.space.rawValue))
+    }
+
+    func testToolbarCustomizationPaletteReceivesUniqueAllowedItemIdentifiers() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar.Customization.Test"))
+
+        let allowed = controller.toolbarAllowedItemIdentifiers(toolbar).map(\.rawValue)
+
+        XCTAssertEqual(allowed.count, Set(allowed).count)
+        XCTAssertEqual(allowed.filter { $0 == "Stacio.Toolbar.importSessions" }.count, 1)
+        XCTAssertEqual(allowed.filter { $0 == NSToolbarItem.Identifier.space.rawValue }.count, 1)
+    }
+
+    func testToolbarDoesNotOfferOrDefaultLegacyUpdatePrompt() {
+        let controller = WorkbenchWindowController()
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("Stacio.Toolbar.Customization.UpdatePrompt.Test"))
+
+        let allowed = controller.toolbarAllowedItemIdentifiers(toolbar).map(\.rawValue)
+
+        XCTAssertFalse(allowed.contains("Stacio.Toolbar.updatePrompt"))
+        XCTAssertFalse(controller.toolbarDefaultItemIdentifiers(toolbar).contains(
+            NSToolbarItem.Identifier("Stacio.Toolbar.updatePrompt")
+        ))
+    }
+
+    func testLegacyAutosavedUpdatePromptIsDroppedWithoutDiscardingOtherToolbarItems() throws {
+        UserDefaults.standard.set(
+            [
+                "TB Item Identifiers": [
+                    "Stacio.Toolbar.sidebar",
+                    "Stacio.Toolbar.updatePrompt",
+                    "Stacio.Toolbar.files"
+                ]
+            ],
+            forKey: toolbarAutosaveDefaultsKey
+        )
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let identifiers = try XCTUnwrap(controller.window?.toolbar?.items.map(\.itemIdentifier.rawValue))
+        XCTAssertEqual(identifiers, ["Stacio.Toolbar.sidebar", "Stacio.Toolbar.files"])
+        let storedConfiguration = try XCTUnwrap(
+            UserDefaults.standard.dictionary(forKey: toolbarAutosaveDefaultsKey)
+        )
+        XCTAssertEqual(
+            storedConfiguration["TB Item Identifiers"] as? [String],
+            ["Stacio.Toolbar.sidebar", "Stacio.Toolbar.files"]
+        )
+    }
+
+    func testToolbarCustomizationModelEditsOneItemAtATime() throws {
+        let sidebar = NSToolbarItem.Identifier("Stacio.Toolbar.sidebar")
+        let files = NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        let browser = NSToolbarItem.Identifier("Stacio.Toolbar.browser")
+        var model = WorkbenchToolbarCustomizationModel(
+            currentIdentifiers: [sidebar, files],
+            defaultIdentifiers: [sidebar, files],
+            duplicateIdentifiers: [.space, .flexibleSpace]
+        )
+
+        XCTAssertTrue(model.insert(browser, at: 1))
+        XCTAssertFalse(model.insert(browser, at: 0))
+        XCTAssertEqual(model.identifiers, [sidebar, browser, files])
+
+        let filesEntryID = try XCTUnwrap(model.entries.first { $0.identifier == files }?.id)
+        XCTAssertTrue(model.move(entryID: filesEntryID, to: 0))
+        XCTAssertEqual(model.identifiers, [files, sidebar, browser])
+
+        let sidebarEntryID = try XCTUnwrap(model.entries.first { $0.identifier == sidebar }?.id)
+        XCTAssertTrue(model.remove(entryID: sidebarEntryID))
+        XCTAssertEqual(model.identifiers, [files, browser])
+        XCTAssertTrue(model.insert(.space, at: 2))
+        XCTAssertTrue(model.insert(.space, at: 3))
+        XCTAssertEqual(model.identifiers, [files, browser, .space, .space])
+    }
+
+    func testToolbarCustomizationUsesStacioSheetWithIndividualItemsAndExplicitActions() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        let originalWindows = Set(NSApp.windows.map(ObjectIdentifier.init))
+        defer {
+            if let sheet = controller.window?.attachedSheet {
+                controller.window?.endSheet(sheet)
+                sheet.close()
+            }
+            for window in NSApp.windows where originalWindows.contains(ObjectIdentifier(window)) == false {
+                window.close()
+            }
+            controller.close()
+        }
+
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertFalse(toolbar.customizationPaletteIsRunning)
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.cancel"))
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault"))
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.done"))
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.available.Stacio.Toolbar.updatePrompt"))
+
+        let individualCurrentItems = content.allSubviews(ofType: NSView.self).filter {
+            $0.accessibilityIdentifier().hasPrefix("Stacio.ToolbarCustomization.current.")
+        }
+        XCTAssertGreaterThan(individualCurrentItems.count, 1)
+        let firstCurrentItem = try XCTUnwrap(individualCurrentItems.first)
+        firstCurrentItem.layoutSubtreeIfNeeded()
+        let hitView = firstCurrentItem.hitTest(
+            NSPoint(x: firstCurrentItem.bounds.midX, y: firstCurrentItem.bounds.midY)
+        )
+        XCTAssertTrue(hitView === firstCurrentItem)
+        for itemView in individualCurrentItems {
+            let dragSource = try XCTUnwrap(
+                itemView as? any WorkbenchToolbarCustomizationDragOperationProviding
+            )
+            let operations = dragSource.permittedToolbarCustomizationDragOperations
+            XCTAssertTrue(operations.contains(.move))
+            XCTAssertTrue(operations.contains(.delete))
+        }
+    }
+
+    func testToolbarCustomizationDropHandlersEditSingleItemsAndDoneApplies() throws {
+        let sidebar = NSToolbarItem.Identifier("Stacio.Toolbar.sidebar")
+        let files = NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        let browser = NSToolbarItem.Identifier("Stacio.Toolbar.browser")
+        var appliedIdentifiers: [[NSToolbarItem.Identifier]] = []
+        var appliedLabelModes: [Bool] = []
+        let controller = WorkbenchToolbarCustomizationWindowController(
+            descriptors: [sidebar, files, browser].map {
+                WorkbenchToolbarCustomizationDescriptor(
+                    identifier: $0,
+                    label: $0.rawValue,
+                    image: NSImage(),
+                    allowsDuplicates: false
+                )
+            },
+            currentIdentifiers: [sidebar, files],
+            defaultIdentifiers: [sidebar, files],
+            showsLabels: false,
+            onApply: { identifiers, showsLabels in
+                appliedIdentifiers.append(identifiers)
+                appliedLabelModes.append(showsLabels)
+            }
+        )
+
+        let labelsCheckbox = try XCTUnwrap(
+            controller.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.showLabels"
+            ) as? NSButton
+        )
+        XCTAssertEqual(labelsCheckbox.state, .off)
+        labelsCheckbox.performClick(nil)
+        XCTAssertTrue(controller.showsLabelsForTesting)
+
+        XCTAssertTrue(controller.dropAvailableItemForTesting(browser, at: 1))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [sidebar, browser, files])
+        XCTAssertTrue(controller.moveCurrentItemForTesting(files, to: 0))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files, sidebar, browser])
+        XCTAssertTrue(controller.dropCurrentItemBackToAvailableForTesting(sidebar))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files, browser])
+        XCTAssertTrue(controller.dragCurrentItemOutsideForTesting(browser))
+        XCTAssertEqual(controller.currentIdentifiersForTesting, [files])
+        XCTAssertTrue(controller.dropAvailableItemForTesting(browser, at: 1))
+
+        let done = try XCTUnwrap(
+            controller.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        done.performClick(nil)
+
+        XCTAssertEqual(appliedIdentifiers, [[files, browser]])
+        XCTAssertEqual(appliedLabelModes, [true])
+    }
+
+    func testToolbarCustomizationDonePersistsLayoutAcrossWorkbenchRecreation() throws {
+        let firstController = WorkbenchWindowController()
+        firstController.showWindow(nil)
+        let firstToolbar = try XCTUnwrap(firstController.window?.toolbar)
+        firstToolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let customizationController = try XCTUnwrap(
+            firstController.window?.attachedSheet?.windowController
+                as? WorkbenchToolbarCustomizationWindowController
+        )
+        XCTAssertTrue(
+            customizationController.dropCurrentItemBackToAvailableForTesting(
+                NSToolbarItem.Identifier("Stacio.Toolbar.files")
+            )
+        )
+        let done = try XCTUnwrap(
+            customizationController.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        done.performClick(nil)
+        let customizedIdentifiers = firstToolbar.items.map(\.itemIdentifier)
+        XCTAssertFalse(customizedIdentifiers.contains(
+            NSToolbarItem.Identifier("Stacio.Toolbar.files")
+        ))
+        firstController.close()
+
+        let recreatedController = WorkbenchWindowController()
+        recreatedController.loadWindow()
+        defer { recreatedController.close() }
+
+        XCTAssertEqual(
+            recreatedController.window?.toolbar?.items.map(\.itemIdentifier),
+            customizedIdentifiers
+        )
+        let storedConfiguration = try XCTUnwrap(
+            UserDefaults.standard.dictionary(forKey: toolbarAutosaveDefaultsKey)
+        )
+        XCTAssertEqual(
+            storedConfiguration["TB Item Identifiers"] as? [String],
+            customizedIdentifiers.map(\.rawValue)
+        )
+    }
+
+    func testToolbarLabelPreferenceSurvivesAttachmentAndCustomizationReopen() throws {
+        UserDefaults.standard.set(true, forKey: toolbarShowsLabelsDefaultsKey)
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        XCTAssertTrue(waitUntil { toolbar.displayMode == .iconAndLabel })
+        XCTAssertEqual(toolbar.sizeMode, .regular)
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let customizationController = try XCTUnwrap(
+            controller.window?.attachedSheet?.windowController
+                as? WorkbenchToolbarCustomizationWindowController
+        )
+        XCTAssertTrue(customizationController.showsLabelsForTesting)
+
+        let done = try XCTUnwrap(
+            customizationController.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        done.performClick(nil)
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: toolbarShowsLabelsDefaultsKey))
+    }
+
+    func testToolbarLabelModeDoesNotDuplicateSidebarLabelInsideCustomButton() throws {
+        UserDefaults.standard.set(true, forKey: toolbarShowsLabelsDefaultsKey)
+        let controller = WorkbenchWindowController()
+        controller.loadWindow()
+        defer { controller.close() }
+
+        let sidebarButton = try sidebarToolbarButton(in: controller)
+        XCTAssertEqual(sidebarButton.title, "")
+        XCTAssertEqual(sidebarButton.imagePosition, .imageOnly)
+        XCTAssertTrue(waitUntil {
+            controller.window?.toolbar?.displayMode == .iconAndLabel
+        })
+    }
+
+    func testToolbarLabelsReserveInspectorTopClearance() throws {
+        UserDefaults.standard.set(true, forKey: toolbarShowsLabelsDefaultsKey)
+        let controller = WorkbenchWindowController()
+        controller.loadWindow()
+        defer { controller.close() }
+
+        let window = try XCTUnwrap(controller.window)
+        controller.showFilesFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let nativeInset = try windowToolbarTopInset(in: window)
+        XCTAssertGreaterThanOrEqual(
+            inspector.effectiveToolbarTopInsetForTesting,
+            min(nativeInset + 24, inspector.maximumCompactToolbarTopInsetForTesting)
+        )
+    }
+
+    func testToolbarLabelToggleRelayoutsOpenInspectorImmediately() throws {
+        let controller = WorkbenchWindowController()
+        controller.loadWindow()
+        defer { controller.close() }
+
+        controller.showFilesFromToolbar(nil)
+        let window = try XCTUnwrap(controller.window)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let iconOnlyInset = inspector.effectiveToolbarTopInsetForTesting
+        let iconOnlyContentHeight = inspector.contentContainerFrameForTesting.height
+
+        let toolbar = try XCTUnwrap(window.toolbar)
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let firstSheet = try XCTUnwrap(
+            window.attachedSheet?.windowController as? WorkbenchToolbarCustomizationWindowController
+        )
+        let checkbox = try XCTUnwrap(
+            firstSheet.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.showLabels"
+            ) as? NSButton
+        )
+        checkbox.performClick(nil)
+        let firstDone = try XCTUnwrap(
+            firstSheet.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        firstDone.performClick(nil)
+        XCTAssertEqual(toolbar.displayMode, .iconAndLabel)
+        XCTAssertGreaterThan(inspector.effectiveToolbarTopInsetForTesting, iconOnlyInset)
+        XCTAssertLessThan(
+            inspector.contentContainerFrameForTesting.height,
+            iconOnlyContentHeight,
+            "An open inspector must consume the new toolbar clearance immediately"
+        )
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let secondSheet = try XCTUnwrap(
+            window.attachedSheet?.windowController as? WorkbenchToolbarCustomizationWindowController
+        )
+        let secondCheckbox = try XCTUnwrap(
+            secondSheet.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.showLabels"
+            ) as? NSButton
+        )
+        secondCheckbox.performClick(nil)
+        let secondDone = try XCTUnwrap(
+            secondSheet.window?.contentView?.firstSubview(
+                withIdentifier: "Stacio.ToolbarCustomization.done"
+            ) as? NSButton
+        )
+        secondDone.performClick(nil)
+        XCTAssertEqual(toolbar.displayMode, .iconOnly)
+        XCTAssertEqual(inspector.effectiveToolbarTopInsetForTesting, iconOnlyInset)
+        XCTAssertEqual(
+            inspector.contentContainerFrameForTesting.height,
+            iconOnlyContentHeight,
+            accuracy: 1,
+            "Switching back to icon-only mode must restore the inspector content height"
+        )
+    }
+
+    func testToolbarCustomizationCancelDiscardsRestoredPreview() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.autosavesConfiguration = false
+        let originalIdentifiers = toolbar.items.map(\.itemIdentifier)
+        replaceToolbarItemsForTesting(
+            in: toolbar,
+            with: controller.toolbarDefaultItemIdentifiers(toolbar)
+        )
+        defer {
+            replaceToolbarItemsForTesting(in: toolbar, with: originalIdentifiers)
+        }
+        let removedIndex = try XCTUnwrap(toolbar.items.firstIndex {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.files"
+        })
+        toolbar.removeItem(at: removedIndex)
+        let customizedIdentifiers = toolbar.items.map(\.itemIdentifier)
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        let restore = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault") as? NSButton
+        )
+        let cancel = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.cancel") as? NSButton
+        )
+
+        restore.performClick(nil)
+        cancel.performClick(nil)
+
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), customizedIdentifiers)
+        XCTAssertNil(controller.window?.attachedSheet)
+    }
+
+    func testToolbarCustomizationRestoreDefaultAppliesOnlyAfterDone() throws {
+        let controller = WorkbenchWindowController()
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let toolbar = try XCTUnwrap(controller.window?.toolbar)
+        toolbar.autosavesConfiguration = false
+        let originalIdentifiers = toolbar.items.map(\.itemIdentifier)
+        replaceToolbarItemsForTesting(
+            in: toolbar,
+            with: controller.toolbarDefaultItemIdentifiers(toolbar)
+        )
+        defer {
+            replaceToolbarItemsForTesting(in: toolbar, with: originalIdentifiers)
+        }
+        let removedIndex = try XCTUnwrap(toolbar.items.firstIndex {
+            $0.itemIdentifier.rawValue == "Stacio.Toolbar.files"
+        })
+        toolbar.removeItem(at: removedIndex)
+
+        toolbar.runCustomizationPalette(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        let content = try XCTUnwrap(sheet.contentView)
+        let restore = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.restoreDefault") as? NSButton
+        )
+        let done = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.ToolbarCustomization.done") as? NSButton
+        )
+
+        restore.performClick(nil)
+        XCTAssertFalse(toolbar.items.contains { $0.itemIdentifier.rawValue == "Stacio.Toolbar.files" })
+        done.performClick(nil)
+
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), controller.toolbarDefaultItemIdentifiers(toolbar))
+        XCTAssertNil(controller.window?.attachedSheet)
+    }
+
+    func testDeviceDashboardToolbarTogglesCurrentWorkspaceDashboardWithoutOpeningInspector() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            deviceMetricsProviderFactory: { _ in RecordingWorkbenchDeviceMetricsProvider() },
+            startsDeviceMetricsPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        workspace.view.frame = NSRect(x: 0, y: 0, width: 900, height: 560)
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_metrics", status: "running", diagnostic: "running"),
+            title: "root@172.16.10.250",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext()
+        )
+        workspace.view.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(workspace.isCurrentDeviceMetricsDashboardVisibleForTesting)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.toggleDeviceDashboardFromToolbar(nil)
+        XCTAssertFalse(workspace.isCurrentDeviceMetricsDashboardVisibleForTesting)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.toggleDeviceDashboardFromToolbar(nil)
+        XCTAssertTrue(workspace.isCurrentDeviceMetricsDashboardVisibleForTesting)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+    }
+
+    func testWorkbenchUsesAppleDocumentLayoutWithInspectorHiddenByDefault() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+
+        let splitController = controller.contentSplitViewController
+        XCTAssertEqual(splitController.splitViewItems.count, 3)
+        XCTAssertEqual(splitController.splitViewItems[0].minimumThickness, 220)
+        XCTAssertEqual(splitController.splitViewItems[0].maximumThickness, 320)
+        XCTAssertEqual(splitController.splitViewItems[1].minimumThickness, 0)
+        let center = try XCTUnwrap(
+            splitController.splitViewItems[1].viewController as? WorkbenchCenterContainerViewController
+        )
+        XCTAssertTrue(center.workspaceViewController === workspace)
+        XCTAssertEqual(splitController.splitViewItems[2].minimumThickness, 0)
+        XCTAssertGreaterThanOrEqual(splitController.splitViewItems[2].maximumThickness, 1_500)
+        XCTAssertTrue(splitController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(controller.window?.toolbar?.displayMode, .iconOnly)
+        XCTAssertNil(
+            controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.commandStrip")
+        )
+        XCTAssertNil(
+            controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.commandActions")
+        )
+    }
+
+    func testWorkbenchInspectorWidthFitsNativeSegmentedHeaderAndTables() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+
+        let inspector = controller.contentSplitViewController.splitViewItems[2]
+        XCTAssertEqual(inspector.minimumThickness, 0)
+        XCTAssertGreaterThanOrEqual(inspector.preferredThicknessFraction, 0.25)
+    }
+
+    func testTunnelsToolbarActionSelectsInspectorTunnelsTab() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        XCTAssertNotEqual(inspector.selectedTabLabelForTesting, "隧道")
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.showTunnelsFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "隧道")
+    }
+
+    func testTunnelsToolbarActionCollapsesInspectorWhenTunnelsAlreadySelected() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        controller.showTunnelsFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "隧道")
+
+        controller.showTunnelsFromToolbar(nil)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "隧道")
+    }
+
+    func testBrowserToolbarActionSelectsInspectorBrowserTab() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        XCTAssertNotEqual(inspector.selectedTabLabelForTesting, "浏览器")
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        controller.showBrowserFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "浏览器")
+    }
+
+    func testBrowserToolbarActionCollapsesInspectorWhenBrowserAlreadySelected() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        controller.showBrowserFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "浏览器")
+
+        controller.showBrowserFromToolbar(nil)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "浏览器")
+    }
+
+    func testPanelsToolbarSecondaryActionsSelectInspectorSections() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        controller.showDiagnosticsFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "诊断")
+
+        controller.showTerminalMacrosFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "宏")
+
+        controller.showCommandHistoryFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "历史命令")
+    }
+
+    func testAIAssistantToolbarActionSelectsInspectorAIPanel() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let rootView = try XCTUnwrap(controller.window?.contentView)
+        rootView.frame = NSRect(x: 0, y: 0, width: 1040, height: 720)
+        rootView.layoutSubtreeIfNeeded()
+
+        XCTAssertNotEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertNil(rootView.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+
+        controller.showAIAssistantFromToolbar(nil)
+        rootView.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertNil(rootView.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertTrue(inspector.aiAssistantViewController?.view.isDescendant(of: rootView) == true)
+    }
+
+    func testAIAssistantToolbarActionCollapsesInspectorWhenAIAlreadySelected() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        controller.showAIAssistantFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+
+        controller.showAIAssistantFromToolbar(nil)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+    }
+
+    func testAIAssistantToolbarActionDoesNotCoverTerminalWithOverlay() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 760), display: false)
+        controller.showAIAssistantFromToolbar(nil)
+        window.layoutIfNeeded()
+
+        let splitView = controller.contentSplitViewController.splitView
+        let workspaceView = splitView.arrangedSubviews[1]
+        let inspectorView = splitView.arrangedSubviews[2]
+        XCTAssertNil(window.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertFalse(splitView.isSubviewCollapsed(inspectorView))
+        XCTAssertGreaterThan(inspectorView.frame.width, 0)
+        XCTAssertEqual(workspaceView.frame.maxX + splitView.dividerThickness,
+                       inspectorView.frame.minX,
+                       accuracy: 1)
+    }
+
+#if STACIO_AI_V2_UI_LEGACY_TESTS
+    func testV2AIAssistantSubmissionKeepsWorkbenchWindowFrameAfterDeferredInspectorLayout() throws {
+        let suiteName = "StacioWorkbenchAIWindowFrame-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let provider = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "83000000-0000-0000-0000-000000000001")!,
+            name: "Frame Test Provider",
+            baseURL: "https://frame-test.example/v1",
+            modelID: "frame-test-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [provider],
+                defaultAIProviderID: provider.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("frame-test-key", for: provider.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] },
+            frameAutosaveName: NSWindow.FrameAutosaveName(suiteName)
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-frame-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "frame-test.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "frame-test.example")
+        )
+        let window = try XCTUnwrap(controller.window)
+        window.setFrame(NSRect(x: 40, y: 80, width: 1_800, height: 900), display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        let expectedFrame = window.frame
+
+        controller.showAIAssistantFromToolbar(nil)
+        assertWindowFrame(window, equals: expectedFrame)
+        let panel = try XCTUnwrap(
+            controller.inspectorViewControllerForTesting?.aiAssistantViewController
+        )
+        panel.setQuestionForTesting("检查窗口尺寸")
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+        XCTAssertTrue(panel.askButtonEnabledForTesting)
+        panel.performAskForTesting()
+        assertWindowFrame(window, equals: expectedFrame)
+
+        XCTAssertTrue(
+            waitUntil { transport.streamRequests.count == 1 },
+            "message=\(panel.messageTextForTesting), status=\(panel.statusTextForTesting), transcript=\(panel.transcriptTextForTesting)"
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        assertWindowFrame(window, equals: expectedFrame)
+    }
+
+    func testV2AIComposerWorkModeFlowsFromInspectorToConversationRuntime() throws {
+        let suiteName = "StacioWorkbenchAIWorkMode-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let provider = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "84000000-0000-0000-0000-000000000001")!,
+            name: "Work Mode Test Provider",
+            baseURL: "https://work-mode-test.example/v1",
+            modelID: "work-mode-test-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [provider],
+                defaultAIProviderID: provider.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("work-mode-test-key", for: provider.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-work-mode-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "work-mode-test.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "work-mode-test.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+        panel.view.layoutSubtreeIfNeeded()
+        XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.stop"))
+        XCTAssertNil(panel.view.firstSubview(withIdentifier: "Stacio.AI.composer.executionDestination"))
+        XCTAssertEqual(
+            panel.view.allSubviews(ofType: NSButton.self).filter {
+                $0.accessibilityIdentifier() == "Stacio.AI.ask"
+            }.count,
+            1
+        )
+        XCTAssertEqual(panel.primaryActionFrameForTesting.size, NSSize(width: 34, height: 34))
+        XCTAssertEqual(panel.primaryActionCornerRadiusForTesting, 17, accuracy: 0.5)
+        XCTAssertEqual(
+            panel.composerWorkModeMenuTitlesForTesting,
+            ["Agent", "先规划", "仅回答", "真实终端", "后台虚拟终端"]
+        )
+        XCTAssertEqual(panel.composerWorkModeMenuCheckedTitlesForTesting, ["Agent", "真实终端"])
+        XCTAssertEqual(panel.conversationSelectedWorkModeForTesting, .agent)
+        XCTAssertEqual(panel.conversationSelectedExecutionChoiceForTesting, .realTerminal)
+        XCTAssertEqual(panel.composerContextTextForTesting, "Agent · 真实终端")
+        XCTAssertEqual(panel.composerWorkModeAccessibilityLabelForTesting, "工作方式：Agent · 真实终端")
+
+        panel.selectComposerWorkModeForTesting(.answerOnly)
+
+        XCTAssertEqual(panel.conversationSelectedWorkModeForTesting, .answerOnly)
+        XCTAssertEqual(panel.composerWorkModeMenuCheckedTitlesForTesting, ["仅回答", "真实终端"])
+        XCTAssertEqual(panel.composerContextTextForTesting, "仅回答 · 真实终端")
+
+        panel.selectComposerExecutionChoiceForTesting(.backgroundVirtualTerminal)
+
+        XCTAssertEqual(panel.conversationSelectedExecutionChoiceForTesting, .backgroundVirtualTerminal)
+        XCTAssertEqual(panel.composerWorkModeMenuCheckedTitlesForTesting, ["仅回答", "后台虚拟终端"])
+        XCTAssertEqual(panel.composerContextTextForTesting, "仅回答 · 后台虚拟终端")
+        XCTAssertEqual(
+            panel.composerWorkModeAccessibilityLabelForTesting,
+            "工作方式：仅回答 · 后台虚拟终端"
+        )
+
+        panel.setConversationRunPhaseForTesting(.awaitingApproval)
+        XCTAssertEqual(panel.primaryActionSymbolNameForTesting, "stop.fill")
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前排查任务")
+
+        panel.setQuestionForTesting("审批完成后继续检查部署日志")
+        panel.queueQuestionForTesting()
+        XCTAssertTrue(waitUntil { panel.conversationQueuedCountForTesting == 1 })
+
+        let decision = PendingToolDecisionPresentation(
+            proposalID: "proposal-inspector-layout",
+            decisionID: "decision-inspector-layout",
+            command: [
+                "journalctl --no-pager --unit=stacio-production.service --since '30 minutes ago'",
+                "systemctl show stacio-production.service --property=ActiveState,SubState,ExecMainStatus",
+                "curl --fail --show-error --silent http://127.0.0.1:8080/health"
+            ].joined(separator: "\n"),
+            explanation: "读取服务状态、近期日志和本机健康检查，不修改目标主机。",
+            risk: "read-only",
+            targetTitle: "work-mode-test.example",
+            targetWorkingDirectory: "/srv/app",
+            executionDestination: "后台虚拟终端",
+            targetBindingDigest: "sha256:inspector-layout-target",
+            targetRuntimeGeneration: 3,
+            immutableSummary: "sha256:inspector-layout-approval",
+            index: 1,
+            total: 1
+        )
+        panel.applyToolDecisionForTesting(decision)
+        let window = try XCTUnwrap(controller.window)
+        let splitView = controller.contentSplitViewController.splitView
+        for windowHeight in [CGFloat(520), 640, 760] {
+            window.setContentSize(NSSize(width: 1_200, height: windowHeight))
+            controller.windowDidResize(
+                Notification(name: NSWindow.didResizeNotification, object: window)
+            )
+            for inspectorWidth in [CGFloat(300), 320, 360] {
+                controller.setInspectorDividerPositionForTesting(
+                    splitView.bounds.width - inspectorWidth - splitView.dividerThickness
+                )
+                window.contentView?.layoutSubtreeIfNeeded()
+                controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+                panel.view.layoutSubtreeIfNeeded()
+                // Window resize and split-view pinning can enqueue one more
+                // AppKit layout pass after the synchronous calls above. Give
+                // the Inspector one bounded run-loop turn before asserting
+                // card/queue separation at the minimum supported height.
+                RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                panel.view.layoutSubtreeIfNeeded()
+
+                let dimensions = "inspector=\(Int(inspectorWidth)), windowHeight=\(Int(windowHeight))"
+                let panelBounds = panel.view.bounds.insetBy(dx: -1, dy: -1)
+                let cardFrame = panel.decisionCardFrameForTesting
+                let detailsFrame = panel.decisionCardDetailsFrameForTesting
+                let detailsDocumentFrame = panel.decisionCardDetailsDocumentFrameForTesting
+                let commandFrame = panel.decisionCardCommandFrameForTesting
+                let approveFrame = panel.decisionCardApprovalButtonFrameForTesting
+                let denyFrame = panel.decisionCardDenialButtonFrameForTesting
+                let composerFrame = panel.composerFrameForTesting
+                let queueView = try XCTUnwrap(
+                    panel.view.firstSubview(withIdentifier: "Stacio.AI.pendingQueue")
+                        as? PendingInputQueueView
+                )
+                let queueFrame = queueView.convert(queueView.bounds, to: panel.view)
+                let cardBounds = cardFrame.insetBy(dx: -1, dy: -1)
+                XCTAssertTrue(panelBounds.contains(cardFrame), dimensions)
+                XCTAssertTrue(NSIntersectionRect(cardFrame, composerFrame).isEmpty, dimensions)
+                XCTAssertGreaterThanOrEqual(cardFrame.minY, composerFrame.maxY + 8, dimensions)
+                XCTAssertTrue(queueView.isCompactPresentation, dimensions)
+                XCTAssertEqual(queueFrame.height, 34, accuracy: 1, dimensions)
+                XCTAssertTrue(panelBounds.contains(queueFrame), dimensions)
+                XCTAssertTrue(NSIntersectionRect(queueFrame, composerFrame).isEmpty, dimensions)
+                XCTAssertTrue(NSIntersectionRect(queueFrame, cardFrame).isEmpty, dimensions)
+                XCTAssertGreaterThanOrEqual(queueFrame.minY, composerFrame.maxY + 8, dimensions)
+                XCTAssertGreaterThanOrEqual(cardFrame.minY, queueFrame.maxY + 7, dimensions)
+                XCTAssertTrue(cardBounds.contains(approveFrame), dimensions)
+                XCTAssertTrue(cardBounds.contains(denyFrame), dimensions)
+                XCTAssertGreaterThan(detailsFrame.height, 0, dimensions)
+                XCTAssertGreaterThan(detailsDocumentFrame.height, detailsFrame.height, dimensions)
+                XCTAssertGreaterThan(NSIntersectionRect(detailsFrame, commandFrame).height, 0, dimensions)
+            }
+        }
+
+        panel.applyToolDecisionForTesting(nil)
+        let expandedQueueView = try XCTUnwrap(
+            panel.view.firstSubview(withIdentifier: "Stacio.AI.pendingQueue")
+                as? PendingInputQueueView
+        )
+        XCTAssertFalse(expandedQueueView.isCompactPresentation)
+        XCTAssertGreaterThan(expandedQueueView.intrinsicContentSize.height, 34)
+        panel.setConversationRunPhaseForTesting(.idle)
+        XCTAssertEqual(panel.primaryActionSymbolNameForTesting, "arrow.up")
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "发送排查问题")
+    }
+
+    func testV2AIModelSelectionFlowsFromPanelSessionToSettingsBackedProvider() throws {
+        let suiteName = "StacioWorkbenchAIModelSelection-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let providerA = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81000000-0000-0000-0000-000000000001")!,
+            name: "Provider A",
+            baseURL: "https://provider-a.example/v1",
+            modelID: "shared"
+        )
+        let providerB = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81000000-0000-0000-0000-000000000002")!,
+            name: "Provider B",
+            baseURL: "https://provider-b.example/v1",
+            modelID: "shared"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [providerA, providerB],
+                defaultAIProviderID: providerA.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("key-a", for: providerA.id)
+        try apiKeyStore.saveAPIKey("key-b", for: providerB.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-model-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "model-test.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "model-test.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+        panel.setQuestionForTesting("检查状态")
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+        panel.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerB.id, modelID: "shared")
+        )
+        XCTAssertTrue(waitUntil {
+            let selection = panel.conversationRuntimeSelectionForTesting
+            return selection?.providerConfigurationID == providerB.id.uuidString
+                && selection?.modelID == "shared"
+                && panel.conversationRuntimeReadyForTesting
+        }, "selection=\(String(describing: panel.conversationRuntimeSelectionForTesting)), message=\(panel.messageTextForTesting), status=\(panel.statusTextForTesting), title=\(panel.composerModelTitleForTesting), state=\(panel.conversationStateForTesting)")
+        XCTAssertTrue(
+            panel.askButtonEnabledForTesting,
+            "message=\(panel.messageTextForTesting), status=\(panel.statusTextForTesting), title=\(panel.composerModelTitleForTesting)"
+        )
+        panel.performAskForTesting()
+
+        XCTAssertTrue(
+            waitUntil { transport.streamRequests.count == 1 },
+            "message=\(panel.messageTextForTesting), status=\(panel.statusTextForTesting), transcript=\(panel.transcriptTextForTesting)"
+        )
+        let request = try XCTUnwrap(transport.streamRequests.first)
+        XCTAssertEqual(request.url?.host, "provider-b.example")
+        let requestBody = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8) ?? ""
+        XCTAssertTrue(requestBody.contains(#""model":"shared""#))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer key-b")
+        XCTAssertEqual(try settingsStore.loadAIProviderSettings().defaultAIProviderID, providerA.id)
+    }
+
+    func testV2AIInvalidModelSelectionKeepsPreviousProviderUsable() throws {
+        let suiteName = "StacioWorkbenchAIModelRollback-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let providerA = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81100000-0000-0000-0000-000000000001")!,
+            name: "Provider A",
+            baseURL: "https://rollback-a.example/v1",
+            modelID: "a-model"
+        )
+        let providerB = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81100000-0000-0000-0000-000000000002")!,
+            name: "Provider B",
+            baseURL: "https://rollback-b.example/v1",
+            modelID: "b-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [providerA, providerB],
+                defaultAIProviderID: providerA.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("rollback-a-key", for: providerA.id)
+        try apiKeyStore.saveAPIKey("rollback-b-key", for: providerB.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-model-rollback-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "rollback.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "rollback.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+
+        panel.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerB.id, modelID: "b-model")
+        )
+        XCTAssertTrue(waitUntil {
+            panel.conversationRuntimeSelectionForTesting?.providerConfigurationID
+                == providerB.id.uuidString
+                && panel.conversationRuntimeReadyForTesting
+        })
+
+        panel.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerB.id, modelID: "missing-model")
+        )
+        XCTAssertTrue(waitUntil {
+            panel.conversationRuntimeReadyForTesting
+                && panel.messageTextForTesting.contains("已保留原选择")
+        })
+        XCTAssertEqual(
+            panel.conversationRuntimeSelectionForTesting?.providerConfigurationID,
+            providerB.id.uuidString
+        )
+        XCTAssertEqual(panel.conversationRuntimeSelectionForTesting?.modelID, "b-model")
+
+        panel.setQuestionForTesting("验证失败回滚后仍可发送")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { transport.streamRequests.count == 1 })
+        XCTAssertEqual(transport.streamRequests.first?.url?.host, "rollback-b.example")
+        XCTAssertEqual(
+            transport.streamRequests.first?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer rollback-b-key"
+        )
+    }
+
+    func testV2AIUseGlobalDefaultCommitsConcreteProviderAndModel() throws {
+        let suiteName = "StacioWorkbenchAIGlobalDefault-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let providerA = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81200000-0000-0000-0000-000000000001")!,
+            name: "Default Provider",
+            baseURL: "https://global-default.example/v1",
+            modelID: "default-model"
+        )
+        let providerB = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81200000-0000-0000-0000-000000000002")!,
+            name: "Alternate Provider",
+            baseURL: "https://global-alternate.example/v1",
+            modelID: "alternate-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [providerA, providerB],
+                defaultAIProviderID: providerA.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("default-key", for: providerA.id)
+        try apiKeyStore.saveAPIKey("alternate-key", for: providerB.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-global-default-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "global-default.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "global-default.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+        XCTAssertTrue(panel.composerModelPickerModelTitlesForTesting.contains("使用全局默认"))
+        XCTAssertFalse(panel.composerModelPickerModelTitlesForTesting.contains("跟随全局默认"))
+
+        panel.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerB.id, modelID: "alternate-model")
+        )
+        XCTAssertTrue(waitUntil {
+            panel.conversationRuntimeSelectionForTesting?.providerConfigurationID
+                == providerB.id.uuidString
+                && panel.conversationRuntimeReadyForTesting
+        })
+
+        panel.selectComposerModelForTesting(nil)
+        XCTAssertTrue(waitUntil {
+            let selection = panel.conversationRuntimeSelectionForTesting
+            return selection?.providerConfigurationID == providerA.id.uuidString
+                && selection?.modelID == "default-model"
+                && panel.conversationRuntimeReadyForTesting
+        })
+        panel.setQuestionForTesting("验证当前全局默认")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { transport.streamRequests.count == 1 })
+        XCTAssertEqual(transport.streamRequests.first?.url?.host, "global-default.example")
+        XCTAssertEqual(
+            transport.streamRequests.first?.value(forHTTPHeaderField: "Authorization"),
+            "Bearer default-key"
+        )
+    }
+
+    func testV2AITurnCommitKeepsNewComposerDraftAndFreezesBindingControls() throws {
+        let suiteName = "StacioWorkbenchAITurnCommit-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let provider = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81300000-0000-0000-0000-000000000001")!,
+            name: "Commit Provider",
+            baseURL: "https://commit-provider.example/v1",
+            modelID: "commit-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(aiProviders: [provider], defaultAIProviderID: provider.id)
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("commit-key", for: provider.id)
+        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        var blocker: TurnSubmissionBlockingConversationStore?
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path,
+                actorStoreFactory: { repository in
+                    let store = TurnSubmissionBlockingConversationStore(repository: repository)
+                    blocker = store
+                    return store
+                }
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-commit-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "commit.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "commit.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
+        let blockingStore = try XCTUnwrap(blocker)
+        defer { blockingStore.releaseTurnSubmission() }
+
+        panel.setQuestionForTesting("第一条排查请求")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { blockingStore.didBlockTurnSubmission })
+
+        panel.setQuestionForTesting("提交期间输入的第二条草稿")
+        XCTAssertEqual(panel.questionTextForTesting, "提交期间输入的第二条草稿")
+        XCTAssertTrue(panel.conversationTurnBindingControlsFrozenForTesting)
+
+        blockingStore.releaseTurnSubmission()
+        XCTAssertTrue(waitUntil { transport.streamRequests.count == 1 })
+        XCTAssertTrue(waitUntil { panel.conversationRuntimeIdleForTesting })
+        XCTAssertEqual(panel.questionTextForTesting, "提交期间输入的第二条草稿")
+        XCTAssertEqual(panel.sentQuestionHistoryForTesting.first, "第一条排查请求")
+    }
+
+    func testV2AIComposerReturnQueuesActiveTurnAndDefersTerminalFollowUntilQueueIsCleared() throws {
+        let suiteName = "StacioWorkbenchAIQueueBinding-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let provider = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "81400000-0000-0000-0000-000000000001")!,
+            name: "Queue Provider",
+            baseURL: "https://queue-provider.example/v1",
+            modelID: "queue-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(aiProviders: [provider], defaultAIProviderID: provider.id)
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("queue-key", for: provider.id)
+        let transport = ControllableWorkbenchAIAssistantHTTPTransport()
+        defer { transport.completeStreams() }
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transport,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transport,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controller.loadWindow()
+        let runtimeA = "term-v2-queue-a-\(UUID().uuidString)"
+        let runtimeB = "term-v2-queue-b-\(UUID().uuidString)"
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: runtimeA, status: "running", diagnostic: "running"),
+            title: "queue-a.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "queue-a.example")
+        )
+        controller.showAIAssistantFromToolbar(nil)
+        let panel = try XCTUnwrap(controller.inspectorViewControllerForTesting?.aiAssistantViewController)
+        XCTAssertTrue(
+            waitUntil { panel.conversationRuntimeReadyForTesting },
+            "message=\(panel.messageTextForTesting), state=\(panel.conversationStateForTesting)"
+        )
+        XCTAssertTrue(panel.targetTitleForTesting.contains("queue-a.example"))
+        var didPauseQueue: Bool?
+        panel.setConversationQueueAutoAdvancePausedForTesting(true) { didPauseQueue = $0 }
+        XCTAssertTrue(waitUntil { didPauseQueue != nil })
+        XCTAssertEqual(didPauseQueue, true)
+
+        panel.setQuestionForTesting("持续检查 A")
+        panel.performAskForTesting()
+        XCTAssertTrue(waitUntil { transport.streamRequests.count == 1 })
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前排查任务")
+        panel.setQuestionForTesting("排队的第二条请求")
+        panel.submitQuestionFromFieldForTesting()
+        XCTAssertTrue(waitUntil { panel.conversationQueuedCountForTesting == 1 })
+        XCTAssertEqual(panel.primaryActionAccessibilityLabelForTesting, "停止当前排查任务")
+        XCTAssertEqual(transport.streamRequests.count, 1)
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: runtimeB, status: "running", diagnostic: "running"),
+            title: "queue-b.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "queue-b.example")
+        )
+        XCTAssertTrue(panel.targetTitleForTesting.contains("queue-a.example"))
+
+        transport.completeStreams()
+        XCTAssertTrue(waitUntil {
+            panel.conversationRuntimeIdleForTesting
+                && panel.conversationQueuedCountForTesting == 1
+        })
+        XCTAssertTrue(panel.targetTitleForTesting.contains("queue-a.example"))
+
+        var didRemoveQueuedInput: Bool?
+        panel.removeFirstQueuedConversationInputForTesting { didRemoveQueuedInput = $0 }
+        XCTAssertTrue(waitUntil { didRemoveQueuedInput != nil })
+        XCTAssertEqual(didRemoveQueuedInput, true)
+        XCTAssertTrue(waitUntil {
+            panel.conversationRuntimeReadyForTesting
+                && panel.targetTitleForTesting.contains("queue-b.example")
+        })
+    }
+
+    func testV2AIModelSelectionSessionsAreIndependentAcrossWorkbenchPanels() throws {
+        let suiteName = "StacioWorkbenchAIModelSelectionIsolation-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let providerA = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "82000000-0000-0000-0000-000000000001")!,
+            name: "Provider A",
+            baseURL: "https://provider-a.example/v1",
+            modelID: "a-model"
+        )
+        let providerB = makeWorkbenchModelProvider(
+            id: UUID(uuidString: "82000000-0000-0000-0000-000000000002")!,
+            name: "Provider B",
+            baseURL: "https://provider-b.example/v1",
+            modelID: "b-model"
+        )
+        try settingsStore.saveAIProviderSettings(
+            AIProviderSettingsEnvelope(
+                aiProviders: [providerA, providerB],
+                defaultAIProviderID: providerA.id
+            )
+        )
+        let apiKeyStore = KeychainAIApiKeyStore(
+            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        )
+        try apiKeyStore.saveAPIKey("key-a", for: providerA.id)
+        try apiKeyStore.saveAPIKey("key-b", for: providerB.id)
+        let transportA = RecordingWorkbenchAIAssistantHTTPTransport()
+        let transportB = RecordingWorkbenchAIAssistantHTTPTransport()
+        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
+        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
+        let workspaceA = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let workspaceB = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controllerA = WorkbenchWindowController(
+            workspaceViewController: workspaceA,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transportA,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transportA,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+        let controllerB = WorkbenchWindowController(
+            workspaceViewController: workspaceB,
+            settingsStore: settingsStore,
+            assistantSettingsValueStoreProvider: { nil },
+            aiAPIKeyStore: apiKeyStore,
+            aiHTTPTransport: transportB,
+            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
+                settingsStore: settingsStore,
+                apiKeyStore: apiKeyStore,
+                transport: transportB,
+                databasePath: conversationDatabase.path
+            ),
+            aiConversationCatalogLoader: { [] }
+        )
+
+        controllerA.loadWindow()
+        controllerB.loadWindow()
+        workspaceA.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-isolation-a-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "isolation-a.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "isolation-a.example")
+        )
+        workspaceB.openRemoteShell(
+            status: LiveShellStatus(
+                runtimeId: "term-v2-isolation-b-\(UUID().uuidString)",
+                status: "running",
+                diagnostic: "running"
+            ),
+            title: "isolation-b.example",
+            connectionKind: .ssh,
+            liveSessionContext: workbenchLiveContext(host: "isolation-b.example")
+        )
+        controllerA.showAIAssistantFromToolbar(nil)
+        controllerB.showAIAssistantFromToolbar(nil)
+        let panelA = try XCTUnwrap(controllerA.inspectorViewControllerForTesting?.aiAssistantViewController)
+        let panelB = try XCTUnwrap(controllerB.inspectorViewControllerForTesting?.aiAssistantViewController)
+        panelA.setQuestionForTesting("检查 A")
+        panelB.setQuestionForTesting("检查 B")
+        XCTAssertTrue(waitUntil {
+            panelA.conversationRuntimeReadyForTesting
+                && panelB.conversationRuntimeReadyForTesting
+        })
+        panelA.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerA.id, modelID: "a-model")
+        )
+        panelB.selectComposerModelForTesting(
+            AIModelSelection(providerID: providerB.id, modelID: "b-model")
+        )
+        XCTAssertTrue(waitUntil {
+            let selectionA = panelA.conversationRuntimeSelectionForTesting
+            let selectionB = panelB.conversationRuntimeSelectionForTesting
+            return selectionA?.providerConfigurationID == providerA.id.uuidString
+                && selectionA?.modelID == "a-model"
+                && selectionB?.providerConfigurationID == providerB.id.uuidString
+                && selectionB?.modelID == "b-model"
+                && panelA.conversationRuntimeReadyForTesting
+                && panelB.conversationRuntimeReadyForTesting
+        })
+        XCTAssertTrue(panelA.askButtonEnabledForTesting)
+        XCTAssertTrue(panelB.askButtonEnabledForTesting)
+        panelA.performAskForTesting()
+        panelB.performAskForTesting()
+
+        XCTAssertTrue(
+            waitUntil {
+                transportA.streamRequests.count == 1 && transportB.streamRequests.count == 1
+            },
+            "A=\(panelA.messageTextForTesting)|\(panelA.statusTextForTesting); B=\(panelB.messageTextForTesting)|\(panelB.statusTextForTesting)"
+        )
+        let requestA = try XCTUnwrap(transportA.streamRequests.first)
+        let requestB = try XCTUnwrap(transportB.streamRequests.first)
+        XCTAssertEqual(requestA.url?.host, "provider-a.example")
+        XCTAssertEqual(requestB.url?.host, "provider-b.example")
+        let bodyA = String(data: try XCTUnwrap(requestA.httpBody), encoding: .utf8) ?? ""
+        let bodyB = String(data: try XCTUnwrap(requestB.httpBody), encoding: .utf8) ?? ""
+        XCTAssertTrue(bodyA.contains(#""model":"a-model""#))
+        XCTAssertTrue(bodyB.contains(#""model":"b-model""#))
+        XCTAssertEqual(requestA.value(forHTTPHeaderField: "Authorization"), "Bearer key-a")
+        XCTAssertEqual(requestB.value(forHTTPHeaderField: "Authorization"), "Bearer key-b")
+        XCTAssertEqual(try settingsStore.loadAIProviderSettings().defaultAIProviderID, providerA.id)
+    }
+
+#endif
+
+    func testTerminalAskAIContextRequestShowsInspectorAndPrefillsComposer() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        _ = try workspace.openLocalShell()
+        workspace.requestAIForCurrentTerminalForTesting(selectedText: "disk full")
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let panel = try XCTUnwrap(inspector.aiAssistantViewController)
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        XCTAssertTrue(panel.questionTextForTesting.contains("disk full"))
+    }
+
+    func testTerminalTraceDoesNotExposeOldTaskControlOpenRoute() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        _ = try workspace.openLocalShell()
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+        pane.appendAgentTraceForTesting(
+            requestID: "req-open-task",
+            state: .running,
+            message: "Codex 正在执行 uptime",
+            redactedCommand: "uptime"
+        )
+
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+
+        XCTAssertNotNil(pane.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
+        XCTAssertTrue(pane.agentTraceOverlayTextForTesting.contains("Codex 正在执行 uptime"))
+        XCTAssertNil(pane.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-open-task"))
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
+        XCTAssertNil(inspector.aiAssistantViewController?.view.firstSubview(withIdentifier: "Stacio.AI.taskWorkspace"))
+        XCTAssertFalse(inspector.aiAssistantViewController?.taskControlTextForTesting.contains("req-open-task") ?? false)
+        XCTAssertFalse(inspector.aiAssistantViewController?.taskControlTextForTesting.contains("Codex 正在执行 uptime") ?? false)
+    }
+
+    func testAgentBridgeHandlerUsesSettingsConfirmationPolicy() throws {
+        let suiteName = "StacioWorkbenchAgentPolicyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.agentConfirmationPolicy = .requireEveryCommand
+        }
+        let confirmer = RecordingWorkbenchAgentActionConfirmer(confirmed: false)
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore,
+            agentActionConfirmer: confirmer
+        )
+
+        controller.loadWindow()
+        let runtimeID = try workspace.openLocalShell()
+        let handler = controller.makeAgentBridgeRequestHandler()
+        let request = AgentBridgeRequest(
+            id: "settings-policy",
+            actor: AgentActor(kind: .externalCLI, name: "codex", processID: 42),
+            action: .runCommand(
+                AgentRunCommandRequest(
+                    target: .runtimeID(runtimeID),
+                    command: "uptime",
+                    follow: true
+                )
+            )
+        )
+
+        XCTAssertThrowsError(try handler.handleAgentBridgeRequest(request))
+        XCTAssertEqual(confirmer.confirmations.count, 1)
+        XCTAssertEqual(confirmer.confirmations[0].risk, .readOnly)
+        XCTAssertEqual(confirmer.confirmations[0].targetTitle, L10n.Workspace.local)
+    }
+
+    func testAgentBridgeHandlerMigratesBackgroundPreferenceAndUsesCurrentTerminalForAllActors() throws {
+        let suiteName = "StacioWorkbenchAgentExecutionModeTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("backgroundTask", forKey: "Stacio.Settings.agentExecutionMode")
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        XCTAssertEqual(settingsStore.snapshot().agentExecutionMode, .visibleTerminal)
+        XCTAssertEqual(defaults.string(forKey: "Stacio.Settings.agentExecutionMode"), "visibleTerminal")
+        let launcher = RecordingWorkbenchLocalTerminalLauncher(initiallyRunning: true)
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            settingsStore: settingsStore,
+            localTerminalProcessLauncherFactory: { launcher }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore
+        )
+
+        controller.loadWindow()
+        let runtimeID = try workspace.openLocalShell()
+        let handler = controller.makeAgentBridgeRequestHandler()
+        let requests = [
+            ("assistant-current-terminal", AgentActor(kind: .builtInAI, name: "Stacio AI", processID: nil), "uptime"),
+            ("local-agent-current-terminal", AgentActor(kind: .externalCLI, name: "codex", processID: 42), "whoami")
+        ]
+        var results: [[AgentTraceEvent]] = []
+        for (requestID, actor, command) in requests {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                TerminalOutputBroadcastHub.shared.publishOutput(
+                    runtimeID: runtimeID,
+                    bytes: Array("command completed\n".utf8)
+                )
+            }
+            results.append(try handler.handleAgentBridgeRequest(
+                AgentBridgeRequest(
+                    id: requestID,
+                    actor: actor,
+                    action: .runCommand(
+                        AgentRunCommandRequest(
+                            target: .runtimeID(runtimeID),
+                            command: command,
+                            follow: true
+                        )
+                    )
+                )
+            ))
+        }
+
+        XCTAssertEqual(
+            launcher.sentInput.map { String(decoding: $0, as: UTF8.self) },
+            [
+                "{ uptime\n}; printf '\\033]777;stacio-agent-done=assistant-current-terminal\\007'\n",
+                "{ whoami\n}; printf '\\033]777;stacio-agent-done=local-agent-current-terminal\\007'\n"
+            ]
+        )
+        XCTAssertTrue(results.allSatisfy { events in
+            events.last?.state == .completed
+                && events.last?.metadata?["executionMode"] == "visibleTerminal"
+                && events.last?.metadata?["sourceRuntimeID"] == runtimeID
+        })
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+        XCTAssertEqual(pane.runtimeID, runtimeID)
+        XCTAssertFalse(pane.agentTraceSnapshotForTesting.contains("独立任务"))
+    }
+
+    func testAgentBridgeCommandKeepsExistingRemoteRuntimeConnected() throws {
+        let suiteName = "StacioWorkbenchRemoteAgentRuntimeTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("backgroundTask", forKey: "Stacio.Settings.agentExecutionMode")
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        let eventSink = RecordingWorkbenchTerminalEventSink()
+        let bridge = RecordingWorkbenchRemoteTerminalBridge()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { eventSink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_existing", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: workbenchLiveContext(host: "example.com")
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            TerminalOutputBroadcastHub.shared.publishOutput(
+                runtimeID: "term_existing",
+                bytes: Array("/srv/app\n".utf8)
+            )
+        }
+
+        let events = try controller.makeAgentBridgeRequestHandler().handleAgentBridgeRequest(
+            AgentBridgeRequest(
+                id: "remote-current-terminal",
+                actor: AgentActor(kind: .externalCLI, name: "claude", processID: 43),
+                action: .runCommand(
+                    AgentRunCommandRequest(
+                        target: .runtimeID("term_existing"),
+                        command: "pwd",
+                        follow: true
+                    )
+                )
+            )
+        )
+
+        XCTAssertEqual(pane.runtimeID, "term_existing")
+        XCTAssertEqual(eventSink.userInputEvents.map(\.runtimeID), ["term_existing"])
+        XCTAssertEqual(
+            eventSink.userInputEvents.map { String(decoding: $0.bytes, as: UTF8.self) },
+            ["{ pwd\n}; printf '\\033]777;stacio-agent-done=remote-current-terminal\\007'\n"]
+        )
+        XCTAssertTrue(bridge.closedRuntimeIDs.isEmpty)
+        XCTAssertEqual(events.last?.state, .completed)
+        XCTAssertEqual(events.last?.metadata?["executionMode"], "visibleTerminal")
+        XCTAssertEqual(events.last?.metadata?["sourceRuntimeID"], "term_existing")
+    }
+
+    func testWorkbenchInspectorFilesUsesSettingsDirectoryFollowDefault() throws {
+        let suiteName = "StacioWorkbenchFilesSettingsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.filesDirectoryFollowDefault = false
+        }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            settingsStore: settingsStore
+        )
+
+        controller.loadWindow()
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        _ = files.view
+        XCTAssertFalse(files.isDirectoryFollowEnabled)
+    }
+
+    func testFilesToolbarEnablesDirectoryFollowForRemoteBindingEvenWhenDefaultOff() throws {
+        let suiteName = "StacioWorkbenchFilesToolbarFollowTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.filesDirectoryFollowDefault = false
+        }
+        let context = workbenchLiveContext(host: "example.com")
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false,
+            settingsStore: settingsStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            settingsStore: settingsStore
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        let files = try XCTUnwrap(controller.inspectorViewControllerForTesting?.filesViewController)
+
+        XCTAssertTrue(files.isDirectoryFollowEnabled)
+        pane.sendInput(Array("cd /srv/app\n".utf8))
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && files.currentRemotePath == "/srv/app"
+        })
+    }
+
+    func testFilesToolbarActionSelectsInspectorFilesTab() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.commandStrip"))
+
+        controller.showTunnelsFromToolbar(nil)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "隧道")
+        controller.contentSplitViewController.splitViewItems[2].isCollapsed = true
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "文件")
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.commandStrip"))
+    }
+
+    func testFilesToolbarActionCollapsesInspectorWhenFilesAlreadySelected() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        controller.showTunnelsFromToolbar(nil)
+        controller.showFilesFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "文件")
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "文件")
+    }
+
+    func testInspectorPanelToolbarActionsSwitchPanelsWithoutCollapsing() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+
+        controller.showTunnelsFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "隧道")
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "文件")
+    }
+
+    func testNewSessionToolbarItemOpensSessionSettingsFlow() throws {
+        let controller = WorkbenchWindowController()
+
+        controller.loadWindow()
+        let item = try XCTUnwrap(
+            controller.window?.toolbar?.items.first {
+                $0.itemIdentifier.rawValue == "Stacio.Toolbar.newSession"
+            }
+        )
+
+        XCTAssertEqual(item.action, #selector(WorkbenchWindowController.performNewSessionFromToolbar(_:)))
+    }
+
+    func testNewSessionToolbarActionOpensLocalShell() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        try controller.openLocalShellFromToolbar(nil)
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertTrue(workspace.currentTerminalPane is TerminalPaneViewController)
+    }
+
+    func testOpeningLocalShellFocusesTerminalViewForKeyboardInput() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try workspace.openLocalShell()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+        XCTAssertIdentical(controller.window?.firstResponder, pane.terminalView)
+    }
+
+    func testOpeningRemoteShellFocusesTerminalViewForKeyboardInput() throws {
+        let workspace = WorkspaceViewController(
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "生产 API"
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertIdentical(controller.window?.firstResponder, pane.terminalView)
+    }
+
+    func testSplitToolbarItemOffersTerminalLayoutModesWithoutStartingMultiExecSelection() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let selector = RecordingMultiExecSessionSelector(
+            selection: MultiExecSessionSelection(targetIDs: ["term_one", "term_two"])
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecSessionSelector: selector
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_one", status: "running", diagnostic: "running"),
+            title: "生产一",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_two", status: "running", diagnostic: "running"),
+            title: "生产二",
+            connectionKind: .ssh
+        )
+        let item = try XCTUnwrap(
+            controller.toolbar(
+                try XCTUnwrap(controller.window?.toolbar),
+                itemForItemIdentifier: NSToolbarItem.Identifier("Stacio.Toolbar.split"),
+                willBeInsertedIntoToolbar: false
+            )
+        )
+
+        XCTAssertEqual(item.action, #selector(WorkbenchWindowController.performSplitTerminalFromToolbar(_:)))
+        XCTAssertEqual(
+            (item as? NSMenuToolbarItem)?.menu.items.map(\.title),
+            ["单终端模式", "垂直分屏", "水平分屏", "网格分屏"]
+        )
+
+        controller.performSplitTerminalFromToolbar(nil)
+
+        XCTAssertEqual(selector.presentedTargets.map(\.id), ["term_one", "term_two"])
+        XCTAssertEqual(selector.presentedTargetChoices.map(\.sessionProtocol), [.ssh, .ssh])
+        XCTAssertEqual(workspace.currentTerminalSplitLayoutModeForTesting, .vertical)
+    }
+
+    func testSplitToolbarCreatesSecondPaneBeforeApplyingVerticalLayout() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        controller.loadWindow()
+        try workspace.openLocalShell()
+
+        controller.performVerticalSplitTerminalFromToolbar(nil)
+
+        XCTAssertEqual(workspace.openTerminalPaneCount, 2)
+        XCTAssertEqual(workspace.currentTerminalSplitLayoutModeForTesting, .vertical)
+        XCTAssertFalse(workspace.isMultiExecSessionActiveForTesting)
+    }
+
+    func testMultiExecToolbarItemStartsInteractiveSelection() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let selector = RecordingMultiExecSessionSelector(
+            selection: MultiExecSessionSelection(targetIDs: ["term_one", "term_two"])
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecSessionSelector: selector
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_one", status: "running", diagnostic: "running"),
+            title: "生产一",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_two", status: "running", diagnostic: "running"),
+            title: "生产二",
+            connectionKind: .serial
+        )
+        let item = try XCTUnwrap(
+            controller.window?.toolbar?.items.first {
+                $0.itemIdentifier.rawValue == "Stacio.Toolbar.multiExec"
+            }
+        )
+
+        XCTAssertEqual(item.action, #selector(WorkbenchWindowController.performMultiExecFromToolbar(_:)))
+        XCTAssertEqual(item.toolTip, "将输入同步执行到多个终端\n快捷键：⌘D")
+        XCTAssertEqual(item.image?.accessibilityDescription, "向多个终端同步执行")
+
+        controller.performMultiExecFromToolbar(nil)
+
+        XCTAssertEqual(selector.presentedTargets.map(\.id), ["term_one", "term_two"])
+        XCTAssertEqual(selector.presentedTargetChoices.map(\.sessionProtocol), [.ssh, .serial])
+        XCTAssertEqual(workspace.currentSplitPaneRuntimeIDsForTesting, ["term_one", "term_two"])
+    }
+
+    func testSplittingTerminalFocusesNewPaneForKeyboardInput() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try workspace.openLocalShell()
+        try workspace.splitCurrentTerminal()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+        XCTAssertIdentical(controller.window?.firstResponder, pane.terminalView)
+    }
+
+    func testWorkbenchCloseCurrentTerminalRequiresConfirmationFromMenu() {
+        let sink = RecordingWorkbenchTerminalEventSink()
+        let bridge = RecordingWorkbenchRemoteTerminalBridge()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { bridge },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let confirmation = RecordingTerminalCloseConfirmation(shouldClose: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            terminalCloseConfirmation: confirmation
+        )
+
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "生产 API"
+        )
+        controller.loadWindow()
+        controller.closeCurrentTerminalFromMenu(nil)
+        confirmation.shouldClose = true
+        controller.closeCurrentTerminalFromMenu(nil)
+
+        XCTAssertEqual(confirmation.requestedTitles, ["生产 API", "生产 API"])
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(bridge.closedRuntimeIDs, ["term_remote"])
+        XCTAssertEqual(sink.closedRuntimeIDs, ["term_remote"])
+    }
+
+    func testWorkbenchSkipsTerminalCloseConfirmationWhenDisabledInSettings() throws {
+        let suiteName = "StacioCloseConfirmationSettingsTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settingsStore = AppSettingsStore(defaults: defaults)
+        settingsStore.update { settings in
+            settings.terminalCloseConfirmationEnabled = false
+        }
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            settingsStore: settingsStore
+        )
+        let confirmation = RecordingTerminalCloseConfirmation(shouldClose: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            terminalCloseConfirmation: confirmation,
+            settingsStore: settingsStore
+        )
+
+        controller.loadWindow()
+        try workspace.openLocalShell()
+        controller.closeCurrentTerminalFromMenu(nil)
+
+        XCTAssertEqual(confirmation.requestedTitles, [])
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+    }
+
+    func testWorkbenchInjectsTunnelLiveSessionContextIntoInspector() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let liveBridge = RecordingWorkbenchLiveTunnelBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionContextProvider: { context },
+            tunnelLiveBridge: liveBridge
+        )
+
+        controller.loadWindow()
+        let inspector = controller.contentSplitViewController
+            .splitViewItems[2]
+            .viewController as? InspectorViewController
+        let status = try inspector?.tunnelsViewControllerForTesting.startForTesting(
+            profile: TunnelProfile(
+                id: "tun_workbench_context",
+                kind: .local,
+                localHost: "127.0.0.1",
+                localPort: 18080,
+                remoteHost: "db.internal",
+                remotePort: 5432
+            )
+        )
+
+        XCTAssertEqual(status?.state, .running)
+        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), ["tun_workbench_context"])
+    }
+
+    func testWorkbenchDefaultTunnelContextProviderReadsSharedStore() throws {
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(
+            with: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:test"
+            )
+        )
+        let liveBridge = RecordingWorkbenchLiveTunnelBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionStore: contextStore,
+            tunnelLiveBridge: liveBridge
+        )
+
+        controller.loadWindow()
+        let inspector = controller.contentSplitViewController
+            .splitViewItems[2]
+            .viewController as? InspectorViewController
+        let status = try inspector?.tunnelsViewControllerForTesting.startForTesting(
+            profile: TunnelProfile(
+                id: "tun_workbench_store",
+                kind: .local,
+                localHost: "127.0.0.1",
+                localPort: 18080,
+                remoteHost: "db.internal",
+                remotePort: 5432
+            )
+        )
+
+        XCTAssertEqual(status?.state, .running)
+        XCTAssertEqual(liveBridge.startedProfiles.map(\.id), ["tun_workbench_store"])
+    }
+
+    func testWorkbenchReportsRunningTunnelCountForApplicationTerminationProtection() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "edge.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:tunnel"
+        )
+        let liveBridge = RecordingWorkbenchLiveTunnelBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionContextProvider: { context },
+            tunnelLiveBridge: liveBridge
+        )
+
+        controller.loadWindow()
+        let inspector = controller.contentSplitViewController
+            .splitViewItems[2]
+            .viewController as? InspectorViewController
+
+        XCTAssertEqual(controller.runningTunnelCount, 0)
+
+        let status = try inspector?.tunnelsViewControllerForTesting.startForTesting(
+            profile: TunnelProfile(
+                id: "tun_quit_guard",
+                kind: .local,
+                localHost: "127.0.0.1",
+                localPort: 19090,
+                remoteHost: "127.0.0.1",
+                remotePort: 9090
+            )
+        )
+
+        XCTAssertEqual(status?.state, .running)
+        XCTAssertEqual(controller.runningTunnelCount, 1)
+    }
+
+    func testWorkbenchStartRemoteSessionDelegatesToSessionStarter() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_live", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter
+        )
+        let config = SshConnectionConfig(
+            host: "example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+
+        let status = try controller.startRemoteSession(config: config, title: "deploy@example.com")
+
+        XCTAssertEqual(status.runtimeId, "term_live")
+        XCTAssertEqual(starter.startedConfigs.map(\.host), ["example.com"])
+        XCTAssertEqual(starter.startedTitles, ["deploy@example.com"])
+    }
+
+    func testWorkbenchStartRemoteSessionKeepsInspectorHiddenUntilFilesToolbarRequested() throws {
+        let contextStore = TunnelLiveSessionStore()
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_live", status: "running", diagnostic: "running"),
+            onStart: {
+                contextStore.replace(with: context)
+            }
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            remoteSessionStarter: starter
+        )
+
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        try controller.startRemoteSession(config: context.config, title: "deploy@example.com")
+
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(filesBridge.liveHosts, [])
+        XCTAssertEqual(filesBridge.liveRemotePaths, [])
+        XCTAssertEqual(inspector.filesViewController?.entryCount, 0)
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts == ["example.com"]
+                && inspector.filesViewController?.entryCount == 1
+        })
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "文件")
+        XCTAssertEqual(filesBridge.liveHosts, ["example.com"])
+        XCTAssertEqual(filesBridge.liveRemotePaths, ["~"])
+        XCTAssertEqual(inspector.filesViewController?.entryCount, 1)
+    }
+
+    func testFilesToolbarLoadsDirectoryFromSelectedRemoteTerminalContext() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let shellStarter = HostRuntimeLiveShellStarter()
+        let remoteStarter = RemoteSSHSessionCoordinator(
+            contextBuilder: HostMappedTunnelContextBuilder(),
+            liveShellStarter: shellStarter,
+            contextStore: contextStore,
+            workspace: workspace,
+            databasePathProvider: { "/tmp/stacio-test.sqlite" }
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/selected.log", size: 64, linkTarget: nil)
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            remoteSessionStarter: remoteStarter
+        )
+
+        controller.loadWindow()
+        try controller.startRemoteSession(
+            config: workbenchSSHConfig(host: "first.example.com"),
+            title: "first.example.com"
+        )
+        try controller.startRemoteSession(
+            config: workbenchSSHConfig(host: "second.example.com"),
+            title: "second.example.com"
+        )
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.75))
+        XCTAssertEqual(workspace.currentRemoteTerminalLiveSessionContext?.config.host, "second.example.com")
+        workspace.selectTabForTesting(0)
+        let selectedPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        selectedPane.hostCurrentDirectoryUpdate(source: selectedPane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts == ["first.example.com"]
+                && controller.inspectorViewControllerForTesting?.filesViewController?.entryCount == 1
+        })
+        XCTAssertEqual(filesBridge.liveHosts, ["first.example.com"])
+        XCTAssertEqual(filesBridge.liveRemotePaths, ["/srv/app"])
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.entryCount, 1)
+    }
+
+    func testRemoteTerminalDroppedFinderFilesCreateUploadTransferTask() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioWorkbenchTerminalDropTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let localFile = temporaryDirectory.appendingPathComponent("release.tar.gz")
+        try Data(repeating: 1, count: 64).write(to: localFile)
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let context = workbenchLiveContext(host: "drop.example.com")
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+            transferHistoryStore: NoOpSCPTransferHistoryStore()
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_drop", status: "running", diagnostic: "running"),
+            title: "drop.example.com",
+            liveSessionContext: context
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/releases")
+
+        pane.performDropLocalFilesForTesting([localFile.path])
+
+        let queue = try XCTUnwrap(controller.inspectorViewControllerForTesting?.transferQueueViewController)
+        XCTAssertTrue(waitUntil {
+            queue.snapshotForTesting.rows.contains {
+                $0.sourcePath == localFile.path
+            }
+        })
+        let row = try XCTUnwrap(queue.snapshotForTesting.rows.first { $0.sourcePath == localFile.path })
+        XCTAssertEqual(row.direction, .upload)
+        XCTAssertEqual(row.sourcePath, localFile.path)
+        XCTAssertEqual(row.destinationPath, "/srv/releases/release.tar.gz")
+        XCTAssertTrue(["queued", "running", "failed"].contains(row.rawStatus))
+    }
+
+    func testWorkbenchKeepsSSHFilesTransferQueueSeparateAndShowsDirectUploads() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioWorkbenchInspectorUploadTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let localFile = temporaryDirectory.appendingPathComponent("inspector-upload.bin")
+        try Data(repeating: 7, count: 64).write(to: localFile)
+
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let context = workbenchLiveContext(host: "files.example.com")
+        let transferBridge = WorkbenchImmediateSCPTransferBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+            transferQueueCoordinatorFactory: { queueView in
+                TransferQueueCoordinator(
+                    bridge: transferBridge,
+                    historyStore: NoOpSCPTransferHistoryStore(),
+                    queueViewController: queueView
+                )
+            }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_files", status: "running", diagnostic: "running"),
+            title: "files.example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let inspectorQueue = try XCTUnwrap(inspector.transferQueueCoordinator)
+        let fileWorkspaceQueue = try XCTUnwrap(controller.fileTransferQueueCoordinatorForTesting)
+        XCTAssertFalse(inspectorQueue === fileWorkspaceQueue)
+
+        fileWorkspaceQueue.enqueueTransfer(
+            runtimeID: "scp_workspace",
+            job: ScpTransferJob(
+                id: "scp_workspace_only",
+                direction: .download,
+                sourcePath: "/srv/workspace-only.bin",
+                destinationPath: "/tmp/workspace-only.bin",
+                bytesTotal: 128
+            )
+        )
+        XCTAssertFalse(inspector.filesViewController?.visibleTextSnapshot.contains("workspace-only.bin") == true)
+
+        inspector.filesViewController?.performDropLocalFilesForTesting([localFile.path])
+
+        XCTAssertTrue(waitUntil {
+            inspector.filesViewController?.visibleTextSnapshot.contains("inspector-upload.bin") == true
+                && inspector.filesViewController?.visibleTextSnapshot.contains("100%") == true
+        })
+        XCTAssertFalse(fileWorkspaceQueue === inspector.transferQueueCoordinator)
+    }
+
+    func testClosingBoundRemoteTerminalDisconnectsInspectorFilesConnection() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = workbenchLiveContext(host: "shared.example.com")
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/root/open.log", size: 64, linkTarget: nil)
+        ])
+        let confirmation = RecordingTerminalCloseConfirmation(shouldClose: true)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            terminalCloseConfirmation: confirmation
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_files_owner", status: "running", diagnostic: "running"),
+            title: "shared.example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let files = try XCTUnwrap(inspector.filesViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths == ["~"] && files.entryCount == 1 })
+
+        controller.closeCurrentTerminalFromMenu(nil)
+        inspector.filesCoordinatorForTesting.refreshCurrentLiveDirectory(remotePath: "/var/log")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(filesBridge.liveRemotePaths, ["~"])
+        XCTAssertEqual(files.entryCount, 0)
+        XCTAssertTrue(files.visibleTextSnapshot.contains("文件连接已断开"))
+        XCTAssertTrue(
+            controller.contentSplitViewController.splitViewItems[2].isCollapsed,
+            "关闭最后一个终端后右侧面板应自动收起"
+        )
+    }
+
+    func testClosingLastTerminalTabCollapsesInspectorThroughTabClosePath() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_tab_close", status: "running", diagnostic: "running"),
+            title: "tab-close.example.com"
+        )
+        controller.showFilesFromToolbar(nil)
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertTrue(
+            waitUntil {
+                workspace.openTerminalPaneCount == 0
+                    && controller.contentSplitViewController.splitViewItems[2].isCollapsed
+            },
+            "通过标签页关闭最后一个终端后右侧面板应自动收起"
+        )
+    }
+
+    func testInspectorFilesDoNotReuseCachedRowsAcrossRemoteTabsOnSameHost() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let firstContext = workbenchLiveContext(
+            host: "same.example.com",
+            expectedFingerprintSHA256: "SHA256:first-tab"
+        )
+        let secondContext = workbenchLiveContext(
+            host: "same.example.com",
+            expectedFingerprintSHA256: "SHA256:second-tab"
+        )
+        let filesBridge = RuntimeScopedWorkbenchRemoteFilesBridge(entriesByFingerprint: [
+            "SHA256:first-tab": [
+                RemoteFileEntry(kind: .file, path: "/home/root/first.log", size: 64, linkTarget: nil)
+            ],
+            "SHA256:second-tab": [
+                RemoteFileEntry(kind: .file, path: "/home/root/second.log", size: 64, linkTarget: nil)
+            ]
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: TunnelLiveSessionStore(),
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_same_host_first", status: "running", diagnostic: "running"),
+            title: "same.example.com",
+            liveSessionContext: firstContext
+        )
+        controller.showFilesFromToolbar(nil)
+        let files = try XCTUnwrap(controller.inspectorViewControllerForTesting?.filesViewController)
+        XCTAssertTrue(waitUntil { files.containsRemoteEntry(named: "first.log") })
+
+        filesBridge.delayNextRequest()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_same_host_second", status: "running", diagnostic: "running"),
+            title: "same.example.com",
+            liveSessionContext: secondContext
+        )
+        XCTAssertTrue(filesBridge.waitUntilDelayedRequestStarted())
+
+        XCTAssertFalse(files.containsRemoteEntry(named: "first.log"))
+        filesBridge.releaseDelayedRequest()
+        XCTAssertTrue(waitUntil { files.containsRemoteEntry(named: "second.log") })
+        XCTAssertEqual(filesBridge.expectedFingerprints, ["SHA256:first-tab", "SHA256:second-tab"])
+    }
+
+    func testFileContextMenuSendsSelectedRemotePathToCurrentTerminal() throws {
+        let sink = RecordingWorkbenchTerminalEventSink()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let contextStore = TunnelLiveSessionStore()
+        let context = workbenchLiveContext(host: "files.example.com")
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .directory, path: "/srv/app/logs", size: 0, linkTarget: nil)
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_files", status: "running", diagnostic: "running"),
+            title: "files.example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let files = try XCTUnwrap(controller.inspectorViewControllerForTesting?.filesViewController)
+        XCTAssertTrue(waitUntil { files.entryCount == 1 })
+
+        files.performContextMenuActionForTesting(title: "将文件路径复制到终端", row: 0)
+
+        XCTAssertEqual(
+            sink.userInputEvents.map { String(decoding: $0.bytes, as: UTF8.self) },
+            ["/srv/app/logs"]
+        )
+    }
+
+    func testFilesToolbarOpensLocalFileTabAtSelectedLocalTerminalDirectory() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false
+        )
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+        let localDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("stacio-local-files-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: localDirectory) }
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+
+        controller.loadWindow()
+        try workspace.openLocalShell()
+        let localPane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
+        localPane.hostCurrentDirectoryUpdate(source: localPane.terminalView, directory: localDirectory.path)
+
+        controller.showFilesFromToolbar(nil)
+
+        let filesPane = try XCTUnwrap(workspace.currentTerminalPane as? LocalFilePaneViewController)
+        XCTAssertEqual(filesPane.currentPathForTesting, localDirectory.path)
+        XCTAssertEqual(workspace.tabLabelsForWorkbenchTesting, ["本地", "本地文件"])
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.selectedTabLabelForTesting, "文件")
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.entryCount, 0)
+    }
+
+    func testFilesToolbarShowsChineseErrorWhenNoCurrentSSHContextExists() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        controller.showFilesFromToolbar(nil)
+
+        let snapshot = try XCTUnwrap(
+            controller.inspectorViewControllerForTesting?.filesViewController?.visibleTextSnapshot
+        )
+        XCTAssertTrue(snapshot.contains("无法加载远端目录"))
+        XCTAssertTrue(snapshot.contains("当前没有可用的 SSH 文件上下文"))
+        XCTAssertFalse(snapshot.localizedCaseInsensitiveContains("missing_live_session_context"))
+    }
+
+    func testWorkbenchOpenSavedSessionUsesEmbeddedRemoteSessionStarter() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_saved",
+            folderId: nil,
+            name: "API Server",
+            protocol: "ssh",
+            host: "api.example.com",
+            port: 2222,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: ["prod"],
+            lastOpenedAt: nil
+        )
+        controller.loadWindow()
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved")
+        XCTAssertEqual(starter.startedConfigs.map(\.host), ["api.example.com"])
+        XCTAssertEqual(starter.startedConfigs.map(\.port), [2222])
+        XCTAssertEqual(starter.startedConfigs.map(\.username), ["deploy"])
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.agent])
+        XCTAssertEqual(starter.startedTitles, ["API Server"])
+        XCTAssertEqual(workspace.aiHistoryScopeIDForTesting(runtimeID: "term_saved"), "session:session_saved")
+    }
+
+    func testWorkbenchOpenSavedSSHSessionShowsConnectingBannerBeforeBackgroundRuntimeCompletes() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let liveShellStarter = DelayedWorkbenchLiveShellStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_delayed", status: "running", diagnostic: "running"),
+            delay: 0.2
+        )
+        let remoteSessionStarter = RemoteSSHSessionCoordinator(
+            contextBuilder: HostMappedTunnelContextBuilder(),
+            liveShellStarter: liveShellStarter,
+            contextStore: TunnelLiveSessionStore(),
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: remoteSessionStarter
+        )
+        let session = SessionRecord(
+            id: "session_saved_pending",
+            folderId: nil,
+            name: "API Server",
+            protocol: "ssh",
+            host: "api.example.com",
+            port: 2222,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: ["prod"],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_"))
+        XCTAssertEqual(status.status, "connecting")
+        let pane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: status.runtimeId))
+        XCTAssertEqual(pane.lifecycleState, .connecting)
+        XCTAssertEqual(pane.lifecycleMessageForTesting, L10n.TerminalLifecycle.connecting)
+        XCTAssertFalse(pane.lifecycleMessageForTesting.contains(L10n.TerminalLifecycle.disconnected))
+        XCTAssertFalse(pane.lifecycleMessageForTesting.contains("os error 65"))
+        XCTAssertFalse(pane.terminalDisplaySnapshotForTesting.contains("SSH 无法到达主机"))
+        XCTAssertTrue(waitUntil { pane.lifecycleState == .running })
+        XCTAssertEqual(pane.runtimeID, "term_saved_delayed")
+    }
+
+    func testWorkbenchOpenSavedSSHSessionAppliesManualIconBeforeAndAfterConnect() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Ubuntu API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: #"{"sessionIconID":"ubuntu"}"#
+            )
+        )
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let liveShellStarter = DelayedWorkbenchLiveShellStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_icon", status: "running", diagnostic: "running"),
+            delay: 0.1
+        )
+        let remoteSessionStarter = RemoteSSHSessionCoordinator(
+            contextBuilder: HostMappedTunnelContextBuilder(),
+            liveShellStarter: liveShellStarter,
+            contextStore: TunnelLiveSessionStore(),
+            workspace: workspace,
+            databasePathProvider: { tempURL.path }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: remoteSessionStarter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_"))
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "ubuntu")
+        XCTAssertTrue(waitUntil {
+            workspace.remoteTerminalPaneForTesting(runtimeID: "term_saved_icon")?.lifecycleState == .running
+        })
+        XCTAssertEqual(workspace.tabIconIdentifierForTesting(index: 0), "ubuntu")
+    }
+
+    func testWorkbenchOpenSavedSSHSessionInitialFailureShowsCurrentFailure() throws {
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let liveShellStarter = FailingWorkbenchLiveShellStarter(
+            error: SshRuntimeError.Transport(message: "SSH 无法到达主机 (os error 65)")
+        )
+        let remoteSessionStarter = RemoteSSHSessionCoordinator(
+            contextBuilder: HostMappedTunnelContextBuilder(),
+            liveShellStarter: liveShellStarter,
+            contextStore: TunnelLiveSessionStore(),
+            workspace: workspace,
+            databasePathProvider: { "/tmp/Stacio-test.sqlite" }
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: remoteSessionStarter
+        )
+        let session = SessionRecord(
+            id: "session_saved_initial_failure",
+            folderId: nil,
+            name: "API Server",
+            protocol: "ssh",
+            host: "api.example.com",
+            port: 2222,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: ["prod"],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        let pane = try XCTUnwrap(workspace.remoteTerminalPaneForTesting(runtimeID: status.runtimeId))
+        XCTAssertTrue(waitUntil { liveShellStarter.startedConfigs.count == 1 })
+        XCTAssertTrue(waitUntil { pane.lifecycleState == .disconnected })
+        XCTAssertEqual(pane.lifecycleMessageForTesting, "连接失败：无法到达主机")
+        XCTAssertFalse(pane.lifecycleMessageForTesting.contains(L10n.TerminalLifecycle.disconnected))
+        XCTAssertFalse(pane.lifecycleMessageForTesting.contains("os error 65"))
+        XCTAssertFalse(pane.terminalDisplaySnapshotForTesting.contains("SSH 无法到达主机"))
+    }
+
+    func testFailingWorkbenchLiveShellStarterRecordsStartsAcrossConcurrentReads() throws {
+        let starter = FailingWorkbenchLiveShellStarter(error: TestWorkbenchError.failed)
+        let config = SshConnectionConfig(
+            host: "api.example.com",
+            port: 22,
+            username: "deploy",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        )
+        let iterationCount = 2_000
+        let queue = DispatchQueue(
+            label: "Stacio.Tests.FailingWorkbenchLiveShellStarter",
+            attributes: .concurrent
+        )
+        let group = DispatchGroup()
+
+        group.enter()
+        queue.async {
+            for _ in 0..<iterationCount {
+                _ = try? starter.startLiveSSHShellRuntime(
+                    config: config,
+                    secret: .agent,
+                    expectedFingerprintSHA256: "SHA256:test",
+                    cols: 120,
+                    rows: 36
+                )
+            }
+            group.leave()
+        }
+        group.enter()
+        queue.async {
+            for _ in 0..<iterationCount {
+                _ = starter.startedConfigs.count
+            }
+            group.leave()
+        }
+
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(starter.startedConfigs.count, iterationCount)
+    }
+
+    func testWorkbenchOpenSavedSSHSessionPassesSavedAutomationPolicyToStarter() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Production API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 2222,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: ["prod"],
+                configJson: #"{"environment":"production","aiExecutionPolicy":"commandCard"}"#
+            )
+        )
+        let starter = RecordingAutomationRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_policy", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved_policy")
+        XCTAssertEqual(starter.startedConfigs.map(\.host), ["api.example.com"])
+        XCTAssertEqual(starter.startedTitles, ["Production API"])
+        XCTAssertEqual(
+            starter.automationPolicies,
+            [SessionAutomationPolicy(environment: "production", aiExecutionPolicy: "commandCard")]
+        )
+    }
+
+    func testWorkbenchOpenSavedSSHSessionPassesSavedStartupPlanToStarter() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Production API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 2222,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: ["prod"],
+                configJson: #"{"environment":"production","aiExecutionPolicy":"commandCard","startupCommand":"cd /srv/app && docker compose ps","environmentVariables":["APP_ENV=prod","STACIO_TRACE=1"]}"#
+            )
+        )
+        let starter = RecordingAutomationRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_startup", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved_startup")
+        XCTAssertEqual(
+            starter.automationPolicies,
+            [
+                SessionAutomationPolicy(
+                    environment: "production",
+                    aiExecutionPolicy: "commandCard",
+                    startupCommand: "cd /srv/app && docker compose ps",
+                    environmentVariables: ["APP_ENV=prod", "STACIO_TRACE=1"]
+                )
+            ]
+        )
+    }
+
+    func testWorkbenchOpenSavedSSHSessionPassesPostConnectScriptToStarter() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Production API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 2222,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: ["prod"],
+                configJson: #"{"postConnectScript":"cd /srv/app\nsource .env"}"#
+            )
+        )
+        let starter = RecordingAutomationRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_on_connect", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved_on_connect")
+        XCTAssertEqual(
+            starter.automationPolicies,
+            [SessionAutomationPolicy(postConnectScript: "cd /srv/app\nsource .env")]
+        )
+    }
+
+    func testWorkbenchOpenSavedSSHSessionUsesSavedConnectTimeout() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "Slow Bastion",
+                protocol: "ssh",
+                host: "bastion.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: ["ops"],
+                configJson: #"{"connectTimeoutMs":45000}"#
+            )
+        )
+        let starter = RecordingAutomationRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_timeout", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved_timeout")
+        XCTAssertEqual(starter.startedConfigs.map(\.connectTimeoutMs), [45_000])
+    }
+
+    func testWorkbenchOpenSavedSSHSessionDefaultsToFastConnectTimeout() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let starter = RecordingAutomationRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_fast_timeout", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_saved_fast_timeout")
+        XCTAssertEqual(starter.startedConfigs.map(\.connectTimeoutMs), [SSHConnectionDefaults.fastConnectTimeoutMs])
+    }
+
+    func testWorkbenchOpenSavedSessionUsesPrivateKeyPathWhenPresent() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_key", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_saved_key",
+            folderId: nil,
+            name: "Key Host",
+            protocol: "ssh",
+            host: "key.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: "~/.ssh/prod",
+            credentialId: "passphrase-ref",
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        _ = try controller.openSavedSession(session)
+
+        XCTAssertEqual(
+            starter.startedConfigs.map(\.authMethod),
+            [.privateKey(keyPath: "~/.ssh/prod", passphraseRef: "passphrase-ref")]
+        )
+    }
+
+    func testWorkbenchOpenSavedSessionUsesPasswordCredentialWhenPresentWithoutPrivateKey() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_password", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_saved_password",
+            folderId: nil,
+            name: "Password Host",
+            protocol: "ssh",
+            host: "password.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: "password-ref",
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        _ = try controller.openSavedSession(session)
+
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.password(credentialRef: "password-ref")])
+    }
+
+    func testWorkbenchOpenSavedSSHSessionRepromptsMissingCredentialAndRetries() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let oldCredential = try CoreBridge.saveCredentialRecord(
+            databasePath: tempURL.path,
+            draft: CredentialDraft(
+                kind: "password",
+                label: "API password",
+                keychainService: KeychainCredentialStore.serviceName,
+                keychainAccount: "deploy@api.example.com"
+            )
+        )
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: oldCredential.id,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        let credentialSaver = KeychainSessionSidebarCredentialSaver(
+            databasePath: tempURL.path,
+            keychainStore: keychainStore
+        )
+        let prompt = RecordingSavedSessionCredentialPromptPresenter(secret: "new-password")
+        let starter = OneTimeFailingRemoteSessionStarter(
+            error: KeychainCredentialError.notFound,
+            status: LiveShellStatus(runtimeId: "term_repaired", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            savedSessionCredentialPromptPresenter: prompt,
+            savedSessionCredentialSaver: credentialSaver,
+            databasePathProvider: { tempURL.path }
+        )
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_repaired")
+        XCTAssertEqual(prompt.requests.map(\.kind), [.password])
+        XCTAssertEqual(prompt.requests.map(\.account), ["deploy@api.example.com"])
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod).count, 2)
+        XCTAssertEqual(starter.startedConfigs.first?.authMethod, .password(credentialRef: oldCredential.id))
+        let updatedSession = try XCTUnwrap(CoreBridge.listAllSessionRecords(databasePath: tempURL.path).first)
+        let replacementCredentialID = try XCTUnwrap(updatedSession.credentialId)
+        XCTAssertNotEqual(replacementCredentialID, oldCredential.id)
+        XCTAssertEqual(starter.startedConfigs.last?.authMethod, .password(credentialRef: replacementCredentialID))
+        XCTAssertEqual(
+            try keychainStore.readSecret(id: replacementCredentialID, account: "deploy@api.example.com"),
+            "new-password"
+        )
+    }
+
+    func testWorkbenchOpenSavedSSHSessionCancelingMissingCredentialPromptStopsRetry() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let oldCredential = try CoreBridge.saveCredentialRecord(
+            databasePath: tempURL.path,
+            draft: CredentialDraft(
+                kind: "password",
+                label: "API password",
+                keychainService: KeychainCredentialStore.serviceName,
+                keychainAccount: "deploy@api.example.com"
+            )
+        )
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "API",
+                protocol: "ssh",
+                host: "api.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: oldCredential.id,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        let credentialSaver = KeychainSessionSidebarCredentialSaver(
+            databasePath: tempURL.path,
+            keychainStore: keychainStore
+        )
+        let prompt = RecordingSavedSessionCredentialPromptPresenter(secret: nil)
+        let starter = OneTimeFailingRemoteSessionStarter(
+            error: KeychainCredentialError.notFound,
+            status: LiveShellStatus(runtimeId: "term_repaired", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            savedSessionCredentialPromptPresenter: prompt,
+            savedSessionCredentialSaver: credentialSaver,
+            databasePathProvider: { tempURL.path }
+        )
+
+        XCTAssertThrowsError(try controller.openSavedSession(session)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(prompt.requests.map(\.account), ["deploy@api.example.com"])
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.password(credentialRef: oldCredential.id)])
+        XCTAssertEqual(try CoreBridge.listCredentialRecords(databasePath: tempURL.path).map(\.id), [oldCredential.id])
+        XCTAssertEqual(
+            try CoreBridge.listAllSessionRecords(databasePath: tempURL.path).map(\.credentialId),
+            [oldCredential.id]
+        )
+    }
+
+    func testWorkbenchOpenSavedSessionWithoutUsernameOrPasswordKeepsHostOnlyTitleAndNoPasswordAuth() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_host_only", status: "running", diagnostic: "running")
+        )
+        let authenticationPrompt = RecordingSavedSessionAuthenticationPromptPresenter(
+            input: SavedSessionAuthenticationInput(username: "", password: "")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            savedSessionAuthenticationPromptPresenter: authenticationPrompt
+        )
+        let session = SessionRecord(
+            id: "session_saved_host_only",
+            folderId: nil,
+            name: "",
+            protocol: "ssh",
+            host: "host-only.example.com",
+            port: 22,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        _ = try controller.openSavedSession(session)
+
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.agent])
+        XCTAssertEqual(starter.startedTitles, ["host-only.example.com"])
+        XCTAssertEqual(authenticationPrompt.hosts, ["host-only.example.com"])
+    }
+
+#if STACIO_AI_V2_UI_LEGACY_TESTS
+    func testWorkbenchOpenSavedRDPSessionOpensConnectingPane() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_wrong",
+                status: "running",
+                diagnostic: "unexpected graphics runtime"
+            )
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { "/Applications/Stacio.app/Contents/Adapters/\($0)" }
+        )
+        let session = SessionRecord(
+            id: "session_rdp",
+            folderId: nil,
+            name: "Windows Host",
+            protocol: "rdp",
+            host: "windows.example.com",
+            port: 3389,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.status, "connecting")
+        // RDP 打开的是内嵌图形面板（GraphicsSessionPaneViewController），不是 SSH 终端。
+        XCTAssertTrue(workspace.currentTerminalPane is GraphicsSessionPaneViewController)
+        // 同步阶段不应启动 SSH starter 或 graphics runtime（后者在凭据表单回调里异步启动）。
+        XCTAssertTrue(graphicsRuntime.requests.isEmpty)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+#endif
+
+    func testWorkbenchOpenSavedVNCSessionStartsPackagedAdapterRuntime() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_test",
+                status: "running",
+                diagnostic: "已启动 Stacio 内置 VNC 适配器，正在建立图形连接。"
+            )
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertEqual(status.diagnostic, L10n.TerminalLifecycle.connecting)
+        XCTAssertEqual(pane.runtimeID, status.runtimeId)
+        XCTAssertTrue(pane.isConnectionStateVisibleForTesting)
+        XCTAssertEqual(
+            pane.visibleTextSnapshotForTesting,
+            "正在连接...\nVNC · desktop.example.com:5900"
+        )
+
+        XCTAssertTrue(waitUntil {
+            pane.runtimeID == "graphics_vnc_test" && graphicsRuntime.requests.count == 1
+        })
+
+        XCTAssertEqual(pane.runtimeID, "graphics_vnc_test")
+        XCTAssertEqual(graphicsRuntime.requests.map(\.protocolName), ["VNC"])
+        XCTAssertEqual(graphicsRuntime.requests.map(\.adapterPath), ["/Applications/Stacio.app/Contents/Adapters/vnc"])
+        XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [["desktop.example.com:5900"]])
+        XCTAssertFalse(pane.isConnectionStateVisibleForTesting)
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("正在建立图形连接"))
+        XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("尚未建立图形连接"))
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchVNCStartFailureKeepsUnifiedConnectionStateVisible() throws {
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_unused",
+                status: "running",
+                diagnostic: "unused"
+            ),
+            startError: TestWorkbenchError.failed
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_failure_state",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        _ = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(waitUntil {
+            pane.isConnectionStateVisibleForTesting
+                && pane.visibleTextSnapshotForTesting.contains("连接失败")
+        })
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("VNC · desktop.example.com:5900"))
+        XCTAssertFalse(pane.hasVisibleDiagnosticChromeForTesting)
+    }
+
+    func testWorkbenchVNCNonRunningRuntimeStatusKeepsUnifiedConnectionStateVisible() throws {
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_failed_status",
+                status: "failed",
+                diagnostic: "VNC 连接超时"
+            )
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_failed_status",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        _ = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(waitUntil {
+            pane.isConnectionStateVisibleForTesting
+                && pane.visibleTextSnapshotForTesting.contains("VNC 连接超时")
+        })
+        XCTAssertFalse(pane.hasVisibleDiagnosticChromeForTesting)
+    }
+
+    func testClosingPendingVNCSessionStopsLateStartedRuntime() throws {
+        let startGate = DispatchSemaphore(value: 0)
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_late",
+                status: "running",
+                diagnostic: "connected"
+            ),
+            startGate: startGate
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_late",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
+        workspace.closeCurrentTerminal()
+        startGate.signal()
+
+        XCTAssertTrue(waitUntil { graphicsRuntime.stoppedRuntimeIDs == ["graphics_vnc_late"] })
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertEqual(pane.runtimeID, status.runtimeId)
+    }
+
+    func testWorkbenchOpenSavedVNCSessionPassesSavedPasswordToPackagedAdapterWithoutLeakingIt() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_password",
+                status: "running",
+                diagnostic: "已启动 Stacio 内置 VNC 适配器，正在建立图形连接。"
+            )
+        )
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        try keychainStore.save(
+            KeychainCredential(
+                id: "vnc-password-ref",
+                account: "admin@desktop.example.com",
+                secret: "vnc-secret"
+            )
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            graphicsCredentialStore: keychainStore,
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_password",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "desktop.example.com",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: "vnc-password-ref",
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertTrue(pane.isConnectionStateVisibleForTesting)
+        XCTAssertTrue(waitUntil {
+            pane.runtimeID == "graphics_vnc_password" && graphicsRuntime.requests.count == 1
+        })
+        XCTAssertEqual(graphicsRuntime.requests.map(\.arguments), [[
+            "desktop.example.com:5900"
+        ]])
+        XCTAssertEqual(
+            graphicsRuntime.requests.map(\.environment),
+            [["STACIO_VNC_PASSWORD": "vnc-secret"]]
+        )
+        XCTAssertFalse(pane.visibleTextSnapshotForTesting.contains("vnc-secret"))
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedVNCSessionPromptsForMissingPasswordBeforeLaunchingAdapter() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let oldCredential = try CoreBridge.saveCredentialRecord(
+            databasePath: tempURL.path,
+            draft: CredentialDraft(
+                kind: "password",
+                label: "VNC password",
+                keychainService: KeychainCredentialStore.serviceName,
+                keychainAccount: "admin@desktop.example.com"
+            )
+        )
+        let staleCredentialSession = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "VNC 桌面",
+                protocol: "vnc",
+                host: "desktop.example.com",
+                port: 5900,
+                username: "admin",
+                privateKeyPath: nil,
+                credentialId: oldCredential.id,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        let credentialSaver = KeychainSessionSidebarCredentialSaver(
+            databasePath: tempURL.path,
+            keychainStore: keychainStore
+        )
+        let prompt = RecordingSavedSessionCredentialPromptPresenter(secret: "prompted-vnc-secret")
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_vnc_prompted",
+                status: "running",
+                diagnostic: "已启动 Stacio 内置 VNC 适配器，正在建立图形连接。"
+            )
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: RecordingRemoteSessionStarter(
+                status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+            ),
+            savedSessionCredentialPromptPresenter: prompt,
+            savedSessionCredentialSaver: credentialSaver,
+            graphicsCredentialStore: keychainStore,
+            databasePathProvider: { tempURL.path },
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+
+        let status = try controller.openSavedSession(staleCredentialSession)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("pending_graphics_"))
+        XCTAssertEqual(status.status, "connecting")
+        XCTAssertEqual(prompt.requests.map(\.protocolName), ["VNC"])
+        XCTAssertEqual(prompt.requests.map(\.account), ["admin@desktop.example.com"])
+        let updatedSession = try XCTUnwrap(CoreBridge.listAllSessionRecords(databasePath: tempURL.path).first)
+        let credentialID = try XCTUnwrap(updatedSession.credentialId)
+        XCTAssertNotEqual(credentialID, oldCredential.id)
+        XCTAssertEqual(
+            try keychainStore.readSecret(id: credentialID, account: "admin@desktop.example.com"),
+            "prompted-vnc-secret"
+        )
+        XCTAssertTrue(waitUntil { graphicsRuntime.requests.count == 1 })
+        let request = try XCTUnwrap(graphicsRuntime.requests.first)
+        XCTAssertEqual(request.arguments, ["desktop.example.com:5900"])
+        XCTAssertEqual(request.environment, ["STACIO_VNC_PASSWORD": "prompted-vnc-secret"])
+    }
+
+    func testWorkbenchOpenSavedVNCSessionWithInvalidEndpointShowsEndpointDiagnostic() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let graphicsRuntime = RecordingGraphicsRuntimeManager(
+            status: GraphicsRuntimeStatus(
+                runtimeID: "graphics_should_not_start",
+                status: "running",
+                diagnostic: "should not start"
+            )
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            graphicsRuntimeManager: graphicsRuntime,
+            graphicsAdapterPathProvider: { _ in "/Applications/Stacio.app/Contents/Adapters/vnc" }
+        )
+        let session = SessionRecord(
+            id: "session_vnc_invalid",
+            folderId: nil,
+            name: "VNC 桌面",
+            protocol: "vnc",
+            host: "",
+            port: 5900,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? GraphicsSessionPaneViewController)
+        XCTAssertEqual(status.status, "diagnostic")
+        XCTAssertEqual(status.diagnostic, "图形会话端点无效")
+        XCTAssertTrue(pane.visibleTextSnapshotForTesting.contains("图形会话端点无效"))
+        XCTAssertTrue(graphicsRuntime.requests.isEmpty)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedTelnetSessionUsesEmbeddedTelnetStarter() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let telnetStarter = RecordingTelnetSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_telnet", status: "running", diagnostic: "telnet")
+        )
+        let authenticationPrompt = RecordingSavedSessionAuthenticationPromptPresenter(
+            input: SavedSessionAuthenticationInput(username: "admin", password: "telnet-secret")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            telnetSessionStarter: telnetStarter,
+            plaintextProtocolSessionConfirmation: RecordingPlaintextProtocolSessionConfirmation(shouldOpen: true),
+            savedSessionAuthenticationPromptPresenter: authenticationPrompt,
+            savedSessionPasswordSavingConfirmation: FixedSavedSessionPasswordSavingConfirmation(shouldSave: false)
+        )
+        let session = SessionRecord(
+            id: "session_telnet",
+            folderId: nil,
+            name: "交换机",
+            protocol: "telnet",
+            host: "switch.example.com",
+            port: 23,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_telnet")
+        XCTAssertEqual(telnetStarter.configs.map(\.host), ["switch.example.com"])
+        XCTAssertEqual(telnetStarter.configs.map(\.port), [23])
+        XCTAssertEqual(telnetStarter.configs.map(\.username), ["admin"])
+        XCTAssertEqual(telnetStarter.configs.map(\.password), ["telnet-secret"])
+        XCTAssertEqual(telnetStarter.titles, ["交换机"])
+        XCTAssertEqual(authenticationPrompt.hosts, ["switch.example.com"])
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedTelnetSessionCancelingPlaintextWarningDoesNotStartOrMarkOpened() {
+        let telnetStarter = RecordingTelnetSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_telnet", status: "running", diagnostic: "telnet")
+        )
+        let recentRecorder = RecordingSavedSessionOpenRecorder()
+        let confirmation = RecordingPlaintextProtocolSessionConfirmation(shouldOpen: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            telnetSessionStarter: telnetStarter,
+            plaintextProtocolSessionConfirmation: confirmation,
+            savedSessionOpenRecorder: recentRecorder,
+            databasePathProvider: { "/tmp/stacio-test.sqlite" }
+        )
+        let session = SessionRecord(
+            id: "session_telnet_plaintext",
+            folderId: nil,
+            name: "交换机",
+            protocol: "telnet",
+            host: "switch.example.com",
+            port: 23,
+            username: "admin",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        XCTAssertThrowsError(try controller.openSavedSession(session)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(confirmation.requestedProtocols, ["Telnet"])
+        XCTAssertTrue(confirmation.requestedMessages.first?.contains("Telnet 不加密") ?? false)
+        XCTAssertTrue(confirmation.requestedMessages.first?.contains("受信任网络") ?? false)
+        XCTAssertTrue(telnetStarter.configs.isEmpty)
+        XCTAssertTrue(recentRecorder.requests.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedSerialSessionUsesEmbeddedSerialStarter() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let serialStarter = RecordingSerialSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_serial", status: "running", diagnostic: "serial")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter,
+            serialSessionStarter: serialStarter
+        )
+        let session = SessionRecord(
+            id: "session_serial",
+            folderId: nil,
+            name: "串口控制台",
+            protocol: "serial",
+            host: "/dev/cu.usbserial-001",
+            port: 9_600,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_serial")
+        XCTAssertEqual(serialStarter.configs.map(\.devicePath), ["/dev/cu.usbserial-001"])
+        XCTAssertEqual(serialStarter.configs.map(\.baudRate), [9_600])
+        XCTAssertEqual(serialStarter.titles, ["串口控制台"])
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedSerialSessionPrefersProtocolConfigJSON() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "高速串口",
+                protocol: "serial",
+                host: "/dev/cu.usbserial-002",
+                port: 115_200,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: #"{"kind":"serial","devicePath":"/ignored","baudRate":1,"dataBits":7,"stopBits":2,"parity":"even","flowControl":"rtscts"}"#
+            )
+        )
+        let serialStarter = RecordingSerialSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_serial_json", status: "running", diagnostic: "serial")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            serialSessionStarter: serialStarter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_serial_json")
+        XCTAssertEqual(serialStarter.configs.map(\.devicePath), ["/dev/cu.usbserial-002"])
+        XCTAssertEqual(serialStarter.configs.map(\.baudRate), [115_200])
+        XCTAssertEqual(serialStarter.configs.map(\.dataBits), [7])
+        XCTAssertEqual(serialStarter.configs.map(\.stopBits), [2])
+        XCTAssertEqual(serialStarter.configs.map(\.parity), ["even"])
+        XCTAssertEqual(serialStarter.configs.map(\.flowControl), ["rtscts"])
+    }
+
+    func testWorkbenchOpenSavedSerialSessionAllowsProtocolConfigWithoutBaudRate() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let session = try CoreBridge.createSessionRecord(
+            databasePath: tempURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "蓝牙 Console",
+                protocol: "serial",
+                host: "/dev/cu.Stacio-Bluetooth",
+                port: 0,
+                username: nil,
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: #"{"kind":"serial","devicePath":"/dev/cu.Stacio-Bluetooth","dataBits":8,"stopBits":1,"parity":"none","flowControl":"none"}"#
+            )
+        )
+        let serialStarter = RecordingSerialSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_serial_auto_baud", status: "running", diagnostic: "serial")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            serialSessionStarter: serialStarter,
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertEqual(status.runtimeId, "term_serial_auto_baud")
+        XCTAssertEqual(serialStarter.configs.map(\.devicePath), ["/dev/cu.Stacio-Bluetooth"])
+        XCTAssertEqual(serialStarter.configs.map(\.baudRate), [0])
+        XCTAssertEqual(serialStarter.configs.map(\.dataBits), [8])
+        XCTAssertEqual(serialStarter.configs.map(\.flowControl), ["none"])
+    }
+
+    func testWorkbenchOpenSavedShellSessionUsesLocalTerminalRuntime() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_shell",
+            folderId: nil,
+            name: "本地 Shell",
+            protocol: "shell",
+            host: "localhost",
+            port: 1,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("term_"))
+        XCTAssertEqual(status.status, "running")
+        XCTAssertEqual(status.diagnostic, "本地 Shell 已打开")
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertTrue(workspace.currentTerminalPane is TerminalPaneViewController)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedBrowserSessionUsesEmbeddedWebView() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_browser",
+            folderId: nil,
+            name: "Docs",
+            protocol: "browser",
+            host: "https://example.com",
+            port: 443,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("browser_"))
+        XCTAssertEqual(status.status, "running")
+        XCTAssertEqual(status.diagnostic, "内置浏览器已打开")
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertTrue(workspace.currentTerminalPane is BrowserPaneViewController)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedFileSessionUsesNativeFilePane() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteSessionStarter: starter
+        )
+        let session = SessionRecord(
+            id: "session_file",
+            folderId: nil,
+            name: "下载目录",
+            protocol: "file",
+            host: NSTemporaryDirectory(),
+            port: 1,
+            username: nil,
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("file_"))
+        XCTAssertEqual(status.status, "running")
+        XCTAssertEqual(status.diagnostic, "本地文件面板已打开")
+        XCTAssertEqual(workspace.openTerminalPaneCount, 1)
+        XCTAssertTrue(workspace.currentTerminalPane is LocalFilePaneViewController)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testWorkbenchOpenSavedSCPSessionUsesEmbeddedFilesPane() throws {
+        let contextBuilder = RecordingWorkbenchTunnelContextBuilder(
+            context: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "files.example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:files"
+            )
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/release.tgz", size: 512, linkTarget: nil)
+        ])
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: filesBridge,
+            remoteSessionStarter: starter,
+            savedSessionContextBuilder: contextBuilder,
+            databasePathProvider: { "/tmp/stacio-scp.sqlite" }
+        )
+        let session = SessionRecord(
+            id: "session_scp",
+            folderId: nil,
+            name: "制品目录",
+            protocol: "scp",
+            host: "files.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        let status = try controller.openSavedSession(session)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("scp_"))
+        XCTAssertEqual(status.status, "running")
+        XCTAssertEqual(status.diagnostic, "文件面板已打开")
+        XCTAssertEqual(contextBuilder.configs.map(\.host), ["files.example.com"])
+        XCTAssertEqual(contextBuilder.configs.map(\.authMethod), [.agent])
+        XCTAssertEqual(contextBuilder.databasePaths, ["/tmp/stacio-scp.sqlite"])
+        XCTAssertEqual(filesBridge.liveHosts, ["files.example.com"])
+        XCTAssertTrue(workspace.currentTerminalPane is RemoteFilesPaneViewController)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+    }
+
+    func testNewSFTPRemoteDeviceStaysInCurrentWorkspaceWithoutSavingSidebarSession() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioTransientSFTP-\(UUID().uuidString)")
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let primary = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "主文件服务器",
+                protocol: "sftp",
+                host: "primary.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let contextBuilder = RecordingWorkbenchTunnelContextBuilder(
+            context: workbenchLiveContext(host: "connected.example.com")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        var requestedProtocols: [String] = []
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+            savedSessionContextBuilder: contextBuilder,
+            fileTransferRemoteSessionDraftProvider: { protocolName, _ in
+                requestedProtocols.append(protocolName)
+                return SessionDraft(
+                    folderId: nil,
+                    name: "临时备份服务器",
+                    protocol: protocolName.lowercased(),
+                    host: "backup.example.com",
+                    port: 2222,
+                    username: "backup",
+                    privateKeyPath: nil,
+                    credentialId: nil,
+                    tags: [],
+                    configJson: nil
+                )
+            },
+            databasePathProvider: { databaseURL.path }
+        )
+        controller.loadWindow()
+        _ = try controller.openSavedSession(primary)
+        let filesPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        let browser = try XCTUnwrap(filesPane.independentTransferBrowserForTesting)
+
+        browser.requestRemoteDeviceCreationForTesting()
+
+        XCTAssertEqual(requestedProtocols, ["SFTP"])
+        XCTAssertEqual(contextBuilder.configs.map(\.host), ["primary.example.com", "backup.example.com"])
+        XCTAssertEqual(contextBuilder.configs.map(\.port), [22, 2222])
+        XCTAssertEqual(browser.workspacePaneCountForTesting, 3)
+        XCTAssertEqual(workspace.tabLabelsForWorkbenchTesting, ["主文件服务器"])
+        XCTAssertEqual(try CoreBridge.listAllSessionRecords(databasePath: databaseURL.path).map(\.id), [primary.id])
+    }
+
+    func testBastionFileTransferDeviceOptionUsesTrueTargetWithoutCompositeAccount() {
+        let session = SessionRecord(
+            id: "session_bastion_sftp",
+            folderId: nil,
+            name: "生产文件服务器",
+            protocol: "sftp",
+            host: "192.0.2.10",
+            port: 22,
+            username: "SSH@fileadmin@10.20.30.50@internal-account-id",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+        let configJSON = """
+        {"bastionVendor":"topsec","bastionTargetHost":"10.20.30.50","bastionTargetPort":22,"bastionTargetUsername":"fileadmin"}
+        """
+
+        let option = WorkbenchWindowController.fileTransferRemoteDeviceOptionForTesting(
+            session: session,
+            configJSON: configJSON
+        )
+
+        XCTAssertEqual(option?.endpoint, "fileadmin@10.20.30.50:22 · 经由 192.0.2.10:22")
+        XCTAssertFalse(option?.menuTitle.contains("internal-account-id") ?? true)
+        XCTAssertFalse(option?.menuTitle.contains("SSH@fileadmin") ?? true)
+    }
+
+    func testWorkbenchRestoresSavedSFTPWorkspaceGroupInsideOneTab() throws {
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("StacioSFTPGroup-\(UUID().uuidString)")
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let primary = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "主文件服务器",
+                protocol: "sftp",
+                host: "primary.example.com",
+                port: 22,
+                username: "deploy",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let backup = try CoreBridge.createSessionRecord(
+            databasePath: databaseURL.path,
+            draft: SessionDraft(
+                folderId: nil,
+                name: "备份文件服务器",
+                protocol: "scp",
+                host: "backup.example.com",
+                port: 22,
+                username: "backup",
+                privateKeyPath: nil,
+                credentialId: nil,
+                tags: [],
+                configJson: nil
+            )
+        )
+        let definition = WorkspaceSessionGroupDefinition(
+            kind: .sftp,
+            layout: .grid,
+            panes: [
+                .localDirectory(path: "/tmp/local-primary"),
+                .localDirectory(path: "/tmp/local-release"),
+                .remoteSession(sessionID: primary.id, path: "/srv/app"),
+                .remoteSession(sessionID: backup.id, path: "/srv/backup")
+            ]
+        )
+        let contextBuilder = RecordingWorkbenchTunnelContextBuilder(
+            context: workbenchLiveContext(host: "group.example.com")
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+        let closePresenter = RecordingWorkbenchWorkspaceGroupClosePresenter()
+        let workspace = WorkspaceViewController(
+            autoStartTerminalProcesses: false,
+            workspaceGroupClosePresenter: closePresenter
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: filesBridge,
+            savedSessionContextBuilder: contextBuilder,
+            databasePathProvider: { databaseURL.path }
+        )
+        controller.loadWindow()
+        let group = try controller.saveWorkspaceSessionGroup(
+            name: "发布文件工作区",
+            definition: definition
+        )
+
+        let status = try controller.openSavedSession(group)
+
+        XCTAssertTrue(status.runtimeId.hasPrefix("sftp_"))
+        XCTAssertEqual(workspace.tabLabelsForWorkbenchTesting, ["发布文件工作区"])
+        XCTAssertEqual(contextBuilder.configs.map(\.host), ["primary.example.com", "backup.example.com"])
+        let filesPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteFilesPaneViewController)
+        let browser = try XCTUnwrap(filesPane.independentTransferBrowserForTesting)
+        XCTAssertEqual(browser.workspacePaneCountForTesting, 4)
+        XCTAssertEqual(browser.workspaceSessionGroupDefinitionForTesting, definition)
+        XCTAssertTrue(waitUntil {
+            Set(filesBridge.liveRemotePaths).isSuperset(of: ["/srv/app", "/srv/backup"])
+        })
+
+        try workspace.performTabContextActionForTesting(.closeTab, index: 0)
+
+        XCTAssertTrue(closePresenter.requests.isEmpty)
+        XCTAssertTrue(workspace.tabLabelsForWorkbenchTesting.isEmpty)
+    }
+
+    func testWorkbenchRejectsLegacyFTPSessionWithoutStartingRuntime() throws {
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/pub/readme.txt", size: 64, linkTarget: nil)
+        ])
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_wrong", status: "running", diagnostic: "running")
+        )
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let recentRecorder = RecordingSavedSessionOpenRecorder()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            remoteFilesBridge: filesBridge,
+            remoteSessionStarter: starter,
+            plaintextProtocolSessionConfirmation: RecordingPlaintextProtocolSessionConfirmation(shouldOpen: true),
+            savedSessionOpenRecorder: recentRecorder
+        )
+        let session = SessionRecord(
+            id: "session_ftp",
+            folderId: nil,
+            name: "FTP 文件",
+            protocol: "ftp",
+            host: "ftp.example.com",
+            port: 21,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: "cred_ftp",
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        controller.loadWindow()
+        XCTAssertThrowsError(try controller.openSavedSession(session)) { error in
+            XCTAssertEqual(
+                error as? WorkbenchSessionOpenError,
+                .protocolRemoved("FTP", replacement: "SFTP")
+            )
+        }
+
+        XCTAssertTrue(filesBridge.ftpHosts.isEmpty)
+        XCTAssertTrue(filesBridge.ftpUsernames.isEmpty)
+        XCTAssertTrue(filesBridge.ftpSecrets.isEmpty)
+        XCTAssertEqual(workspace.openTerminalPaneCount, 0)
+        XCTAssertTrue(starter.startedConfigs.isEmpty)
+        XCTAssertTrue(recentRecorder.requests.isEmpty)
+    }
+
+
+    func testWorkbenchOpenSavedSessionMarksOpenedAfterSuccessfulStart() throws {
+        var events: [String] = []
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_saved_recent", status: "running", diagnostic: "running"),
+            onStart: { events.append("start") }
+        )
+        let recentRecorder = RecordingSavedSessionOpenRecorder(onMark: { events.append("mark") })
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            savedSessionOpenRecorder: recentRecorder,
+            databasePathProvider: { "/tmp/stacio-test.sqlite" }
+        )
+        let session = SessionRecord(
+            id: "session_recent",
+            folderId: nil,
+            name: "Recent Host",
+            protocol: "ssh",
+            host: "recent.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        _ = try controller.openSavedSession(session)
+
+        XCTAssertEqual(events, ["start", "mark"])
+        XCTAssertEqual(recentRecorder.requests.map(\.databasePath), ["/tmp/stacio-test.sqlite"])
+        XCTAssertEqual(recentRecorder.requests.map(\.id), ["session_recent"])
+    }
+
+    func testWorkbenchOpenSavedSessionDoesNotMarkOpenedWhenStartFails() {
+        let starter = RecordingRemoteSessionStarter(error: TestWorkbenchError.failed)
+        let recentRecorder = RecordingSavedSessionOpenRecorder()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            savedSessionOpenRecorder: recentRecorder,
+            savedSessionAuthenticationPromptPresenter: RecordingSavedSessionAuthenticationPromptPresenter(
+                input: SavedSessionAuthenticationInput(username: "deploy", password: "test-secret")
+            ),
+            savedSessionPasswordSavingConfirmation: FixedSavedSessionPasswordSavingConfirmation(shouldSave: false),
+            databasePathProvider: { "/tmp/stacio-test.sqlite" }
+        )
+        let session = SessionRecord(
+            id: "session_recent",
+            folderId: nil,
+            name: "Recent Host",
+            protocol: "ssh",
+            host: "recent.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: nil
+        )
+
+        XCTAssertThrowsError(try controller.openSavedSession(session))
+        XCTAssertTrue(recentRecorder.requests.isEmpty)
+    }
+
+    func testQuickConnectToolbarPromptsAndStartsRemoteSession() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_quick", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(target: "deploy@example.com:2200")
+            )
+        )
+
+        controller.loadWindow()
+        let status = try controller.quickConnectFromToolbar(nil)
+
+        XCTAssertEqual(status?.runtimeId, "term_quick")
+        XCTAssertEqual(starter.startedConfigs.map(\.host), ["example.com"])
+        XCTAssertEqual(starter.startedConfigs.map(\.port), [2200])
+        XCTAssertEqual(starter.startedConfigs.map(\.connectTimeoutMs), [SSHConnectionDefaults.fastConnectTimeoutMs])
+        XCTAssertEqual(starter.startedTitles, ["deploy@example.com"])
+    }
+
+    func testToolbarQuickConnectUsesWorkbenchQuickConnectFlow() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_quick", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(target: "deploy@example.com")
+            )
+        )
+
+        controller.loadWindow()
+        controller.performQuickConnectFromToolbar(nil)
+
+        XCTAssertEqual(starter.startedConfigs.map(\.host), ["example.com"])
+        XCTAssertEqual(starter.startedTitles, ["deploy@example.com"])
+    }
+
+    func testToolbarQuickConnectPresentsConnectionError() throws {
+        let errorPresenter = RecordingQuickConnectErrorPresenter()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: RecordingRemoteSessionStarter(error: TestWorkbenchError.failed),
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(target: "deploy@example.com")
+            ),
+            quickConnectErrorPresenter: errorPresenter
+        )
+
+        controller.loadWindow()
+        controller.performQuickConnectFromToolbar(nil)
+
+        XCTAssertEqual(errorPresenter.presentedErrors.count, 1)
+    }
+
+    func testWorkspaceDoesNotExposeInlineQuickConnectControlsInDocumentLayout() throws {
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_inline", status: "running", diagnostic: "running")
+        )
+        let prompt = RecordingQuickConnectPromptPresenter(request: nil)
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: prompt
+        )
+
+        controller.loadWindow()
+
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.quickConnectTarget"))
+        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Workspace.quickConnectButton"))
+        XCTAssertEqual(prompt.callCount, 0)
+        XCTAssertEqual(starter.startedConfigs.map(\.host), [])
+        XCTAssertEqual(starter.startedTitles, [])
+    }
+
+    func testTerminalTabsRenderInSeparateRowBelowToolbar() throws {
+        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
+        let controller = WorkbenchWindowController(workspaceViewController: workspace)
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        try workspace.openLocalShell()
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let contentView = try XCTUnwrap(window.contentView)
+        let tabControl = try XCTUnwrap(contentView.allSubviews(ofType: NSSegmentedControl.self).first)
+        let terminalView = try XCTUnwrap(workspace.currentTerminalPane?.view)
+        let contentLayoutFrame = contentView.convert(window.contentLayoutRect, from: nil)
+        let tabFrame = tabControl.convert(tabControl.bounds, to: contentView)
+        let terminalFrame = terminalView.convert(terminalView.bounds, to: contentView)
+
+        XCTAssertLessThanOrEqual(tabFrame.maxY, contentLayoutFrame.maxY - 1)
+        XCTAssertGreaterThan(tabFrame.minY, terminalFrame.maxY)
+        XCTAssertGreaterThanOrEqual(tabFrame.minX, terminalFrame.minX)
+        XCTAssertLessThanOrEqual(tabFrame.minX, terminalFrame.minX + 16)
+    }
+
+    func testInspectorContentUsesCompactToolbarInsetWhenRevealedResizedAndSwitched() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+        controller.showTunnelsFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        try assertInspectorUsesCompactToolbarInset(in: window)
+
+        let splitView = controller.contentSplitViewController.splitView
+        controller.setInspectorDividerPositionForTesting(splitView.bounds.width - 260 - splitView.dividerThickness)
+        window.contentView?.layoutSubtreeIfNeeded()
+        try assertInspectorUsesCompactToolbarInset(in: window)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let browserIndex = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.Inspector.browser))
+        inspector.selectSectionForTesting(browserIndex)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        try assertInspectorUsesCompactToolbarInset(in: window)
+
+        let diagnosticsIndex = try XCTUnwrap(inspector.sectionLabelsForTesting.firstIndex(of: L10n.Inspector.logs))
+        inspector.selectSectionForTesting(diagnosticsIndex)
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        try assertInspectorUsesCompactToolbarInset(in: window)
+    }
+
+    func testInspectorContentUsesBaseTopMarginWhenWindowHasNoToolbar() throws {
+        let inspector = InspectorViewController()
+        inspector.view.frame = NSRect(x: 0, y: 0, width: 420, height: 640)
+        inspector.view.layoutSubtreeIfNeeded()
+
+        let content = try XCTUnwrap(
+            inspector.view.firstSubview(withIdentifier: "Stacio.Inspector.content")
+        )
+        let topConstraint = try XCTUnwrap(
+            inspector.view.constraints.first { constraint in
+                (constraint.firstItem as? NSView) === content
+                    && constraint.firstAttribute == .top
+                    && constraint.secondItem === inspector.view
+                    && constraint.secondAttribute == .top
+            }
+        )
+
+        XCTAssertEqual(topConstraint.constant, 18, accuracy: 1)
+    }
+
+    func testFilesInspectorTitleStartsNearToolbarOnInitialWindowDisplay() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+
+        controller.showWindow(nil)
+        controller.showFilesFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let toolbarInset = try windowToolbarTopInset(in: window)
+        XCTAssertGreaterThan(toolbarInset, 0)
+        try assertInspectorUsesCompactToolbarInset(in: window)
+
+        let contentView = try XCTUnwrap(window.contentView)
+        let filesTitle = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Files.title"),
+            "Files title should be visible after opening the inspector files panel"
+        )
+        let titleFrame = filesTitle.convert(filesTitle.bounds, to: contentView)
+        let titleTopGap = contentView.bounds.maxY - titleFrame.maxY
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertLessThan(
+            titleTopGap,
+            toolbarInset + 24,
+            "Files title should not be pushed down by the full toolbar content-layout inset plus the file panel's own padding"
+        )
+        XCTAssertLessThanOrEqual(
+            titleTopGap,
+            inspector.maximumCompactToolbarTopInsetForTesting + 36,
+            "Files title should start close to the toolbar with only the compact inspector margin"
+        )
+    }
+
+    func testInspectorBrowserAndTunnelsKeepComfortableInternalTopPadding() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+
+        controller.showWindow(nil)
+        controller.showBrowserFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let contentView = try XCTUnwrap(window.contentView)
+        let inspectorContent = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Inspector.content")
+        )
+        let inspectorContentFrame = inspectorContent.convert(inspectorContent.bounds, to: contentView)
+        let browserAddress = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Browser.address"),
+            "Browser address field should be visible after opening the browser inspector panel"
+        )
+        let browserAddressFrame = browserAddress.convert(browserAddress.bounds, to: contentView)
+        XCTAssertGreaterThanOrEqual(
+            inspectorContentFrame.maxY - browserAddressFrame.maxY,
+            16,
+            "Browser toolbar controls should not sit flush against the inspector content top"
+        )
+
+        controller.showTunnelsFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let tunnelsTitle = try XCTUnwrap(
+            contentView.firstSubview(withIdentifier: "Stacio.Tunnels.title"),
+            "Tunnels title should be visible after opening the tunnels inspector panel"
+        )
+        let tunnelsTitleFrame = tunnelsTitle.convert(tunnelsTitle.bounds, to: contentView)
+        XCTAssertGreaterThanOrEqual(
+            inspectorContentFrame.maxY - tunnelsTitleFrame.maxY,
+            16,
+            "Tunnels header should not sit flush against the inspector content top"
+        )
+    }
+
+    func testInspectorSectionSwitcherIsHiddenWhenInspectorIsNarrowButSectionsRemainSelectable() throws {
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        defer { controller.close() }
+
+        controller.showWindow(nil)
+        controller.showTunnelsFromToolbar(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let splitView = controller.contentSplitViewController.splitView
+        controller.setInspectorDividerPositionForTesting(splitView.bounds.width - 180 - splitView.dividerThickness)
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let sectionControl = inspector.sectionControlForTesting
+        XCTAssertNil(sectionControl.enclosingScrollView)
+
+        for index in inspector.sectionLabelsForTesting.indices {
+            inspector.selectSectionForTesting(index)
+            XCTAssertEqual(inspector.selectedSectionIndexForTesting, index)
+            XCTAssertEqual(sectionControl.selectedSegment, index)
+        }
+    }
+
+    func testQuickConnectToolbarActionPresentsConnectionError() {
+        let errorPresenter = RecordingQuickConnectErrorPresenter()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: RecordingRemoteSessionStarter(error: TestWorkbenchError.failed),
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(target: "deploy@example.com")
+            ),
+            quickConnectErrorPresenter: errorPresenter
+        )
+
+        controller.loadWindow()
+        controller.performQuickConnectFromToolbar(nil)
+
+        XCTAssertEqual(errorPresenter.presentedErrors.count, 1)
+    }
+
+    func testSidebarImportPresentsOuterSetupError() throws {
+        let errorPresenter = RecordingSessionImportErrorPresenter()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            sessionImportErrorPresenter: errorPresenter,
+            databasePathProvider: { throw TestWorkbenchError.failed }
+        )
+
+        controller.loadWindow()
+        controller.performImportFromToolbar(nil)
+
+        XCTAssertEqual(errorPresenter.presentedErrors.count, 1)
+    }
+
+    func testWorkbenchInjectsLiveSessionContextIntoInspectorFilesCoordinator() throws {
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(
+            with: TunnelLiveSessionContext(
+                config: SshConnectionConfig(
+                    host: "example.com",
+                    port: 22,
+                    username: "deploy",
+                    authMethod: .agent,
+                    connectTimeoutMs: 10_000
+                ),
+                secret: .agent,
+                expectedFingerprintSHA256: "SHA256:test"
+            )
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        let inspector = controller.contentSplitViewController
+            .splitViewItems[2]
+            .viewController as? InspectorViewController
+        let entries = try inspector?.filesCoordinatorForTesting.loadCurrentLiveDirectory(remotePath: "/home/deploy")
+
+        XCTAssertEqual(entries?.count, 1)
+        XCTAssertEqual(filesBridge.liveHosts, ["example.com"])
+    }
+
+    func testWorkbenchInspectorFilesFollowCurrentRemoteTerminalDirectoryWhenEnabled() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.contentSplitViewController
+            .splitViewItems[2]
+            .viewController as? InspectorViewController)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+
+        pane.sendInput(Array("cd /srv/app\n".utf8))
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && inspector.filesViewController?.currentRemotePath == "/srv/app"
+        })
+        XCTAssertEqual(filesBridge.liveRemotePaths.last, "/srv/app")
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+
+        inspector.filesViewController?.setDirectoryFollowEnabled(false)
+        pane.sendInput(Array("cd /var/log\n".utf8))
+
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/var/log"))
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+    }
+
+    func testTerminalDroppedUploadRefreshesBoundInspectorFilesListAfterCompletion() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+        let localFile = tempDirectory.appendingPathComponent("release.tar.gz")
+        try Data(repeating: 1, count: 48).write(to: localFile)
+        let uploadedEntry = RemoteFileEntry(
+            kind: .file,
+            path: "/srv/app/release.tar.gz",
+            size: 48,
+            linkTarget: nil
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [])
+        let scpBridge = WorkbenchImmediateSCPTransferBridge { _ in
+            filesBridge.replaceEntries([uploadedEntry])
+        }
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge,
+            transferQueueCoordinatorFactory: { transferQueue in
+                TransferQueueCoordinator(
+                    bridge: scpBridge,
+                    historyStore: NoOpSCPTransferHistoryStore(),
+                    queueViewController: transferQueue
+                )
+            }
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        let initialDirectoryRequest = expectation(description: "files requests followed terminal directory")
+        filesBridge.observeNextLiveRemoteDirectoryRequest(matching: "/srv/app") {
+            initialDirectoryRequest.fulfill()
+        }
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+        wait(for: [initialDirectoryRequest], timeout: 3)
+
+        let uploadDirectoryRefresh = expectation(description: "files refreshes after terminal drop upload")
+        filesBridge.observeNextLiveRemoteDirectoryRequest(matching: "/srv/app") {
+            uploadDirectoryRefresh.fulfill()
+        }
+        pane.performDropLocalFilesForTesting([localFile.path])
+
+        wait(for: [uploadDirectoryRefresh], timeout: 3)
+        XCTAssertTrue(waitUntil {
+            inspector.filesViewController?.containsRemoteEntry(named: "release.tar.gz") == true
+        })
+        XCTAssertEqual(scpBridge.destinationPaths, ["/srv/app/release.tar.gz"])
+        XCTAssertTrue(inspector.filesViewController?.visibleTextSnapshot.contains("release.tar.gz") == true)
+    }
+
+    func testWorkbenchInspectorFilesShowsFollowedDirectoryBeforeSlowListingCompletes() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = SlowFollowWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        filesBridge.delayNextRequest()
+        pane.sendInput(Array("cd /srv/app\n".utf8))
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+
+        filesBridge.releaseDelayedRequest()
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+    }
+
+    func testWorkbenchInspectorFilesCoalescesRapidTerminalDirectoryChangesToLatestPath() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/one")
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/two")
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/latest")
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/latest"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/srv/latest"
+        })
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/srv/one"))
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/srv/two"))
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/srv/latest")
+    }
+
+    func testWorkbenchInspectorFilesFollowPromptDirectoryAfterTabCompletedRemoteCd() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "fengstor.example.com",
+                port: 22,
+                username: "FengLee",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/FengLee/.bashrc", size: 128, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "FengLee@FengStor",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil as Any?)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        pane.send(source: pane.terminalView, data: ArraySlice(Array("cd /\n".utf8)))
+        pane.send(source: pane.terminalView, data: ArraySlice(Array("cd /ho".utf8)))
+        pane.send(source: pane.terminalView, data: ArraySlice([9]))
+        pane.send(source: pane.terminalView, data: ArraySlice(Array("\n".utf8)))
+        pane.feedRemoteOutput(Array("FengLee@FengStor:/home$ ".utf8))
+        pane.send(source: pane.terminalView, data: ArraySlice(Array("cd Feng".utf8)))
+        pane.send(source: pane.terminalView, data: ArraySlice([9]))
+        pane.send(source: pane.terminalView, data: ArraySlice(Array("\n".utf8)))
+        pane.feedRemoteOutput(Array("FengLee@FengStor:~$ ".utf8))
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.count >= 2 })
+        XCTAssertEqual(filesBridge.liveRemotePaths.suffix(2), ["~", "~"])
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/"))
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/home"))
+        XCTAssertTrue(waitUntil {
+            controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/home/FengLee"
+        })
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/home/FengLee")
+    }
+
+    func testWorkbenchInspectorFilesFollowAnolisPromptFallbackWhenOSC7IsUnavailable() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "anolis8.example.com",
+                port: 22,
+                username: "root",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:anolis"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/opt/服务/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_anolis", status: "running", diagnostic: "running"),
+            title: "root@anolis8",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil as Any?)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+
+        pane.feedRemoteOutput(Array("\u{1B}]0;root@anolis8:/opt/服务\u{07}\u{1B}[01;32m[root@anolis8 /opt/服务]\u{1B}[00m# ".utf8))
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/opt/服务"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/opt/服务"
+        })
+
+        pane.feedRemoteOutput(Array("\r\n[root@anolis8 ~/release]# ".utf8))
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "~/release"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "~/release"
+        })
+        XCTAssertEqual(filesBridge.liveRemotePaths.suffix(2), ["/opt/服务", "~/release"])
+    }
+
+    func testWorkbenchInspectorFilesKeepsFollowedDirectoryWhenReloadingFilesSection() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/home/deploy/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+        pane.sendInput(Array("cd /srv/app\n".utf8))
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && inspector.filesViewController?.currentRemotePath == "/srv/app"
+        })
+
+        inspector.selectSectionForTesting(1)
+        inspector.selectSectionForTesting(0)
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.count >= 3 })
+        XCTAssertEqual(filesBridge.liveRemotePaths.suffix(2), ["/srv/app", "/srv/app"])
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+    }
+
+    func testWorkbenchInspectorFilesKeepsFollowingAfterSwitchingThroughAIAssistant() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        controller.showAIAssistantFromToolbar(nil)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && inspector.filesViewController?.currentRemotePath == "/srv/app"
+        })
+
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/var/log")
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/var/log"
+                && inspector.filesViewController?.currentRemotePath == "/var/log"
+        })
+    }
+
+    func testWorkbenchInspectorFilesRebindsHiddenFollowStateWhenTerminalTabChanges() throws {
+        let firstContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "first.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:first"
+        )
+        let secondContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "second.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:second"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: firstContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/second/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "first@example.com",
+            liveSessionContext: firstContext
+        )
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        inspector.selectAIAssistantTab()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "second@example.com",
+            liveSessionContext: secondContext
+        )
+        let secondPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        secondPane.hostCurrentDirectoryUpdate(source: secondPane.terminalView, directory: "/srv/second")
+
+        inspector.selectFilesTabForTesting()
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/second"
+                && inspector.filesViewController?.currentRemotePath == "/srv/second"
+        })
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_second",
+                context: secondContext,
+                remotePath: "/srv/second"
+            )
+        ))
+    }
+
+    func testFilesToolbarKeepsRemoteDirectoryAfterAIAssistantTakesKeyboardFocus() throws {
+        let runtimeID = "term-v2-focus-\(UUID().uuidString)"
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+
+        controller.showAIAssistantFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        let panel = try XCTUnwrap(inspector.aiAssistantViewController)
+        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
+        panel.focusQuestionField()
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/srv/app"
+        })
+        XCTAssertTrue(controller.inspectorViewControllerForTesting?.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: runtimeID,
+                context: context,
+                remotePath: "/srv/app"
+            )
+        ) == true)
+    }
+
+    func testFilesToolbarKeepsRemoteDirectoryAfterRemoteBrowserTakesKeyboardFocus() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            tunnelLiveBridge: RecordingWorkbenchLiveTunnelBridge(),
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        inspector.selectBrowserTab()
+        let addressField = try XCTUnwrap(
+            inspector.remoteBrowserViewController?
+                .browserPaneViewControllerForTesting?
+                .view
+                .firstSubview(withIdentifier: "Stacio.Browser.address") as? NSTextField
+        )
+        controller.window?.makeFirstResponder(addressField)
+
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && inspector.filesViewController?.currentRemotePath == "/srv/app"
+        })
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_remote",
+                context: context,
+                remotePath: "/srv/app"
+            )
+        ))
+    }
+
+    func testWorkbenchInspectorFilesKeepsTerminalDirectoryChangesWhileInspectorIsHidden() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        controller.showFilesFromToolbar(nil as Any?)
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "~" })
+
+        controller.showFilesFromToolbar(nil as Any?)
+        XCTAssertTrue(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil as Any?)
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/srv/app")
+    }
+
+    func testFilesToolbarReloadsSameTerminalWhenCurrentDirectoryChanged() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/")
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/" })
+
+        inspector.filesViewController?.setDirectoryFollowEnabled(false)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+        XCTAssertEqual(inspector.filesViewController?.currentRemotePath, "/srv/app")
+    }
+
+    func testWorkbenchInspectorFilesFollowPushdPopdAndChainedDirectoryCommands() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            liveSessionContext: context
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+
+        pane.sendInput(Array("pushd ../logs; cd releases\n".utf8))
+        pane.sendInput(Array("popd\n".utf8))
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(filesBridge.liveRemotePaths, ["/srv/app"])
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/srv/logs"))
+        XCTAssertFalse(filesBridge.liveRemotePaths.contains("/srv/logs/releases"))
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/srv/app")
+    }
+
+    func testWorkbenchInspectorFilesKeepsFollowingBoundRuntimeWhenCurrentPaneIsTemporarilyDifferent() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:test"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let reconnecter = RecordingWorkbenchRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_remote_split", status: "running", diagnostic: "running"),
+            liveSessionContext: context
+        )
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        let forwardRemoteSelection = workspace.onCurrentRemoteTerminalChanged
+        var deliveredRemoteRuntimeIDs: [String?] = []
+        workspace.onCurrentRemoteTerminalChanged = { pane in
+            deliveredRemoteRuntimeIDs.append(pane?.runtimeID)
+            forwardRemoteSelection?(pane)
+        }
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            liveSessionContext: context
+        )
+        let boundPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        boundPane.hostCurrentDirectoryUpdate(source: boundPane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+
+        try workspace.splitCurrentTerminal()
+        XCTAssertFalse(workspace.currentTerminalPane === boundPane)
+
+        // The tab controller may have queued a selection callback while the
+        // split was being installed.  Drain the main queue before exercising
+        // the still-bound pane so that stale callbacks cannot be hidden by
+        // the directory-follow update below.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(
+            controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath,
+            "/srv/app"
+        )
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(inspector.isFilesTabBound(to: InspectorViewController.RemoteFilesBinding(
+            runtimeID: boundPane.runtimeID,
+            context: context,
+            remotePath: "/srv/app"
+        )))
+
+        boundPane.sendInput(Array("cd /srv/releases\n".utf8))
+        XCTAssertEqual(boundPane.currentRemoteDirectory, "/srv/releases")
+        XCTAssertTrue(inspector.isFilesTabBound(to: InspectorViewController.RemoteFilesBinding(
+            runtimeID: boundPane.runtimeID,
+            context: context,
+            remotePath: "/srv/releases"
+        )))
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/releases"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/srv/releases"
+        })
+        XCTAssertEqual(filesBridge.liveRemotePaths.last, "/srv/releases")
+        XCTAssertEqual(controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath, "/srv/releases")
+        XCTAssertEqual(deliveredRemoteRuntimeIDs.compactMap { $0 }, ["term_remote"])
+    }
+
+    func testWorkbenchInspectorFilesRebindsToSelectedConnectedSSHTab() throws {
+        let firstContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "first.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:first"
+        )
+        let secondContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "second.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:second"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: firstContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/current/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "first",
+            liveSessionContext: firstContext
+        )
+        let firstPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        firstPane.hostCurrentDirectoryUpdate(source: firstPane.terminalView, directory: "/srv/first")
+        controller.showFilesFromToolbar(nil)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/first" })
+
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "second",
+            liveSessionContext: secondContext
+        )
+        let secondPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        secondPane.hostCurrentDirectoryUpdate(source: secondPane.terminalView, directory: "/srv/second")
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts.last == "second.example.com"
+                && filesBridge.liveRemotePaths.last == "/srv/second"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/srv/second"
+        })
+        XCTAssertTrue(controller.inspectorViewControllerForTesting?.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_second",
+                context: secondContext,
+                remotePath: "/srv/second"
+            )
+        ) == true)
+    }
+
+    func testWorkbenchInspectorFilesBindsUninitializedPanelWhenSwitchingToSSHTab() throws {
+        let firstContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "first.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:first"
+        )
+        let secondContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "second.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:second"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: firstContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/second/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+
+        workspace.loadView()
+        try workspace.openLocalShell()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "first",
+            liveSessionContext: firstContext
+        )
+        let firstPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        firstPane.hostCurrentDirectoryUpdate(source: firstPane.terminalView, directory: "/srv/first")
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "second",
+            liveSessionContext: secondContext
+        )
+        let secondPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        secondPane.hostCurrentDirectoryUpdate(source: secondPane.terminalView, directory: "/srv/second")
+
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+        controller.loadWindow()
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(inspector.isFilesTabBound(to: nil))
+        XCTAssertEqual(filesBridge.liveRemotePaths, [])
+
+        workspace.selectTabForTesting(2)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts.last == "second.example.com"
+                && filesBridge.liveRemotePaths.last == "/srv/second"
+                && inspector.filesViewController?.currentRemotePath == "/srv/second"
+                && inspector.filesViewController?.entryCount == 1
+        })
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_second",
+                context: secondContext,
+                remotePath: "/srv/second"
+            )
+        ))
+    }
+
+    func testWorkbenchInspectorFilesUnbindsWhenSelectingLocalTerminalTab() throws {
+        let context = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "remote.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:remote"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: context)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        try workspace.openLocalShell()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "remote",
+            liveSessionContext: context
+        )
+        let remotePane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        remotePane.hostCurrentDirectoryUpdate(source: remotePane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/app"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.entryCount == 1
+        })
+
+        workspace.selectTabForTesting(0)
+
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil {
+            inspector.isFilesTabBound(to: nil)
+                && inspector.filesViewController?.entryCount == 0
+        })
+        XCTAssertTrue(inspector.filesViewController?.visibleTextSnapshot.contains("请选择一个已连接的远程终端") == true)
+        XCTAssertEqual(filesBridge.liveRemotePaths, ["/srv/app"])
+    }
+
+    func testWorkbenchInspectorFilesRebindsToSelectedSSHWhenDirectoryFollowDisabled() throws {
+        let firstContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "first.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:first"
+        )
+        let secondContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "second.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:second"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: firstContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/current/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_first", status: "running", diagnostic: "running"),
+            title: "first",
+            liveSessionContext: firstContext
+        )
+        let firstPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        firstPane.hostCurrentDirectoryUpdate(source: firstPane.terminalView, directory: "/srv/first")
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_second", status: "running", diagnostic: "running"),
+            title: "second",
+            liveSessionContext: secondContext
+        )
+        let secondPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        secondPane.hostCurrentDirectoryUpdate(source: secondPane.terminalView, directory: "/srv/second")
+        workspace.selectTabForTesting(0)
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/first" })
+
+        inspector.filesViewController?.setDirectoryFollowEnabled(false)
+        workspace.selectTabForTesting(1)
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts.last == "second.example.com"
+                && filesBridge.liveRemotePaths.last == "/srv/second"
+                && inspector.filesViewController?.currentRemotePath == "/srv/second"
+        })
+        XCTAssertFalse(inspector.filesViewController?.isDirectoryFollowEnabled ?? true)
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_second",
+                context: secondContext,
+                remotePath: "/srv/second"
+            )
+        ))
+    }
+
+    func testWorkbenchSelectingRemoteFilesTabKeepsItsOwnFilesSessionState() throws {
+        let terminalContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "terminal.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:terminal"
+        )
+        let filesContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "files.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:files"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: terminalContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/files/release.tgz", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_remote", status: "running", diagnostic: "running"),
+            title: "terminal",
+            liveSessionContext: terminalContext
+        )
+        let terminalPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        terminalPane.hostCurrentDirectoryUpdate(source: terminalPane.terminalView, directory: "/srv/terminal")
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/terminal" })
+
+        try workspace.openRemoteFilesSession(
+            context: filesContext,
+            title: "files",
+            bridge: filesBridge,
+            transferScheduler: nil,
+            initialRemotePath: "/srv/files"
+        )
+
+        XCTAssertTrue(waitUntil {
+            workspace.currentTerminalPane is RemoteFilesPaneViewController
+                && filesBridge.liveHosts.last == "files.example.com"
+                && filesBridge.liveRemotePaths.last == "/srv/files"
+        })
+        XCTAssertTrue(workspace.currentTerminalPane is RemoteFilesPaneViewController)
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_remote",
+                context: terminalContext,
+                remotePath: "/srv/terminal"
+            )
+        ))
+    }
+
+    func testWorkbenchInspectorFilesRebindsAfterPendingRemoteTerminalConnects() throws {
+        let oldContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "old.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:old"
+        )
+        let newContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "new.example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:new"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: oldContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/new/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_old", status: "running", diagnostic: "running"),
+            title: "old",
+            liveSessionContext: oldContext
+        )
+        let oldPane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        oldPane.hostCurrentDirectoryUpdate(source: oldPane.terminalView, directory: "/srv/old")
+        controller.showFilesFromToolbar(nil)
+        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/old" })
+
+        workspace.closeCurrentTerminal()
+        XCTAssertTrue(waitUntil {
+            inspector.filesViewController?.visibleTextSnapshot.contains("文件连接已断开") == true
+        })
+
+        let pendingPane = workspace.openConnectingRemoteShell(
+            title: "new",
+            reconnecter: nil,
+            connectionKind: .ssh,
+            liveSessionContext: nil
+        )
+        pendingPane.attachConnectedRuntime(
+            status: LiveShellStatus(runtimeId: "term_new", status: "running", diagnostic: "running"),
+            liveSessionContext: newContext
+        )
+        pendingPane.hostCurrentDirectoryUpdate(source: pendingPane.terminalView, directory: "/srv/new")
+
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveHosts.last == "new.example.com"
+                && filesBridge.liveRemotePaths.last == "/srv/new"
+                && inspector.filesViewController?.currentRemotePath == "/srv/new"
+                && inspector.filesViewController?.entryCount == 1
+        })
+        XCTAssertTrue(inspector.isFilesTabBound(
+            to: InspectorViewController.RemoteFilesBinding(
+                runtimeID: "term_new",
+                context: newContext,
+                remotePath: "/srv/new"
+            )
+        ))
+        XCTAssertFalse(inspector.filesViewController?.visibleTextSnapshot.contains("文件连接已断开") == true)
+    }
+
+    func testWorkbenchInspectorFilesKeepsFollowingRemoteDirectoryAfterTerminalReconnect() throws {
+        let oldContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:old"
+        )
+        let newContext = TunnelLiveSessionContext(
+            config: SshConnectionConfig(
+                host: "example.com",
+                port: 22,
+                username: "deploy",
+                authMethod: .agent,
+                connectTimeoutMs: 10_000
+            ),
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:new"
+        )
+        let contextStore = TunnelLiveSessionStore()
+        contextStore.replace(with: oldContext)
+        let filesBridge = RecordingWorkbenchRemoteFilesBridge(entries: [
+            RemoteFileEntry(kind: .file, path: "/srv/app/app.log", size: 64, linkTarget: nil)
+        ])
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        let reconnecter = RecordingWorkbenchRemoteTerminalReconnecter(
+            status: LiveShellStatus(runtimeId: "term_new", status: "running", diagnostic: "running"),
+            liveSessionContext: newContext
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            tunnelLiveSessionStore: contextStore,
+            remoteFilesBridge: filesBridge
+        )
+
+        controller.loadWindow()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_old", status: "running", diagnostic: "running"),
+            title: "deploy@example.com",
+            reconnecter: reconnecter,
+            liveSessionContext: oldContext
+        )
+        let pane = try XCTUnwrap(workspace.currentTerminalPane as? RemoteTerminalPaneViewController)
+        pane.hostCurrentDirectoryUpdate(source: pane.terminalView, directory: "/srv/app")
+        controller.showFilesFromToolbar(nil)
+        XCTAssertTrue(waitUntil { filesBridge.liveRemotePaths.last == "/srv/app" })
+
+        try pane.reconnectTerminal()
+        pane.sendInput(Array("cd /srv/releases\n".utf8))
+
+        XCTAssertEqual(pane.runtimeID, "term_new")
+        XCTAssertEqual(reconnecter.reconnectedTitles, ["deploy@example.com"])
+        XCTAssertTrue(waitUntil {
+            filesBridge.liveRemotePaths.last == "/srv/releases"
+                && controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath == "/srv/releases"
+        })
+        XCTAssertEqual(
+            controller.inspectorViewControllerForTesting?.filesViewController?.currentRemotePath,
+            "/srv/releases"
+        )
+    }
+
+    func testWorkbenchMultiExecPromptsPreparesAndBroadcastsToSelectedTargets() throws {
+        let sink = RecordingWorkbenchTerminalEventSink()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API"
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_prod", status: "running", diagnostic: "running"),
+            title: "生产 API"
+        )
+        let prompt = RecordingMultiExecPromptPresenter(
+            request: MultiExecPromptRequest(
+                input: "uptime\n",
+                targetIDs: ["term_prod"],
+                productionConfirmed: true
+            )
+        )
+        let bridge = RecordingMultiExecBridge()
+        let auditRecorder = RecordingMultiExecAuditRecorder()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecPromptPresenter: prompt,
+            multiExecBridge: bridge,
+            multiExecAuditRecorder: auditRecorder,
+            databasePathProvider: { "/tmp/stacio-multiexec-audit-test.sqlite" }
+        )
+
+        controller.loadWindow()
+        let result = try controller.multiExecFromToolbar(nil)
+
+        XCTAssertEqual(result?.targetCount, 1)
+        XCTAssertEqual(result?.sentCount, 1)
+        XCTAssertEqual(result?.failedCount, 0)
+        XCTAssertEqual(result?.executed, true)
+        XCTAssertEqual(prompt.presentedTargets.map(\.id), ["term_dev", "term_prod"])
+        XCTAssertEqual(bridge.requests.map(\.productionConfirmed), [true])
+        XCTAssertEqual(bridge.requests.first?.targets.map(\.id), ["term_prod"])
+        XCTAssertEqual(auditRecorder.requests.map(\.databasePath), ["/tmp/stacio-multiexec-audit-test.sqlite"])
+        XCTAssertEqual(auditRecorder.requests.map(\.event), [result])
+        XCTAssertEqual(sink.userInputEvents, [
+            TerminalInputEvent(runtimeID: "term_prod", bytes: Array("uptime\n".utf8))
+        ])
+    }
+
+    func testWorkbenchMultiExecToolbarStartsInteractiveSplitSelection() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API",
+            connectionKind: .ssh
+        )
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_serial", status: "running", diagnostic: "running"),
+            title: "串口控制台",
+            connectionKind: .serial
+        )
+        let selector = RecordingMultiExecSessionSelector(
+            selection: MultiExecSessionSelection(targetIDs: ["term_dev", "term_serial"])
+        )
+        let prompt = RecordingMultiExecPromptPresenter(
+            request: MultiExecPromptRequest(
+                input: "should-not-run\n",
+                targetIDs: ["term_dev"],
+                productionConfirmed: false
+            )
+        )
+        let bridge = RecordingMultiExecBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecPromptPresenter: prompt,
+            multiExecSessionSelector: selector,
+            multiExecBridge: bridge
+        )
+
+        controller.loadWindow()
+        try controller.startMultiExecFromToolbar(nil)
+
+        XCTAssertEqual(selector.presentedTargets.map(\.id), ["term_dev", "term_serial"])
+        XCTAssertEqual(prompt.presentedTargets, [])
+        XCTAssertTrue(bridge.requests.isEmpty)
+        XCTAssertTrue(workspace.isMultiExecSessionActiveForTesting)
+        XCTAssertEqual(workspace.currentSplitPaneRuntimeIDsForTesting, ["term_dev", "term_serial"])
+    }
+
+    func testWorkbenchMultiExecToolbarPresentsChineseErrorWhenSelectionIsInvalid() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API",
+            connectionKind: .ssh
+        )
+        let selector = RecordingMultiExecSessionSelector(
+            selection: MultiExecSessionSelection(targetIDs: ["term_dev"])
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecSessionSelector: selector
+        )
+
+        controller.loadWindow()
+
+        XCTAssertThrowsError(try controller.startMultiExecFromToolbar(nil))
+        XCTAssertEqual(selector.presentedTargets.map(\.id), [])
+        XCTAssertEqual(selector.presentedErrorMessages, ["多执行需要至少两个可用终端。"])
+    }
+
+    func testWorkbenchMultiExecAuditCountsMissingSelectedTargetsAsFailed() throws {
+        let sink = RecordingWorkbenchTerminalEventSink()
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { sink },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API"
+        )
+        let prompt = RecordingMultiExecPromptPresenter(
+            request: MultiExecPromptRequest(
+                input: "uptime\n",
+                targetIDs: ["term_dev", "missing_runtime"],
+                productionConfirmed: false
+            )
+        )
+        let bridge = RecordingMultiExecBridge()
+        let auditRecorder = RecordingMultiExecAuditRecorder()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecPromptPresenter: prompt,
+            multiExecBridge: bridge,
+            multiExecAuditRecorder: auditRecorder,
+            databasePathProvider: { "/tmp/stacio-multiexec-audit-missing.sqlite" }
+        )
+
+        controller.loadWindow()
+        let result = try controller.multiExecFromToolbar(nil)
+
+        XCTAssertEqual(result?.targetCount, 2)
+        XCTAssertEqual(result?.sentCount, 1)
+        XCTAssertEqual(result?.failedCount, 1)
+        XCTAssertEqual(bridge.requests.first?.targets.map(\.id), ["term_dev", "missing_runtime"])
+        XCTAssertEqual(auditRecorder.requests.map(\.event), [result])
+        XCTAssertEqual(sink.userInputEvents, [
+            TerminalInputEvent(runtimeID: "term_dev", bytes: Array("uptime\n".utf8))
+        ])
+    }
+
+    func testWorkbenchMultiExecShowsBroadcastStateAndBlocksWindowCloseDuringExecution() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API"
+        )
+        let prompt = RecordingMultiExecPromptPresenter(
+            request: MultiExecPromptRequest(
+                input: "uptime\n",
+                targetIDs: ["term_dev"],
+                productionConfirmed: false
+            )
+        )
+        let bridge = RecordingMultiExecBridge()
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecPromptPresenter: prompt,
+            multiExecBridge: bridge,
+            multiExecAuditRecorder: RecordingMultiExecAuditRecorder(),
+            databasePathProvider: { "/tmp/stacio-multiexec-visible-state.sqlite" }
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        bridge.onPrepare = { [weak controller, weak window] in
+            XCTAssertEqual(window?.title, "Stacio - 正在广播")
+            guard let window else {
+                XCTFail("Expected workbench window during MultiExec broadcast")
+                return
+            }
+            XCTAssertEqual(controller?.windowShouldClose(window), false)
+        }
+
+        _ = try controller.multiExecFromToolbar(nil)
+
+        XCTAssertEqual(window.title, "Stacio")
+        XCTAssertEqual(controller.windowShouldClose(window), true)
+    }
+
+    func testWorkbenchMultiExecRestoresBroadcastStateWhenPrepareFails() throws {
+        let workspace = WorkspaceViewController(
+            shellPathProvider: { "/bin/zsh" },
+            eventSinkFactory: { CoreBridgeTerminalEventSink() },
+            autoStartTerminalProcesses: false,
+            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+            startsRemoteTerminalPollingAutomatically: false
+        )
+        workspace.loadView()
+        workspace.openRemoteShell(
+            status: LiveShellStatus(runtimeId: "term_dev", status: "running", diagnostic: "running"),
+            title: "开发 API"
+        )
+        let prompt = RecordingMultiExecPromptPresenter(
+            request: MultiExecPromptRequest(
+                input: "uptime\n",
+                targetIDs: ["term_dev"],
+                productionConfirmed: false
+            )
+        )
+        let bridge = RecordingMultiExecBridge()
+        bridge.prepareError = TestWorkbenchError.failed
+        let controller = WorkbenchWindowController(
+            workspaceViewController: workspace,
+            multiExecPromptPresenter: prompt,
+            multiExecBridge: bridge,
+            multiExecAuditRecorder: RecordingMultiExecAuditRecorder(),
+            databasePathProvider: { "/tmp/stacio-multiexec-prepare-failure.sqlite" }
+        )
+
+        controller.loadWindow()
+        let window = try XCTUnwrap(controller.window)
+        bridge.onPrepare = { [weak controller, weak window] in
+            XCTAssertEqual(window?.title, "Stacio - 正在广播")
+            guard let window else {
+                XCTFail("Expected workbench window during MultiExec broadcast")
+                return
+            }
+            XCTAssertEqual(controller?.windowShouldClose(window), false)
+        }
+
+        XCTAssertThrowsError(try controller.multiExecFromToolbar(nil))
+        XCTAssertEqual(window.title, "Stacio")
+        XCTAssertEqual(controller.windowShouldClose(window), true)
+    }
+
+    func testQuickConnectSavesSessionAfterSuccessfulConnection() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let settingsSuiteName = "StacioQuickConnectSaveSessionTests-\(UUID().uuidString)"
+        let settingsDefaults = UserDefaults(suiteName: settingsSuiteName)!
+        defer { settingsDefaults.removePersistentDomain(forName: settingsSuiteName) }
+        let settingsStore = AppSettingsStore(defaults: settingsDefaults)
+        settingsStore.update { settings in
+            settings.sessionSidebarShowRecentSessions = false
+        }
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_quick_saved", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(
+                    target: "deploy@example.com:2200",
+                    saveAsSession: true,
+                    sessionName: "API 快速连接"
+                )
+            ),
+            settingsStore: settingsStore,
+            databasePathProvider: { tempURL.path }
+        )
+        controller.loadWindow()
+        let sidebar = try XCTUnwrap(
+            controller.contentSplitViewController
+                .splitViewItems[0]
+                .viewController as? SessionSidebarViewController
+        )
+
+        _ = try controller.quickConnectFromToolbar(nil)
+
+        let sessions = try CoreBridge.listAllSessionRecords(databasePath: tempURL.path)
+        XCTAssertEqual(sessions.map(\.name), ["API 快速连接"])
+        XCTAssertEqual(sessions.map(\.host), ["example.com"])
+        XCTAssertEqual(sessions.map(\.port), [2200])
+        XCTAssertEqual(sessions.map(\.username), ["deploy"])
+        XCTAssertEqual(sessions.map(\.credentialId), [nil])
+        XCTAssertEqual(sidebar.sessionOutlineTextSnapshot, "API 快速连接\ndeploy@example.com:2200")
+    }
+
+    func testQuickConnectDoesNotSaveSessionWhenConnectionFails() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: RecordingRemoteSessionStarter(error: TestWorkbenchError.failed),
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(
+                    target: "deploy@example.com",
+                    saveAsSession: true,
+                    sessionName: "失败连接"
+                )
+            ),
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+
+        XCTAssertThrowsError(try controller.quickConnectFromToolbar(nil))
+        XCTAssertEqual(try CoreBridge.listAllSessionRecords(databasePath: tempURL.path), [])
+    }
+
+    func testQuickConnectSavesPasswordCredentialToKeychainBeforeStartingAndCreatesSavedSessionReference() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_quick_password", status: "running", diagnostic: "running")
+        )
+        let credentialSaver = KeychainSessionSidebarCredentialSaver(
+            databasePath: tempURL.path,
+            keychainStore: keychainStore
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(
+                    target: "deploy@example.com",
+                    authMode: .password,
+                    temporarySecret: "super-secret",
+                    saveAsSession: true,
+                    sessionName: "API 密码"
+                )
+            ),
+            quickConnectCredentialSaver: credentialSaver,
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+        _ = try controller.quickConnectFromToolbar(nil)
+
+        let session = try XCTUnwrap(CoreBridge.listAllSessionRecords(databasePath: tempURL.path).first)
+        let credentialID = try XCTUnwrap(session.credentialId)
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod), [.password(credentialRef: credentialID)])
+        XCTAssertEqual(try keychainStore.readSecret(id: credentialID, account: "deploy@example.com"), "super-secret")
+        XCTAssertFalse(String(describing: session).contains("super-secret"))
+    }
+
+    func testQuickConnectPasswordWithoutSavingSessionCleansTemporaryCredentialAfterSuccessfulStart() throws {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("sqlite")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        let keychainStore = KeychainCredentialStore(backend: InMemoryKeychainBackend())
+        let credentialSaver = KeychainSessionSidebarCredentialSaver(
+            databasePath: tempURL.path,
+            keychainStore: keychainStore
+        )
+        let starter = RecordingRemoteSessionStarter(
+            status: LiveShellStatus(runtimeId: "term_quick_password", status: "running", diagnostic: "running")
+        )
+        let controller = WorkbenchWindowController(
+            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false),
+            remoteSessionStarter: starter,
+            quickConnectPromptPresenter: RecordingQuickConnectPromptPresenter(
+                request: QuickConnectRequest(
+                    target: "deploy@example.com",
+                    authMode: .password,
+                    temporarySecret: "super-secret",
+                    saveAsSession: false
+                )
+            ),
+            quickConnectCredentialSaver: credentialSaver,
+            databasePathProvider: { tempURL.path }
+        )
+
+        controller.loadWindow()
+        _ = try controller.quickConnectFromToolbar(nil)
+
+        XCTAssertEqual(try CoreBridge.listAllSessionRecords(databasePath: tempURL.path), [])
+        XCTAssertEqual(try CoreBridge.listCredentialRecords(databasePath: tempURL.path), [])
+        XCTAssertEqual(starter.startedConfigs.map(\.authMethod).count, 1)
+    }
+}
+
+private func workbenchSSHConfig(host: String) -> SshConnectionConfig {
+    SshConnectionConfig(
+        host: host,
+        port: 22,
+        username: "deploy",
+        authMethod: .agent,
+        connectTimeoutMs: 10_000
+    )
+}
+
+private func makeTemporaryWorkbenchFile(name: String, contents: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("StacioWorkbenchTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let fileURL = directory.appendingPathComponent(name)
+    try contents.write(to: fileURL, atomically: true, encoding: .utf8)
+    return fileURL
+}
+
+@MainActor
+private final class WorkbenchEditorHarness {
+    let controller: WorkbenchWindowController
+    let window: NSWindow
+    let center: WorkbenchCenterContainerViewController
+    let presentation: RemoteEditorPresentationCoordinator
+    let presentationStore: UserDefaultsRemoteEditorPresentationStore
+
+    private let filesViewController: FilesViewController
+    private let frameAutosaveName: NSWindow.FrameAutosaveName
+    private let defaults: UserDefaults
+    private let ownedDefaultsSuiteName: String?
+    private var temporaryDirectories: [URL] = []
+    private var isClosed = false
+
+    init(
+        controller: WorkbenchWindowController,
+        window: NSWindow,
+        center: WorkbenchCenterContainerViewController,
+        presentation: RemoteEditorPresentationCoordinator,
+        presentationStore: UserDefaultsRemoteEditorPresentationStore,
+        filesViewController: FilesViewController,
+        frameAutosaveName: NSWindow.FrameAutosaveName,
+        defaults: UserDefaults,
+        ownedDefaultsSuiteName: String?
+    ) {
+        self.controller = controller
+        self.window = window
+        self.center = center
+        self.presentation = presentation
+        self.presentationStore = presentationStore
+        self.filesViewController = filesViewController
+        self.frameAutosaveName = frameAutosaveName
+        self.defaults = defaults
+        self.ownedDefaultsSuiteName = ownedDefaultsSuiteName
+    }
+
+    var inspectorWidth: CGFloat {
+        controller.contentSplitViewController.splitView.arrangedSubviews.last?.frame.width ?? 0
+    }
+
+    var filesWidth: CGFloat {
+        guard let contentView = window.contentView else { return 0 }
+        let browser = filesViewController.fileBrowserPaneViewForTesting
+        return browser.convert(browser.bounds, to: contentView).width
+    }
+
+    var storedInspectorWidth: CGFloat {
+        CGFloat(UserDefaults.standard.double(
+            forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector")
+        ))
+    }
+
+    func openLocalDocument(name: String, contents: String) throws {
+        let fileURL = try makeTemporaryWorkbenchFile(name: name, contents: contents)
+        temporaryDirectories.append(fileURL.deletingLastPathComponent())
+        presentation.openLocalCopy(
+            at: fileURL,
+            mode: .textEditor,
+            applicationURL: nil,
+            saveHandler: nil
+        )
+        layout()
+    }
+
+    func layout() {
+        for _ in 0..<2 {
+            window.layoutIfNeeded()
+            controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
+            center.view.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.06))
+        }
+    }
+
+    func resizeWindow(width: CGFloat) {
+        var frame = window.frame
+        frame.size.width = width
+        window.setFrame(frame, display: false)
+        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+        layout()
+    }
+
+    func close() {
+        guard isClosed == false else { return }
+        _ = presentation.requestClose(parentWindow: window, completion: nil)
+        controller.close()
+        for directory in temporaryDirectories {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        temporaryDirectories.removeAll()
+        isClosed = true
+    }
+
+    func closeAndClearDefaults() {
+        close()
+        clearWorkbenchEditorDefaults(frameAutosaveName: frameAutosaveName)
+        defaults.removeObject(forKey: workbenchEditorSidecarDefaultsKeyForTesting(frameAutosaveName))
+        if let ownedDefaultsSuiteName {
+            defaults.removePersistentDomain(forName: ownedDefaultsSuiteName)
+        }
+    }
+}
+
+@MainActor
+private func makeWorkbenchEditorHarness(
+    frameAutosaveName: NSWindow.FrameAutosaveName = NSWindow.FrameAutosaveName(
+        "Stacio.Workbench.EditorHarness.\(UUID().uuidString)"
+    ),
+    defaults suppliedDefaults: UserDefaults? = nil,
+    windowWidth: CGFloat,
+    inspectorWidth: CGFloat? = nil,
+    visibleFrame: NSRect = NSRect(x: 0, y: 0, width: 4_000, height: 2_400),
+    savedEditorWidth: CGFloat? = nil
+) throws -> WorkbenchEditorHarness {
+    let ownedDefaultsSuiteName: String?
+    let defaults: UserDefaults
+    if let suppliedDefaults {
+        ownedDefaultsSuiteName = nil
+        defaults = suppliedDefaults
+    } else {
+        let suiteName = "Stacio.Workbench.EditorHarness.\(UUID().uuidString)"
+        let suiteDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        suiteDefaults.removePersistentDomain(forName: suiteName)
+        ownedDefaultsSuiteName = suiteName
+        defaults = suiteDefaults
+    }
+
+    let presentationStore = UserDefaultsRemoteEditorPresentationStore(
+        defaults: defaults,
+        frameAutosaveName: frameAutosaveName
+    )
+    if let savedEditorWidth {
+        presentationStore.saveSidecarTargetWidth(savedEditorWidth)
+    }
+
+    let workspace = WorkspaceViewController(
+        autoStartTerminalProcesses: false,
+        remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
+        remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
+        startsRemoteTerminalPollingAutomatically: false
+    )
+    workspace.openRemoteShell(
+        status: LiveShellStatus(
+            runtimeId: "term_editor_harness_\(UUID().uuidString)",
+            status: "running",
+            diagnostic: "running"
+        ),
+        title: "editor-harness.example.com",
+        connectionKind: .ssh,
+        liveSessionContext: workbenchLiveContext(host: "editor-harness.example.com")
+    )
+
+    let screenProvider = DeterministicWorkbenchEditorScreenProvider(visibleFrame: visibleFrame)
+    let controller = WorkbenchWindowController(
+        workspaceViewController: workspace,
+        remoteFilesBridge: RecordingWorkbenchRemoteFilesBridge(entries: []),
+        frameAutosaveName: frameAutosaveName,
+        remoteEditorPresentationStore: presentationStore,
+        remoteEditorScreenProvider: screenProvider
+    )
+    controller.showWindow(nil)
+
+    let window = try XCTUnwrap(controller.window)
+    let frameHeight = min(900, visibleFrame.height)
+    window.setFrame(
+        NSRect(
+            x: visibleFrame.minX,
+            y: visibleFrame.minY,
+            width: windowWidth,
+            height: frameHeight
+        ),
+        display: false
+    )
+    controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+    controller.showFilesFromToolbar(nil)
+
+    let center = try XCTUnwrap(controller.centerContainerViewController)
+    let presentation = try XCTUnwrap(controller.remoteEditorPresentationCoordinator)
+    let filesViewController = try XCTUnwrap(
+        controller.inspectorViewControllerForTesting?.filesViewController
+    )
+    let harness = WorkbenchEditorHarness(
+        controller: controller,
+        window: window,
+        center: center,
+        presentation: presentation,
+        presentationStore: presentationStore,
+        filesViewController: filesViewController,
+        frameAutosaveName: frameAutosaveName,
+        defaults: defaults,
+        ownedDefaultsSuiteName: ownedDefaultsSuiteName
+    )
+    harness.layout()
+
+    if let inspectorWidth {
+        let splitView = controller.contentSplitViewController.splitView
+        controller.setInspectorDividerPositionForTesting(
+            splitView.bounds.width - inspectorWidth - splitView.dividerThickness
+        )
+        harness.layout()
+        controller.saveSplitColumnWidthsForTesting()
+        harness.layout()
+    }
+
+    return harness
+}
+
+@MainActor
+private final class DeterministicWorkbenchEditorScreenProvider: RemoteEditorScreenProviding {
+    private let screen: RemoteEditorScreenDescriptor
+
+    init(visibleFrame: NSRect) {
+        screen = RemoteEditorScreenDescriptor(
+            identity: RemoteEditorScreenIdentity(
+                displayID: 1,
+                localizedName: "Workbench Editor Test Display",
+                frame: visibleFrame
+            ),
+            frame: visibleFrame,
+            visibleFrame: visibleFrame
+        )
+    }
+
+    func availableScreens() -> [RemoteEditorScreenDescriptor] {
+        [screen]
+    }
+
+    func descriptor(containing window: NSWindow?) -> RemoteEditorScreenDescriptor? {
+        screen
+    }
+}
+
+@MainActor
+private func assertWorkbenchEditorWidths(
+    _ harness: WorkbenchEditorHarness,
+    inspector expectedInspectorWidth: CGFloat,
+    files expectedFilesWidth: CGFloat,
+    message: String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    XCTAssertEqual(
+        harness.inspectorWidth,
+        expectedInspectorWidth,
+        accuracy: 2,
+        message,
+        file: file,
+        line: line
+    )
+    XCTAssertEqual(
+        harness.filesWidth,
+        expectedFilesWidth,
+        accuracy: 2,
+        message,
+        file: file,
+        line: line
+    )
+}
+
+private func clearWorkbenchEditorDefaults(frameAutosaveName: NSWindow.FrameAutosaveName) {
+    UserDefaults.standard.removeObject(forKey: managedWorkbenchFrameDefaultsKey(frameAutosaveName))
+    UserDefaults.standard.removeObject(
+        forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "sidebar")
+    )
+    UserDefaults.standard.removeObject(
+        forKey: workbenchSplitWidthDefaultsKeyForTesting(frameAutosaveName, column: "inspector")
+    )
+    UserDefaults.standard.removeObject(
+        forKey: workbenchEditorSidecarDefaultsKeyForTesting(frameAutosaveName)
+    )
+}
+
+private func workbenchEditorSidecarDefaultsKeyForTesting(
+    _ frameAutosaveName: NSWindow.FrameAutosaveName
+) -> String {
+    "Stacio.WorkbenchEditorSidecar.width.\(frameAutosaveName)"
+}
+
+private func managedWorkbenchFrameDefaultsKey(_ name: NSWindow.FrameAutosaveName) -> String {
+    "NSWindow Frame \(name)"
+}
+
+private func workbenchSplitWidthDefaultsKeyForTesting(
+    _ frameAutosaveName: NSWindow.FrameAutosaveName,
+    column: String
+) -> String {
+    "Stacio.WorkbenchSplit.\(column)Width.\(frameAutosaveName)"
+}
+
+private func defaultWorkbenchFrameAutosaveName() -> NSWindow.FrameAutosaveName {
+    NSWindow.FrameAutosaveName("Stacio.WorkbenchWindow.v4")
+}
+
+private func makeWorkbenchModelProvider(
+    id: UUID,
+    name: String,
+    baseURL: String,
+    modelID: String
+) -> AIProviderConfiguration {
+    AIProviderConfiguration(
+        id: id,
+        profile: .openAICompatible,
+        displayName: name,
+        baseURL: baseURL,
+        models: [
+            AIProviderModelConfiguration(
+                id: modelID,
+                isEnabled: true,
+                isManual: false,
+                wasReturnedByLatestCatalog: true
+            )
+        ],
+        defaultModelID: modelID,
+        compatibilityProtocol: .chatCompletions,
+        maxRetryCount: 1,
+        requestTimeoutSeconds: 45,
+        userAgent: "Stacio",
+        isEnabled: true,
+        lastVerifiedAt: nil,
+        lastModelSyncAt: nil,
+        confirmedCredentialOrigin: AIProviderCredentialOriginPolicy.normalizedOrigin(
+            forBaseURL: baseURL
+        )
+    )
+}
+
+private struct TemporaryWorkbenchConversationDatabase {
+    let directory: URL
+    let path: String
+}
+
+private func makeTemporaryWorkbenchConversationDatabase() throws -> TemporaryWorkbenchConversationDatabase {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("StacioWorkbenchConversationTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return TemporaryWorkbenchConversationDatabase(
+        directory: directory,
+        path: directory.appendingPathComponent("agent-conversations-v2.sqlite3").path
+    )
+}
+
+@MainActor
+private func makeWorkbenchV2RuntimeFactory(
+    settingsStore: AppSettingsStore,
+    apiKeyStore: AIApiKeyStoring,
+    transport: AIAssistantHTTPTransport,
+    databasePath: String,
+    actorStoreFactory: @escaping (ConversationRepositoryV2) -> ConversationSessionStore = { $0 }
+) -> InspectorConversationRuntimeFactory {
+    { sessionID, terminalContext, modelSelection in
+        let runtimeSettings = try AssistantRuntimeSettingsSnapshot.resolve(from: nil)
+        let encryption = ConversationEncryption(masterKeyData: Data(repeating: 0x5A, count: 32))
+        let repository = try ConversationRepositoryV2(
+            conversationID: sessionID,
+            databasePath: databasePath,
+            encryption: encryption
+        )
+        let sealing = ConversationEncryptionSealingAdapter(
+            encryption: encryption,
+            conversationID: sessionID
+        )
+        var initialState = ConversationV2StorageFactory.makeInitialSessionState(
+            sessionID: sessionID,
+            queueAutoAdvanceEnabled: runtimeSettings.queueAutoAdvanceEnabled,
+            defaultWorkMode: runtimeSettings.defaultWorkMode,
+            defaultReasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
+            memoryScope: terminalContext.historyScopeID,
+            initialTargetContext: terminalContext
+        )
+        let selectedConfigurationID = modelSelection?.providerID.uuidString
+        let resolved = LegacyProviderConfigurationAdapter.resolveActiveProvider(
+            settingsStore: settingsStore,
+            keyStore: apiKeyStore,
+            transport: transport,
+            preferredConfigurationID: selectedConfigurationID,
+            preferredModelID: modelSelection?.modelID,
+            defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
+        )
+        if let resolved {
+            initialState.session.runtimeSelection = AgentRuntimeSelection(
+                kind: .nativeAPI,
+                providerConfigurationID: resolved.configuration.runtimeConfigurationKind == .provider
+                    ? resolved.configuration.effectiveConfigurationID : nil,
+                codingPlanConfigurationID: resolved.configuration.runtimeConfigurationKind == .codingPlan
+                    ? resolved.configuration.effectiveConfigurationID : nil,
+                modelID: resolved.configuration.model,
+                reasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
+                workMode: runtimeSettings.defaultWorkMode
+            )
+        } else if let selectedConfigurationID {
+            initialState.session.runtimeSelection = AgentRuntimeSelection(
+                kind: .nativeAPI,
+                providerConfigurationID: selectedConfigurationID,
+                modelID: modelSelection?.modelID,
+                reasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
+                workMode: runtimeSettings.defaultWorkMode
+            )
+        }
+        let actor = ConversationSessionActor(
+            sessionID: sessionID,
+            initialState: initialState,
+            store: actorStoreFactory(repository),
+            sealing: sealing
+        )
+        guard let bundledCatalog = BundledRuntimeCatalog.shared.toolCatalog else {
+            throw TestWorkbenchConversationRuntimeError.toolCatalogUnavailable
+        }
+        let terminalTools = bundledCatalog.tools.filter {
+            $0.toolID == StacioBuiltinToolID.terminalCommand
+        }
+        guard terminalTools.count == 1 else {
+            throw TestWorkbenchConversationRuntimeError.terminalToolUnavailable
+        }
+        let toolCatalog = StacioToolCatalog(
+            revision: bundledCatalog.revision,
+            tools: terminalTools
+        )
+        let resolveDefaultProvider = {
+            LegacyProviderConfigurationAdapter.resolveActiveProvider(
+                settingsStore: settingsStore,
+                keyStore: apiKeyStore,
+                transport: transport,
+                defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
+            )
+        }
+        let bridge = SessionRuntimeBridge(
+            actor: actor,
+            sessionID: sessionID,
+            initialState: initialState,
+            provider: resolved?.provider,
+            providerConfig: resolved?.configuration,
+            terminalContextProvider: { terminalContext },
+            targetContextResolver: { runtimeID in
+                runtimeID == nil || runtimeID == terminalContext.runtimeID ? terminalContext : nil
+            },
+            runtimeSettingsProvider: { runtimeSettings },
+            admissionCoordinator: ProductionAgentExecutionScheduler(capacity: 2),
+            toolCatalog: toolCatalog,
+            providerResolver: resolveDefaultProvider,
+            providerConfigurationResolver: { configurationID in
+                LegacyProviderConfigurationAdapter.resolveActiveProvider(
+                    settingsStore: settingsStore,
+                    keyStore: apiKeyStore,
+                    transport: transport,
+                    preferredConfigurationID: configurationID,
+                    defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
+                )
+            },
+            providerSelectionResolver: { configurationID, modelID in
+                LegacyProviderConfigurationAdapter.resolveActiveProvider(
+                    settingsStore: settingsStore,
+                    keyStore: apiKeyStore,
+                    transport: transport,
+                    preferredConfigurationID: configurationID,
+                    preferredModelID: modelID,
+                    defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
+                )
+            },
+            settingsProvider: { settingsStore.snapshot() },
+            initialTargetContext: terminalContext,
+            initialExecutionChoice: .realTerminal,
+            restorePending: true,
+            persistsSessionCreationEvent: true
+        )
+        return InspectorConversationRuntime(
+            sessionID: sessionID,
+            bridge: bridge,
+            repository: repository,
+            initialExecutionChoice: .realTerminal
+        )
+    }
+}
+
+private enum TestWorkbenchConversationRuntimeError: Error {
+    case toolCatalogUnavailable
+    case terminalToolUnavailable
+}
+
+private final class TurnSubmissionBlockingConversationStore:
+    ConversationSessionStore,
+    ConversationEventLoading,
+    ConversationEventIdentityProviding
+{
+    private let repository: ConversationRepositoryV2
+    private let lock = NSLock()
+    private let turnSubmissionGate = DispatchSemaphore(value: 0)
+    private var blocked = false
+
+    init(repository: ConversationRepositoryV2) {
+        self.repository = repository
+    }
+
+    var didBlockTurnSubmission: Bool {
+        lock.withLock { blocked }
+    }
+
+    func releaseTurnSubmission() {
+        turnSubmissionGate.signal()
+    }
+
+    func load() throws -> ConversationSessionSnapshot {
+        try repository.load()
+    }
+
+    func commit(
+        expectedLastSequence: Int,
+        candidates: [ConversationEventEnvelope],
+        projections: [String: Data],
+        outbox: [ConversationEffectOutboxItem]
+    ) throws -> ConversationCommitOutcome {
+        let shouldBlock = lock.withLock { () -> Bool in
+            guard blocked == false,
+                  candidates.contains(where: { $0.kind == .turnSubmitted }) else {
+                return false
+            }
+            blocked = true
+            return true
+        }
+        if shouldBlock {
+            turnSubmissionGate.wait()
+        }
+        return try repository.commit(
+            expectedLastSequence: expectedLastSequence,
+            candidates: candidates,
+            projections: projections,
+            outbox: outbox
+        )
+    }
+
+    func existingEventID(at sequence: Int) -> String? {
+        repository.existingEventID(at: sequence)
+    }
+
+    func existingPayloadHash(at sequence: Int) -> String? {
+        repository.existingPayloadHash(at: sequence)
+    }
+
+    func existingEventIdentity(at sequence: Int) -> ConversationEventIdentity? {
+        repository.existingEventIdentity(at: sequence)
+    }
+
+    func loadEvents() throws -> [ConversationEventEnvelope] {
+        try repository.loadEvents()
+    }
+
+    func loadUnsettledOutbox() throws -> [ConversationOutboxDispatchRecord] {
+        try repository.loadUnsettledOutbox()
+    }
+
+    func claimOutboxEffect(
+        effectID: String,
+        dispatchToken: String,
+        dispatchedAt: String
+    ) throws -> ConversationOutboxDispatchRecord? {
+        try repository.claimOutboxEffect(
+            effectID: effectID,
+            dispatchToken: dispatchToken,
+            dispatchedAt: dispatchedAt
+        )
+    }
+
+    func settleOutbox(
+        itemID: String,
+        dispatchToken: String,
+        outcome: ConversationOutboxSettlementOutcome,
+        settledAt: String
+    ) throws -> Bool {
+        try repository.settleOutbox(
+            itemID: itemID,
+            dispatchToken: dispatchToken,
+            outcome: outcome,
+            settledAt: settledAt
+        )
+    }
+
+    func requireOutboxReconciliation(itemID: String, reason: String) throws -> Bool {
+        try repository.requireOutboxReconciliation(itemID: itemID, reason: reason)
+    }
+}
+
+private final class RecordingWorkbenchAIAssistantHTTPTransport: AIAssistantHTTPTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedStreamRequests: [URLRequest] = []
+
+    var streamRequests: [URLRequest] {
+        lock.withLock { recordedStreamRequests }
+    }
+
+    func perform(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        throw AIAssistantProviderError.streamUnsupported
+    }
+
+    func stream(
+        _ request: URLRequest,
+        onChunk: @escaping (Data) -> Void
+    ) async throws -> HTTPURLResponse {
+        lock.withLock {
+            recordedStreamRequests.append(request)
+        }
+
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "choices": [
+                [
+                    "delta": [
+                        "content": #"{"message":"ok","commands":[]}"#
+                    ]
+                ]
+            ]
+        ])
+        var event = Data("data: ".utf8)
+        event.append(payload)
+        event.append(Data("\n\ndata: [DONE]\n\n".utf8))
+        onChunk(event)
+        return HTTPURLResponse(
+            url: request.url ?? URL(string: "https://api.example.com")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/event-stream"]
+        )!
+    }
+}
+
+private final class ControllableWorkbenchAIAssistantHTTPTransport:
+    AIAssistantHTTPTransport,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var recordedStreamRequests: [URLRequest] = []
+    private var shouldComplete = false
+
+    var streamRequests: [URLRequest] {
+        lock.withLock { recordedStreamRequests }
+    }
+
+    func completeStreams() {
+        lock.withLock { shouldComplete = true }
+    }
+
+    func perform(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        throw AIAssistantProviderError.streamUnsupported
+    }
+
+    func stream(
+        _ request: URLRequest,
+        onChunk: @escaping (Data) -> Void
+    ) async throws -> HTTPURLResponse {
+        lock.withLock {
+            recordedStreamRequests.append(request)
+        }
+        while lock.withLock({ shouldComplete }) == false {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try Task.checkCancellation()
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "choices": [
+                [
+                    "delta": [
+                        "content": #"{"message":"ok","commands":[]}"#
+                    ]
+                ]
+            ]
+        ])
+        var event = Data("data: ".utf8)
+        event.append(payload)
+        event.append(Data("\n\ndata: [DONE]\n\n".utf8))
+        onChunk(event)
+        return HTTPURLResponse(
+            url: request.url ?? URL(string: "https://api.example.com")!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/event-stream"]
+        )!
+    }
+}
+
+private func rootMinimumConstraintCount(in window: NSWindow) -> Int {
+    guard let contentView = window.contentView else { return 0 }
+    return contentView.constraints.filter { constraint in
+        constraint.relation == .greaterThanOrEqual
+            && constraint.secondItem == nil
+            && (constraint.firstItem as? NSView) === contentView
+            && (constraint.firstAttribute == .width || constraint.firstAttribute == .height)
+    }.count
+}
+
+private func assertInspectorUsesCompactToolbarInset(
+    in window: NSWindow,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws {
+    let contentView = try XCTUnwrap(window.contentView, file: file, line: line)
+    let inspectorRoot = try XCTUnwrap(
+        contentView.firstSubview(withIdentifier: "Stacio.Inspector.surface"),
+        file: file,
+        line: line
+    )
+    let inspectorContent = try XCTUnwrap(
+        contentView.firstSubview(withIdentifier: "Stacio.Inspector.content"),
+        file: file,
+        line: line
+    )
+    let toolbarInset = try windowToolbarTopInset(in: window, file: file, line: line)
+    let maximumCompactInset = InspectorViewController().maximumCompactToolbarTopInsetForTesting
+    let expectedInset = min(max(0, toolbarInset), maximumCompactInset)
+    let topConstraint = try XCTUnwrap(
+        inspectorRoot.constraints.first { constraint in
+            (constraint.firstItem as? NSView) === inspectorContent
+                && constraint.firstAttribute == .top
+                && constraint.secondItem === inspectorRoot
+                && constraint.secondAttribute == .top
+        },
+        file: file,
+        line: line
+    )
+    XCTAssertEqual(
+        topConstraint.constant,
+        expectedInset + 18,
+        accuracy: 1,
+        "Inspector content should cap the toolbar inset so hidden headers do not leave a large blank region",
+        file: file,
+        line: line
+    )
+}
+
+private func windowToolbarTopInset(in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) throws -> CGFloat {
+    let contentView = try XCTUnwrap(window.contentView, file: file, line: line)
+    let contentLayoutFrame = contentView.convert(window.contentLayoutRect, from: nil)
+    return max(0, contentView.bounds.maxY - contentLayoutFrame.maxY)
+}
+
+private func inspectorSafeAreaTopInset(containing view: NSView) -> CGFloat {
+    var current: NSView? = view
+    while let candidate = current {
+        if candidate.accessibilityIdentifier() == "Stacio.Inspector.surface" {
+            return candidate.safeAreaInsets.top
+        }
+        current = candidate.superview
+    }
+    return 0
+}
+
+private func assertWindowFrame(
+    _ window: NSWindow,
+    equals expected: NSRect,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    XCTAssertEqual(window.frame.origin.x, expected.origin.x, accuracy: 1, file: file, line: line)
+    XCTAssertEqual(window.frame.origin.y, expected.origin.y, accuracy: 1, file: file, line: line)
+    XCTAssertEqual(window.frame.width, expected.width, accuracy: 1, file: file, line: line)
+    XCTAssertEqual(window.frame.height, expected.height, accuracy: 1, file: file, line: line)
+}
+
+private func sidebarToolbarButton(in controller: WorkbenchWindowController) throws -> SidebarToggleTitlebarButton {
+    let window = try XCTUnwrap(controller.window)
+    return try XCTUnwrap(
+        window.toolbar?.items
+            .compactMap { $0.view?.firstSubview(withIdentifier: "Stacio.Toolbar.sidebarToggle") as? SidebarToggleTitlebarButton }
+            .first
+    )
+}
+
+private final class RecordingSparkleUpdateButtonController: SparkleUpdateButtonControlling {
+    var buttonState: SparkleUpdateButtonState = .hidden
+    var onButtonStateChanged: ((SparkleUpdateButtonState) -> Void)?
+    var probeCount = 0
+    var installCount = 0
+    var senderDescriptions: [String] = []
+
+    func checkForUpdates(_ sender: Any?) {
+        senderDescriptions.append((sender as? NSObject)?.description ?? "<nil>")
+        installAvailableUpdateFromPrompt()
+    }
+
+    func probeForAvailableUpdate() {
+        probeCount += 1
+    }
+
+    func installAvailableUpdateFromPrompt() {
+        installCount += 1
+    }
+
+    func publish(_ state: SparkleUpdateButtonState) {
+        buttonState = state
+        onButtonStateChanged?(state)
+    }
+}
+
+private final class RecordingRemoteSessionStarter: RemoteSSHSessionStarting {
+    var startedConfigs: [SshConnectionConfig] = []
+    var startedTitles: [String] = []
+    private let status: LiveShellStatus?
+    private let error: Error?
+    private let onStart: () -> Void
+
+    init(
+        status: LiveShellStatus,
+        onStart: @escaping () -> Void = {}
+    ) {
+        self.status = status
+        self.error = nil
+        self.onStart = onStart
+    }
+
+    init(error: Error) {
+        self.status = nil
+        self.error = error
+        self.onStart = {}
+    }
+
+    func start(config: SshConnectionConfig, title: String) throws -> LiveShellStatus {
+        startedConfigs.append(config)
+        startedTitles.append(title)
+        onStart()
+        if let error {
+            throw error
+        }
+        return status!
+    }
+}
+
+private final class RecordingAutomationRemoteSessionStarter: RemoteSSHSessionAutomationStarting {
+    var startedConfigs: [SshConnectionConfig] = []
+    var startedTitles: [String] = []
+    var automationPolicies: [SessionAutomationPolicy] = []
+    private let status: LiveShellStatus
+
+    init(status: LiveShellStatus) {
+        self.status = status
+    }
+
+    func start(config: SshConnectionConfig, title: String) throws -> LiveShellStatus {
+        try start(config: config, title: title, automationPolicy: .default)
+    }
+
+    func start(
+        config: SshConnectionConfig,
+        title: String,
+        automationPolicy: SessionAutomationPolicy
+    ) throws -> LiveShellStatus {
+        startedConfigs.append(config)
+        startedTitles.append(title)
+        automationPolicies.append(automationPolicy)
+        return status
+    }
+}
+
+private final class OneTimeFailingRemoteSessionStarter: RemoteSSHSessionStarting {
+    var startedConfigs: [SshConnectionConfig] = []
+    var startedTitles: [String] = []
+    private let error: Error
+    private let status: LiveShellStatus
+    private var shouldFail = true
+
+    init(error: Error, status: LiveShellStatus) {
+        self.error = error
+        self.status = status
+    }
+
+    func start(config: SshConnectionConfig, title: String) throws -> LiveShellStatus {
+        startedConfigs.append(config)
+        startedTitles.append(title)
+        if shouldFail {
+            shouldFail = false
+            throw error
+        }
+        return status
+    }
+}
+
+private final class RecordingSavedSessionCredentialPromptPresenter: SavedSessionCredentialPrompting {
+    private(set) var requests: [SavedSessionCredentialPromptRequest] = []
+    private let secret: String?
+
+    init(secret: String?) {
+        self.secret = secret
+    }
+
+    func promptForSavedSessionCredential(
+        _ request: SavedSessionCredentialPromptRequest,
+        parentWindow: NSWindow?
+    ) -> String? {
+        requests.append(request)
+        return secret
+    }
+}
+
+private final class RecordingSavedSessionAuthenticationPromptPresenter: SavedSessionAuthenticationPrompting {
+    private(set) var hosts: [String] = []
+    private let input: SavedSessionAuthenticationInput?
+
+    init(input: SavedSessionAuthenticationInput?) {
+        self.input = input
+    }
+
+    func promptForSavedSessionAuthentication(
+        host: String,
+        initialUsername: String?,
+        parentWindow: NSWindow?
+    ) -> SavedSessionAuthenticationInput? {
+        hosts.append(host)
+        return input
+    }
+}
+
+private struct FixedSavedSessionPasswordSavingConfirmation: SavedSessionPasswordSavingConfirming {
+    let shouldSave: Bool
+
+    func shouldSavePassword(forHost host: String, username: String, parentWindow: NSWindow?) -> Bool {
+        shouldSave
+    }
+}
+
+private struct HostMappedTunnelContextBuilder: TunnelLiveSessionContextBuilding {
+    func makeTunnelLiveSessionContext(
+        config: SshConnectionConfig,
+        databasePath: String
+    ) throws -> TunnelLiveSessionContext {
+        TunnelLiveSessionContext(
+            config: config,
+            secret: .agent,
+            expectedFingerprintSHA256: "SHA256:\(config.host)"
+        )
+    }
+}
+
+private final class HostRuntimeLiveShellStarter: LiveShellStarting {
+    func startLiveSSHShellRuntime(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> LiveShellStatus {
+        LiveShellStatus(
+            runtimeId: "term_\(config.host.replacingOccurrences(of: ".", with: "_"))",
+            status: "running",
+            diagnostic: "running"
+        )
+    }
+}
+
+private final class DelayedWorkbenchLiveShellStarter: LiveShellStarting {
+    private let status: LiveShellStatus
+    private let delay: TimeInterval
+
+    init(status: LiveShellStatus, delay: TimeInterval) {
+        self.status = status
+        self.delay = delay
+    }
+
+    func startLiveSSHShellRuntime(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> LiveShellStatus {
+        Thread.sleep(forTimeInterval: delay)
+        return status
+    }
+}
+
+private final class FailingWorkbenchLiveShellStarter: LiveShellStarting, @unchecked Sendable {
+    private let error: Error
+    private let lock = NSLock()
+    private var recordedStartedConfigs: [SshConnectionConfig] = []
+
+    var startedConfigs: [SshConnectionConfig] {
+        lock.withLock { recordedStartedConfigs }
+    }
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func startLiveSSHShellRuntime(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        cols: UInt32,
+        rows: UInt32
+    ) throws -> LiveShellStatus {
+        lock.withLock {
+            recordedStartedConfigs.append(config)
+        }
+        throw error
+    }
+}
+
+private final class RecordingTelnetSessionStarter: TelnetSessionStarting {
+    private let status: LiveShellStatus
+    private(set) var configs: [TelnetConnectionConfig] = []
+    private(set) var titles: [String] = []
+
+    init(status: LiveShellStatus) {
+        self.status = status
+    }
+
+    func start(config: TelnetConnectionConfig, title: String) throws -> LiveShellStatus {
+        configs.append(config)
+        titles.append(title)
+        return status
+    }
+}
+
+private final class RecordingSerialSessionStarter: SerialSessionStarting {
+    private let status: LiveShellStatus
+    private(set) var configs: [SerialConnectionConfig] = []
+    private(set) var titles: [String] = []
+
+    init(status: LiveShellStatus) {
+        self.status = status
+    }
+
+    func start(config: SerialConnectionConfig, title: String) throws -> LiveShellStatus {
+        configs.append(config)
+        titles.append(title)
+        return status
+    }
+}
+
+private final class RecordingGraphicsRuntimeManager: GraphicsRuntimeManaging {
+    private let status: GraphicsRuntimeStatus
+    private let startGate: DispatchSemaphore?
+    private let startError: Error?
+    private let lock = NSLock()
+    private var recordedRequests: [GraphicsRuntimeStartRequest] = []
+    private var recordedStoppedRuntimeIDs: [String] = []
+
+    var requests: [GraphicsRuntimeStartRequest] {
+        lock.withLock { recordedRequests }
+    }
+
+    var stoppedRuntimeIDs: [String] {
+        lock.withLock { recordedStoppedRuntimeIDs }
+    }
+
+    init(
+        status: GraphicsRuntimeStatus,
+        startGate: DispatchSemaphore? = nil,
+        startError: Error? = nil
+    ) {
+        self.status = status
+        self.startGate = startGate
+        self.startError = startError
+    }
+
+    func start(request: GraphicsRuntimeStartRequest) throws -> GraphicsRuntimeStatus {
+        lock.withLock {
+            recordedRequests.append(request)
+        }
+        _ = startGate?.wait(timeout: .now() + 2)
+        if let startError {
+            throw startError
+        }
+        return status
+    }
+
+    func stop(runtimeID: String) -> GraphicsRuntimeStatus {
+        lock.withLock {
+            recordedStoppedRuntimeIDs.append(runtimeID)
+        }
+        return GraphicsRuntimeStatus(
+            runtimeID: runtimeID,
+            status: "closed",
+            diagnostic: "closed"
+        )
+    }
+}
+
+private final class RecordingWorkbenchEmbeddedGraphicsSession: EmbeddedGraphicsSession {
+    var onFrame: ((GraphicsFrame) -> Void)?
+    var onPointerPosition: ((_ x: Int, _ y: Int) -> Void)?
+    var onPointerVisibilityChanged: ((_ isVisible: Bool) -> Void)?
+    var onPointerBitmap: ((GraphicsPointerBitmap) -> Void)?
+    private(set) var inputEvents: [GraphicsInputEvent] = []
+
+    func start() throws {}
+
+    func stop() {}
+
+    func sendInput(_ event: GraphicsInputEvent) {
+        inputEvents.append(event)
+    }
+}
+
+private final class RecordingSavedSessionOpenRecorder: SavedSessionOpenRecording {
+    var requests: [(databasePath: String, id: String)] = []
+    private let onMark: () -> Void
+
+    init(onMark: @escaping () -> Void = {}) {
+        self.onMark = onMark
+    }
+
+    func markSessionRecordOpened(databasePath: String, id: String) throws -> SessionRecord {
+        requests.append((databasePath: databasePath, id: id))
+        onMark()
+        return SessionRecord(
+            id: id,
+            folderId: nil,
+            name: "Recent Host",
+            protocol: "ssh",
+            host: "recent.example.com",
+            port: 22,
+            username: "deploy",
+            privateKeyPath: nil,
+            credentialId: nil,
+            tags: [],
+            lastOpenedAt: "2026-05-28T00:00:00Z"
+        )
+    }
+}
+
+private final class RecordingWorkbenchTunnelContextBuilder: TunnelLiveSessionContextBuilding {
+    private let context: TunnelLiveSessionContext
+    private(set) var configs: [SshConnectionConfig] = []
+    private(set) var databasePaths: [String] = []
+
+    init(context: TunnelLiveSessionContext) {
+        self.context = context
+    }
+
+    func makeTunnelLiveSessionContext(
+        config: SshConnectionConfig,
+        databasePath: String
+    ) throws -> TunnelLiveSessionContext {
+        configs.append(config)
+        databasePaths.append(databasePath)
+        return context
+    }
+}
+
+private enum TestWorkbenchError: Error {
+    case failed
+}
+
+private final class RecordingQuickConnectPromptPresenter: QuickConnectPromptPresenting {
+    let request: QuickConnectRequest?
+    private(set) var callCount = 0
+
+    init(request: QuickConnectRequest?) {
+        self.request = request
+    }
+
+    func promptQuickConnect(parentWindow: NSWindow?) -> QuickConnectRequest? {
+        callCount += 1
+        return request
+    }
+}
+
+private final class RecordingQuickConnectErrorPresenter: QuickConnectErrorPresenting {
+    var presentedErrors: [Error] = []
+
+    func presentQuickConnectError(_ error: Error, parentWindow: NSWindow?) {
+        presentedErrors.append(error)
+    }
+}
+
+private final class RecordingSessionImportErrorPresenter: SessionImportErrorPresenting {
+    var presentedErrors: [Error] = []
+
+    func presentSessionImportError(_ error: Error, parentWindow: NSWindow?) {
+        presentedErrors.append(error)
+    }
+}
+
+private final class RecordingMultiExecPromptPresenter: MultiExecPromptPresenting {
+    var presentedTargets: [MultiExecTarget] = []
+    var presentedTargetChoices: [MultiExecTargetChoice] = []
+    private let request: MultiExecPromptRequest?
+
+    init(request: MultiExecPromptRequest?) {
+        self.request = request
+    }
+
+    func promptMultiExec(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecPromptRequest? {
+        presentedTargetChoices = targetChoices
+        presentedTargets = targetChoices.map(\.target)
+        return request
+    }
+}
+
+private final class RecordingMultiExecSessionSelector: MultiExecSessionSelecting {
+    var presentedTargets: [MultiExecTarget] = []
+    var presentedTargetChoices: [MultiExecTargetChoice] = []
+    var presentedErrorMessages: [String] = []
+    private let selection: MultiExecSessionSelection?
+
+    init(selection: MultiExecSessionSelection?) {
+        self.selection = selection
+    }
+
+    func selectMultiExecTargets(
+        targetChoices: [MultiExecTargetChoice],
+        parentWindow: NSWindow?
+    ) -> MultiExecSessionSelection? {
+        presentedTargetChoices = targetChoices
+        presentedTargets = targetChoices.map(\.target)
+        return selection
+    }
+
+    func presentMultiExecError(_ error: Error, parentWindow: NSWindow?) {
+        presentedErrorMessages.append((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+    }
+}
+
+private final class RecordingMultiExecBridge: MultiExecPreparing {
+    struct Request {
+        let targets: [MultiExecTarget]
+        let input: String
+        let productionConfirmed: Bool
+    }
+
+    var requests: [Request] = []
+    var onPrepare: (() -> Void)?
+    var prepareError: Error?
+
+    func prepareBroadcastInput(
+        targets: [MultiExecTarget],
+        input: String,
+        productionConfirmed: Bool
+    ) throws -> BroadcastAuditEvent {
+        onPrepare?()
+        if let prepareError {
+            throw prepareError
+        }
+        requests.append(
+            Request(
+                targets: targets,
+                input: input,
+                productionConfirmed: productionConfirmed
+            )
+        )
+        return BroadcastAuditEvent(
+            targetCount: UInt32(targets.count),
+            sentCount: 0,
+            failedCount: 0,
+            redactedInput: input,
+            executed: false
+        )
+    }
+
+    func markBroadcastExecuted(
+        _ event: BroadcastAuditEvent,
+        sentCount: UInt32
+    ) -> BroadcastAuditEvent {
+        BroadcastAuditEvent(
+            targetCount: event.targetCount,
+            sentCount: sentCount,
+            failedCount: event.targetCount - sentCount,
+            redactedInput: event.redactedInput,
+            executed: true
+        )
+    }
+}
+
+private final class RecordingMultiExecAuditRecorder: MultiExecAuditRecording {
+    struct Request: Equatable {
+        let databasePath: String
+        let event: BroadcastAuditEvent
+    }
+
+    var requests: [Request] = []
+
+    func recordBroadcastAuditEvent(
+        databasePath: String,
+        event: BroadcastAuditEvent
+    ) throws -> BroadcastAuditRecord {
+        requests.append(Request(databasePath: databasePath, event: event))
+        return BroadcastAuditRecord(
+            id: "audit_1",
+            traceId: "trace_1",
+            targetCount: event.targetCount,
+            sentCount: event.sentCount,
+            failedCount: event.failedCount,
+            redactedInput: event.redactedInput,
+            executed: event.executed,
+            createdAt: "2026-05-29T00:00:00Z"
+        )
+    }
+}
+
+private final class RecordingTerminalCloseConfirmation: TerminalCloseConfirming {
+    var shouldClose: Bool
+    private(set) var requestedTitles: [String] = []
+
+    init(shouldClose: Bool) {
+        self.shouldClose = shouldClose
+    }
+
+    func confirmCloseTerminal(title: String, parentWindow: NSWindow?) -> Bool {
+        requestedTitles.append(title)
+        return shouldClose
+    }
+}
+
+private final class RecordingPlaintextProtocolSessionConfirmation: PlaintextProtocolSessionConfirming {
+    var shouldOpen: Bool
+    private(set) var requestedProtocols: [String] = []
+    private(set) var requestedMessages: [String] = []
+
+    init(shouldOpen: Bool) {
+        self.shouldOpen = shouldOpen
+    }
+
+    func confirmPlaintextProtocolSession(protocolName: String, message: String, parentWindow: NSWindow?) -> Bool {
+        requestedProtocols.append(protocolName)
+        requestedMessages.append(message)
+        return shouldOpen
+    }
+}
+
+private final class RecordingWorkbenchTerminalEventSink: TerminalEventSink {
+    var inputEvents: [TerminalInputEvent] = []
+    var closedRuntimeIDs: [String] = []
+
+    var userInputEvents: [TerminalInputEvent] {
+        inputEvents.filter { event in
+            String(decoding: event.bytes, as: UTF8.self).contains("__stacio_report_cwd") == false
+        }
+    }
+
+    func terminalDidResize(runtimeID: String, cols: Int, rows: Int) throws {}
+    func terminalDidProduceOutput(runtimeID: String, bytes: [UInt8]) throws {}
+    func terminalDidReceiveInput(runtimeID: String, bytes: [UInt8]) throws {
+        inputEvents.append(TerminalInputEvent(runtimeID: runtimeID, bytes: bytes))
+    }
+    func terminalDidClose(runtimeID: String) throws {
+        closedRuntimeIDs.append(runtimeID)
+    }
+}
+
+private final class RecordingWorkbenchLocalTerminalLauncher: LocalTerminalProcessLaunching {
+    private(set) var sentInput: [[UInt8]] = []
+    private var running: Bool
+
+    init(initiallyRunning: Bool = false) {
+        running = initiallyRunning
+    }
+
+    func isRunning(_ terminalView: LocalProcessTerminalView) -> Bool {
+        running
+    }
+
+    func startProcess(
+        in terminalView: LocalProcessTerminalView,
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    ) {
+        running = true
+    }
+
+    func terminate(_ terminalView: LocalProcessTerminalView) {
+        running = false
+    }
+
+    func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView) {
+        sentInput.append(bytes)
+    }
+}
+
+private struct WorkbenchStaticLocalAgentToolResolver: LocalAgentToolResolving {
+    let paths: [LocalAgentTool: String]
+
+    func executablePath(for tool: LocalAgentTool) -> String? {
+        paths[tool]
+    }
+
+    func passthroughConfiguration(for tool: LocalAgentTool) -> LocalAgentPassthroughConfiguration? {
+        guard let path = paths[tool] else { return nil }
+        let launchEnvironment = [
+            "PATH=/tools",
+            "STACIO_LOCAL_AGENT=\(tool.catalogRawIdentity)"
+        ].sorted()
+        return LocalAgentPassthroughConfiguration(
+            configurationID: "test-config-\(tool.rawValue)",
+            configurationRevision: 1,
+            catalogID: "local-agent.\(tool.rawValue)",
+            catalogSetRevision: 1,
+            descriptorRevision: 1,
+            tool: tool,
+            displayName: tool.displayName,
+            executablePath: path,
+            executableIdentityDigest: "test-executable-\(tool.rawValue)",
+            executableReferenceConfirmedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            lastVerifiedAt: Date(timeIntervalSince1970: 1_700_000_001),
+            executionProfileID: "test-profile-\(tool.rawValue)",
+            executionProfileRevision: 1,
+            authenticationState: .authenticated,
+            authenticationEvidenceRevision: "test-auth-1",
+            cliAuthenticationScopeDigest: "test-scope",
+            cliLoginIdentityDigest: "test-login",
+            environmentDigest: LocalAgentConfigurationIntegrity.environmentDigest(launchEnvironment),
+            launchArguments: tool.embeddedTerminalArguments,
+            launchEnvironment: launchEnvironment,
+            executableName: URL(fileURLWithPath: path).lastPathComponent,
+            supportLevel: .experimental,
+            explicitlyEnabled: true
+        )
+    }
+}
+
+private final class RecordingWorkbenchLocalAgentProcessLauncher: LocalTerminalProcessLaunching {
+    private(set) var startedExecutable: String?
+    private(set) var startedArgs: [String]?
+    private(set) var startedEnvironment: [String]?
+    private(set) var startedExecName: String?
+    private(set) var startedCurrentDirectory: String?
+    private(set) var startCount = 0
+    private(set) var terminated = false
+    var running = false
+    private let processIdentifier: Int32 = 9_003
+    private let trustedStartTime = Date(timeIntervalSince1970: 1_700_000_003)
+
+    func isRunning(_ terminalView: LocalProcessTerminalView) -> Bool {
+        running
+    }
+
+    func managedProcessGroupID(_ terminalView: LocalProcessTerminalView) -> Int32? {
+        isRunning(terminalView) ? 9_003 : nil
+    }
+
+    func managedProcessIdentifier(_ terminalView: LocalProcessTerminalView) -> Int32? {
+        isRunning(terminalView) ? processIdentifier : nil
+    }
+
+    func managedProcessTrustedStartTime(_ terminalView: LocalProcessTerminalView) -> Date? {
+        isRunning(terminalView) ? trustedStartTime : nil
+    }
+
+    func startProcess(
+        in terminalView: LocalProcessTerminalView,
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    ) {
+        startCount += 1
+        startedExecutable = executable
+        startedArgs = args
+        startedEnvironment = environment
+        startedExecName = execName
+        startedCurrentDirectory = currentDirectory
+        running = true
+    }
+
+    func terminate(_ terminalView: LocalProcessTerminalView) {
+        terminated = true
+        running = false
+    }
+
+    func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView) {}
+}
+
+private final class WorkbenchLocalAgentRuntimeLaunchAuthorizer:
+    LocalAgentRuntimeLaunchAuthorizing
+{
+    private let usage = LocalAgentRuntimeUsageRegistry()
+
+    func acquireUsage(
+        configurationID: String,
+        expectedConfigurationRevision: Int64
+    ) throws -> LocalAgentRuntimeUsageLease {
+        guard configurationID.isEmpty == false,
+              expectedConfigurationRevision > 0,
+              let lease = usage.acquireUsage(configurationID: configurationID)
+        else {
+            throw LocalAgentRuntimeLaunchAuthorizationError.unavailable
+        }
+        return lease
+    }
+}
+
+private final class RecordingWorkbenchRemoteTerminalBridge: RemoteTerminalBridging {
+    var closedRuntimeIDs: [String] = []
+
+    func pollLiveSSHShell(runtimeID: String) throws -> LiveShellStatus {
+        LiveShellStatus(runtimeId: runtimeID, status: "running", diagnostic: "running")
+    }
+
+    func takeTerminalOutputBatch(runtimeID: String) throws -> TerminalOutputBatch {
+        TerminalOutputBatch(runtimeId: runtimeID, bytes: Data(), droppedByteCount: 0)
+    }
+
+    func setTerminalOutputPaused(runtimeID: String, paused: Bool) throws -> TerminalRuntime {
+        TerminalRuntime(
+            id: runtimeID,
+            kind: "remote_ssh",
+            shellPath: "",
+            remoteHost: "example.com",
+            remotePort: 22,
+            username: "deploy",
+            cols: 80,
+            rows: 24,
+            resizeRevision: 0,
+            status: "running",
+            outputPaused: paused
+        )
+    }
+
+    func setLiveShellKeepaliveInterval(runtimeID: String, seconds: UInt32) throws {}
+
+    func closeLiveSSHShell(runtimeID: String) throws -> LiveShellStatus {
+        closedRuntimeIDs.append(runtimeID)
+        return LiveShellStatus(runtimeId: runtimeID, status: "closed", diagnostic: "closed")
+    }
+}
+
+private final class RecordingWorkbenchRemoteTerminalReconnecter: RemoteTerminalReconnecting {
+    private let status: LiveShellStatus
+    private(set) var liveSessionContext: TunnelLiveSessionContext?
+    private(set) var reconnectedTitles: [String] = []
+
+    init(status: LiveShellStatus, liveSessionContext: TunnelLiveSessionContext? = nil) {
+        self.status = status
+        self.liveSessionContext = liveSessionContext
+    }
+
+    func reconnectRemoteTerminal(title: String) throws -> LiveShellStatus {
+        reconnectedTitles.append(title)
+        return status
+    }
+}
+
+private final class RecordingWorkbenchDeviceMetricsProvider: DeviceMetricsProviding {
+    func pollDeviceMetrics(completion: @escaping (Result<DeviceMetricsDisplaySnapshot, Error>) -> Void) {
+        completion(.success(DeviceMetricsDisplaySnapshot(
+            cpuUsage: 0.12,
+            memory: DeviceMemoryDisplayUsage(usedBytes: 1024, totalBytes: 4096),
+            networks: [],
+            disks: []
+        )))
+    }
+}
+
+private final class RecordingWorkbenchLiveTunnelBridge: LiveTunnelCoreBridging {
+    var startedProfiles: [TunnelProfile] = []
+
+    func checkLocalPortAvailable(_ profile: TunnelProfile) throws {}
+
+    func startLiveLocalTunnelRuntime(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        profile: TunnelProfile
+    ) throws -> TunnelRuntimeStatus {
+        startedProfiles.append(profile)
+        return TunnelRuntimeStatus(profileId: profile.id, state: .running, message: "running")
+    }
+
+    func closeLiveTunnelRuntime(profileID: String) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profileID, state: .stopped, message: "stopped")
+    }
+
+    func pollLiveTunnelRuntime(profileID: String) throws -> TunnelRuntimeStatus {
+        TunnelRuntimeStatus(profileId: profileID, state: .running, message: "running")
+    }
+
+    func stopTunnelRuntime(state: TunnelState) throws -> TunnelState {
+        .stopped
+    }
+}
+
+private final class RecordingWorkbenchRemoteFilesBridge: RemoteFilesBridging {
+    private let recordingQueue = DispatchQueue(label: "Stacio.Tests.RecordingWorkbenchRemoteFilesBridge")
+    private var recordedLiveHosts: [String] = []
+    private var recordedLiveRemotePaths: [String] = []
+    private var recordedExpectedFingerprints: [String] = []
+    private var recordedFTPHosts: [String] = []
+    private var recordedFTPUsernames: [String] = []
+    private var recordedFTPSecrets: [String] = []
+    private var recordedEntries: [RemoteFileEntry]
+    private var nextLiveRemoteDirectoryRequestObserver: (path: String, handler: () -> Void)?
+
+    init(entries: [RemoteFileEntry]) {
+        self.recordedEntries = entries
+    }
+
+    func replaceEntries(_ entries: [RemoteFileEntry]) {
+        recordingQueue.sync {
+            recordedEntries = entries
+        }
+    }
+
+    var liveHosts: [String] {
+        recordingQueue.sync { recordedLiveHosts }
+    }
+
+    var liveRemotePaths: [String] {
+        recordingQueue.sync { recordedLiveRemotePaths }
+    }
+
+    var expectedFingerprints: [String] {
+        recordingQueue.sync { recordedExpectedFingerprints }
+    }
+
+    var ftpHosts: [String] {
+        recordingQueue.sync { recordedFTPHosts }
+    }
+
+    var ftpUsernames: [String] {
+        recordingQueue.sync { recordedFTPUsernames }
+    }
+
+    var ftpSecrets: [String] {
+        recordingQueue.sync { recordedFTPSecrets }
+    }
+
+    func observeNextLiveRemoteDirectoryRequest(
+        matching path: String,
+        handler: @escaping () -> Void
+    ) {
+        recordingQueue.sync {
+            nextLiveRemoteDirectoryRequestObserver = (path, handler)
+        }
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        recordingQueue.sync { recordedEntries }
+    }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        let result = recordingQueue.sync { () -> ([RemoteFileEntry], (() -> Void)?) in
+            recordedLiveHosts.append(config.host)
+            recordedLiveRemotePaths.append(remotePath)
+            recordedExpectedFingerprints.append(expectedFingerprintSHA256)
+            let observer: (() -> Void)?
+            if nextLiveRemoteDirectoryRequestObserver?.path == remotePath {
+                observer = nextLiveRemoteDirectoryRequestObserver?.handler
+                nextLiveRemoteDirectoryRequestObserver = nil
+            } else {
+                observer = nil
+            }
+            return (recordedEntries, observer)
+        }
+        result.1?()
+        return result.0
+    }
+
+    func listLiveSFTPDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        try listLiveRemoteDirectory(
+            config: config,
+            secret: secret,
+            expectedFingerprintSHA256: expectedFingerprintSHA256,
+            remotePath: remotePath
+        )
+    }
+
+    func listLiveFTPDirectory(
+        config: FtpConnectionConfig,
+        secret: FtpAuthSecret,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        recordingQueue.sync {
+            recordedFTPHosts.append(config.host)
+            recordedFTPUsernames.append(config.username)
+            switch secret {
+            case .password(let value):
+                recordedFTPSecrets.append(value)
+            case .anonymous:
+                recordedFTPSecrets.append("anonymous")
+            }
+            return recordedEntries
+        }
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {}
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {}
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {}
+}
+
+private final class RuntimeScopedWorkbenchRemoteFilesBridge: RemoteFilesBridging {
+    private let lock = NSLock()
+    private let entriesByFingerprint: [String: [RemoteFileEntry]]
+    private var shouldDelayNextRequest = false
+    private let delayedRequestStarted = DispatchSemaphore(value: 0)
+    private let delayedRequestRelease = DispatchSemaphore(value: 0)
+    private(set) var expectedFingerprints: [String] = []
+
+    init(entriesByFingerprint: [String: [RemoteFileEntry]]) {
+        self.entriesByFingerprint = entriesByFingerprint
+    }
+
+    func delayNextRequest() {
+        lock.lock()
+        shouldDelayNextRequest = true
+        lock.unlock()
+    }
+
+    func waitUntilDelayedRequestStarted(timeout: TimeInterval = 1) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if delayedRequestStarted.wait(timeout: .now()) == .success {
+                return true
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        return delayedRequestStarted.wait(timeout: .now()) == .success
+    }
+
+    func releaseDelayedRequest() {
+        delayedRequestRelease.signal()
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        []
+    }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        let shouldDelay: Bool = lock.withLock {
+            expectedFingerprints.append(expectedFingerprintSHA256)
+            let shouldDelay = shouldDelayNextRequest
+            shouldDelayNextRequest = false
+            return shouldDelay
+        }
+        if shouldDelay {
+            delayedRequestStarted.signal()
+            _ = delayedRequestRelease.wait(timeout: .now() + 1)
+        }
+        return entriesByFingerprint[expectedFingerprintSHA256] ?? []
+    }
+
+    func listLiveFTPDirectory(
+        config: FtpConnectionConfig,
+        secret: FtpAuthSecret,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        []
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {}
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {}
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {}
+}
+
+private final class WorkbenchImmediateSCPTransferBridge: SCPTransferBridging {
+    private let recordingQueue = DispatchQueue(label: "Stacio.Tests.WorkbenchImmediateSCPTransferBridge")
+    private var recordedDestinationPaths: [String] = []
+    private let onTransfer: (ScpTransferJob) -> Void
+
+    init(onTransfer: @escaping (ScpTransferJob) -> Void = { _ in }) {
+        self.onTransfer = onTransfer
+    }
+
+    var destinationPaths: [String] {
+        recordingQueue.sync { recordedDestinationPaths }
+    }
+
+    func runLiveSCPTransfer(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        job: ScpTransferJob
+    ) throws -> [ScpTransferProgress] {
+        recordingQueue.sync {
+            recordedDestinationPaths.append(job.destinationPath)
+        }
+        onTransfer(job)
+        return [
+            ScpTransferProgress(
+                jobId: job.id,
+                bytesDone: job.bytesTotal,
+                bytesTotal: job.bytesTotal,
+                status: "completed"
+            )
+        ]
+    }
+}
+
+private final class SlowFollowWorkbenchRemoteFilesBridge: RemoteFilesBridging {
+    private let recordingQueue = DispatchQueue(label: "Stacio.Tests.SlowFollowWorkbenchRemoteFilesBridge")
+    private var recordedLiveRemotePaths: [String] = []
+    private var shouldDelayNextRequest = false
+    private let delayedRequestStarted = DispatchSemaphore(value: 0)
+    private let delayedRequestRelease = DispatchSemaphore(value: 0)
+    private let entries: [RemoteFileEntry]
+
+    init(entries: [RemoteFileEntry]) {
+        self.entries = entries
+    }
+
+    var liveRemotePaths: [String] {
+        recordingQueue.sync { recordedLiveRemotePaths }
+    }
+
+    func delayNextRequest() {
+        recordingQueue.sync {
+            shouldDelayNextRequest = true
+        }
+    }
+
+    func releaseDelayedRequest() {
+        delayedRequestRelease.signal()
+    }
+
+    func parseRemoteListing(_ input: String) throws -> [RemoteFileEntry] {
+        entries
+    }
+
+    func listLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws -> [RemoteFileEntry] {
+        let shouldDelay = recordingQueue.sync { () -> Bool in
+            recordedLiveRemotePaths.append(remotePath)
+            let value = shouldDelayNextRequest
+            shouldDelayNextRequest = false
+            return value
+        }
+        if shouldDelay {
+            delayedRequestStarted.signal()
+            _ = delayedRequestRelease.wait(timeout: .now() + 1)
+        }
+        return entries
+    }
+
+    func createLiveRemoteDirectory(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String
+    ) throws {}
+
+    func renameLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        fromPath: String,
+        toPath: String
+    ) throws {}
+
+    func deleteLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        recursive: Bool
+    ) throws {}
+
+    func chmodLiveRemotePath(
+        config: SshConnectionConfig,
+        secret: SshAuthSecret,
+        expectedFingerprintSHA256: String,
+        remotePath: String,
+        mode: String
+    ) throws {}
+}
+
+private extension InspectorViewController {
+    var tunnelsViewControllerForTesting: TunnelsViewController {
+        tunnelsViewController!
+    }
+
+    var selectedTabLabelForTesting: String? {
+        selectedTabLabel
+    }
+
+    var filesCoordinatorForTesting: FilesCoordinator {
+        let mirror = Mirror(reflecting: self)
+        return mirror.children.first { $0.label == "filesCoordinator" }?.value as! FilesCoordinator
+    }
+}
+
+private extension WorkbenchWindowController {
+    var inspectorViewControllerForTesting: InspectorViewController? {
+        contentSplitViewController
+            .splitViewItems
+            .compactMap { $0.viewController as? InspectorViewController }
+            .first
+    }
+}
+
+private extension WorkspaceViewController {
+    var tabLabelsForWorkbenchTesting: [String] {
+        let mirror = Mirror(reflecting: self)
+        let tabController = mirror.children.first { $0.label == "tabViewController" }?.value as? NSTabViewController
+        return tabController?.tabViewItems.map(\.label) ?? []
+    }
+}
+
+private func workbenchLiveContext(
+    host: String = "172.16.10.250",
+    expectedFingerprintSHA256: String? = nil
+) -> TunnelLiveSessionContext {
+    TunnelLiveSessionContext(
+        config: SshConnectionConfig(
+            host: host,
+            port: 22,
+            username: "root",
+            authMethod: .agent,
+            connectTimeoutMs: 10_000
+        ),
+        secret: .agent,
+        expectedFingerprintSHA256: expectedFingerprintSHA256 ?? "SHA256:\(host)"
+    )
+}
+
+@MainActor
+private func replaceToolbarItemsForTesting(
+    in toolbar: NSToolbar,
+    with identifiers: [NSToolbarItem.Identifier]
+) {
+    if #available(macOS 15.0, *) {
+        toolbar.itemIdentifiers = identifiers
+    } else {
+        for index in toolbar.items.indices.reversed() {
+            toolbar.removeItem(at: index)
+        }
+        for identifier in identifiers {
+            toolbar.insertItem(withItemIdentifier: identifier, at: toolbar.items.count)
+        }
+    }
+}
+
+@MainActor
+private final class RecordingWorkbenchWorkspaceGroupClosePresenter: WorkspaceSessionGroupClosePresenting {
+    private(set) var requests: [WorkspaceSessionGroupDefinition] = []
+
+    func decisionForClosingGroup(
+        definition: WorkspaceSessionGroupDefinition,
+        suggestedName: String,
+        parentWindow: NSWindow?
+    ) -> WorkspaceSessionGroupCloseDecision {
+        requests.append(definition)
+        return .cancel
+    }
+}
+
+private final class MutableWorkbenchLicenseAccessProvider: LicenseFeatureAccessProviding {
+    var enabledFeatures: Set<StacioLicensedFeature>
+
+    init(enabledFeatures: Set<StacioLicensedFeature>) {
+        self.enabledFeatures = enabledFeatures
+    }
+
+    func isEnabled(_ feature: StacioLicensedFeature) -> Bool {
+        enabledFeatures.contains(feature)
+    }
+}
+
+private extension TunnelsViewController {
+    func startForTesting(profile: TunnelProfile) throws -> TunnelRuntimeStatus {
+        setTunnelProfiles([profile])
+        performTunnelActionDirectlyForTesting(at: 0)
+        return TunnelRuntimeStatus(
+            profileId: profile.id,
+            state: runningTunnelCount == 1 ? .running : .failed,
+            message: ""
+        )
+    }
+}
+
+@MainActor
+private final class RecordingWorkbenchAgentActionConfirmer: AgentActionConfirming {
+    private let confirmed: Bool
+    private(set) var confirmations: [AgentActionConfirmation] = []
+
+    init(confirmed: Bool) {
+        self.confirmed = confirmed
+    }
+
+    func confirmAgentAction(_ confirmation: AgentActionConfirmation, parentWindow: NSWindow?) -> Bool {
+        confirmations.append(confirmation)
+        return confirmed
+    }
+}
+
+private extension NSView {
+    func firstSubview(withIdentifier identifier: String) -> NSView? {
+        if accessibilityIdentifier() == identifier {
+            return self
+        }
+
+        for subview in subviews {
+            if let match = subview.firstSubview(withIdentifier: identifier) {
+                return match
+            }
+        }
+
+        return nil
+    }
+
+    func nearestSuperview<T: NSView>(ofType type: T.Type) -> T? {
+        var candidate = superview
+        while let current = candidate {
+            if let typed = current as? T {
+                return typed
+            }
+            candidate = current.superview
+        }
+        return nil
+    }
+
+    func allSubviews<T: NSView>(ofType type: T.Type) -> [T] {
+        subviews.flatMap { subview -> [T] in
+            var matches = subview.allSubviews(ofType: type)
+            if let typed = subview as? T {
+                matches.insert(typed, at: 0)
+            }
+            return matches
+        }
+    }
+}

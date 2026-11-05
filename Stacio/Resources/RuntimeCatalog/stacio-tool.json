@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "revision": 3,
+  "tools": [
+    {
+      "toolID": "terminal.command",
+      "schemaRevision": 1,
+      "applicableTargetBindingKinds": ["local", "terminal"],
+      "writeRisk": true,
+      "escalationRisk": true,
+      "networkRisk": true,
+      "planningSafeReadOnly": false,
+      "requiredLease": "terminal.runtime",
+      "maxInputBytes": 65536,
+      "maxOutputBytes": 1048576,
+      "auditPolicy": "durable-decision-and-terminal-trace"
+    }
+  ]
+}

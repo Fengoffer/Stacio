@@ -1,0 +1,286 @@
+{
+  "schemaVersion": 1,
+  "registryVersion": 1,
+  "description": "Stacio 排查助手 V2 阻断性证据公开索引（脱敏、可提交）。禁止包含测试账号、授权范围、凭据、正文或任何 secret。本地私密证据另存 ~/StacioEvidence/，永不入库。",
+  "entries": [
+    {
+      "evidenceID": "V2-PLAN-BASELINE-2026-08-05",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS (authoritative checkout)",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Re-verify on spec revision change or before each release gate",
+      "reviewer": "implementation-plan author",
+      "conclusion": "defer",
+      "redactedSummary": "Frozen spec c60c8292 verified; implementation plan approved; baseline registered",
+      "blockerIDs": [
+        "B-01",
+        "B-02",
+        "B-03",
+        "B-04",
+        "B-05",
+        "B-06",
+        "B-07",
+        "B-08",
+        "B-09"
+      ]
+    },
+    {
+      "evidenceID": "B-01-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0 gate; re-verify on each GA CLI version change",
+      "reviewer": "macOS Runtime owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要 Developer ID/Hardened Runtime/notarized 构建与目标 macOS/CPU 矩阵做 managed containment 越界测试",
+      "blockerIDs": [
+        "B-01"
+      ]
+    },
+    {
+      "evidenceID": "B-02-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0 + phase 10 release gate",
+      "reviewer": "Provider/Local Agent owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要阿里 Coding Plan 套餐测试账号与具名 CLI 做 managed 兼容验证",
+      "blockerIDs": [
+        "B-02"
+      ]
+    },
+    {
+      "evidenceID": "B-03-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0 + phase 10 release gate",
+      "reviewer": "Provider/Local Agent owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要 GLM Coding Plan 套餐测试账号与具名 CLI 做 managed 兼容验证",
+      "blockerIDs": [
+        "B-03"
+      ]
+    },
+    {
+      "evidenceID": "B-04-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0; re-verify before Catalog GA",
+      "reviewer": "Provider owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要 Kimi Code 非生产真实套餐 Key 做 Native 协议验证",
+      "blockerIDs": [
+        "B-04"
+      ]
+    },
+    {
+      "evidenceID": "B-05-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0; re-verify before Catalog GA",
+      "reviewer": "Provider owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要 MiniMax 套餐非生产真实 Key 做 Native 协议验证",
+      "blockerIDs": [
+        "B-05"
+      ]
+    },
+    {
+      "evidenceID": "B-06-EXTERNAL-BLOCK",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Phase 0 environment gate + phase 10 release gate",
+      "reviewer": "Release/QA owner",
+      "conclusion": "defer",
+      "redactedSummary": "外部受阻：需要 SDK 27 与真实 macOS 27 设备做视觉/辅助功能验收",
+      "blockerIDs": [
+        "B-06"
+      ]
+    },
+    {
+      "evidenceID": "B-07-SCOPED-DEFER",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Before phase 4; each GA CLI",
+      "reviewer": "Security owner",
+      "conclusion": "defer",
+      "redactedSummary": "scoped defer：依赖 P4 实现后验证 CLI 最小 authentication containment",
+      "blockerIDs": [
+        "B-07"
+      ]
+    },
+    {
+      "evidenceID": "B-08-SCOPED-DEFER",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Before phase 3/8; each Supervisor change",
+      "reviewer": "Runtime/Supervisor owner",
+      "conclusion": "defer",
+      "redactedSummary": "scoped defer：依赖 P3/P8 的 Supervisor/launch journal 实现后做崩溃/orphan 对账",
+      "blockerIDs": [
+        "B-08"
+      ]
+    },
+    {
+      "evidenceID": "B-09-SCOPED-DEFER",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "pending",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Before phase 3; each release candidate",
+      "reviewer": "Security/Storage owner",
+      "conclusion": "defer",
+      "redactedSummary": "scoped defer：依赖 P3 的生命周期/绑定 saga 存储实现后做单写入验证",
+      "blockerIDs": [
+        "B-09"
+      ]
+    },
+    {
+      "evidenceID": "B-01-20260805-144437",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T14:44:37",
+      "expiryCondition": "Phase 0 gate; re-verify on each GA CLI version change",
+      "reviewer": "macOS-Runtime-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "managed containment 探针待 P8 profile 与最终签名构建就绪；当前仅登记环境基线与待验项",
+      "blockerIDs": [
+        "B-01"
+      ]
+    },
+    {
+      "evidenceID": "B-02-20260805-144921",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T14:49:21",
+      "expiryCondition": "Phase 0 + phase 10 release gate",
+      "reviewer": "Provider-LocalAgent-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "阿里 Coding Plan：账号未配置，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-02"
+      ]
+    },
+    {
+      "evidenceID": "B-02-20260805-153032",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T15:30:32",
+      "expiryCondition": "Phase 0 + phase 10 release gate",
+      "reviewer": "Provider-LocalAgent-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "阿里 Coding Plan：账号未配置，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-02"
+      ]
+    },
+    {
+      "evidenceID": "B-03-20260805-144921",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T14:49:21",
+      "expiryCondition": "Phase 0 + phase 10 release gate",
+      "reviewer": "Provider-LocalAgent-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "GLM Coding Plan：账号未配置，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-03"
+      ]
+    },
+    {
+      "evidenceID": "B-04-20260805-144437",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T14:44:37",
+      "expiryCondition": "Phase 0; re-verify before Catalog GA",
+      "reviewer": "Provider-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "Provider 未配置非生产真实 Key，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-04"
+      ]
+    },
+    {
+      "evidenceID": "B-04-20260805-153032",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T15:30:32",
+      "expiryCondition": "Phase 0; re-verify before Catalog GA",
+      "reviewer": "Provider-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "Provider 未配置非生产真实 Key，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-04"
+      ]
+    },
+    {
+      "evidenceID": "B-05-20260805-144437",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6",
+      "generatedAt": "2026-08-05T14:44:37",
+      "expiryCondition": "Phase 0; re-verify before Catalog GA",
+      "reviewer": "Provider-Owner",
+      "conclusion": "defer",
+      "redactedSummary": "Provider 未配置非生产真实 Key，仅登记环境与待验项",
+      "blockerIDs": [
+        "B-05"
+      ]
+    },
+    {
+      "evidenceID": "B-06-20260805-144438",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS 26.6; Xcode Xcode 26.6; SDK \tmacOS 26.5                    \t-sdk macosx26.5",
+      "generatedAt": "2026-08-05T14:44:38",
+      "expiryCondition": "Phase 0 environment gate + phase 10 release gate",
+      "reviewer": "Release-QA-Owner",
+      "conclusion": "pass",
+      "redactedSummary": "环境满足 SDK 27/macOS 27；请在目标机完成截图与辅助功能清单并回填",
+      "blockerIDs": [
+        "B-06"
+      ]
+    },
+    {
+      "evidenceID": "V2-DEV-DECISION-PROCEED-PHASE1-WITH-OPEN-GATE-2026-08-05",
+      "buildCommit": "9c0097fa",
+      "catalogSetRevision": "pending",
+      "deviceSystem": "macOS (authoritative checkout)",
+      "generatedAt": "2026-08-05",
+      "expiryCondition": "Re-verify when B-01..B-06 evidence becomes available or user provides keys",
+      "reviewer": "user (approved continuing development)",
+      "conclusion": "defer",
+      "redactedSummary": "用户授权在阶段0证据外部受阻（未提供各平台Key/签名/SDK27）的情况下继续推进不依赖证据的阶段1契约测试；B-01..B-06 证据保持 defer，阶段0门禁未通过，Phase1 仅冻结现有行为不改业务代码",
+      "blockerIDs": [
+        "B-01",
+        "B-02",
+        "B-03",
+        "B-04",
+        "B-05",
+        "B-06"
+      ]
+    }
+  ]
+}

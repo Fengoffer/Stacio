@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["scenarioID", "buildCommit", "catalogRevision", "result", "redactedSummary", "cleanupVerification"],
+  "properties": {
+    "scenarioID": { "type": "string" },
+    "buildCommit": { "type": "string" },
+    "catalogRevision": { "type": "integer" },
+    "result": { "enum": ["pass", "fail", "blocked", "skipped"] },
+    "statusReason": { "type": "string" },
+    "redactedSummary": { "type": "string" },
+    "cleanupVerification": { "type": "boolean" }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "description": "Stacio 的版本号唯一来源。scripts/package-app.sh 与 scripts/print-version.sh 都读这里；不要再把版本号写死在脚本里。",
+  "version": "0.15.3",
+  "minimumSystemVersion": "14.0",
+  "notes": [
+    "发版时仍建议显式传 STACIO_VERSION，让构建可复现；未传时以本文件为准。",
+    "构建号不在这里：由 STACIO_BUILD_NUMBER 或 CI 的 run number 提供。",
+    "改动版本号时同步更新 CHANGELOG.md。"
+  ]
+}

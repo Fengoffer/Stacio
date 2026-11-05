@@ -1,0 +1,45 @@
+Stacio Source Available Non-Commercial License
+
+Version 1.0
+
+Copyright (c) 2026 Fengoffer
+
+1. Permission
+
+You may use, copy, study, modify, and create derivative works from this software and its source code for personal learning, research, evaluation, and non-commercial secondary development.
+
+You may publish or share non-commercial modifications if you keep this license notice, clearly mark your changes, and do not imply that your modified version is an official Stacio release.
+
+2. Commercial Restrictions
+
+Without prior written authorization from the copyright holder, you may not use this software, source code, binaries, modified versions, or derivative works for commercial purposes.
+
+Commercial purposes include, but are not limited to:
+
+- selling, licensing, sublicensing, renting, or leasing the software or derivative works;
+- offering the software or derivative works as a paid product, paid service, managed service, hosted service, or internal commercial tool;
+- bundling the software or derivative works with a commercial product or service;
+- using the software or derivative works to provide paid consulting, operations, hosting, support, training, or integration services;
+- removing or obscuring Stacio branding, copyright notices, or license terms for redistribution.
+
+3. Distribution of Binaries
+
+Public binary distribution of official Stacio releases is controlled by the copyright holder. You may build the software from source for personal non-commercial use. Redistribution of binaries, installers, DMG packages, or branded builds requires prior written authorization unless a separate written permission says otherwise.
+
+4. No Trademark License
+
+This license does not grant rights to use the Stacio name, logo, icons, screenshots, or other branding in a way that suggests endorsement, official status, or commercial association.
+
+5. Third-Party Components
+
+Third-party dependencies remain governed by their own licenses. This license applies only to the Stacio source code and assets owned by the copyright holder.
+
+6. Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+7. Termination
+
+Your rights under this license terminate automatically if you violate its terms. After termination, you must stop using, copying, modifying, and distributing the software and derivative works.
+
+For commercial authorization, contact the copyright holder through the project repository.

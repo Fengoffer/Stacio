@@ -1,0 +1,1010 @@
+import AppKit
+import StacioAgentBridge
+import SwiftTerm
+
+public protocol LocalTerminalProcessLaunching {
+    func isRunning(_ terminalView: LocalProcessTerminalView) -> Bool
+    func startProcess(
+        in terminalView: LocalProcessTerminalView,
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    )
+    func terminate(_ terminalView: LocalProcessTerminalView)
+    func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView)
+    func managedProcessGroupID(_ terminalView: LocalProcessTerminalView) -> Int32?
+    func managedProcessIdentifier(_ terminalView: LocalProcessTerminalView) -> Int32?
+    func managedProcessTrustedStartTime(_ terminalView: LocalProcessTerminalView) -> Date?
+    func interrupt(_ terminalView: LocalProcessTerminalView)
+}
+
+public extension LocalTerminalProcessLaunching {
+    func managedProcessGroupID(_ terminalView: LocalProcessTerminalView) -> Int32? { nil }
+    func managedProcessIdentifier(_ terminalView: LocalProcessTerminalView) -> Int32? { nil }
+    func managedProcessTrustedStartTime(_ terminalView: LocalProcessTerminalView) -> Date? { nil }
+    func interrupt(_ terminalView: LocalProcessTerminalView) {
+        sendInput([0x03], to: terminalView)
+    }
+}
+
+public struct SwiftTermLocalTerminalProcessLauncher: LocalTerminalProcessLaunching {
+    public init() {}
+
+    public func isRunning(_ terminalView: LocalProcessTerminalView) -> Bool {
+        if let localAgentTerminalView = terminalView as? StacioLocalAgentTerminalView {
+            return localAgentTerminalView.managedProcessChainActive
+        }
+        return terminalView.process.running
+    }
+
+    public func managedProcessGroupID(_ terminalView: LocalProcessTerminalView) -> Int32? {
+        (terminalView as? StacioLocalAgentTerminalView)?.managedProcessGroupID
+    }
+
+    public func managedProcessIdentifier(_ terminalView: LocalProcessTerminalView) -> Int32? {
+        (terminalView as? StacioLocalAgentTerminalView)?.managedProcessIdentifier
+    }
+
+    public func managedProcessTrustedStartTime(_ terminalView: LocalProcessTerminalView) -> Date? {
+        (terminalView as? StacioLocalAgentTerminalView)?.managedProcessTrustedStartTime
+    }
+
+    public func interrupt(_ terminalView: LocalProcessTerminalView) {
+        if let localAgentTerminalView = terminalView as? StacioLocalAgentTerminalView {
+            localAgentTerminalView.interruptManagedProcess()
+            return
+        }
+        sendInput([0x03], to: terminalView)
+    }
+
+    public func startProcess(
+        in terminalView: LocalProcessTerminalView,
+        executable: String,
+        args: [String],
+        environment: [String]?,
+        execName: String?,
+        currentDirectory: String?
+    ) {
+        if let localAgentTerminalView = terminalView as? StacioLocalAgentTerminalView {
+            localAgentTerminalView.startManagedProcess(
+                executable: executable,
+                args: args,
+                environment: environment,
+                execName: execName,
+                currentDirectory: currentDirectory
+            )
+            return
+        }
+        terminalView.startProcess(
+            executable: executable,
+            args: args,
+            environment: environment,
+            execName: execName,
+            currentDirectory: currentDirectory
+        )
+    }
+
+    public func terminate(_ terminalView: LocalProcessTerminalView) {
+        if let localAgentTerminalView = terminalView as? StacioLocalAgentTerminalView {
+            localAgentTerminalView.terminateManagedProcess()
+            return
+        }
+        terminalView.terminate()
+    }
+
+    public func sendInput(_ bytes: [UInt8], to terminalView: LocalProcessTerminalView) {
+        if let stacioTerminalView = terminalView as? StacioLocalTerminalView {
+            stacioTerminalView.sendProgrammaticInput(bytes)
+            return
+        }
+        if let localAgentTerminalView = terminalView as? StacioLocalAgentTerminalView {
+            localAgentTerminalView.sendProgrammaticInput(bytes)
+            return
+        }
+        terminalView.send(data: ArraySlice(bytes))
+    }
+}
+
+public final class TerminalPaneViewController: NSViewController, LocalProcessTerminalViewDelegate {
+    public let runtimeID: String
+    public let shellPath: String
+    public let terminalView: StacioLocalTerminalView
+    public var keyboardFocusView: NSView { terminalView }
+    public var onUserInput: ((TerminalPaneViewController, [UInt8]) -> Bool)?
+    public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
+    public var onKeyboardFocusRequested: (() -> Void)?
+    public var onCommandSubmitted: ((TerminalPaneViewController, String) -> Void)?
+    public var onCommandFinished: ((TerminalPaneViewController) -> Void)?
+    public private(set) var currentLocalDirectory: String?
+    public private(set) var commandCompletionGeneration: UInt64 = 0
+    public var terminalRuntimeGeneration: UInt64 { 0 }
+    public var isTerminalRuntimeConnected: Bool {
+        didClose == false && processLauncher.isRunning(terminalView)
+    }
+    private var agentInteractionLocked = false
+
+    private let eventSink: TerminalEventSink
+    private let transcriptRecorder: TranscriptRecorder
+    private let settingsStore: AppSettingsStore
+    private let processLauncher: LocalTerminalProcessLaunching
+    private let linkOpener: TerminalLinkOpening
+    private let initialDirectory: String?
+    private let agentTraceController = TerminalTraceController()
+    private let commandInputObserver = TerminalCommandInputObserver()
+    private let commandHistoryInputBuffer = TerminalCommandHistoryInputBuffer()
+    private let sensitiveInputState = TerminalSensitiveInputStateMachine()
+    private var commandSuggestionHistoryCommands: [String] = []
+    private let commandHintOverlay = TerminalCommandHintOverlayView()
+    private let agentTraceOverlay = TerminalAgentTraceOverlayView(frame: .zero)
+    private let agentInteractionGlow = TerminalAgentInteractionGlowView(frame: .zero)
+    private let lineInfoGutter = TerminalLineInfoGutterView()
+    private lazy var terminalSearchController = TerminalSearchController(
+        terminalView: terminalView,
+        focusView: terminalView
+    )
+    private var terminalBottomToContainerConstraint: NSLayoutConstraint?
+    private var terminalBottomToCommandHintConstraint: NSLayoutConstraint?
+    private var terminalLeadingToContainerConstraint: NSLayoutConstraint?
+    private var terminalLeadingToLineInfoConstraint: NSLayoutConstraint?
+    private var lineInfoGutterWidthConstraint: NSLayoutConstraint?
+    private var terminalTopToContainerConstraint: NSLayoutConstraint?
+    private var terminalTopWithPaddingConstraint: NSLayoutConstraint?
+    private var terminalTrailingToContainerConstraint: NSLayoutConstraint?
+    private var terminalTrailingWithPaddingConstraint: NSLayoutConstraint?
+    private var commandHintLeadingConstraint: NSLayoutConstraint?
+    private var commandHintBottomConstraint: NSLayoutConstraint?
+    private var commandHintWidthConstraint: NSLayoutConstraint?
+    private let autoStartProcess: Bool
+    private lazy var terminalContextMenuController = TerminalContextMenuController(
+        runtimeID: runtimeID,
+        paste: { [weak self] in
+            self?.pasteClipboard()
+        },
+        copySelection: { [weak self] in
+            guard let self else { return }
+            self.terminalView.copy(self.terminalView)
+        },
+        selectAll: { [weak self] in self?.terminalView.selectAll(nil) },
+        clear: { [weak self] in
+            guard let self else { return }
+            self.terminalView.send(source: self.terminalView, data: ArraySlice([0x0c]))
+        },
+        askAI: { [weak self] request in
+            self?.onAIContextRequest?(request)
+        },
+        favoriteCommands: { TerminalFavoriteCommandStore.shared.commands },
+        favoriteOperatingSystem: { .macOS },
+        insertFavoriteCommand: { [weak self] command in
+            guard let self else { return }
+            self.terminalView.send(source: self.terminalView, data: ArraySlice(Array(command.utf8)))
+        }
+    )
+    private var settingsObserver: NSObjectProtocol?
+    private var favoriteCommandsObserver: NSObjectProtocol?
+    private var didClose = false
+
+    public init(
+        runtimeID: String,
+        shellPath: String,
+        eventSink: TerminalEventSink,
+        transcriptRecorder: TranscriptRecorder = TranscriptRecorder(),
+        settingsStore: AppSettingsStore = .shared,
+        processLauncher: LocalTerminalProcessLaunching = SwiftTermLocalTerminalProcessLauncher(),
+        linkOpener: TerminalLinkOpening? = nil,
+        initialDirectory: String? = nil,
+        autoStartProcess: Bool = true
+    ) {
+        self.runtimeID = runtimeID
+        self.shellPath = shellPath
+        self.eventSink = eventSink
+        self.transcriptRecorder = transcriptRecorder
+        self.settingsStore = settingsStore
+        self.processLauncher = processLauncher
+        self.linkOpener = linkOpener ?? WorkspaceTerminalLinkOpener.shared
+        let normalizedInitialDirectory = TerminalCurrentDirectoryNormalizer.normalize(initialDirectory)
+        self.initialDirectory = normalizedInitialDirectory
+        self.currentLocalDirectory = normalizedInitialDirectory
+        self.autoStartProcess = autoStartProcess
+        self.terminalView = StacioLocalTerminalView(frame: .zero)
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) {
+        nil
+    }
+
+    public override func loadView() {
+        let container = TerminalFocusContainerView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.onTerminalFocusRequested = { [weak self] in
+            self?.onKeyboardFocusRequested?()
+        }
+        container.onEffectiveAppearanceChanged = { [weak self] in
+            self?.terminalEffectiveAppearanceDidChange()
+        }
+        container.acceptsLocalFileDrops = { [weak self] in
+            self?.canAcceptLocalFileDrops ?? false
+        }
+        container.localFileDropHandler = { [weak self] localPaths in
+            self?.handleDroppedLocalFilePaths(localPaths)
+        }
+
+        terminalView.translatesAutoresizingMaskIntoConstraints = false
+        terminalView.fontZoomSettingsStore = settingsStore
+        terminalView.notifyUpdateChanges = true
+        terminalView.acceptsLocalFileDrops = { [weak self] in
+            self?.canAcceptLocalFileDrops ?? false
+        }
+        terminalView.localFileDropHandler = { [weak self] localPaths in
+            self?.handleDroppedLocalFilePaths(localPaths)
+        }
+        TerminalAppearanceApplier.apply(settings: settingsStore.snapshot(), to: terminalView)
+        observeSettingsChanges()
+        observeFavoriteCommandChanges()
+        terminalView.contextMenuProvider = { [weak self] selectedText in
+            self?.terminalContextMenuController.makeMenu(selectedText: selectedText)
+        }
+        terminalView.processDelegate = self
+        terminalView.onOutput = { [weak self] bytes in
+            guard let self else { return }
+            let wasAwaitingSensitiveInput = self.sensitiveInputState.isAwaitingSensitiveInput
+            self.sensitiveInputState.ingestOutput(bytes)
+            self.handleSensitiveInputStateTransition(from: wasAwaitingSensitiveInput)
+            let observableBytes = self.sensitiveInputState.redactOutputForObservation(bytes)
+            guard observableBytes.isEmpty == false else { return }
+            self.transcriptRecorder.append(bytes: observableBytes)
+            TerminalOutputBroadcastHub.shared.publishOutput(runtimeID: self.runtimeID, bytes: observableBytes)
+            try? self.eventSink.terminalDidProduceOutput(runtimeID: self.runtimeID, bytes: observableBytes)
+        }
+        terminalView.onUserInput = { [weak self] bytes in
+            self?.handleUserInput(bytes) ?? false
+        }
+        terminalView.onSearchViewportChanged = { [weak self] in
+            guard let self else { return }
+            self.terminalSearchController.terminalContentDidChange()
+            self.refreshLineInfoGutter()
+        }
+        commandHintOverlay.onVisibilityChanged = { [weak self] visible in
+            self?.setCommandHintOverlayVisible(visible)
+        }
+        agentTraceOverlay.onControlAction = { [weak self] requestID, action in
+            guard let self else { return }
+            TerminalAgentTaskControlNotification.post(
+                runtimeID: self.runtimeID,
+                requestID: requestID,
+                action: action
+            )
+        }
+
+        container.addSubview(terminalView)
+        container.terminalFocusView = terminalView
+        container.addSubview(lineInfoGutter)
+        container.addSubview(agentInteractionGlow, positioned: .above, relativeTo: terminalView)
+        container.addSubview(commandHintOverlay)
+        container.addSubview(agentTraceOverlay)
+        terminalSearchController.install(in: container, overlaying: terminalView)
+        let terminalBottomToContainer = terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        let terminalBottomToCommandHint = terminalView.bottomAnchor.constraint(
+            equalTo: commandHintOverlay.topAnchor,
+            constant: -8
+        )
+        let terminalLeadingToContainer = terminalView.leadingAnchor.constraint(equalTo: container.leadingAnchor)
+        let terminalLeadingToLineInfo = terminalView.leadingAnchor.constraint(equalTo: lineInfoGutter.trailingAnchor, constant: 6)
+        let lineInfoGutterWidth = lineInfoGutter.widthAnchor.constraint(equalToConstant: 0)
+        let terminalTopToContainer = terminalView.topAnchor.constraint(equalTo: container.topAnchor)
+        let terminalTopWithPadding = terminalView.topAnchor.constraint(equalTo: container.topAnchor, constant: 12)
+        let terminalTrailingToContainer = terminalView.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+        let terminalTrailingWithPadding = terminalView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12)
+        let commandHintLeading = commandHintOverlay.leadingAnchor.constraint(
+            equalTo: container.leadingAnchor,
+            constant: TerminalCommandHintOverlayLayout.containerMargin
+        )
+        let commandHintBottom = commandHintOverlay.bottomAnchor.constraint(
+            equalTo: container.bottomAnchor,
+            constant: -TerminalCommandHintOverlayLayout.containerMargin
+        )
+        let commandHintWidth = commandHintOverlay.widthAnchor.constraint(
+            equalToConstant: TerminalCommandHintOverlayLayout.completionPreferredWidth
+        )
+        let agentTraceLeading = agentTraceOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8)
+        let agentTraceTop = agentTraceOverlay.topAnchor.constraint(equalTo: container.topAnchor, constant: 8)
+        agentTraceOverlay.onDragOffsetChanged = { [weak container, weak agentTraceOverlay] offset in
+            guard let container, let agentTraceOverlay else { return }
+            let maximumX = max(8, container.bounds.width - agentTraceOverlay.bounds.width - 8)
+            let maximumY = max(8, container.bounds.height - agentTraceOverlay.bounds.height - 8)
+            agentTraceLeading.constant = min(max(8, 8 + offset.x), maximumX)
+            agentTraceTop.constant = min(max(8, 8 + offset.y), maximumY)
+        }
+        terminalBottomToContainerConstraint = terminalBottomToContainer
+        terminalBottomToCommandHintConstraint = terminalBottomToCommandHint
+        terminalLeadingToContainerConstraint = terminalLeadingToContainer
+        terminalLeadingToLineInfoConstraint = terminalLeadingToLineInfo
+        lineInfoGutterWidthConstraint = lineInfoGutterWidth
+        terminalTopToContainerConstraint = terminalTopToContainer
+        terminalTopWithPaddingConstraint = terminalTopWithPadding
+        terminalTrailingToContainerConstraint = terminalTrailingToContainer
+        terminalTrailingWithPaddingConstraint = terminalTrailingWithPadding
+        commandHintLeadingConstraint = commandHintLeading
+        commandHintBottomConstraint = commandHintBottom
+        commandHintWidthConstraint = commandHintWidth
+        NSLayoutConstraint.activate([
+            terminalLeadingToContainer,
+            terminalTrailingToContainer,
+            terminalTopToContainer,
+            terminalBottomToContainer,
+            agentInteractionGlow.leadingAnchor.constraint(equalTo: terminalView.leadingAnchor),
+            agentInteractionGlow.trailingAnchor.constraint(equalTo: terminalView.trailingAnchor),
+            agentInteractionGlow.topAnchor.constraint(equalTo: terminalView.topAnchor),
+            agentInteractionGlow.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
+            lineInfoGutter.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            lineInfoGutter.topAnchor.constraint(equalTo: terminalView.topAnchor),
+            lineInfoGutter.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor),
+            lineInfoGutterWidth,
+            commandHintLeading,
+            commandHintOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -12),
+            commandHintBottom,
+            commandHintOverlay.widthAnchor.constraint(
+                lessThanOrEqualToConstant: TerminalCommandHintOverlayLayout.submittedPreferredMaxWidth
+            ),
+            agentTraceLeading,
+            agentTraceOverlay.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -8),
+            agentTraceTop,
+            agentTraceOverlay.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
+        ])
+        applyTerminalRuntimeSettings(settingsStore.snapshot())
+
+        view = container
+    }
+
+    public override func viewDidLayout() {
+        super.viewDidLayout()
+        positionCommandCompletionOverlayIfNeeded(requiresLayout: false)
+    }
+
+    public override func viewDidAppear() {
+        super.viewDidAppear()
+        focusTerminalViewForKeyboardInput()
+
+        if didClose == false,
+           autoStartProcess,
+           processLauncher.isRunning(terminalView) == false {
+            let launch = Self.localShellLaunchConfiguration(shellPath: shellPath)
+            processLauncher.startProcess(
+                in: terminalView,
+                executable: launch.executable,
+                args: launch.args,
+                environment: {
+                    let settings = settingsStore.snapshot()
+                    return TerminalHighlighting.shellEnvironment(
+                        level: settings.terminalHighlightLevel,
+                        shellName: launch.shellName,
+                        x11Display: settings.terminalX11Display
+                    )
+                }(),
+                execName: launch.execName,
+                currentDirectory: initialDirectory
+            )
+        }
+    }
+
+    private static func localShellLaunchConfiguration(shellPath: String) -> (
+        executable: String,
+        args: [String],
+        execName: String?,
+        shellName: String?
+    ) {
+        let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
+        let shellExecutable = quotedShellCommandArgument(shellPath)
+        switch shellName {
+        case "zsh":
+            return (
+                shellPath,
+                ["-l", "-c", "eval \"$STACIO_OSC7_BOOTSTRAP\"; exec \(shellExecutable) -l"],
+                "-zsh",
+                shellName
+            )
+        case "bash":
+            return (
+                shellPath,
+                ["-l", "-c", "eval \"$STACIO_OSC7_BOOTSTRAP\"; exec \(shellExecutable) -l"],
+                "-bash",
+                shellName
+            )
+        case "fish":
+            return (
+                shellPath,
+                ["-lc", "eval \"$STACIO_OSC7_BOOTSTRAP\"; exec \(shellExecutable) -l"],
+                "fish",
+                shellName
+            )
+        default:
+            return (shellPath, ["-l"], nil, nil)
+        }
+    }
+
+    private static func quotedShellCommandArgument(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "$", with: "\\$")
+            .replacingOccurrences(of: "`", with: "\\`")
+        return "\"\(escaped)\""
+    }
+
+    public func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {
+        guard TerminalResizeValidator.shouldForward(cols: newCols, rows: newRows) else { return }
+        try? eventSink.terminalDidResize(runtimeID: runtimeID, cols: newCols, rows: newRows)
+        refreshLineInfoGutter()
+    }
+
+    public func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+
+    public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+        guard let normalized = TerminalCurrentDirectoryNormalizer.normalize(directory) else {
+            return
+        }
+        currentLocalDirectory = normalized
+        sensitiveInputState.clearExpiredProtectionAfterCommandCompletion()
+        commandCompletionGeneration &+= 1
+        TerminalOutputBroadcastHub.shared.publishCommandFinished(runtimeID: runtimeID)
+        onCommandFinished?(self)
+    }
+
+    public func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
+        if let url = TerminalLinkURLNormalizer.browserURL(from: link) {
+            linkOpener.openTerminalLink(url)
+        } else if let path = TerminalLinkURLNormalizer.terminalPath(from: link) {
+            copyTerminalPathToPasteboard(path)
+        }
+    }
+
+    public func rangeChanged(source: TerminalView, startY: Int, endY: Int) {
+        refreshLineInfoGutter()
+    }
+
+    public func scrolled(source: TerminalView, position: Double) {
+        refreshLineInfoGutter()
+    }
+
+    public func processTerminated(source: TerminalView, exitCode: Int32?) {
+        notifyClosed()
+    }
+
+    @discardableResult
+    public func find(_ term: String) -> Bool {
+        terminalView.findNext(term)
+    }
+
+    public func copySelection() {
+        terminalView.copy(self)
+    }
+
+    public func pasteClipboard() {
+        _ = TerminalPastePreparation.pastePreparedString(
+            into: terminalView,
+            settings: settingsStore.snapshot()
+        )
+    }
+
+    private func copyTerminalPathToPasteboard(_ path: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
+    }
+
+    public func terminalContextMenuForTesting(selectedText: String?) -> NSMenu {
+        terminalContextMenuController.makeMenu(selectedText: selectedText)
+    }
+
+    public func showFind() {
+        terminalSearchController.show()
+    }
+
+    public func closeTerminal() {
+        sensitiveInputState.reset()
+        terminalView.cancelPendingSemanticOutput()
+        processLauncher.terminate(terminalView)
+        notifyClosed()
+    }
+
+    public func sendInput(_ bytes: [UInt8]) {
+        guard sensitiveInputState.isSensitiveInputProtectionActive == false else { return }
+        guard agentInteractionLocked == false else { return }
+        TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: bytes)
+        processLauncher.sendInput(bytes, to: terminalView)
+        recordSubmittedCommands(bytes)
+    }
+
+    @discardableResult
+    public func sendAgentInput(_ bytes: [UInt8]) -> Bool {
+        guard didClose == false,
+              processLauncher.isRunning(terminalView),
+              sensitiveInputState.isSensitiveInputProtectionActive == false
+        else { return false }
+        processLauncher.sendInput(bytes, to: terminalView)
+        recordSubmittedCommands(bytes)
+        return true
+    }
+
+    /// 安全重载本地终端 shell（OhMyZshAutoApplier 本地部署成功后调用）。
+    /// 仅当进程运行、未被敏感输入保护/Agent 交互锁定时发送 `exec $SHELL`（同 cwd、同环境，仅重读启动文件）；
+    /// 忙时（前台命令运行中）跳过——新终端会自然加载新配置，不打断用户前台命令。
+    public func reloadShellSafely() {
+        guard processLauncher.isRunning(terminalView),
+              sensitiveInputState.isSensitiveInputProtectionActive == false,
+              agentInteractionLocked == false else { return }
+        sendAgentInput(Array("exec $SHELL\n".utf8))
+    }
+
+    @discardableResult
+    public func sendSensitiveUserInput(_ bytes: [UInt8]) -> Bool {
+        guard let acceptedBytes = sensitiveInputState.consumeSensitiveInputBytes(bytes) else {
+            return false
+        }
+        processLauncher.sendInput(acceptedBytes, to: terminalView)
+        return true
+    }
+
+    public func performDropLocalFilesForTesting(_ localPaths: [String]) {
+        handleDroppedLocalFilePaths(localPaths)
+    }
+
+    public func appendAgentTrace(
+        requestID: String,
+        state: AgentTraceState,
+        message: String,
+        redactedCommand: String?,
+        metadata: [String: String]? = nil
+    ) {
+        let event = AgentTraceEvent(
+            requestID: requestID,
+            state: state,
+            message: message,
+            redactedCommand: redactedCommand,
+            metadata: metadata
+        )
+        var retainedMetadata = event.metadata
+        retainedMetadata?.removeValue(forKey: "terminalHistoryOutput")
+        agentTraceController.append(
+            TerminalTraceEvent(
+                requestID: event.requestID,
+                state: event.state,
+                message: event.message,
+                redactedCommand: event.redactedCommand,
+                metadata: retainedMetadata
+            )
+        )
+        agentTraceOverlay.render(agentTraceController.eventsSnapshot)
+        TerminalAgentTraceNotification.post(
+            runtimeID: runtimeID,
+            title: title ?? L10n.Workspace.local,
+            event: event
+        )
+    }
+
+    public var terminalOutputTranscript: String {
+        transcriptRecorder.snapshot
+    }
+
+    public var terminalDisplaySnapshotForTesting: String {
+        String(data: terminalView.getTerminal().getBufferAsData(), encoding: .utf8) ?? ""
+    }
+
+    public var agentTraceSnapshotForTesting: String {
+        agentTraceController.snapshot
+    }
+
+    public func agentTraceMetadataValuesForTesting(key: String) -> [String] {
+        agentTraceController.eventsSnapshot.compactMap { $0.metadata?[key] }
+    }
+
+    public var agentTraceOverlayTextForTesting: String {
+        agentTraceOverlay.visibleTextForTesting
+    }
+
+    public var agentTraceOverlayVisibleForTesting: Bool {
+        agentTraceOverlay.isHidden == false
+    }
+
+    public var commandHintVisibleTextForTesting: String {
+        commandHintOverlay.visibleTextForTesting
+    }
+
+    public var commandHintCompletionChoiceCountForTesting: Int {
+        commandHintOverlay.completionChoiceCountForTesting
+    }
+
+    public var commandHintSelectedCompletionIndexForTesting: Int {
+        commandHintOverlay.selectedCompletionIndexForTesting
+    }
+
+    public var commandHintPresentationKindForTesting: TerminalCommandHintOverlayPresentationKind {
+        commandHintOverlay.presentationKind
+    }
+
+    public var commandHintUsesTerminalCompletionStyleForTesting: Bool {
+        commandHintOverlay.usesTerminalCompletionStyleForTesting
+    }
+
+    public var commandHintCompletionUsesFixedDarkAppearanceForTesting: Bool {
+        commandHintOverlay.completionUsesFixedDarkAppearanceForTesting
+    }
+
+    public var commandHintCompletionBackgroundColorForTesting: NSColor {
+        commandHintOverlay.completionBackgroundColorForTesting
+    }
+
+    public var commandHintCompletionPrimaryTextColorForTesting: NSColor {
+        commandHintOverlay.completionPrimaryTextColorForTesting
+    }
+
+    public var commandHintFrameForTesting: NSRect {
+        commandHintOverlay.frame
+    }
+
+    public var lineInfoGutterVisibleTextForTesting: String {
+        lineInfoGutter.visibleTextForTesting
+    }
+
+    public var lineInfoGutterPreferredWidthForTesting: CGFloat {
+        lineInfoGutter.preferredWidthForTesting
+    }
+
+    public var lineInfoGutterUsesTerminalSurfaceStyleForTesting: Bool {
+        lineInfoGutter.usesTerminalSurfaceStyleForTesting
+    }
+
+    public var lineInfoGutterFontPointSizeForTesting: CGFloat {
+        lineInfoGutter.lineInfoFontPointSizeForTesting
+    }
+
+    public var lineInfoGutterLabelCountForTesting: Int {
+        lineInfoGutter.lineInfoLabelCountForTesting
+    }
+
+    public var lineInfoGutterRowHeightForTesting: CGFloat {
+        lineInfoGutter.lineInfoRowHeightForTesting
+    }
+
+    public var lineInfoGutterColorForTesting: NSColor? {
+        lineInfoGutter.lineInfoColorForTesting
+    }
+
+    public var terminalSearchBarVisibleForTesting: Bool {
+        terminalSearchController.isVisible
+    }
+
+    public var terminalSearchSummaryForTesting: String {
+        terminalSearchController.summaryText
+    }
+
+    public var terminalSearchVisibleHighlightCountForTesting: Int {
+        terminalSearchController.visibleHighlightCount
+    }
+
+    public func setTerminalSearchQueryForTesting(_ query: String) {
+        terminalSearchController.setQuery(query)
+    }
+
+    public func selectNextTerminalSearchMatchForTesting() {
+        terminalSearchController.selectNext()
+    }
+
+    public func selectPreviousTerminalSearchMatchForTesting() {
+        terminalSearchController.selectPrevious()
+    }
+
+    public func closeTerminalSearchWithEscapeForTesting() {
+        terminalSearchController.close()
+    }
+
+    public func appendAgentTraceForTesting(
+        requestID: String,
+        state: AgentTraceState,
+        message: String,
+        redactedCommand: String?,
+        metadata: [String: String]? = nil
+    ) {
+        appendAgentTrace(
+            requestID: requestID,
+            state: state,
+            message: message,
+            redactedCommand: redactedCommand,
+            metadata: metadata
+        )
+    }
+
+    deinit {
+        terminalView.cancelPendingSemanticOutput()
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
+        }
+        if let favoriteCommandsObserver {
+            NotificationCenter.default.removeObserver(favoriteCommandsObserver)
+        }
+    }
+
+    private func notifyClosed() {
+        guard didClose == false else { return }
+        didClose = true
+        sensitiveInputState.reset()
+        try? eventSink.terminalDidClose(runtimeID: runtimeID)
+    }
+
+    private func focusTerminalViewForKeyboardInput() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.terminalView.window?.firstResponder !== self.terminalView
+            else { return }
+            self.terminalView.window?.makeFirstResponder(self.terminalView)
+        }
+    }
+
+    private func refreshTerminalAppearanceAfterEffectiveAppearanceChange() {
+        let snapshot = settingsStore.snapshot()
+        guard snapshot.terminalTheme == .system else {
+            return
+        }
+        terminalView.appearance = terminalView.window?.effectiveAppearance ?? view.effectiveAppearance
+        TerminalAppearanceApplier.apply(settings: snapshot, to: terminalView)
+    }
+
+    private func observeSettingsChanges() {
+        guard settingsObserver == nil else { return }
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: AppSettingsStore.didChangeNotification,
+            object: settingsStore,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let snapshot = self.settingsStore.snapshot()
+            TerminalAppearanceApplier.apply(settings: snapshot, to: self.terminalView)
+            self.applyTerminalRuntimeSettings(snapshot)
+            self.commandInputObserver.reset()
+            self.commandHistoryInputBuffer.reset()
+            self.commandHintOverlay.clear()
+        }
+    }
+
+    private func observeFavoriteCommandChanges() {
+        guard favoriteCommandsObserver == nil else { return }
+        favoriteCommandsObserver = NotificationCenter.default.addObserver(
+            forName: TerminalFavoriteCommandStore.didChangeNotification,
+            object: TerminalFavoriteCommandStore.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshCommandCompletionAfterFavoriteChange()
+        }
+    }
+
+    private func refreshCommandCompletionAfterFavoriteChange() {
+        guard isViewLoaded else { return }
+        let observation = commandInputObserver.refreshCompletion(
+            settings: settingsStore.snapshot(),
+            historyCommands: commandSuggestionHistoryCommands,
+            operatingSystem: .macOS,
+            pathCompletionProvider: LocalTerminalPathCompletionProvider(currentDirectory: currentLocalDirectory)
+        )
+        renderCommandInputObservation(observation)
+    }
+
+    private func terminalEffectiveAppearanceDidChange() {
+        guard isViewLoaded else { return }
+        let snapshot = settingsStore.snapshot()
+        terminalView.appearance = terminalView.window?.effectiveAppearance ?? view.effectiveAppearance
+        TerminalAppearanceApplier.apply(settings: snapshot, to: terminalView)
+        applyTerminalRuntimeSettings(snapshot)
+        refreshLineInfoGutter()
+        guard commandHintOverlay.presentationKind == .completion,
+              commandHintOverlay.isHidden == false
+        else { return }
+        applyCommandCompletionTheme()
+        commandHintOverlay.refreshVisibleCompletionStyle()
+        positionCommandCompletionOverlayIfNeeded()
+    }
+
+    private func applyTerminalRuntimeSettings(_ settings: AppSettings) {
+        lineInfoGutter.apply(settings: settings, terminalView: terminalView)
+        lineInfoGutterWidthConstraint?.constant = lineInfoGutter.preferredWidthForTesting
+        terminalLeadingToContainerConstraint?.isActive = false
+        terminalLeadingToLineInfoConstraint?.isActive = false
+        terminalTopToContainerConstraint?.isActive = false
+        terminalTopWithPaddingConstraint?.isActive = false
+        terminalTrailingToContainerConstraint?.isActive = false
+        terminalTrailingWithPaddingConstraint?.isActive = false
+        if settings.terminalLineNumbersEnabled || settings.terminalTimestampsEnabled {
+            terminalLeadingToLineInfoConstraint?.isActive = true
+        } else {
+            terminalLeadingToContainerConstraint?.isActive = true
+        }
+        if settings.terminalWorkspacePaddingEnabled {
+            terminalTopWithPaddingConstraint?.isActive = true
+            terminalTrailingWithPaddingConstraint?.isActive = true
+        } else {
+            terminalTopToContainerConstraint?.isActive = true
+            terminalTrailingToContainerConstraint?.isActive = true
+        }
+    }
+
+    private func refreshLineInfoGutter(date: Date = Date()) {
+        lineInfoGutter.refresh(from: terminalView, date: date)
+        lineInfoGutterWidthConstraint?.constant = lineInfoGutter.preferredWidthForTesting
+    }
+
+    private func handleUserInput(_ bytes: [UInt8]) -> Bool {
+        if sendSensitiveUserInput(bytes) {
+            return true
+        }
+        if agentInteractionLocked { return true }
+        if onUserInput?(self, bytes) == true { return true }
+        let observation = commandInputObserver.ingest(
+            bytes: bytes,
+            settings: settingsStore.snapshot(),
+            historyCommands: commandSuggestionHistoryCommands,
+            operatingSystem: .macOS,
+            pathCompletionProvider: LocalTerminalPathCompletionProvider(currentDirectory: currentLocalDirectory)
+        )
+        renderCommandInputObservation(observation)
+        if let acceptedCompletionBytes = observation.acceptedCompletionBytes {
+            TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: acceptedCompletionBytes)
+            processLauncher.sendInput(acceptedCompletionBytes, to: terminalView)
+            recordSubmittedCommands(acceptedCompletionBytes)
+            return true
+        }
+        if observation.shouldConsumeInput {
+            return true
+        }
+        TerminalOutputBroadcastHub.shared.publishUserInput(runtimeID: runtimeID, bytes: bytes)
+        recordSubmittedCommands(bytes)
+        return false
+    }
+
+    private func handleDroppedLocalFilePaths(_ localPaths: [String]) {
+        let text = TerminalFilePathInput.shellText(for: localPaths)
+        guard text.isEmpty == false else { return }
+        StacioTerminalMouseBehavior.focusForKeyboardInput(terminalView)
+        let bytes = Array(text.utf8)
+        if handleUserInput(bytes) == false {
+            processLauncher.sendInput(bytes, to: terminalView)
+        }
+    }
+
+    public func setAgentInteractionLocked(_ locked: Bool) {
+        agentInteractionLocked = locked
+        agentInteractionGlow.setActive(locked)
+    }
+
+    public var isAwaitingSensitiveInput: Bool {
+        sensitiveInputState.isAwaitingSensitiveInput
+    }
+
+    public var isSensitiveInputProtectionActive: Bool {
+        sensitiveInputState.isSensitiveInputProtectionActive
+    }
+
+    public var isAwaitingSensitiveInputForTesting: Bool {
+        isAwaitingSensitiveInput
+    }
+
+    private var canAcceptLocalFileDrops: Bool {
+        agentInteractionLocked == false && sensitiveInputState.isSensitiveInputProtectionActive == false
+    }
+
+    var canAcceptLocalFileDropsForTesting: Bool {
+        canAcceptLocalFileDrops
+    }
+
+    public var agentInteractionGlowActiveForTesting: Bool {
+        agentInteractionGlow.isActiveForTesting
+    }
+
+    private func handleSensitiveInputStateTransition(from wasAwaitingSensitiveInput: Bool) {
+        guard wasAwaitingSensitiveInput == false,
+              sensitiveInputState.isAwaitingSensitiveInput
+        else { return }
+        commandInputObserver.reset()
+        commandHistoryInputBuffer.reset()
+        commandHintOverlay.clear()
+    }
+
+    private func renderCommandInputObservation(_ observation: TerminalCommandInputObservation) {
+        if let completionSuggestion = observation.completionSuggestion {
+            applyCommandCompletionTheme()
+            commandHintOverlay.renderCompletion(completionSuggestion)
+            positionCommandCompletionOverlayIfNeeded()
+        } else if let hint = observation.submittedHint,
+                  settingsStore.snapshot().terminalHighlightLevel == .commandLineEnhanced {
+            commandHintOverlay.render(hint)
+            positionSubmittedCommandHintOverlay()
+        } else if observation.submittedHint != nil || observation.completionSuggestion == nil {
+            commandHintOverlay.clear()
+        }
+    }
+
+    private func applyCommandCompletionTheme() {
+        commandHintOverlay.applyCompletionTheme(
+            foreground: resolvedTerminalColor(terminalView.nativeForegroundColor),
+            background: resolvedTerminalColor(terminalView.nativeBackgroundColor),
+            accent: resolvedTerminalColor(terminalView.caretColor)
+        )
+    }
+
+    private func resolvedTerminalColor(_ color: NSColor) -> NSColor {
+        NSColor(cgColor: StacioDesignSystem.resolvedLayerColor(color, for: terminalView)) ?? color
+    }
+
+    private func setCommandHintOverlayVisible(_ visible: Bool) {
+        if visible == false {
+            commandHintWidthConstraint?.isActive = false
+        }
+        terminalBottomToCommandHintConstraint?.isActive = false
+        terminalBottomToContainerConstraint?.isActive = false
+        if visible && commandHintOverlay.presentationKind == .submittedHint {
+            terminalBottomToCommandHintConstraint?.isActive = true
+        } else {
+            terminalBottomToContainerConstraint?.isActive = true
+        }
+        view.needsLayout = true
+    }
+
+    private func positionSubmittedCommandHintOverlay() {
+        commandHintWidthConstraint?.isActive = false
+        commandHintLeadingConstraint?.constant = TerminalCommandHintOverlayLayout.containerMargin
+        commandHintBottomConstraint?.constant = -TerminalCommandHintOverlayLayout.containerMargin
+        view.layoutSubtreeIfNeeded()
+        view.needsLayout = true
+    }
+
+    private func positionCommandCompletionOverlayIfNeeded(requiresLayout: Bool = true) {
+        guard commandHintOverlay.presentationKind == .completion,
+              commandHintOverlay.isHidden == false
+        else { return }
+        if requiresLayout {
+            view.layoutSubtreeIfNeeded()
+        }
+        guard view.bounds.width >= TerminalCommandHintOverlayLayout.completionMinimumWidth
+            + TerminalCommandHintOverlayLayout.containerMargin * 2,
+            view.bounds.height >= 120
+        else {
+            return
+        }
+        commandHintOverlay.layoutSubtreeIfNeeded()
+        let fittingSize = commandHintOverlay.fittingSize
+        let targetFrame = TerminalCommandHintOverlayLayout.completionFrame(
+            in: view,
+            terminalView: terminalView,
+            overlaySize: CGSize(
+                width: TerminalCommandHintOverlayLayout.completionPreferredWidth,
+                height: fittingSize.height
+            )
+        )
+        let targetBottomConstant = -targetFrame.minY
+        let needsConstraintUpdate = commandHintWidthConstraint?.isActive != true
+            || abs((commandHintWidthConstraint?.constant ?? 0) - targetFrame.width) > 0.5
+            || abs((commandHintLeadingConstraint?.constant ?? 0) - targetFrame.minX) > 0.5
+            || abs((commandHintBottomConstraint?.constant ?? 0) - targetBottomConstant) > 0.5
+        guard needsConstraintUpdate else { return }
+        commandHintWidthConstraint?.constant = targetFrame.width
+        commandHintWidthConstraint?.isActive = true
+        commandHintLeadingConstraint?.constant = targetFrame.minX
+        commandHintBottomConstraint?.constant = targetBottomConstant
+        if requiresLayout {
+            view.layoutSubtreeIfNeeded()
+        }
+        view.needsLayout = true
+    }
+
+    private func recordSubmittedCommands(_ bytes: [UInt8]) {
+        sensitiveInputState.noteOrdinaryInput(bytes)
+        for command in commandHistoryInputBuffer.ingest(bytes: bytes) {
+            commandSuggestionHistoryCommands.removeAll { $0 == command }
+            commandSuggestionHistoryCommands.insert(command, at: 0)
+            if commandSuggestionHistoryCommands.count > 200 {
+                commandSuggestionHistoryCommands.removeLast(commandSuggestionHistoryCommands.count - 200)
+            }
+            onCommandSubmitted?(self, command)
+        }
+    }
+}

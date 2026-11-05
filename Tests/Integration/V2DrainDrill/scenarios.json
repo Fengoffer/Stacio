@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    { "id": "normal-drain", "steps": ["enabled-to-draining", "draining-to-disabled", "disabled-to-enabled"], "cleanup": ["no-residual-permits", "no-residual-leases", "no-residual-processes", "no-scratch", "no-draft-loss", "no-duplicate-effects"] },
+    { "id": "forced-safe-stop", "steps": ["forced-safe-stop", "verify-settled"], "cleanup": ["no-residual-permits", "no-residual-processes"] },
+    { "id": "crash-during-draining", "steps": ["crash-during-draining", "reconcile-on-restart"], "cleanup": ["no-residual-processes", "no-scratch"] },
+    { "id": "orphaned-managed-process", "steps": ["orphan-detect", "block-conflict-launch"], "cleanup": ["no-conflicting-launch"] },
+    { "id": "unknown-remote-effect", "steps": ["unknown-effect-lock", "settle"], "cleanup": ["no-unlocked-effects"] },
+    { "id": "credential-revoke-delete-incomplete", "steps": ["revoke-fence", "delete-saga-incomplete"], "cleanup": ["no-inflight-saga"] },
+    { "id": "re-enable", "steps": ["disabled-to-enabled", "new-generation"], "cleanup": ["old-artifacts-not-resurrected"] }
+  ]
+}

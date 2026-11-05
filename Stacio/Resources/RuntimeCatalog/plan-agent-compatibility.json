@@ -1,0 +1,68 @@
+[
+  {
+    "planID": "aliyun-coding-plan",
+    "agentRawIdentity": "stacioAgent",
+    "compatible": false,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": null,
+    "allowedCapabilities": [],
+    "authorizationNotes": "当前 Catalog revision 没有可验证的 Stacio Agent executable runtime。",
+    "supportLevel": "unsupported",
+    "lastVerifiedCatalogRevision": null
+  },
+  {
+    "planID": "glm-coding-plan",
+    "agentRawIdentity": "stacioAgent",
+    "compatible": false,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": null,
+    "allowedCapabilities": [],
+    "authorizationNotes": "当前 Catalog revision 没有可验证的 Stacio Agent executable runtime。",
+    "supportLevel": "unsupported",
+    "lastVerifiedCatalogRevision": null
+  },
+  {
+    "planID": "chatgpt-codex",
+    "agentRawIdentity": "codex",
+    "compatible": true,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": "cliManagedAccount",
+    "allowedCapabilities": ["terminalPassthrough"],
+    "authorizationNotes": "账号授权由 Codex CLI 管理；Stacio 不读取、复制或导出登录材料。",
+    "supportLevel": "experimental",
+    "lastVerifiedCatalogRevision": null
+  },
+  {
+    "planID": "claude-code",
+    "agentRawIdentity": "claudeCode",
+    "compatible": true,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": "cliManagedAccount",
+    "allowedCapabilities": ["terminalPassthrough"],
+    "authorizationNotes": "账号授权由 Claude Code CLI 管理；Stacio 不读取、复制或导出登录材料。",
+    "supportLevel": "experimental",
+    "lastVerifiedCatalogRevision": null
+  },
+  {
+    "planID": "github-copilot",
+    "agentRawIdentity": "githubCopilot",
+    "compatible": true,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": "cliManagedAccount",
+    "allowedCapabilities": ["terminalPassthrough"],
+    "authorizationNotes": "账号授权由 GitHub Copilot CLI 管理；Stacio 不读取、复制或导出登录材料。",
+    "supportLevel": "experimental",
+    "lastVerifiedCatalogRevision": null
+  },
+  {
+    "planID": "gemini-cli",
+    "agentRawIdentity": "geminiCli",
+    "compatible": true,
+    "supportedVersionRange": null,
+    "credentialInjectionKind": "cliManagedAccount",
+    "allowedCapabilities": ["terminalPassthrough"],
+    "authorizationNotes": "账号授权由 Gemini CLI 管理；Stacio 不读取、复制或导出登录材料。",
+    "supportLevel": "experimental",
+    "lastVerifiedCatalogRevision": null
+  }
+]

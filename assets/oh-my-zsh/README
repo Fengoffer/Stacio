@@ -1,0 +1,37 @@
+# Oh My Zsh — Stacio Vendored Snapshot
+
+本目录是 [ohmyzsh/ohmyzsh](https://github.com/ohmyzsh/ohmyzsh) 的固定版本事实源快照，用于生成经过校验的按需下载资源；正式 Stacio app 不内置整套快照：
+
+- 用户点击下载后，本地终端将已校验资源复制到 `~/.oh-my-zsh` 并生成 `.zshrc` 区块
+- 用户点击下载后，远程主机经 SCP 递归上传到目标机 `~/.oh-my-zsh`
+
+## 来源
+
+- 仓库：https://github.com/ohmyzsh/ohmyzsh
+- 分支：`master`
+- 固定 commit：`ad586ffecaaeb695cc73ced4d643c6727d47f535`
+- 获取方式：`git clone --depth 1 https://github.com/ohmyzsh/ohmyzsh.git`（clone 后切换至该 commit，随后移除 `.git` 与 `.github`）
+
+## 校验
+
+- 目录内容 SHA-256（对上游内容计算，排除 Stacio 附加元数据 `README`、`THIRD_PARTY_LICENSES.md` 与仓库管理文件 `.gitignore`/`.DS_Store`；常规文件纳入相对路径和内容哈希，符号链接纳入相对路径、类型和原始 target，由 `scripts/sync-ohmyzsh-resources.sh` 计算）：
+  `b79f83cff7ccf537050aa9aa811de9202b455c46069dd40528a1a0917ce73587`
+
+  该哈希对应当前 Stacio 支持的 355 个插件子集，而不是完整上游插件集合。
+- Nerd Font SHA-256（`Stacio/Resources/Fonts/JetBrainsMonoNLNerdFont-Regular.ttf`，用于可下载快照，不随正式 App 内置）：
+  `0707232475ef0b002c2fbc0af3a918b12adb2668fdefeb92728ac83ca0b70926`
+- 构建/发布流程必须校验以上哈希一致，不一致即失败（供应链约束）。当前快照有意不包含上游的 `gitfast`、`iterm2`、`term_tab` 三个插件；恢复它们必须引入新内容、重算哈希，并将发布版本提升为 `2026.08.2`。
+
+## 旧安装迁移
+
+树摘要标记首次出现在内部开发提交 `ad0d1162`，此前的 `97e26caa` 未进入发布 tag、远端分支或对外测试包。客户端仍防御性兼容可能残留的内部安装：缺少树摘要标记时不原地信任或补签当前目录，也不删除原目录，而是在设置中明确要求重新下载可信快照。
+
+## 内容规模
+
+- 插件目录：355 个（`plugins/`）
+- 主题文件：143 个（`themes/*.zsh-theme`）
+- 目录体积（去 `.git`）：约 9.5 MB
+
+## 更新方式
+
+由 Stacio 版本带动：升级 Stacio 时若上游有新版本，按上述流程重新 vendor 并更新本 README 的 commit 与哈希。

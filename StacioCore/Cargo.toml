@@ -1,0 +1,58 @@
+[package]
+name = "stacio_core"
+version = "0.1.0"
+edition = "2021"
+description = "Stacio core runtime: SSH/SCP/SFTP, tunnels, sessions, credentials, and device metrics for the native macOS SSH client."
+license-file = "../LICENSE"
+repository = "https://github.com/Fengoffer/Stacio"
+
+[lib]
+name = "stacio_core"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "uniffi-bindgen-swift.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = { version = "4.9.0", default-features = false }
+hex = "0.4"
+libc = "0.2"
+sha2 = "0.10"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+thiserror = "2"
+uniffi = { version = "0.29", features = ["cli"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# IronRDP client (pure-Rust RDP, no libfreerdp/X11 dependency)
+ironrdp-client = { version = "0.1.0", path = "Vendor/ironrdp-client", features = ["rustls", "clipboard"] }
+ironrdp-cliprdr = "0.7.0"
+ironrdp-core = "0.2.1"
+ironrdp-graphics = "0.9.0"
+ironrdp-session = "0.11.0"
+ironrdp-input = "0.7.0"
+ironrdp-displaycontrol = "0.8.0"
+ironrdp-connector = "0.10.0"
+ironrdp-pdu = "0.9.0"
+# RDP device redirection (drives, smartcards, printers, serial, parallel)
+ironrdp-rdpdr = { version = "0.7.0", optional = true }
+ironrdp-rdpdr-native = { version = "0.7.0", path = "Vendor/ironrdp-rdpdr-native", optional = true }
+smallvec = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+
+[features]
+default = ["rdpdr"]
+rdpdr = ["ironrdp-client/rdpdr", "ironrdp-rdpdr", "ironrdp-rdpdr-native"]
+
+[dev-dependencies]
+ironrdp-svc = "0.8.0"
+tempfile = "3"
+
+[patch.crates-io]
+ironrdp-tls = { path = "Vendor/ironrdp-tls" }

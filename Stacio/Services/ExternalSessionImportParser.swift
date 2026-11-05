@@ -1,0 +1,703 @@
+import Foundation
+
+public enum ExternalImportedCredential: Equatable, Sendable {
+    case password(String)
+    case privateKeyPassphrase(String)
+}
+
+public struct ExternalImportedSession: Equatable, Sendable {
+    public let name: String
+    public let folderPath: String?
+    public let protocolName: String
+    public let host: String
+    public let port: UInt16
+    public let username: String?
+    public let privateKeyPath: String?
+    public let credential: ExternalImportedCredential?
+    public let configJSON: String?
+
+    public init(
+        name: String,
+        folderPath: String?,
+        protocolName: String,
+        host: String,
+        port: UInt16,
+        username: String?,
+        privateKeyPath: String?,
+        credential: ExternalImportedCredential?,
+        configJSON: String? = nil
+    ) {
+        self.name = name
+        self.folderPath = folderPath
+        self.protocolName = protocolName
+        self.host = host
+        self.port = port
+        self.username = username
+        self.privateKeyPath = privateKeyPath
+        self.credential = credential
+        self.configJSON = configJSON
+    }
+}
+
+public struct ExternalSessionImportPayload: Equatable, Sendable {
+    public let sessions: [ExternalImportedSession]
+    public let warnings: [String]
+}
+
+public enum ExternalSessionImportParserError: Error, Equatable, LocalizedError {
+    case unsupportedSource
+    case invalidFormat
+    case noSessions
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSource:
+            return "暂不支持该配置文件类型。"
+        case .invalidFormat:
+            return "无法识别配置文件内容，请确认文件为来源系统导出的原始配置。"
+        case .noSessions:
+            return "配置文件中没有可导入的会话。"
+        }
+    }
+}
+
+public enum ExternalSessionImportParser {
+    public static func parseText(
+        _ text: String,
+        sourceType: SessionImportSourceType,
+        sourceName: String
+    ) throws -> ExternalSessionImportPayload {
+        let payload: ExternalSessionImportPayload
+        switch sourceType {
+        case .xterminal:
+            payload = parseXTerminal(text)
+        case .mobaXterm:
+            payload = parseMobaXterm(text)
+        case .xShell:
+            payload = parseXshell(text, sourceName: sourceName)
+        case .windTerm:
+            payload = try parseWindTerm(text)
+        case .secureCRT:
+            payload = try parseSecureCRT(text, sourceName: sourceName)
+        case .electerm:
+            payload = try parseElecterm(text)
+        case .termius:
+            payload = try parseTermius(text)
+        default:
+            throw ExternalSessionImportParserError.unsupportedSource
+        }
+        guard payload.sessions.isEmpty == false else {
+            throw ExternalSessionImportParserError.noSessions
+        }
+        return payload
+    }
+
+    private static func parseXTerminal(_ text: String) -> ExternalSessionImportPayload {
+        var sessions: [ExternalImportedSession] = []
+        var warnings: [String] = []
+
+        for (lineNumber, rawLine) in text.components(separatedBy: .newlines).enumerated() {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.isEmpty == false, line.hasPrefix("#") == false, line.hasPrefix(";") == false else {
+                continue
+            }
+            let fields = xterminalFields(line)
+            guard let host = optionalTrimmed(fields["host"]),
+                  let title = optionalTrimmed(fields["title"]),
+                  let authType = optionalTrimmed(fields["authtype"]),
+                  let username = optionalTrimmed(fields["user"] ?? fields["username"])
+            else {
+                continue
+            }
+            guard authType.caseInsensitiveCompare("password") == .orderedSame else {
+                warnings.append("第 \(lineNumber + 1) 行的 XTerminal 认证方式暂不支持，已跳过")
+                continue
+            }
+            guard let password = optionalPreservingWhitespace(fields["password"]) else {
+                warnings.append("第 \(lineNumber + 1) 行缺少 XTerminal 密码，已跳过")
+                continue
+            }
+            guard let portValue = optionalTrimmed(fields["port"]),
+                  let port = UInt16(portValue), port > 0
+            else {
+                warnings.append("第 \(lineNumber + 1) 行的 XTerminal 端口无效，已跳过")
+                continue
+            }
+            sessions.append(
+                ExternalImportedSession(
+                    name: title,
+                    folderPath: nil,
+                    protocolName: "ssh",
+                    host: host,
+                    port: port,
+                    username: username,
+                    privateKeyPath: nil,
+                    credential: .password(password)
+                )
+            )
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: warnings)
+    }
+
+    private static let xterminalKnownKeys: Set<String> = [
+        "host", "port", "user", "username", "authtype", "password", "title"
+    ]
+
+    private static func xterminalFields(_ line: String) -> [String: String] {
+        let characters = Array(line)
+        var fields: [String: String] = [:]
+        var index = 0
+
+        while index < characters.count {
+            while index < characters.count, characters[index].isWhitespace { index += 1 }
+            let keyStart = index
+            while index < characters.count,
+                  characters[index].isLetter || characters[index].isNumber || characters[index] == "_" {
+                index += 1
+            }
+            guard index > keyStart else {
+                index += 1
+                continue
+            }
+            let key = String(characters[keyStart..<index]).lowercased()
+            while index < characters.count, characters[index].isWhitespace { index += 1 }
+            guard index < characters.count, characters[index] == "=" else { continue }
+            index += 1
+            while index < characters.count, characters[index].isWhitespace { index += 1 }
+
+            let value: String
+            if index < characters.count, characters[index] == "\"" {
+                index += 1
+                var valueCharacters: [Character] = []
+                while index < characters.count {
+                    let character = characters[index]
+                    index += 1
+                    if character == "\\", index < characters.count {
+                        valueCharacters.append(characters[index])
+                        index += 1
+                    } else if character == "\"" {
+                        break
+                    } else {
+                        valueCharacters.append(character)
+                    }
+                }
+                value = String(valueCharacters)
+            } else {
+                let valueStart = index
+                while index < characters.count {
+                    guard characters[index].isWhitespace else {
+                        index += 1
+                        continue
+                    }
+                    var next = index
+                    while next < characters.count, characters[next].isWhitespace { next += 1 }
+                    let nextKeyStart = next
+                    while next < characters.count,
+                          characters[next].isLetter || characters[next].isNumber || characters[next] == "_" {
+                        next += 1
+                    }
+                    let nextKey = String(characters[nextKeyStart..<next]).lowercased()
+                    if xterminalKnownKeys.contains(nextKey) {
+                        var equals = next
+                        while equals < characters.count, characters[equals].isWhitespace { equals += 1 }
+                        if equals < characters.count, characters[equals] == "=" { break }
+                    }
+                    index = next == index ? index + 1 : next
+                }
+                value = String(characters[valueStart..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            fields[key] = value
+        }
+        return fields
+    }
+
+    public static func parseDirectory(
+        _ directoryURL: URL,
+        sourceType: SessionImportSourceType,
+        sourceName: String
+    ) throws -> ExternalSessionImportPayload {
+        let payload: ExternalSessionImportPayload
+        switch sourceType {
+        case .finalShell:
+            payload = try parseFinalShell(directoryURL)
+        case .xShell:
+            payload = try parseXshellDirectory(directoryURL)
+        default:
+            throw ExternalSessionImportParserError.unsupportedSource
+        }
+        guard payload.sessions.isEmpty == false else {
+            throw ExternalSessionImportParserError.noSessions
+        }
+        return payload
+    }
+
+    private static func parseXshellDirectory(_ directoryURL: URL) throws -> ExternalSessionImportPayload {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { throw ExternalSessionImportParserError.invalidFormat }
+        var sessions: [ExternalImportedSession] = []
+        for case let fileURL as URL in enumerator where ["xsh", "xts"].contains(fileURL.pathExtension.lowercased()) {
+            let rootComponents = directoryURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+            let fileComponents = fileURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+            let relativePath = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
+            let sourceName = relativePath.replacingOccurrences(of: "/", with: "__")
+            let text = try SessionImportTextDecoder.decode(Data(contentsOf: fileURL))
+            sessions.append(contentsOf: parseXshell(text, sourceName: sourceName).sessions)
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private static func parseMobaXterm(_ text: String) -> ExternalSessionImportPayload {
+        let sections = iniSections(text)
+        let passwords = sections["Passwords"] ?? [:]
+        var sessions: [ExternalImportedSession] = []
+        for (sectionName, values) in sections where sectionName.hasPrefix("Bookmarks") {
+            let folder = normalizedFolderPath(values["SubRep"]?.replacingOccurrences(of: "\\", with: "/"))
+            for (name, value) in values where name != "SubRep" && value.hasPrefix("#109#") {
+                let fields = value.split(separator: "%", omittingEmptySubsequences: false).map(String.init)
+                guard fields.count >= 4 else { continue }
+                let host = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard host.isEmpty == false else { continue }
+                let port = UInt16(fields[2]) ?? 22
+                let username = optionalTrimmed(fields[3])
+                let password = mobaXtermPassword(
+                    for: name,
+                    host: host,
+                    port: port,
+                    username: username,
+                    passwords: passwords
+                )
+                sessions.append(
+                    ExternalImportedSession(
+                        name: name,
+                        folderPath: folder,
+                        protocolName: "ssh",
+                        host: host,
+                        port: port,
+                        username: username,
+                        privateKeyPath: nil,
+                        credential: password.flatMap(optionalTrimmed).map(ExternalImportedCredential.password)
+                    )
+                )
+            }
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private static func parseXshell(_ text: String, sourceName: String) -> ExternalSessionImportPayload {
+        let sections = iniSections(text)
+        let connection = sections["CONNECTION"] ?? sections["Connection"] ?? [:]
+        let authentication = sections["CONNECTION:AUTHENTICATION"]
+            ?? sections["Connection:Authentication"]
+            ?? sections["AUTHENTICATION"]
+            ?? sections["Authentication"]
+            ?? [:]
+        guard let host = optionalTrimmed(connection["Host"] ?? connection["HostName"]) else {
+            return ExternalSessionImportPayload(sessions: [], warnings: [])
+        }
+        let rawBaseName = URL(fileURLWithPath: sourceName).deletingPathExtension().lastPathComponent
+        let nameParts = rawBaseName.components(separatedBy: "__")
+        let name = nameParts.last.flatMap(optionalTrimmed) ?? host
+        let folder = nameParts.count > 1 ? normalizedFolderPath(nameParts.dropLast().joined(separator: "/")) : nil
+        let keyPath = optionalTrimmed(authentication["UserKey"] ?? authentication["PrivateKey"])
+        let passphrase = optionalTrimmed(authentication["Passphrase"])
+        let password = optionalTrimmed(connection["Password"] ?? authentication["Password"])
+        let credential: ExternalImportedCredential?
+        if keyPath != nil {
+            credential = passphrase.map(ExternalImportedCredential.privateKeyPassphrase)
+        } else {
+            credential = password.map(ExternalImportedCredential.password)
+        }
+        return ExternalSessionImportPayload(
+            sessions: [
+                ExternalImportedSession(
+                    name: name,
+                    folderPath: folder,
+                    protocolName: "ssh",
+                    host: host,
+                    port: UInt16(connection["Port"] ?? "") ?? 22,
+                    username: optionalTrimmed(
+                        authentication["UserName"]
+                            ?? authentication["Username"]
+                            ?? connection["UserName"]
+                            ?? connection["Username"]
+                    ),
+                    privateKeyPath: keyPath,
+                    credential: credential
+                )
+            ],
+            warnings: []
+        )
+    }
+
+    private static func parseWindTerm(_ text: String) throws -> ExternalSessionImportPayload {
+        guard let entries = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]] else {
+            throw ExternalSessionImportParserError.invalidFormat
+        }
+        let sessions = entries.compactMap { entry -> ExternalImportedSession? in
+            guard (entry["session.protocol"] as? String)?.caseInsensitiveCompare("SSH") == .orderedSame,
+                  let target = optionalTrimmed(entry["session.target"] as? String)
+            else { return nil }
+            let targetParts = target.split(separator: "@", maxSplits: 1).map(String.init)
+            let username = targetParts.count == 2 ? optionalTrimmed(targetParts[0]) : nil
+            let host = targetParts.count == 2 ? targetParts[1] : targetParts[0]
+            guard host.isEmpty == false else { return nil }
+            return ExternalImportedSession(
+                name: optionalTrimmed(entry["session.label"] as? String) ?? host,
+                folderPath: normalizedFolderPath((entry["session.group"] as? String)?.replacingOccurrences(of: ">", with: "/")),
+                protocolName: "ssh",
+                host: host,
+                port: uint16(entry["session.port"]) ?? 22,
+                username: username,
+                privateKeyPath: optionalTrimmed(entry["session.privateKey"] as? String),
+                credential: optionalTrimmed(entry["session.password"] as? String).map(ExternalImportedCredential.password)
+            )
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private struct SecureCRTINIField {
+        let type: Character
+        let value: String
+    }
+
+    private static func parseSecureCRT(
+        _ text: String,
+        sourceName: String
+    ) throws -> ExternalSessionImportPayload {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<") {
+            let delegate = SecureCRTImportXMLDelegate()
+            let parser = XMLParser(data: Data(text.utf8))
+            parser.delegate = delegate
+            guard parser.parse() else { throw ExternalSessionImportParserError.invalidFormat }
+            return ExternalSessionImportPayload(sessions: delegate.sessions, warnings: delegate.warnings)
+        }
+
+        let fields = secureCRTINIFields(text)
+        guard fields["Protocol Name"]?.value.caseInsensitiveCompare("SSH2") == .orderedSame,
+              let host = optionalTrimmed(fields["Hostname"]?.value)
+        else { throw ExternalSessionImportParserError.invalidFormat }
+
+        let sourceStem = URL(fileURLWithPath: sourceName)
+            .deletingPathExtension()
+            .lastPathComponent
+        let sessionName = optionalTrimmed(sourceStem) ?? host
+        let password = ["Password V2", "Password"]
+            .compactMap { optionalTrimmed(fields[$0]?.value) }
+            .first
+        let warnings = password == nil
+            ? []
+            : ["\(sessionName) 的 SecureCRT 加密密码无法直接迁移"]
+        let portField = fields["[SSH2] Port"]
+            ?? fields["[SSH2] 端口"]
+            ?? fields["Port"]
+        let privateKeyPath = ["Identity Filename V2", "Identity Filename"]
+            .compactMap { optionalTrimmed(fields[$0]?.value) }
+            .first
+        let session = ExternalImportedSession(
+            name: sessionName,
+            folderPath: nil,
+            protocolName: "ssh",
+            host: host,
+            port: secureCRTPort(portField) ?? 22,
+            username: optionalTrimmed(fields["Username"]?.value),
+            privateKeyPath: privateKeyPath,
+            credential: nil
+        )
+        return ExternalSessionImportPayload(sessions: [session], warnings: warnings)
+    }
+
+    private static func secureCRTINIFields(_ text: String) -> [String: SecureCRTINIField] {
+        var fields: [String: SecureCRTINIField] = [:]
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let type = line.first, type == "S" || type == "D" else { continue }
+            let colonIndex = line.index(after: line.startIndex)
+            guard colonIndex < line.endIndex, line[colonIndex] == ":" else { continue }
+            let openingQuoteIndex = line.index(after: colonIndex)
+            guard openingQuoteIndex < line.endIndex, line[openingQuoteIndex] == "\"" else { continue }
+            let keyStartIndex = line.index(after: openingQuoteIndex)
+            guard let closingQuoteIndex = line[keyStartIndex...].firstIndex(of: "\"") else { continue }
+            let equalsIndex = line.index(after: closingQuoteIndex)
+            guard equalsIndex < line.endIndex, line[equalsIndex] == "=" else { continue }
+            let valueStartIndex = line.index(after: equalsIndex)
+            let key = String(line[keyStartIndex..<closingQuoteIndex])
+            guard key.isEmpty == false else { continue }
+            fields[key] = SecureCRTINIField(type: type, value: String(line[valueStartIndex...]))
+        }
+        return fields
+    }
+
+    private static func secureCRTPort(_ field: SecureCRTINIField?) -> UInt16? {
+        guard let field else { return nil }
+        let value = field.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed: UInt64?
+        if field.type == "D" {
+            parsed = UInt64(value, radix: 16)
+        } else {
+            parsed = UInt64(value)
+        }
+        guard let parsed, parsed > 0 else { return nil }
+        return UInt16(exactly: parsed)
+    }
+
+    private static func parseElecterm(_ text: String) throws -> ExternalSessionImportPayload {
+        guard let root = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              let bookmarks = root["bookmarks"] as? [[String: Any]]
+        else { throw ExternalSessionImportParserError.invalidFormat }
+        let groups = (root["bookmarkGroups"] as? [[String: Any]] ?? []).reduce(into: [String: String]()) { result, group in
+            guard let title = optionalTrimmed(group["title"] as? String) else { return }
+            for bookmarkID in group["bookmarkIds"] as? [String] ?? [] {
+                result[bookmarkID] = title
+            }
+        }
+        let sessions = bookmarks.compactMap { bookmark -> ExternalImportedSession? in
+            guard (bookmark["type"] as? String)?.caseInsensitiveCompare("ssh") == .orderedSame,
+                  bookmark["enableSsh"] as? Bool != false,
+                  let host = optionalTrimmed(bookmark["host"] as? String)
+            else { return nil }
+            let id = bookmark["id"] as? String ?? ""
+            return ExternalImportedSession(
+                name: optionalTrimmed(bookmark["title"] as? String) ?? host,
+                folderPath: normalizedFolderPath(groups[id]),
+                protocolName: "ssh",
+                host: host,
+                port: uint16(bookmark["port"]) ?? 22,
+                username: optionalTrimmed(bookmark["username"] as? String),
+                privateKeyPath: optionalTrimmed(bookmark["privateKeyPath"] as? String),
+                credential: optionalTrimmed(bookmark["password"] as? String).map(ExternalImportedCredential.password)
+            )
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private static func parseTermius(_ text: String) throws -> ExternalSessionImportPayload {
+        guard let root = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              let hosts = root["hosts"] as? [[String: Any]]
+        else { throw ExternalSessionImportParserError.invalidFormat }
+        let groups = (root["groups"] as? [[String: Any]] ?? []).reduce(into: [String: String]()) { result, group in
+            guard let id = group["id"] as? String,
+                  let label = optionalTrimmed(group["label"] as? String ?? group["name"] as? String)
+            else { return }
+            result[id] = label
+        }
+        let sessions = hosts.compactMap { hostRecord -> ExternalImportedSession? in
+            guard let host = optionalTrimmed(hostRecord["address"] as? String ?? hostRecord["host"] as? String) else {
+                return nil
+            }
+            let keyPath = optionalTrimmed(hostRecord["private_key_path"] as? String ?? hostRecord["privateKeyPath"] as? String)
+            let passphrase = optionalTrimmed(hostRecord["passphrase"] as? String)
+            let password = optionalTrimmed(hostRecord["password"] as? String)
+            return ExternalImportedSession(
+                name: optionalTrimmed(hostRecord["label"] as? String ?? hostRecord["name"] as? String) ?? host,
+                folderPath: (hostRecord["group_id"] as? String).flatMap { normalizedFolderPath(groups[$0]) },
+                protocolName: "ssh",
+                host: host,
+                port: uint16(hostRecord["port"]) ?? 22,
+                username: optionalTrimmed(hostRecord["username"] as? String),
+                privateKeyPath: keyPath,
+                credential: keyPath == nil
+                    ? password.map(ExternalImportedCredential.password)
+                    : passphrase.map(ExternalImportedCredential.privateKeyPassphrase)
+            )
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private static func parseFinalShell(_ directoryURL: URL) throws -> ExternalSessionImportPayload {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { throw ExternalSessionImportParserError.invalidFormat }
+        var folders: [String: (name: String, parentID: String?)] = [:]
+        var connections: [[String: Any]] = []
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent == "folder.json" || url.lastPathComponent.hasSuffix("_connect_config.json") else {
+                continue
+            }
+            let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+            guard let record = object as? [String: Any] else { continue }
+            if url.lastPathComponent == "folder.json",
+               (record["delete_time"] as? NSNumber)?.uint64Value ?? 0 == 0,
+               let id = record["id"] as? String,
+               let name = optionalTrimmed(record["name"] as? String) {
+                folders[id] = (name, optionalTrimmed(record["parent_id"] as? String))
+            } else {
+                connections.append(record)
+            }
+        }
+        let sessions = connections.compactMap { record -> ExternalImportedSession? in
+            guard (record["delete_time"] as? NSNumber)?.uint64Value ?? 0 == 0,
+                  (record["conection_type"] as? NSNumber)?.intValue == 100,
+                  let host = optionalTrimmed(record["host"] as? String)
+            else { return nil }
+            let keyPath = optionalTrimmed(record["private_key_path"] as? String)
+            let password = optionalTrimmed(record["password"] as? String)
+            let passphrase = optionalTrimmed(record["passphrase"] as? String)
+            return ExternalImportedSession(
+                name: optionalTrimmed(record["name"] as? String) ?? host,
+                folderPath: (record["parent_id"] as? String).flatMap { finalShellFolderPath($0, folders: folders) },
+                protocolName: "ssh",
+                host: host,
+                port: uint16(record["port"]) ?? 22,
+                username: optionalTrimmed(record["user_name"] as? String),
+                privateKeyPath: keyPath,
+                credential: keyPath == nil
+                    ? password.map(ExternalImportedCredential.password)
+                    : passphrase.map(ExternalImportedCredential.privateKeyPassphrase)
+            )
+        }
+        return ExternalSessionImportPayload(sessions: sessions, warnings: [])
+    }
+
+    private static func finalShellFolderPath(
+        _ id: String,
+        folders: [String: (name: String, parentID: String?)]
+    ) -> String? {
+        var path: [String] = []
+        var current: String? = id
+        var visited: Set<String> = []
+        while let id = current, id != "root", id != "0", visited.insert(id).inserted,
+              let folder = folders[id] {
+            path.append(folder.name)
+            current = folder.parentID
+        }
+        return normalizedFolderPath(path.reversed().joined(separator: "/"))
+    }
+
+    private static func iniSections(_ text: String) -> [String: [String: String]] {
+        var result: [String: [String: String]] = [:]
+        var section = ""
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("["), line.hasSuffix("]") {
+                section = String(line.dropFirst().dropLast())
+                result[section, default: [:]] = result[section, default: [:]]
+            } else if let separator = line.firstIndex(of: "="), section.isEmpty == false {
+                let key = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
+                result[section, default: [:]][key] = value
+            }
+        }
+        return result
+    }
+
+    private static func normalizedFolderPath(_ value: String?) -> String? {
+        let segments = value?.split(separator: "/").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } ?? []
+        return segments.isEmpty ? nil : segments.joined(separator: "/")
+    }
+
+    private static func mobaXtermPassword(
+        for sessionName: String,
+        host: String,
+        port: UInt16,
+        username: String?,
+        passwords: [String: String]
+    ) -> String? {
+        var keys = [host, "\(host):\(port)", sessionName]
+        if let username {
+            keys.insert("\(username)@\(host)", at: 0)
+            keys.insert("\(username)@\(host):\(port)", at: 1)
+            keys.append("\(host)@\(username)")
+            keys.append("\(host):\(port)@\(username)")
+        }
+        let normalizedPasswords = passwords.reduce(into: [String: String]()) { result, entry in
+            let key = entry.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard key.isEmpty == false, result[key] == nil else { return }
+            result[key] = entry.value
+        }
+        for key in keys {
+            let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let password = optionalTrimmed(normalizedPasswords[normalizedKey]) {
+                return password
+            }
+        }
+        return nil
+    }
+
+    private static func optionalTrimmed(_ value: String?) -> String? {
+        let value = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    private static func optionalPreservingWhitespace(_ value: String?) -> String? {
+        guard let value, value.isEmpty == false else { return nil }
+        return value
+    }
+
+    private static func uint16(_ value: Any?) -> UInt16? {
+        if let value = value as? NSNumber { return UInt16(exactly: value.uint64Value) }
+        if let value = value as? String { return UInt16(value) }
+        return nil
+    }
+}
+
+private final class SecureCRTImportXMLDelegate: NSObject, XMLParserDelegate {
+    struct Frame {
+        let name: String
+        var fields: [String: String]
+    }
+
+    var sessions: [ExternalImportedSession] = []
+    var warnings: [String] = []
+    private var stack: [Frame] = []
+    private var currentField: String?
+    private var currentValue = ""
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName: String?, attributes attributeDict: [String: String] = [:]) {
+        if elementName == "key" {
+            stack.append(Frame(name: attributeDict["name"] ?? "", fields: [:]))
+        } else if elementName == "string" || elementName == "dword" {
+            currentField = attributeDict["name"]
+            currentValue = ""
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if currentField != nil { currentValue += string }
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        if elementName == "string" || elementName == "dword" {
+            if let field = currentField, stack.isEmpty == false {
+                stack[stack.count - 1].fields[field] = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            currentField = nil
+            currentValue = ""
+            return
+        }
+        guard elementName == "key", let frame = stack.popLast() else { return }
+        guard frame.fields["Protocol Name"]?.caseInsensitiveCompare("SSH2") == .orderedSame,
+              let host = frame.fields["Hostname"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              host.isEmpty == false
+        else { return }
+        let sessionsIndex = stack.firstIndex { $0.name == "Sessions" }
+        let folder = sessionsIndex.map { index in
+            stack.dropFirst(index + 1).map(\.name).filter { !$0.isEmpty }.joined(separator: "/")
+        }.flatMap { $0.isEmpty ? nil : $0 }
+        let rawPassword = frame.fields["Password V2"] ?? frame.fields["Password"]
+        let password = rawPassword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let credential: ExternalImportedCredential?
+        if let password, password.isEmpty == false, password.hasPrefix("02:") == false {
+            credential = .password(password)
+        } else {
+            credential = nil
+            if password?.isEmpty == false { warnings.append("\(frame.name) 的 SecureCRT 加密密码无法直接迁移") }
+        }
+        sessions.append(
+            ExternalImportedSession(
+                name: frame.name.isEmpty ? host : frame.name,
+                folderPath: folder,
+                protocolName: "ssh",
+                host: host,
+                port: UInt16(frame.fields["[SSH2] Port"] ?? frame.fields["Port"] ?? "") ?? 22,
+                username: frame.fields["Username"].flatMap { $0.isEmpty ? nil : $0 },
+                privateKeyPath: frame.fields["Identity Filename V2"].flatMap { $0.isEmpty ? nil : $0 },
+                credential: credential
+            )
+        )
+    }
+}

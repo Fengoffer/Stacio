@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "catalogSetRevision": 3,
+  "appCompatibilityRange": {
+    "minimum": "0.14.0",
+    "maximum": "2.0.0"
+  },
+  "resources": [
+    {"relativePath":"provider.json","sha256":"9a14c9806fdce72d474cd56d4cda3e643fcfb783cd557c8ea3caa1e3849d9d4f","schemaRevision":1},
+    {"relativePath":"coding-plan.json","sha256":"3fbda6c0cdb7c469bb3c6b6e6bffbbe9bb21787c0107381878a674d0b0430b0e","schemaRevision":1},
+    {"relativePath":"local-agent.json","sha256":"44993fab6950d5cc086afec738ea36ea064426099e6eabae765778412e5f7c38","schemaRevision":2},
+    {"relativePath":"plan-agent-compatibility.json","sha256":"c9e0762ea9041568f2b4ae2b0d83c77eee9938b6fc0de07eaf20aaf9502e3b4f","schemaRevision":1},
+    {"relativePath":"website-action.json","sha256":"f10814c39dfeb8b6ab149af48edb1d91df755a3dcfee1c76bc41d899b01386e0","schemaRevision":1},
+    {"relativePath":"provider-pricing.json","sha256":"d6d05b5517be7795dbad218e60139c38d4adc09e7a2bdc1f88ed4e32d0feb556","schemaRevision":1},
+    {"relativePath":"stacio-tool.json","sha256":"3521b545541fdb3285764b6d578124b0ee00368e3f12f196a09e716f53996ac9","schemaRevision":1}
+  ],
+  "generatedAt": "2026-08-11T00:00:00Z",
+  "validationEvidenceRef": "catalog-review:diagnostic-assistant-v2:revision-3"
+}

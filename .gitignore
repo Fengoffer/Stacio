@@ -1,0 +1,50 @@
+.build/
+.swiftpm/
+DerivedData/
+node_modules/
+StacioCore/target/
+StacioCore/Vendor/**/target/
+StacioAdapters/RDPBridge/**/target/
+.worktrees/
+worktrees/
+.DS_Store
+__pycache__/
+*.py[cod]
+/.sync_temp_dir/
+/Icon?
+dist/
+.superpowers/
+.ohmyagent/
+/竞品截图/
+
+# Internal product, research, planning, and deployment material.
+# Keep these paths local; public repositories should contain only the
+# public README and user-facing source/assets.
+/docs/
+/ops-platform/
+/website/
+/官网/
+/后台/
+/操作系统图标/
+
+# Internal working directories
+/stacio-promotion/
+/stacio-strategy/
+/stacio-doc-audit/
+/.trae-html-share-packages/
+/CLAUDE.md
+
+# Internal material that must never reach the public repositories.
+# Boundary policy: config/public-repo-boundary.json
+/Stacio应用截图/
+/mobaxterm资源监控截图/
+/2026开源大赛提交材料/
+/stacio-promotion-plan/
+/.claude/
+/.codex/
+/.trae/
+/.reasonix/
+/.zcode/
+/.coaligne/
+/.writing/
+/.sync_temp_dir/

@@ -1,0 +1,2220 @@
+import AppKit
+import CryptoKit
+import XCTest
+@testable import StacioApp
+
+@MainActor
+final class ProductOpsWindowControllerTests: XCTestCase {
+    func testFeedbackWindowShowsRequiredFieldsAndVisibleDiagnostics() throws {
+        let context = FeedbackDiagnosticContext(
+            appVersion: "0.13.1-Beta",
+            build: "42",
+            osVersion: "macOS 14.5",
+            deviceID: "anonymous-device-id",
+            diagnostics: ["configuredUpdateChannel": "stable"]
+        )
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: context,
+            submitter: StubFeedbackSubmitting()
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        XCTAssertEqual(controller.window?.title, "反馈")
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Feedback.title") as? NSTextField)
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Feedback.description") as? NSScrollView)
+        let contact = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.contact") as? NSTextField
+        )
+        XCTAssertEqual(contact.placeholderString, "邮箱，选填")
+        let includeDiagnostics = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.includeDiagnostics") as? NSButton
+        )
+        XCTAssertEqual(includeDiagnostics.state, .on)
+        let previewDiagnostics = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.previewDiagnostics") as? NSButton
+        )
+        XCTAssertTrue(previewDiagnostics.isEnabled)
+        let typePopup = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.type") as? NSPopUpButton)
+        XCTAssertEqual(typePopup.itemTitles, FeedbackType.allCases.map(\.displayName))
+        let diagnostics = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.Feedback.diagnostics") as? NSTextField
+        )
+        XCTAssertTrue(diagnostics.stringValue.contains("匿名设备标识：anonymous-device-id"))
+        XCTAssertTrue(diagnostics.stringValue.contains("不会包含密码"))
+        XCTAssertTrue(diagnostics.stringValue.contains("SSH 配置"))
+        let submit = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.submit") as? NSButton)
+        XCTAssertEqual(submit.title, "提交反馈")
+    }
+
+    func testFeedbackWindowFreezesOneConsentedDiagnosticSnapshotForPreviewKeyAndPayload() async throws {
+        let timestamp = Date()
+        let firstTrace = try XCTUnwrap(FeedbackDiagnosticTrace(events: [
+            FeedbackDiagnosticTraceEvent(
+                timestamp: timestamp,
+                stage: .preview,
+                sourceType: .bastionHost,
+                vendor: "topsec",
+                sessionCount: 1,
+                conflictCount: 0,
+                result: .ready,
+                errorCode: nil,
+                routeIdentity: "route-a",
+                hasTargetMetadata: true
+            )
+        ]).encodedJSONString())
+        let secondTrace = try XCTUnwrap(FeedbackDiagnosticTrace(events: [
+            FeedbackDiagnosticTraceEvent(
+                timestamp: timestamp,
+                stage: .apply,
+                sourceType: .bastionHost,
+                vendor: "topsec",
+                sessionCount: 1,
+                conflictCount: 0,
+                result: .succeeded,
+                errorCode: nil,
+                routeIdentity: "route-a",
+                hasTargetMetadata: true
+            )
+        ]).encodedJSONString())
+        let environment = FeedbackDiagnosticLogEnvironment(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS 27.0",
+            architecture: "arm64"
+        )
+        let firstLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: environment,
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .importFlow,
+                    eventCode: .sessionImportStage,
+                    stage: .preview,
+                    result: .ready,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        let secondLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: environment,
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .importFlow,
+                    eventCode: .sessionImportStage,
+                    stage: .apply,
+                    result: .succeeded,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        var currentContext = FeedbackDiagnosticContext(
+            appVersion: "0.14.2",
+            build: "300",
+            osVersion: "macOS",
+            deviceID: "anonymous-device",
+            diagnostics: [
+                FeedbackDiagnosticTraceStore.diagnosticsKey: firstTrace,
+                FeedbackDiagnosticLogStore.diagnosticsKey: firstLog
+            ]
+        )
+        let submitter = StubFeedbackSubmitting()
+        let idempotencyStore = RecordingFeedbackIdempotencyStore()
+        let submitted = expectation(description: "submitted with frozen diagnostics")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            contextProvider: { currentContext },
+            submitter: submitter,
+            idempotencyStore: idempotencyStore
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.setIncludeDiagnosticsForTesting(true)
+        let previewText = controller.diagnosticsPreviewTextForTesting()
+        currentContext.diagnostics[FeedbackDiagnosticTraceStore.diagnosticsKey] = secondTrace
+        currentContext.diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey] = secondLog
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.succeeded, in: controller)
+
+        let submittedContext = try XCTUnwrap(submitter.contexts.first)
+        XCTAssertTrue(previewText.contains("阶段=preview"))
+        XCTAssertTrue(previewText.contains("结果=ready"))
+        XCTAssertFalse(previewText.contains("阶段=apply"))
+        XCTAssertFalse(previewText.contains("结果=succeeded"))
+        XCTAssertEqual(submittedContext.diagnostics[FeedbackDiagnosticTraceStore.diagnosticsKey], firstTrace)
+        XCTAssertEqual(submittedContext.diagnostics[FeedbackDiagnosticLogStore.diagnosticsKey], firstLog)
+        XCTAssertEqual(idempotencyStore.keyedContexts, [submittedContext])
+        XCTAssertEqual(idempotencyStore.clearedContexts, [submittedContext])
+        let submittedReport = try XCTUnwrap(submitter.reports.first)
+        let payload = try FeedbackSubmissionService.payload(
+            report: submittedReport,
+            context: submittedContext,
+            configuration: ProductOpsConfiguration(productID: "stacio")
+        )
+        XCTAssertEqual(payload.diagnostics?[FeedbackDiagnosticTraceStore.diagnosticsKey], firstTrace)
+        XCTAssertEqual(payload.diagnostics?[FeedbackDiagnosticLogStore.diagnosticsKey], firstLog)
+    }
+
+    func testFeedbackWindowCanExcludeDiagnosticsCompletely() async throws {
+        let timestamp = Date()
+        let diagnosticLog = try XCTUnwrap(FeedbackDiagnosticLogSnapshot(
+            environment: FeedbackDiagnosticLogEnvironment(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                architecture: "arm64"
+            ),
+            events: [
+                FeedbackDiagnosticLogEvent(
+                    timestamp: timestamp,
+                    level: .info,
+                    subsystem: .application,
+                    eventCode: .applicationStarted,
+                    stage: .startup,
+                    result: .succeeded,
+                    errorCategory: nil,
+                    resourceHashes: []
+                )
+            ]
+        ).encodedJSONString())
+        let submitter = StubFeedbackSubmitting()
+        let submitted = expectation(description: "submitted without diagnostics")
+        submitter.onSubmission = { submitted.fulfill() }
+        let configuration = ProductOpsConfiguration(productID: "stacio")
+        let controller = FeedbackWindowController(
+            configuration: configuration,
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device",
+                diagnostics: [FeedbackDiagnosticLogStore.diagnosticsKey: diagnosticLog]
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.setIncludeDiagnosticsForTesting(false)
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+
+        let report = try XCTUnwrap(submitter.reports.first)
+        let context = try XCTUnwrap(submitter.contexts.first)
+        let payload = try FeedbackSubmissionService.payload(
+            report: report,
+            context: context,
+            configuration: configuration
+        )
+        XCTAssertFalse(report.includeDiagnostics)
+        XCTAssertNil(payload.diagnostics)
+    }
+
+    func testFeedbackWindowRecordsOpenStartedAndSuccessfulSubmissionEvents() async throws {
+        let recorder = makeFeedbackDiagnosticLogStoreForWindowTests()
+        let submitter = StubFeedbackSubmitting()
+        let submitted = expectation(description: "successful feedback submission")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(productID: "stacio"),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device"
+            ),
+            submitter: submitter,
+            diagnosticLogRecorder: recorder
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.succeeded, in: controller)
+
+        XCTAssertEqual(
+            recorder.snapshot().events.map(\.eventCode),
+            [.feedbackWindowOpened, .feedbackSubmissionStarted, .feedbackSubmissionSucceeded]
+        )
+    }
+
+    func testFeedbackWindowRecordsFailedSubmissionWithoutRawErrorText() async throws {
+        let recorder = makeFeedbackDiagnosticLogStoreForWindowTests()
+        let submitter = StubFeedbackSubmitting(error: ProductOpsError.timeout)
+        let submitted = expectation(description: "failed feedback submission")
+        submitter.onSubmission = { submitted.fulfill() }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(productID: "stacio"),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                deviceID: "anonymous-device"
+            ),
+            submitter: submitter,
+            diagnosticLogRecorder: recorder
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [submitted], timeout: 1)
+        try await waitForFeedbackState(.failed, in: controller)
+
+        let events = recorder.snapshot().events
+        XCTAssertEqual(
+            events.map(\.eventCode),
+            [.feedbackWindowOpened, .feedbackSubmissionStarted, .feedbackSubmissionFailed]
+        )
+        XCTAssertEqual(events.last?.errorCategory, .timeout)
+        let json = try XCTUnwrap(recorder.snapshot().encodedJSONString())
+        XCTAssertFalse(json.contains(ProductOpsError.timeout.localizedDescription))
+    }
+
+    func testFeedbackWindowKeepsDraftWhenSubmissionFails() throws {
+        let submitter = StubFeedbackSubmitting(error: ProductOpsError.missingAPIBaseURL)
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: nil),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.1-Beta",
+                build: "42",
+                osVersion: "macOS 14.5",
+                deviceID: "anonymous-device-id"
+            ),
+            submitter: submitter
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let title = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.title") as? NSTextField)
+        let contact = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.contact") as? NSTextField)
+        title.stringValue = "Update check failed"
+        contact.stringValue = "user@example.com"
+
+        controller.renderSubmissionFailureForTesting("网络不可用")
+
+        XCTAssertEqual(title.stringValue, "Update check failed")
+        XCTAssertEqual(contact.stringValue, "user@example.com")
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.status") as? NSTextField)
+        XCTAssertTrue(status.stringValue.contains("提交失败"))
+        XCTAssertFalse((content.firstSubview(withIdentifier: "Stacio.Feedback.copyError") as? NSButton)?.isHidden ?? true)
+    }
+
+    func testFeedbackWindowShowsSpecificValidationErrors() throws {
+        let submitter = StubFeedbackSubmitting()
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2-Beta",
+                build: "42",
+                osVersion: "macOS 14.5",
+                deviceID: "anonymous-device-id"
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let title = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.title") as? NSTextField)
+        let contact = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.contact") as? NSTextField)
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.status") as? NSTextField)
+        title.stringValue = String(repeating: "a", count: FeedbackReport.maximumTitleLength + 1)
+        contact.stringValue = "not-an-email"
+
+        controller.submitCurrentReportForTesting()
+
+        XCTAssertTrue(status.stringValue.contains(FeedbackReportValidationError.titleTooLong.displayName))
+        XCTAssertTrue(status.stringValue.contains(FeedbackReportValidationError.invalidContactEmail.displayName))
+        XCTAssertTrue(submitter.idempotencyKeys.isEmpty)
+    }
+
+    func testFeedbackWindowPreventsConcurrentSubmissionOfSameDraft() async throws {
+        let submitter = GatedFeedbackSubmitter()
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2-Beta",
+                build: "42",
+                osVersion: "macOS 14.5",
+                deviceID: "anonymous-device-id"
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        controller.submitCurrentReportForTesting()
+
+        let deadline = Date().addingTimeInterval(0.2)
+        while await submitter.submissionCount() < 2, Date() < deadline {
+            await Task.yield()
+        }
+        let submissionCount = await submitter.submissionCount()
+        await submitter.finishAll()
+
+        XCTAssertEqual(submissionCount, 1)
+    }
+
+    func testFeedbackWindowReusesIdempotencyKeyForManualRetryAndPreventsDuplicateAfterSuccess() async throws {
+        let firstSubmission = expectation(description: "first submission")
+        let secondSubmission = expectation(description: "second submission")
+        let submitter = StubFeedbackSubmitting(outcomes: [
+            .failure(ProductOpsError.timeout),
+            .success(FeedbackSubmissionResult(id: "feedback-1", message: "ok"))
+        ])
+        submitter.onSubmission = {
+            if submitter.idempotencyKeys.count == 1 {
+                firstSubmission.fulfill()
+            } else if submitter.idempotencyKeys.count == 2 {
+                secondSubmission.fulfill()
+            }
+        }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2",
+                build: "17",
+                osVersion: "macOS",
+                deviceID: "device"
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [firstSubmission], timeout: 1)
+        try await waitForFeedbackState(.failed, in: controller)
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [secondSubmission], timeout: 1)
+
+        XCTAssertEqual(submitter.idempotencyKeys.count, 2)
+        XCTAssertEqual(submitter.idempotencyKeys[0], submitter.idempotencyKeys[1])
+        let submitButton = try XCTUnwrap(
+            controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Feedback.submit") as? NSButton
+        )
+        XCTAssertFalse(submitButton.isEnabled)
+
+        controller.submitCurrentReportForTesting()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(submitter.idempotencyKeys.count, 2)
+    }
+
+    func testFeedbackWindowGeneratesNewIdempotencyKeyWhenDraftChangesAfterFailure() async throws {
+        let firstSubmission = expectation(description: "first changed-draft submission")
+        let secondSubmission = expectation(description: "second changed-draft submission")
+        let submitter = StubFeedbackSubmitting(outcomes: [
+            .failure(ProductOpsError.timeout),
+            .failure(ProductOpsError.offline)
+        ])
+        submitter.onSubmission = {
+            if submitter.idempotencyKeys.count == 1 {
+                firstSubmission.fulfill()
+            } else if submitter.idempotencyKeys.count == 2 {
+                secondSubmission.fulfill()
+            }
+        }
+        let controller = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2",
+                build: "17",
+                osVersion: "macOS",
+                deviceID: "device"
+            ),
+            submitter: submitter
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        try fillValidFeedbackDraft(in: controller)
+
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [firstSubmission], timeout: 1)
+        try await waitForFeedbackState(.failed, in: controller)
+        let title = try XCTUnwrap(
+            controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.Feedback.title") as? NSTextField
+        )
+        title.stringValue = "Changed feedback title"
+        controller.submitCurrentReportForTesting()
+        await fulfillment(of: [secondSubmission], timeout: 1)
+
+        XCTAssertEqual(submitter.idempotencyKeys.count, 2)
+        XCTAssertNotEqual(submitter.idempotencyKeys[0], submitter.idempotencyKeys[1])
+    }
+
+    func testFeedbackWindowReusesIdempotencyKeyAcrossControllerRecreationWithoutPersistingDraft() async throws {
+        let defaults = try makeProductOpsWindowDefaults()
+        let firstSubmission = expectation(description: "first persisted-key submission")
+        let firstSubmitter = StubFeedbackSubmitting(outcomes: [.failure(ProductOpsError.timeout)])
+        firstSubmitter.onSubmission = { firstSubmission.fulfill() }
+        var firstController: FeedbackWindowController? = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2",
+                build: "17",
+                osVersion: "macOS",
+                deviceID: "device"
+            ),
+            submitter: firstSubmitter,
+            idempotencyStore: FeedbackIdempotencyKeyStore(defaults: defaults)
+        )
+        firstController?.showWindow(nil)
+        try fillValidFeedbackDraft(in: try XCTUnwrap(firstController))
+        firstController?.submitCurrentReportForTesting()
+        await fulfillment(of: [firstSubmission], timeout: 1)
+        try await waitForFeedbackState(.failed, in: try XCTUnwrap(firstController))
+        firstController?.close()
+        firstController = nil
+
+        let secondSubmission = expectation(description: "second persisted-key submission")
+        let secondSubmitter = StubFeedbackSubmitting(outcomes: [.failure(ProductOpsError.offline)])
+        secondSubmitter.onSubmission = { secondSubmission.fulfill() }
+        let secondController = FeedbackWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            context: FeedbackDiagnosticContext(
+                appVersion: "0.13.2",
+                build: "17",
+                osVersion: "macOS",
+                deviceID: "device"
+            ),
+            submitter: secondSubmitter,
+            idempotencyStore: FeedbackIdempotencyKeyStore(defaults: defaults)
+        )
+        secondController.showWindow(nil)
+        defer { secondController.close() }
+        try fillValidFeedbackDraft(in: secondController)
+        secondController.submitCurrentReportForTesting()
+        await fulfillment(of: [secondSubmission], timeout: 1)
+
+        XCTAssertEqual(firstSubmitter.idempotencyKeys, secondSubmitter.idempotencyKeys)
+        let persisted = try XCTUnwrap(defaults.data(forKey: FeedbackIdempotencyKeyStore.defaultsKey))
+        let persistedText = try XCTUnwrap(String(data: persisted, encoding: .utf8))
+        XCTAssertFalse(persistedText.contains("Connection problem"))
+        XCTAssertFalse(persistedText.contains("The connection did not recover."))
+    }
+
+    func testUpdatePromptRendersManualStatesWithoutOpeningDownloadURL() throws {
+        let opener = StubProductOpsURLOpener()
+        let controller = UpdatePromptWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            checker: StubUpdateChecking(status: .upToDate),
+            urlOpener: opener
+        )
+        let update = UpdateInfo(
+            version: "0.14.0",
+            build: "50",
+            channel: .stable,
+            releaseNotes: "反馈、更新检查与 License 基础能力。",
+            artifactURL: URL(string: "https://download.example.test/Stacio.dmg"),
+            publishedAt: nil,
+            minSupportedVersion: nil
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        controller.renderStatusForTesting(.updateAvailable(update))
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.status") as? NSTextField)
+        let download = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.download") as? NSButton)
+        XCTAssertTrue(status.stringValue.contains("发现新版本"))
+        XCTAssertFalse(download.isHidden)
+        XCTAssertEqual(opener.openedURLs, [])
+
+        controller.renderStatusForTesting(.upToDate)
+        XCTAssertTrue(status.stringValue.contains("已是最新"))
+        XCTAssertTrue(download.isHidden)
+
+        controller.renderFailureForTesting("网络不可用")
+        XCTAssertTrue(status.stringValue.contains("检查失败"))
+        XCTAssertTrue(download.isHidden)
+    }
+
+    func testSparkleUpdateWindowRendersManualResultsAndFullUpdateDetails() throws {
+        let checker = StubSparkleManualUpdateChecker()
+        let actions = RecordingSparkleUpdateActions()
+        let controller = UpdatePromptWindowController(
+            sparkleChecker: checker,
+            actionHandler: actions
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.status") as? NSTextField)
+        let details = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.details") as? NSTextField)
+        let notes = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.releaseNotes") as? NSTextView)
+        let download = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.download") as? NSButton)
+        let later = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.later") as? NSButton)
+        let skip = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Update.skip") as? NSButton)
+
+        controller.renderManualStateForTesting(.checking)
+        XCTAssertTrue(status.stringValue.contains("正在检查"))
+
+        controller.renderManualStateForTesting(.upToDate)
+        XCTAssertTrue(status.stringValue.contains("已是最新"))
+
+        controller.renderManualStateForTesting(.failed("Appcast 不可用"))
+        XCTAssertTrue(status.stringValue.contains("Appcast 不可用"))
+
+        let update = SparkleUpdatePromptInfo(
+            version: "0.14.0",
+            build: "50",
+            releaseNotes: "<p>新增<strong>更新中心</strong>与安装确认。</p>",
+            packageSize: 12_000_000
+        )
+        controller.renderManualStateForTesting(.available(update))
+
+        XCTAssertTrue(status.stringValue.contains("发现新版本"))
+        XCTAssertTrue(details.stringValue.contains("0.14.0"))
+        XCTAssertTrue(details.stringValue.contains("Build 50"))
+        XCTAssertTrue(details.stringValue.contains("12"))
+        XCTAssertEqual(notes.string, "新增更新中心与安装确认。")
+        XCTAssertFalse(download.isHidden)
+        XCTAssertFalse(later.isHidden)
+        XCTAssertFalse(skip.isHidden)
+
+        download.performClick(nil)
+        later.performClick(nil)
+        skip.performClick(nil)
+
+        XCTAssertEqual(actions.downloadedUpdates, [update])
+        XCTAssertEqual(actions.remindedLaterUpdates, [update])
+        XCTAssertEqual(actions.skippedUpdates, [update])
+    }
+
+    func testUpdatePromptRendersMarkdownReleaseNotesConsistentlyAcrossUpdateSources() throws {
+        let releaseNotes = """
+        # Stacio 0.14.1 本次更新重点
+        ## SCP 与 SFTP 文件传输
+        - 左侧管理本地文件
+        - 右侧管理远端文件
+        """
+        let productController = UpdatePromptWindowController(
+            configuration: ProductOpsConfiguration(apiBaseURL: URL(string: "https://ops.example.test")),
+            checker: StubUpdateChecking(status: .upToDate),
+            urlOpener: StubProductOpsURLOpener()
+        )
+        let sparkleController = UpdatePromptWindowController(
+            sparkleChecker: StubSparkleManualUpdateChecker(),
+            actionHandler: RecordingSparkleUpdateActions()
+        )
+        productController.showWindow(nil)
+        sparkleController.showWindow(nil)
+        defer {
+            productController.close()
+            sparkleController.close()
+        }
+
+        productController.renderStatusForTesting(.updateAvailable(UpdateInfo(
+            version: "0.14.1",
+            build: "298",
+            channel: .stable,
+            releaseNotes: releaseNotes,
+            artifactURL: URL(string: "https://download.example.test/Stacio.dmg"),
+            publishedAt: nil,
+            minSupportedVersion: nil
+        )))
+        sparkleController.renderManualStateForTesting(.available(SparkleUpdatePromptInfo(
+            version: "0.14.1",
+            build: "298",
+            releaseNotes: releaseNotes,
+            packageSize: 30_500_000
+        )))
+
+        let productNotesView = try XCTUnwrap(
+            productController.window?.contentView?.firstSubview(withIdentifier: "Stacio.Update.releaseNotes")
+                as? NSTextView
+        )
+        let sparkleNotesView = try XCTUnwrap(
+            sparkleController.window?.contentView?.firstSubview(withIdentifier: "Stacio.Update.releaseNotes")
+                as? NSTextView
+        )
+        let productNotes = productNotesView.attributedString()
+        let sparkleNotes = sparkleNotesView.attributedString()
+
+        XCTAssertTrue(productNotes.isEqual(to: sparkleNotes))
+        XCTAssertFalse(productNotes.string.contains("# "))
+        XCTAssertFalse(productNotes.string.contains("## "))
+        XCTAssertFalse(productNotes.string.contains("- 左侧"))
+        XCTAssertTrue(productNotes.string.contains("• 左侧管理本地文件"))
+        XCTAssertTrue(productNotes.string.contains("• 右侧管理远端文件"))
+
+        let titleRange = (productNotes.string as NSString).range(of: "Stacio 0.14.1 本次更新重点")
+        let bodyRange = (productNotes.string as NSString).range(of: "左侧管理本地文件")
+        let titleFont = try XCTUnwrap(
+            productNotes.attribute(.font, at: titleRange.location, effectiveRange: nil) as? NSFont
+        )
+        let bodyFont = try XCTUnwrap(
+            productNotes.attribute(.font, at: bodyRange.location, effectiveRange: nil) as? NSFont
+        )
+        XCTAssertGreaterThan(titleFont.pointSize, bodyFont.pointSize)
+    }
+
+    func testReleaseNotesRestoreEscapedLineBreaksAndRenderItemsAsAList() {
+        let releaseNotes = "支持导入会话和分组。\\n新增单个会话加密导出与导入。\\r\\n优化 SSH 启动与凭据重试。"
+
+        XCTAssertEqual(
+            releaseNotes.stacioPlainReleaseNotesForDisplay(),
+            "• 支持导入会话和分组。\n• 新增单个会话加密导出与导入。\n• 优化 SSH 启动与凭据重试。"
+        )
+    }
+
+    func testReleaseNotesKeepExistingListMarkers() {
+        let releaseNotes = "<ul><li>修复终端刷新</li><li>改善工作台稳定性</li></ul>"
+        let rendered = releaseNotes.stacioPlainReleaseNotesForDisplay()
+
+        XCTAssertFalse(rendered.contains("<li>"))
+        XCTAssertTrue(rendered.contains("修复终端刷新"))
+        XCTAssertTrue(rendered.contains("改善工作台稳定性"))
+    }
+
+    func testFreePlanNoticeShowsWebsiteFeatureComparisonAndOpensPricingPage() throws {
+        let opener = StubProductOpsURLOpener()
+        let controller = FreePlanNoticeWindowController(urlOpener: opener)
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        XCTAssertEqual(controller.window?.title, "")
+        let title = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.FreePlan.title") as? NSTextField)
+        XCTAssertEqual(title.stringValue, "当前使用的是免费版")
+        let table = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.FreePlan.comparison") as? NSTableView)
+        XCTAssertEqual(table.numberOfRows, 19)
+        XCTAssertEqual(table.tableColumns.map(\.title), ["功能", "免费版", "专业版"])
+        let firstFeatureCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NSTableCellView
+        )
+        XCTAssertEqual(firstFeatureCell.textField?.stringValue, "SSH、Telnet、VNC、SFTP、SCP、串口和本地终端")
+        let professionalFeatureCell = try XCTUnwrap(
+            table.view(atColumn: 0, row: 8, makeIfNecessary: true) as? NSTableCellView
+        )
+        XCTAssertEqual(professionalFeatureCell.textField?.stringValue, "多终端批量执行与输入广播")
+        table.layoutSubtreeIfNeeded()
+        firstFeatureCell.layoutSubtreeIfNeeded()
+        let firstFeatureLabel = try XCTUnwrap(firstFeatureCell.textField)
+        XCTAssertEqual(firstFeatureLabel.frame.midY, firstFeatureCell.bounds.midY, accuracy: 1.0)
+
+        let getLicenseButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.FreePlan.getLicense") as? NSButton
+        )
+        getLicenseButton.performClick(nil)
+        XCTAssertEqual(
+            opener.openedURLs.map(\.absoluteString),
+            [FreePlanNoticeWindowController.pricingURL.absoluteString]
+        )
+    }
+
+    func testLicenseWindowShowsPublicOfflineExchangeLink() throws {
+        let controller = LicenseWindowController(
+            service: LicenseService(store: InMemoryProductOpsLicenseStateStore())
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let link = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.offlineExchangeLink") as? NSButton
+        )
+        XCTAssertEqual(link.title, "https://www.stacio.cn/offline-license.html")
+        XCTAssertFalse(link.isBordered)
+        XCTAssertEqual(link.contentTintColor, .linkColor)
+    }
+
+    func testLicenseWindowShowsOnlyAuthorizationInformationAfterActivation() throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let state = LicenseState(
+            username: "Ada",
+            email: "ada@example.com",
+            signedLicenseToken: "signed-token",
+            plan: "team",
+            expiresAt: ISO8601DateFormatter().date(from: "2026-08-01T00:00:00Z"),
+            graceUntil: ISO8601DateFormatter().date(from: "2026-07-12T12:00:00Z"),
+            status: .offlineGrace,
+            lastValidatedAt: ISO8601DateFormatter().date(from: "2026-07-01T12:00:00Z"),
+            offlineToken: nil
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: state),
+                verifier: StubProductOpsOfflineLicenseTokenVerifier(isValid: false),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: SignedLicenseClaims(
+                    licenseID: "license-1",
+                    productID: "stacio",
+                    email: state.email,
+                    username: state.username,
+                    plan: state.plan,
+                    entitlements: state.permissions,
+                    expiresAt: state.expiresAt!,
+                    offlineGraceSeconds: 14 * 24 * 60 * 60,
+                    issuedAt: state.lastValidatedAt!
+                ))
+            ),
+            nowProvider: { now }
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.status") as? NSTextField)
+        XCTAssertTrue(status.stringValue.contains("离线宽限期"))
+        XCTAssertTrue(status.stringValue.contains("Ada"))
+        XCTAssertTrue(try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.activationForm")).isHidden)
+        XCTAssertTrue(try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.actions")).isHidden)
+    }
+
+    func testLicenseWindowUsesLargeNativeManagementButtonsWithClearActions() throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let state = LicenseState(
+            username: "Ada",
+            email: "ada@example.com",
+            signedLicenseToken: "signed-token",
+            plan: "professional",
+            expiresAt: ISO8601DateFormatter().date(from: "2026-08-01T00:00:00Z"),
+            status: .active,
+            lastValidatedAt: now
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: state),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: SignedLicenseClaims(
+                    licenseID: "license-1",
+                    productID: "stacio",
+                    email: state.email,
+                    username: state.username,
+                    plan: state.plan,
+                    entitlements: state.permissions,
+                    expiresAt: state.expiresAt!,
+                    offlineGraceSeconds: 14 * 24 * 60 * 60,
+                    issuedAt: state.lastValidatedAt!
+                ))
+            ),
+            nowProvider: { now }
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let syncButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let reimportButton = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.reimport") as? NSButton
+        )
+
+        XCTAssertEqual(syncButton.title, "同步许可")
+        XCTAssertEqual(syncButton.bezelStyle, .rounded)
+        XCTAssertTrue(syncButton.isBordered)
+        XCTAssertFalse(syncButton.wantsLayer)
+        XCTAssertEqual(syncButton.keyEquivalent, "\r")
+        XCTAssertEqual(syncButton.controlSize, .large)
+        XCTAssertNotNil(syncButton.image)
+        XCTAssertEqual(syncButton.imagePosition, .imageLeading)
+
+        XCTAssertEqual(reimportButton.title, "重新导入许可")
+        XCTAssertEqual(reimportButton.bezelStyle, .rounded)
+        XCTAssertTrue(reimportButton.isBordered)
+        XCTAssertFalse(reimportButton.wantsLayer)
+        XCTAssertEqual(reimportButton.controlSize, .large)
+        XCTAssertNotNil(reimportButton.image)
+        XCTAssertEqual(reimportButton.imagePosition, .imageLeading)
+
+        for button in [syncButton, reimportButton] {
+            XCTAssertTrue(button.constraints.contains {
+                $0.firstAttribute == .height && $0.relation == .equal && $0.constant >= 36
+            })
+            XCTAssertTrue(button.constraints.contains {
+                $0.firstAttribute == .width && $0.relation == .greaterThanOrEqual && $0.constant >= 132
+            })
+        }
+    }
+
+    func testLicenseWindowRejectsPlaintextOfflineLicenseData() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let store = InMemoryProductOpsLicenseStateStore()
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: store,
+                verifier: StubProductOpsOfflineLicenseTokenVerifier(isValid: true)
+            ),
+            nowProvider: { now }
+        )
+
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let username = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField)
+        let email = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField)
+        username.stringValue = "Ada"
+        email.stringValue = "ada@example.com"
+        await controller.importOfflineLicenseFileForTesting(Data("{\"productID\":\"stacio\"}".utf8))
+
+        XCTAssertNil(store.state)
+        let status = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField)
+        XCTAssertTrue(status.stringValue.contains("离线授权文件格式错误"))
+    }
+
+    func testLicenseWindowRejectsLegacyBackendSignedOfflineLicenseFile() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "team",
+            entitlements: ["remote_sessions"],
+            expiresAt: ISO8601DateFormatter().date(from: "2026-08-10T12:00:00Z")!,
+            offlineGraceSeconds: 1_209_600,
+            issuedAt: now
+        )
+        let store = InMemoryProductOpsLicenseStateStore()
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: store,
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        username.stringValue = claims.username
+        email.stringValue = claims.email
+        let fileData = try JSONSerialization.data(withJSONObject: [
+            "signedLicenseToken": "v1.payload.signature"
+        ])
+
+        await controller.importOfflineLicenseFileForTesting(fileData)
+
+        XCTAssertNil(store.state)
+        let status = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+        XCTAssertTrue(status.stringValue.contains("离线授权文件格式错误"), status.stringValue)
+    }
+
+    func testLicenseWindowShowsRevokedOnlineValidationAsTerminalState() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let validator = StubProductOpsLicenseOnlineValidator(
+            response: LicenseValidationResponse(
+                username: "Ada",
+                email: "ada@example.com",
+                plan: "",
+                expiresAt: nil,
+                status: .revoked
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(store: InMemoryProductOpsLicenseStateStore()),
+            onlineValidator: validator,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let licenseKey = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField
+        )
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        let validate = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.validateOnline") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+        licenseKey.stringValue = "STACIO-KEY"
+        username.stringValue = "Ada"
+        email.stringValue = "ada@example.com"
+
+        validate.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains("已撤销") == false, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertTrue(actionStatus.stringValue.contains("已撤销"), actionStatus.stringValue)
+        XCTAssertFalse(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
+    }
+
+    func testLicenseWindowPersistsActivationRecordAfterSuccessfulOnlineValidation() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "pro",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let activationStore = ThreadRecordingProductOpsActivationStore(record: nil)
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore()
+        let validator = StubProductOpsLicenseOnlineValidator(
+            response: LicenseValidationResponse(
+                username: claims.username,
+                email: claims.email,
+                signedLicenseToken: "v1.payload.signature",
+                plan: claims.plan,
+                permissions: claims.entitlements,
+                expiresAt: claims.expiresAt,
+                offlineGraceSeconds: claims.offlineGraceSeconds,
+                status: .active
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: validator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let licenseKey = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField
+        )
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        let validate = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.validateOnline") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+        licenseKey.stringValue = "STACIO-SECRET-KEY"
+        username.stringValue = claims.username
+        email.stringValue = claims.email
+
+        validate.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while activationStore.currentRecord == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(
+            activationStore.currentRecord,
+            LicenseActivationRecord(
+                licenseKey: "STACIO-SECRET-KEY",
+                username: claims.username,
+                email: claims.email
+            )
+        )
+        XCTAssertEqual(activationStore.firstSaveWasOnMainThread, false)
+        XCTAssertEqual(stateStore.firstSaveWasOnMainThread, false)
+        XCTAssertTrue(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
+    }
+
+    func testLicenseWindowDoesNotPersistActiveStateWhenActivationRecordWriteFails() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "pro",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let stateStore = InMemoryProductOpsLicenseStateStore()
+        let activationStore = ThrowingProductOpsActivationStore()
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: StubProductOpsLicenseOnlineValidator(
+                response: LicenseValidationResponse(
+                    username: claims.username,
+                    email: claims.email,
+                    signedLicenseToken: "v1.payload.signature",
+                    plan: claims.plan,
+                    permissions: claims.entitlements,
+                    expiresAt: claims.expiresAt,
+                    offlineGraceSeconds: claims.offlineGraceSeconds,
+                    status: .active
+                )
+            ),
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let licenseKey = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField
+        )
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        let validate = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.validateOnline") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+        licenseKey.stringValue = "STACIO-SECRET-KEY"
+        username.stringValue = claims.username
+        email.stringValue = claims.email
+
+        validate.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineFailedPrefix) == false,
+              Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertNil(stateStore.state)
+        XCTAssertEqual(activationStore.saveAttempts, 1)
+    }
+
+    func testLicenseWindowRejectingPlaintextImportPreservesPreviousOnlineActivationRecord() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let activationStore = InMemoryProductOpsActivationStore()
+        let previous = LicenseActivationRecord(
+            licenseKey: "OLD-LICENSE-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        activationStore.record = previous
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(),
+                verifier: StubProductOpsOfflineLicenseTokenVerifier(isValid: true)
+            ),
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        username.stringValue = "Ada"
+        email.stringValue = "ada@example.com"
+        await controller.importOfflineLicenseFileForTesting(Data("legacy offline token".utf8))
+
+        XCTAssertEqual(activationStore.record, previous)
+    }
+
+    func testLicenseServiceRestoresPreviousActivationWhenOnlineStatePersistenceFails() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "pro",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let previous = LicenseActivationRecord(
+            licenseKey: "OLD-LICENSE-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = previous
+        let service = LicenseService(
+            store: ThrowingProductOpsLicenseStateStore(),
+            signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+        )
+        let request = LicenseValidationRequest(
+            licenseKey: "NEW-LICENSE-KEY",
+            username: claims.username,
+            email: claims.email,
+            appVersion: "1.0",
+            buildNumber: "1",
+            anonymousDeviceID: "anonymous-device"
+        )
+        let response = LicenseValidationResponse(
+            username: claims.username,
+            email: claims.email,
+            signedLicenseToken: "v1.payload.signature",
+            plan: claims.plan,
+            permissions: claims.entitlements,
+            expiresAt: claims.expiresAt,
+            offlineGraceSeconds: claims.offlineGraceSeconds,
+            status: .active
+        )
+
+        XCTAssertThrowsError(
+            try service.state(
+                applyingOnlineValidation: response,
+                expected: request,
+                activationStore: activationStore,
+                now: now
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProductOpsWindowTestError, .stateWriteFailed)
+        }
+        XCTAssertEqual(activationStore.record, previous)
+    }
+
+    func testLicenseServicePreservesPreviousActivationWhenOfflineStatePersistenceFails() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let previous = LicenseActivationRecord(
+            licenseKey: "OLD-LICENSE-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = previous
+        let service = LicenseService(
+            store: ThrowingProductOpsLicenseStateStore(),
+            verifier: StubProductOpsOfflineLicenseTokenVerifier(isValid: true)
+        )
+        let token = OfflineLicenseToken(
+            productID: "stacio",
+            username: "Ada",
+            email: "ada@example.com",
+            plan: "pro",
+            permissions: ["remote_sessions"],
+            issuedAt: now,
+            expiresAt: now.addingTimeInterval(86_400),
+            signatureKeyID: "primary",
+            signature: "signature"
+        )
+
+        XCTAssertThrowsError(
+            try service.state(
+                applyingOfflineToken: token,
+                expectedUsername: "Ada",
+                expectedEmail: "ada@example.com",
+                activationStore: activationStore,
+                now: now
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProductOpsWindowTestError, .stateWriteFailed)
+        }
+        XCTAssertEqual(activationStore.record, previous)
+    }
+
+    func testLicenseWindowRefreshPrefersOfflineAuthorizationWhenActivationRecordAlsoExists() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let deviceID = "offline-device"
+        let signatureKeyID = "offline-signing-test"
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: deviceID,
+            signatureKeyID: signatureKeyID
+        )
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-OLD-ONLINE-KEY",
+            username: authorization.username,
+            email: authorization.email
+        )
+        let onlineValidator = StubProductOpsLicenseOnlineValidator(
+            response: LicenseValidationResponse(
+                username: authorization.username,
+                email: authorization.email,
+                plan: "",
+                expiresAt: nil,
+                status: .revoked
+            )
+        )
+        let offlineRefresher = RecordingProductOpsOfflineStatusRefresher(response: authorization)
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: signatureKeyID,
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: deviceID)
+                )
+            ),
+            onlineValidator: onlineValidator,
+            activationStore: activationStore,
+            offlineStatusRefresher: offlineRefresher,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while (offlineRefresher.requests.isEmpty
+            || actionStatus.stringValue.contains("离线授权状态已同步") == false),
+            Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(offlineRefresher.requests, [authorization])
+        XCTAssertTrue(onlineValidator.requests.isEmpty)
+        XCTAssertFalse(actionStatus.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains("离线授权状态已同步"), actionStatus.stringValue)
+        XCTAssertEqual(stateStore.firstSaveWasOnMainThread, false)
+    }
+
+    func testLicenseWindowDisablesOfflineAuthorizationWhenStatusSyncIsTerminal() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: "offline-device",
+            signatureKeyID: "offline-signing-test"
+        )
+        let stateStore = InMemoryProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: "offline-signing-test",
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: "offline-device")
+                )
+            ),
+            offlineStatusRefresher: FailingProductOpsOfflineStatusRefresher(
+                error: ProductOpsError.backend(
+                    code: OfflineLicenseStatusErrorCode.licenseRevoked.rawValue,
+                    message: "License 已撤销",
+                    requestID: "req-terminal",
+                    statusCode: 409
+                )
+            ),
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains("离线授权已停止") == false,
+              Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(stateStore.state?.status, .revoked)
+        XCTAssertTrue(stateStore.state?.permissions.isEmpty == true)
+        XCTAssertNil(stateStore.state?.offlineDeviceAuthorization)
+        XCTAssertTrue(actionStatus.stringValue.contains("请重新导入许可"), actionStatus.stringValue)
+    }
+
+    func testLicenseWindowReimportCancelsPendingOfflineStatusRefresh() async throws {
+        let now = ISO8601DateFormatter().date(from: "2026-07-10T12:00:00Z")!
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let deviceID = "offline-device"
+        let signatureKeyID = "offline-signing-test"
+        let authorization = try makeSignedProductOpsOfflineAuthorization(
+            signingKey: signingKey,
+            deviceID: deviceID,
+            signatureKeyID: signatureKeyID
+        )
+        let stateStore = ThreadRecordingProductOpsLicenseStateStore(state: LicenseState(
+            username: authorization.username,
+            email: authorization.email,
+            plan: authorization.plan,
+            permissions: authorization.entitlements,
+            expiresAt: authorization.expirationDate(),
+            status: .offlineActive,
+            offlineDeviceAuthorization: authorization
+        ))
+        let gate = ProductOpsWindowAsyncGate()
+        let offlineRefresher = GatedProductOpsOfflineStatusRefresher(
+            gate: gate,
+            response: authorization
+        )
+        let onlineGate = ProductOpsWindowAsyncGate()
+        let onlineValidator = GatedProductOpsLicenseOnlineValidator(
+            gate: onlineGate,
+            response: LicenseValidationResponse(
+                username: authorization.username, email: authorization.email,
+                signedLicenseToken: "test-token", plan: authorization.plan,
+                expiresAt: authorization.expirationDate(), status: .active
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                offlineDeviceAuthorizationVerifier: OfflineDeviceAuthorizationVerifier(
+                    publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString(),
+                    expectedSignatureKeyID: signatureKeyID,
+                    fingerprintProvider: StacioDeviceFingerprintProvider(fixedDeviceID: deviceID)
+                )
+            ),
+            onlineValidator: onlineValidator,
+            activationStore: InMemoryProductOpsActivationStore(),
+            offlineStatusRefresher: offlineRefresher,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let reimport = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.reimport") as? NSButton
+        )
+        let activationForm = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.activationForm")
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+        while await offlineRefresher.requestCount == 0 {
+            await Task.yield()
+        }
+        reimport.performClick(nil)
+        let key = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField)
+        let validate = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.License.validateOnline") as? NSButton)
+        key.stringValue = "new-online-test-key"
+        validate.performClick(nil)
+        while await onlineValidator.requestCount == 0 {
+            await Task.yield()
+        }
+        await gate.open()
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertFalse(activationForm.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains(L10n.ProductOps.licenseValidatingOnline))
+        XCTAssertFalse(validate.isEnabled)
+        XCTAssertFalse(refresh.isEnabled)
+        XCTAssertNil(stateStore.firstSaveWasOnMainThread)
+        // Closing must still cancel the new online request after the stale
+        // offline task finishes; it must not clear the new task handle.
+        controller.close()
+        await onlineGate.open()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertNil(stateStore.firstSaveWasOnMainThread)
+    }
+
+    func testLicenseWindowKeepsManagementActionsForPersistedActivationThatNeedsRefresh() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: "Ada",
+            email: "ada@example.com"
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: LicenseState(
+                    username: "Ada",
+                    email: "ada@example.com",
+                    plan: "professional",
+                    expiresAt: now.addingTimeInterval(86_400),
+                    status: .invalid
+                ))
+            ),
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let activationForm = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.activationForm")
+        )
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+
+        XCTAssertTrue(activationForm.isHidden)
+        XCTAssertFalse(try XCTUnwrap(refresh.superview).isHidden)
+    }
+
+    func testLicenseWindowShowsOnlineSyncResultFromManagementState() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let stateStore = InMemoryProductOpsLicenseStateStore(state: LicenseState(
+            username: claims.username,
+            email: claims.email,
+            plan: claims.plan,
+            expiresAt: claims.expiresAt,
+            status: .invalid
+        ))
+        let activationStore = InMemoryProductOpsActivationStore()
+        activationStore.record = LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: claims.username,
+            email: claims.email
+        )
+        let onlineValidator = StubProductOpsLicenseOnlineValidator(response: LicenseValidationResponse(
+            username: claims.username,
+            email: claims.email,
+            signedLicenseToken: "v1.payload.signature",
+            plan: claims.plan,
+            permissions: claims.entitlements,
+            expiresAt: claims.expiresAt,
+            offlineGraceSeconds: claims.offlineGraceSeconds,
+            status: .active
+        ))
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: stateStore,
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: onlineValidator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+        defer { controller.close() }
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated) == false,
+              Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(onlineValidator.requests.first?.licenseKey, "STACIO-PERSISTED-KEY")
+        XCTAssertEqual(stateStore.state?.status, .active)
+        XCTAssertFalse(actionStatus.isHidden)
+        XCTAssertTrue(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
+    }
+
+    func testLicenseWindowLoadsPersistedActivationOffMainThreadWhenSyncing() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "professional",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let activationStore = ThreadRecordingProductOpsActivationStore(record: LicenseActivationRecord(
+            licenseKey: "STACIO-PERSISTED-KEY",
+            username: claims.username,
+            email: claims.email
+        ))
+        let gate = ProductOpsWindowAsyncGate()
+        let validator = GatedProductOpsLicenseOnlineValidator(
+            gate: gate,
+            response: LicenseValidationResponse(
+                username: claims.username,
+                email: claims.email,
+                signedLicenseToken: "v1.payload.signature",
+                plan: claims.plan,
+                permissions: claims.entitlements,
+                expiresAt: claims.expiresAt,
+                offlineGraceSeconds: claims.offlineGraceSeconds,
+                status: .active
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(state: LicenseState(
+                    username: claims.username,
+                    email: claims.email,
+                    signedLicenseToken: "v1.payload.signature",
+                    plan: claims.plan,
+                    permissions: claims.entitlements,
+                    expiresAt: claims.expiresAt,
+                    status: .active,
+                    lastValidatedAt: now
+                )),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: validator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let refresh = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.refresh") as? NSButton
+        )
+
+        refresh.performClick(nil)
+
+        let deadline = Date().addingTimeInterval(1)
+        while activationStore.firstLoadWasOnMainThread == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(activationStore.firstLoadWasOnMainThread, false)
+        controller.close()
+        await gate.open()
+    }
+
+    func testLicenseWindowCancelsPendingOnlineValidationWhenClosed() async throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let claims = SignedLicenseClaims(
+            licenseID: "license-1",
+            productID: "stacio",
+            email: "ada@example.com",
+            username: "Ada",
+            plan: "pro",
+            entitlements: ["remote_sessions"],
+            expiresAt: now.addingTimeInterval(86_400),
+            offlineGraceSeconds: 7_200,
+            issuedAt: now
+        )
+        let activationStore = InMemoryProductOpsActivationStore()
+        let gate = ProductOpsWindowAsyncGate()
+        let validator = GatedProductOpsLicenseOnlineValidator(
+            gate: gate,
+            response: LicenseValidationResponse(
+                username: claims.username,
+                email: claims.email,
+                signedLicenseToken: "v1.payload.signature",
+                plan: claims.plan,
+                permissions: claims.entitlements,
+                expiresAt: claims.expiresAt,
+                offlineGraceSeconds: claims.offlineGraceSeconds,
+                status: .active
+            )
+        )
+        let controller = LicenseWindowController(
+            service: LicenseService(
+                store: InMemoryProductOpsLicenseStateStore(),
+                signedTokenVerifier: StubProductOpsSignedLicenseTokenVerifier(claims: claims)
+            ),
+            onlineValidator: validator,
+            activationStore: activationStore,
+            nowProvider: { now }
+        )
+        controller.showWindow(nil)
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let licenseKey = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.licenseKey") as? NSSecureTextField
+        )
+        let username = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.username") as? NSTextField
+        )
+        let email = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.email") as? NSTextField
+        )
+        let validate = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.validateOnline") as? NSButton
+        )
+        let actionStatus = try XCTUnwrap(
+            content.firstSubview(withIdentifier: "Stacio.License.actionStatus") as? NSTextField
+        )
+        licenseKey.stringValue = "STACIO-SECRET-KEY"
+        username.stringValue = claims.username
+        email.stringValue = claims.email
+
+        validate.performClick(nil)
+        while await validator.requestCount == 0 {
+            await Task.yield()
+        }
+        controller.close()
+        await gate.open()
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertNil(activationStore.record)
+        XCTAssertFalse(actionStatus.stringValue.contains(L10n.ProductOps.licenseOnlineValidated))
+    }
+}
+
+private func makeProductOpsWindowDefaults() throws -> UserDefaults {
+    let suiteName = "StacioProductOpsWindowControllerTests-\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    return defaults
+}
+
+private func makeFeedbackDiagnosticLogStoreForWindowTests() -> FeedbackDiagnosticLogStore {
+    FeedbackDiagnosticLogStore(
+        routeHashKey: Data(repeating: 0x42, count: 32),
+        environmentProvider: {
+            FeedbackDiagnosticLogEnvironment(
+                appVersion: "0.14.2",
+                build: "300",
+                osVersion: "macOS 27.0",
+                architecture: "arm64"
+            )
+        }
+    )
+}
+
+private final class StubFeedbackSubmitting: FeedbackSubmitting {
+    private var outcomes: [Result<FeedbackSubmissionResult, Error>]
+    private(set) var idempotencyKeys: [String] = []
+    private(set) var contexts: [FeedbackDiagnosticContext] = []
+    private(set) var reports: [FeedbackReport] = []
+    var onSubmission: (() -> Void)?
+
+    init(error: Error? = nil) {
+        if let error {
+            outcomes = [.failure(error)]
+        } else {
+            outcomes = [.success(FeedbackSubmissionResult(id: "feedback-1", message: "ok"))]
+        }
+    }
+
+    init(outcomes: [Result<FeedbackSubmissionResult, Error>]) {
+        self.outcomes = outcomes
+    }
+
+    func submit(report: FeedbackReport, context: FeedbackDiagnosticContext) async throws -> FeedbackSubmissionResult {
+        try await submit(report: report, context: context, idempotencyKey: "legacy-submit")
+    }
+
+    func submit(
+        report: FeedbackReport,
+        context: FeedbackDiagnosticContext,
+        idempotencyKey: String
+    ) async throws -> FeedbackSubmissionResult {
+        idempotencyKeys.append(idempotencyKey)
+        contexts.append(context)
+        reports.append(report)
+        onSubmission?()
+        guard outcomes.isEmpty == false else {
+            return FeedbackSubmissionResult(id: "feedback-1", message: "ok")
+        }
+        return try outcomes.removeFirst().get()
+    }
+}
+
+private final class RecordingFeedbackIdempotencyStore: FeedbackIdempotencyKeyStoring {
+    private(set) var keyedContexts: [FeedbackDiagnosticContext] = []
+    private(set) var clearedContexts: [FeedbackDiagnosticContext] = []
+
+    func key(for report: FeedbackReport, context: FeedbackDiagnosticContext) -> String {
+        keyedContexts.append(context)
+        return "frozen-diagnostic-key"
+    }
+
+    func clearKey(
+        for report: FeedbackReport,
+        context: FeedbackDiagnosticContext,
+        matching idempotencyKey: String
+    ) {
+        clearedContexts.append(context)
+    }
+}
+
+private actor GatedFeedbackSubmitter: FeedbackSubmitting {
+    private var idempotencyKeys: [String] = []
+    private var continuations: [CheckedContinuation<FeedbackSubmissionResult, Never>] = []
+
+    func submit(report: FeedbackReport, context: FeedbackDiagnosticContext) async throws -> FeedbackSubmissionResult {
+        try await submit(report: report, context: context, idempotencyKey: "legacy-submit")
+    }
+
+    func submit(
+        report: FeedbackReport,
+        context: FeedbackDiagnosticContext,
+        idempotencyKey: String
+    ) async throws -> FeedbackSubmissionResult {
+        idempotencyKeys.append(idempotencyKey)
+        return await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func submissionCount() -> Int {
+        idempotencyKeys.count
+    }
+
+    func finishAll() {
+        let pending = continuations
+        continuations.removeAll()
+        pending.forEach {
+            $0.resume(returning: FeedbackSubmissionResult(id: "feedback-1", message: "ok"))
+        }
+    }
+}
+
+private final class StubUpdateChecking: UpdateChecking {
+    let status: UpdateCheckStatus
+
+    init(status: UpdateCheckStatus) {
+        self.status = status
+    }
+
+    func checkForUpdates() async throws -> UpdateCheckStatus {
+        status
+    }
+}
+
+@MainActor
+private final class StubSparkleManualUpdateChecker: SparkleUpdateChecking {
+    func checkForUpdates(_ sender: Any?) {}
+
+    func checkForUpdateInformation(_ sender: Any?) {}
+}
+
+@MainActor
+private final class RecordingSparkleUpdateActions: SparkleUpdateActionHandling {
+    private(set) var downloadedUpdates: [SparkleUpdatePromptInfo] = []
+    private(set) var remindedLaterUpdates: [SparkleUpdatePromptInfo] = []
+    private(set) var skippedUpdates: [SparkleUpdatePromptInfo] = []
+
+    func downloadUpdate(_ update: SparkleUpdatePromptInfo) {
+        downloadedUpdates.append(update)
+    }
+
+    func remindLater(_ update: SparkleUpdatePromptInfo) {
+        remindedLaterUpdates.append(update)
+    }
+
+    func skip(_ update: SparkleUpdatePromptInfo) {
+        skippedUpdates.append(update)
+    }
+}
+
+private final class StubProductOpsURLOpener: ProductOpsURLOpening {
+    private(set) var openedURLs: [URL] = []
+
+    func open(_ url: URL) {
+        openedURLs.append(url)
+    }
+}
+
+private struct StubProductOpsOfflineLicenseTokenVerifier: OfflineLicenseTokenVerifying {
+    let isValid: Bool
+
+    func validate(_ token: OfflineLicenseToken) -> Bool {
+        isValid
+    }
+}
+
+private struct StubProductOpsSignedLicenseTokenVerifier: SignedLicenseTokenVerifying {
+    let claims: SignedLicenseClaims
+
+    func verifiedClaims(from token: String) throws -> SignedLicenseClaims {
+        claims
+    }
+}
+
+private final class StubProductOpsLicenseOnlineValidator: LicenseOnlineValidating {
+    let response: LicenseValidationResponse
+    private(set) var requests: [LicenseValidationRequest] = []
+
+    init(response: LicenseValidationResponse) {
+        self.response = response
+    }
+
+    func validate(_ requestBody: LicenseValidationRequest) async throws -> LicenseValidationResponse {
+        requests.append(requestBody)
+        return response
+    }
+}
+
+private final class RecordingProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    let response: OfflineDeviceAuthorization
+    private(set) var requests: [OfflineDeviceAuthorization] = []
+
+    init(response: OfflineDeviceAuthorization) {
+        self.response = response
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        requests.append(authorization)
+        return response
+    }
+}
+
+private final class FailingProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        throw error
+    }
+}
+
+private actor GatedProductOpsOfflineStatusRefresher: OfflineLicenseStatusRefreshing {
+    private let gate: ProductOpsWindowAsyncGate
+    private let response: OfflineDeviceAuthorization
+    private(set) var requestCount = 0
+
+    init(gate: ProductOpsWindowAsyncGate, response: OfflineDeviceAuthorization) {
+        self.gate = gate
+        self.response = response
+    }
+
+    func refresh(
+        authorization: OfflineDeviceAuthorization,
+        appVersion: String,
+        buildNumber: String
+    ) async throws -> OfflineDeviceAuthorization {
+        requestCount += 1
+        await gate.wait()
+        return response
+    }
+}
+
+private actor GatedProductOpsLicenseOnlineValidator: LicenseOnlineValidating {
+    private let gate: ProductOpsWindowAsyncGate
+    private let response: LicenseValidationResponse
+    private(set) var requestCount = 0
+
+    init(gate: ProductOpsWindowAsyncGate, response: LicenseValidationResponse) {
+        self.gate = gate
+        self.response = response
+    }
+
+    func validate(_ requestBody: LicenseValidationRequest) async throws -> LicenseValidationResponse {
+        requestCount += 1
+        await gate.wait()
+        return response
+    }
+}
+
+private actor ProductOpsWindowAsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard isOpen == false else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private final class InMemoryProductOpsActivationStore: LicenseActivationRecordStoring {
+    var record: LicenseActivationRecord?
+
+    func loadActivationRecord() throws -> LicenseActivationRecord? {
+        record
+    }
+
+    func saveActivationRecord(_ record: LicenseActivationRecord) throws {
+        self.record = record
+    }
+
+    func deleteActivationRecord() throws {
+        record = nil
+    }
+}
+
+private final class ThreadRecordingProductOpsActivationStore: LicenseActivationRecordStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var record: LicenseActivationRecord?
+    private var loadThreads: [Bool] = []
+    private var saveThreads: [Bool] = []
+
+    init(record: LicenseActivationRecord?) {
+        self.record = record
+    }
+
+    var firstLoadWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadThreads.first
+    }
+
+    var firstSaveWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return saveThreads.first
+    }
+
+    var currentRecord: LicenseActivationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return record
+    }
+
+    func loadActivationRecord() throws -> LicenseActivationRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        loadThreads.append(Thread.isMainThread)
+        return record
+    }
+
+    func saveActivationRecord(_ record: LicenseActivationRecord) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        saveThreads.append(Thread.isMainThread)
+        self.record = record
+    }
+
+    func deleteActivationRecord() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        record = nil
+    }
+}
+
+private final class ThreadRecordingProductOpsLicenseStateStore: LicenseStateStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: LicenseState?
+    private var saveThreads: [Bool] = []
+
+    init(state: LicenseState? = nil) {
+        self.state = state
+    }
+
+    var firstSaveWasOnMainThread: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return saveThreads.first
+    }
+
+    func load() throws -> LicenseState? {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+
+    func save(_ state: LicenseState) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        saveThreads.append(Thread.isMainThread)
+        self.state = state
+    }
+}
+
+private enum ProductOpsWindowTestError: Error {
+    case activationWriteFailed
+    case stateWriteFailed
+}
+
+private final class ThrowingProductOpsActivationStore: LicenseActivationRecordStoring {
+    private(set) var saveAttempts = 0
+
+    func loadActivationRecord() throws -> LicenseActivationRecord? {
+        nil
+    }
+
+    func saveActivationRecord(_ record: LicenseActivationRecord) throws {
+        saveAttempts += 1
+        throw ProductOpsWindowTestError.activationWriteFailed
+    }
+
+    func deleteActivationRecord() throws {}
+}
+
+private final class ThrowingProductOpsLicenseStateStore: LicenseStateStoring {
+    func load() throws -> LicenseState? {
+        nil
+    }
+
+    func save(_ state: LicenseState) throws {
+        throw ProductOpsWindowTestError.stateWriteFailed
+    }
+}
+
+private final class InMemoryProductOpsLicenseStateStore: LicenseStateStoring {
+    var state: LicenseState?
+
+    init(state: LicenseState? = nil) {
+        self.state = state
+    }
+
+    func load() throws -> LicenseState? {
+        state
+    }
+
+    func save(_ state: LicenseState) throws {
+        self.state = state
+    }
+}
+
+private func makeSignedProductOpsOfflineAuthorization(
+    signingKey: Curve25519.Signing.PrivateKey,
+    deviceID: String,
+    signatureKeyID: String
+) throws -> OfflineDeviceAuthorization {
+    let unsigned = OfflineDeviceAuthorization(
+        productID: "stacio",
+        deviceID: deviceID,
+        username: "Ada",
+        email: "ada@example.com",
+        plan: "professional",
+        entitlements: ["multi_exec", "ssh_tunnel"],
+        issuedAt: "2026-07-01T00:00:00.000Z",
+        expiresAt: "2026-08-01T00:00:00.000Z",
+        signatureKeyID: signatureKeyID,
+        signature: ""
+    )
+    let signature = try signingKey.signature(for: unsigned.canonicalSignedPayload())
+    return OfflineDeviceAuthorization(
+        productID: unsigned.productID,
+        platform: unsigned.platform,
+        deviceID: unsigned.deviceID,
+        username: unsigned.username,
+        email: unsigned.email,
+        plan: unsigned.plan,
+        entitlements: unsigned.entitlements,
+        issuedAt: unsigned.issuedAt,
+        expiresAt: unsigned.expiresAt,
+        signatureKeyID: unsigned.signatureKeyID,
+        signature: signature.base64EncodedString()
+    )
+}
+
+private extension NSView {
+    func firstSubview(withIdentifier identifier: String) -> NSView? {
+        if accessibilityIdentifier() == identifier {
+            return self
+        }
+        for subview in subviews {
+            if let match = subview.firstSubview(withIdentifier: identifier) {
+                return match
+            }
+        }
+        return nil
+    }
+}
+
+@MainActor
+private func fillValidFeedbackDraft(in controller: FeedbackWindowController) throws {
+    let content = try XCTUnwrap(controller.window?.contentView)
+    let title = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Feedback.title") as? NSTextField)
+    let descriptionScroll = try XCTUnwrap(
+        content.firstSubview(withIdentifier: "Stacio.Feedback.description") as? NSScrollView
+    )
+    let description = try XCTUnwrap(descriptionScroll.documentView as? NSTextView)
+    title.stringValue = "Connection problem"
+    description.string = "The connection did not recover."
+}
+
+@MainActor
+private func waitForFeedbackState(
+    _ expectedState: FeedbackSubmissionState,
+    in controller: FeedbackWindowController,
+    timeout: TimeInterval = 1
+) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while controller.submissionState != expectedState, Date() < deadline {
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    XCTAssertEqual(controller.submissionState, expectedState)
+}

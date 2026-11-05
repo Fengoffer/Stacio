@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 讨论 / 提问
+    url: https://github.com/Fengoffer/Stacio/discussions
+    about: 使用问题、想法讨论和经验分享请发到 Discussions
+  - name: 📖 文档
+    url: https://www.stacio.cn/
+    about: 查看官方文档和产品介绍

@@ -1,0 +1,1152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${STACIO_PACKAGE_ROOT_OVERRIDE:-$SCRIPT_ROOT_DIR}"
+SOURCE_PROVENANCE_JSON="$(python3 "$SCRIPT_ROOT_DIR/scripts/verify-source-checkout.py" \
+  --root "$ROOT_DIR" --expected-root "$HOME/Documents/Stacio")"
+# 资源清单一致性：package-app.sh 的拷贝片段必须由 config/bundle-resources.json 生成。
+# 不一致时立刻失败，避免"改了清单却忘了重新生成脚本"。
+python3 "$SCRIPT_ROOT_DIR/scripts/bundle_resources.py" \
+  --manifest "$ROOT_DIR/config/bundle-resources.json" \
+  --check-package-block "$SCRIPT_ROOT_DIR/scripts/package-app.sh"
+
+APP_NAME="Stacio"
+BUNDLE_ID="com.stacio.Stacio"
+# 版本号唯一来源：config/release.json（可用 STACIO_VERSION 覆盖）。
+# 不要再把版本号写死在这里——历史上这里默认 0.14.4，导致打出来的包版本号漂移。
+RELEASE_CONFIG="$ROOT_DIR/config/release.json"
+if [[ -f "$RELEASE_CONFIG" ]]; then
+  CONFIG_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$RELEASE_CONFIG")"
+else
+  CONFIG_VERSION=""
+fi
+VERSION="${STACIO_VERSION:-$CONFIG_VERSION}"
+BUILD_NUMBER="${STACIO_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
+SWIFT_BUILD_TRIPLE="${STACIO_SWIFT_BUILD_TRIPLE:-}"
+SWIFT_BUILD_SYSTEM="${STACIO_SWIFT_BUILD_SYSTEM:-}"
+SWIFT_SCRATCH_PATH="${STACIO_SWIFT_SCRATCH_PATH:-}"
+CARGO_BUILD_TARGET="${STACIO_CARGO_BUILD_TARGET:-}"
+OUTPUT_DIR="${STACIO_OUTPUT_DIR:-$ROOT_DIR/dist}"
+CODESIGN_IDENTITY="${STACIO_CODESIGN_IDENTITY:--}"
+CODESIGN_ARGS=(--force)
+CODESIGN_APP_ARGS=(--force)
+if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+  CODESIGN_ARGS+=(--options runtime --timestamp)
+  CODESIGN_APP_ARGS+=(--options runtime --timestamp)
+fi
+SPARKLE_CODESIGN_ARGS=("${CODESIGN_ARGS[@]}" --preserve-metadata=identifier,entitlements,requirements)
+LICENSE_TRUST_ANCHORS_PATH="${STACIO_LICENSE_TRUST_ANCHORS_PATH:-$ROOT_DIR/config/license-trust-anchors.json}"
+if [[ "$LICENSE_TRUST_ANCHORS_PATH" != "$ROOT_DIR/config/license-trust-anchors.json" \
+      && "${STACIO_ALLOW_CUSTOM_LICENSE_TRUST_ANCHORS:-0}" != "1" ]]; then
+  echo "Custom License trust-anchor files are disabled for packaging." >&2
+  echo "Use the repository config/license-trust-anchors.json for releases, or set STACIO_ALLOW_CUSTOM_LICENSE_TRUST_ANCHORS=1 only for an explicit test build." >&2
+  exit 1
+fi
+
+read_license_trust_anchor() {
+  local path="$1"
+  shift
+  [[ -f "$path" ]] || return 0
+  python3 - "$path" "$@" <<'PY'
+import json
+import sys
+
+path, *keys = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+for key in keys:
+    value = value[key]
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+TRUST_PRODUCT_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" productID || true)"
+TRUST_API_BASE_URL="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" apiBaseURL || true)"
+TRUST_ONLINE_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" onlineAuthorization publicKeyBase64 || true)"
+TRUST_ONLINE_SIGNATURE_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" onlineAuthorization signatureKeyID || true)"
+TRUST_OFFLINE_EXCHANGE_URL="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense exchangeURL || true)"
+TRUST_OFFLINE_REQUEST_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense request keyID || true)"
+TRUST_OFFLINE_EXCHANGE_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense request publicKeyBase64 || true)"
+TRUST_OFFLINE_SIGNATURE_KEY_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense authorization signatureKeyID || true)"
+TRUST_OFFLINE_AUTHORIZATION_PUBLIC_KEY="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" offlineLicense authorization publicKeyBase64 || true)"
+TRUST_STORAGE_CONTRACT_ID="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" storage contractID || true)"
+TRUST_STORAGE_SCHEMA_VERSION="$(read_license_trust_anchor "$LICENSE_TRUST_ANCHORS_PATH" storage schemaVersion || true)"
+
+PRODUCT_OPS_PRODUCT_ID="${STACIO_PRODUCT_OPS_PRODUCT_ID:-${TRUST_PRODUCT_ID:-stacio}}"
+PRODUCT_OPS_API_BASE_URL="${STACIO_PRODUCT_OPS_API_BASE_URL:-${TRUST_API_BASE_URL:-}}"
+PRODUCT_OPS_UPDATE_CHANNEL="${STACIO_PRODUCT_OPS_UPDATE_CHANNEL:-stable}"
+PRODUCT_OPS_BETA_UPDATES_ENABLED="${STACIO_PRODUCT_OPS_BETA_UPDATES_ENABLED:-0}"
+FEEDBACK_PRODUCT_API_KEY="${STACIO_FEEDBACK_PRODUCT_API_KEY:-}"
+SPARKLE_STABLE_APPCAST_URL="${STACIO_SPARKLE_STABLE_APPCAST_URL:-}"
+SPARKLE_BETA_APPCAST_URL="${STACIO_SPARKLE_BETA_APPCAST_URL:-}"
+SPARKLE_UPDATE_ARCHITECTURE="${STACIO_SPARKLE_ARCHITECTURE:-}"
+SPARKLE_PUBLIC_ED_KEY="${STACIO_SPARKLE_PUBLIC_ED_KEY:-}"
+LICENSE_PUBLIC_ED25519_KEY="${STACIO_LICENSE_PUBLIC_ED25519_KEY:-${TRUST_ONLINE_PUBLIC_KEY:-}}"
+ONLINE_LICENSE_SIGNATURE_KEY_ID="${STACIO_ONLINE_LICENSE_SIGNATURE_KEY_ID:-${TRUST_ONLINE_SIGNATURE_KEY_ID:-}}"
+OFFLINE_LICENSE_EXCHANGE_URL="${STACIO_OFFLINE_LICENSE_EXCHANGE_URL:-${TRUST_OFFLINE_EXCHANGE_URL:-}}"
+OFFLINE_EXCHANGE_PUBLIC_KEY="${STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY:-${TRUST_OFFLINE_EXCHANGE_PUBLIC_KEY:-}}"
+OFFLINE_REQUEST_KEY_ID="${STACIO_OFFLINE_REQUEST_KEY_ID:-${TRUST_OFFLINE_REQUEST_KEY_ID:-}}"
+OFFLINE_LICENSE_SIGNATURE_KEY_ID="${STACIO_OFFLINE_SIGNATURE_KEY_ID:-${TRUST_OFFLINE_SIGNATURE_KEY_ID:-}}"
+OFFLINE_LICENSE_PUBLIC_KEY="${STACIO_OFFLINE_LICENSE_PUBLIC_KEY:-${TRUST_OFFLINE_AUTHORIZATION_PUBLIC_KEY:-}}"
+LICENSE_STORAGE_CONTRACT_ID="${STACIO_LICENSE_STORAGE_CONTRACT_ID:-${TRUST_STORAGE_CONTRACT_ID:-stacio-license-vault-v1}}"
+LICENSE_STORAGE_SCHEMA_VERSION="${STACIO_LICENSE_STORAGE_SCHEMA_VERSION:-${TRUST_STORAGE_SCHEMA_VERSION:-1}}"
+ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG="${STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG:-0}"
+APP_DIR="$OUTPUT_DIR/$APP_NAME.app"
+LOCK_DIR="${STACIO_PACKAGE_LOCK_DIR:-$OUTPUT_DIR/.package-app.lock}"
+CONTENTS_DIR="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS_DIR/MacOS"
+FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
+ADAPTERS_DIR="$CONTENTS_DIR/Adapters"
+HELPERS_DIR="$CONTENTS_DIR/Helpers"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+RUNTIME_CATALOG_SOURCE="${STACIO_RUNTIME_CATALOG_PATH:-$ROOT_DIR/Stacio/Resources/RuntimeCatalog}"
+SWIFTTERM_RESOURCE_BUNDLE_NAME="SwiftTerm_SwiftTerm.bundle"
+SWIFTTERM_RESOURCE_BUNDLE_OUTPUT="$RESOURCES_DIR/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+SWIFTTERM_CHECKOUT_PATH="${STACIO_SWIFTTERM_CHECKOUT_PATH:-$ROOT_DIR/Vendor/SwiftTerm}"
+SWIFTTERM_RESOURCE_PATCHER="$ROOT_DIR/scripts/patch-swiftterm-macos-resources.sh"
+PLIST_PATH="$CONTENTS_DIR/Info.plist"
+# Keep the legacy ICNS renditions in the packaged app. Icon Composer's
+# ic12-only output is ignored by macOS versions before 26, which otherwise
+# leaves the Dock/Finder icon blank. The legacy file still renders normally on
+# current systems and contains ic07–ic10 PNG renditions.
+APP_ICON_SOURCE="$ROOT_DIR/logo/icon-legacy.icns"
+ABOUT_RESOURCES_SOURCE="$ROOT_DIR/Stacio/Resources/About"
+LICENSE_CERTIFICATE_SOURCE="$ROOT_DIR/Stacio/Resources/LicenseCertificate"
+GITHUB_ICON_SOURCE="$ROOT_DIR/Stacio/Resources/github.svg"
+GITEE_ICON_SOURCE="$ROOT_DIR/Stacio/Resources/gitee.svg"
+SESSION_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/SessionIcons"
+IMPORT_SOURCE_ICONS_SOURCE="$ROOT_DIR/Stacio/Resources/ImportSourceIcons"
+LOCAL_AGENT_FONT_SOURCE="$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf"
+LOCAL_AGENT_BOLD_FONT_SOURCE="$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Bold.ttf"
+LOCAL_AGENT_FONT_LICENSE_SOURCE="$ROOT_DIR/Stacio/Resources/Fonts/LICENSE.txt"
+HISTORY_BRAND_FONT_SOURCE="$ROOT_DIR/Stacio/Resources/Fonts/lack-regular-2.otf"
+STACIO_LOGO_SOURCE="$ROOT_DIR/Stacio/Resources/stacio-logo.png"
+MONACO_VS_SOURCE="${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}"
+VNC_ADAPTER_PRODUCT="StacioVNCAdapter"
+CLI_PRODUCT="StacioCLI"
+CLI_HELPER_NAME="stacio"
+PACKAGE_TMP_DIR=""
+PACKAGE_LOCK_ACQUIRED=0
+
+cleanup_tmp() {
+  if [[ -n "$PACKAGE_TMP_DIR" ]]; then
+    rm -rf "$PACKAGE_TMP_DIR"
+  fi
+  if [[ "$PACKAGE_LOCK_ACQUIRED" == "1" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
+}
+trap cleanup_tmp EXIT
+
+validate_runtime_catalog_source() {
+  python3 - "$RUNTIME_CATALOG_SOURCE" "$VERSION" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+catalog_dir, app_version = sys.argv[1:]
+manifest_path = os.path.join(catalog_dir, "runtime-catalog-manifest-v1.json")
+required = {
+    "provider.json",
+    "coding-plan.json",
+    "local-agent.json",
+    "plan-agent-compatibility.json",
+    "website-action.json",
+    "provider-pricing.json",
+    "stacio-tool.json",
+}
+
+try:
+    with open(manifest_path, "r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+except (OSError, ValueError) as error:
+    raise SystemExit(f"Runtime Catalog manifest is unavailable or invalid: {error}")
+
+def version(value):
+    core = value.split("-", 1)[0]
+    parts = core.split(".")
+    if not 1 <= len(parts) <= 4 or any(not part.isdigit() for part in parts):
+        raise SystemExit(f"Runtime Catalog contains an invalid app version: {value}")
+    return tuple(int(part) for part in parts) + (0,) * (4 - len(parts))
+
+compatibility = manifest.get("appCompatibilityRange") or {}
+minimum = compatibility.get("minimum", "")
+maximum = compatibility.get("maximum", "")
+candidate = version(app_version)
+if not version(minimum) <= candidate <= version(maximum):
+    raise SystemExit(
+        f"Runtime Catalog does not support Stacio {app_version}: expected {minimum}...{maximum}"
+    )
+
+resources = manifest.get("resources")
+if not isinstance(resources, list):
+    raise SystemExit("Runtime Catalog manifest resources must be an array.")
+paths = [entry.get("relativePath") for entry in resources if isinstance(entry, dict)]
+if len(paths) != len(resources) or set(paths) != required or len(paths) != len(set(paths)):
+    raise SystemExit("Runtime Catalog manifest must declare exactly the seven required resources.")
+
+for entry in resources:
+    relative_path = entry["relativePath"]
+    if os.path.basename(relative_path) != relative_path:
+        raise SystemExit(f"Runtime Catalog resource path must be a file name: {relative_path}")
+    resource_path = os.path.join(catalog_dir, relative_path)
+    try:
+        with open(resource_path, "rb") as stream:
+            digest = hashlib.sha256(stream.read()).hexdigest()
+    except OSError as error:
+        raise SystemExit(f"Runtime Catalog resource is unavailable: {relative_path}: {error}")
+    if digest != entry.get("sha256"):
+        raise SystemExit(f"Runtime Catalog resource hash mismatch: {relative_path}")
+PY
+}
+
+acquire_package_lock() {
+  if [[ "${STACIO_SKIP_PACKAGE_LOCK:-0}" == "1" ]]; then
+    return
+  fi
+
+  mkdir -p "$OUTPUT_DIR"
+  local timeout_seconds="${STACIO_PACKAGE_LOCK_TIMEOUT_SECONDS:-120}"
+  local waited_seconds=0
+
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    local holder_pid=""
+    if [[ -f "$LOCK_DIR/pid" ]]; then
+      holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    fi
+    if [[ "$holder_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    if (( waited_seconds >= timeout_seconds )); then
+      echo "Another Stacio package-app.sh appears to be running for $OUTPUT_DIR." >&2
+      echo "Lock: $LOCK_DIR" >&2
+      echo "Set STACIO_PACKAGE_LOCK_TIMEOUT_SECONDS to wait longer, or STACIO_SKIP_PACKAGE_LOCK=1 to bypass intentionally." >&2
+      exit 1
+    fi
+    sleep 1
+    waited_seconds=$((waited_seconds + 1))
+  done
+
+  PACKAGE_LOCK_ACQUIRED=1
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+}
+
+source_snapshot() {
+  local paths=()
+  local candidate
+  for candidate in \
+    "$ROOT_DIR/Package.swift" \
+    "$ROOT_DIR/Package.resolved" \
+    "$ROOT_DIR/Vendor/SwiftTerm" \
+    "$ROOT_DIR/Stacio" \
+    "$ROOT_DIR/StacioAdapters" \
+    "$ROOT_DIR/StacioAgentBridge" \
+    "$ROOT_DIR/StacioCLI" \
+    "$ROOT_DIR/StacioExecutable" \
+    "$LICENSE_TRUST_ANCHORS_PATH" \
+    "$ROOT_DIR/StacioCore/Cargo.toml" \
+    "$ROOT_DIR/StacioCore/Cargo.lock" \
+    "$ROOT_DIR/StacioCore/migrations" \
+    "$ROOT_DIR/StacioCore/src" \
+    "$ROOT_DIR/StacioCore/uniffi-bindgen-swift.rs" \
+    "$APP_ICON_SOURCE" \
+    "$GITHUB_ICON_SOURCE" \
+    "$GITEE_ICON_SOURCE" \
+    "$SESSION_ICONS_SOURCE" \
+    "$IMPORT_SOURCE_ICONS_SOURCE" \
+    "$ABOUT_RESOURCES_SOURCE" \
+    "$MONACO_VS_SOURCE" \
+    "$ROOT_DIR/scripts/package-app.sh"
+  do
+    if [[ -e "$candidate" ]]; then
+      paths+=("$candidate")
+    fi
+  done
+
+  if (( ${#paths[@]} == 0 )); then
+    printf 'empty\n'
+    return
+  fi
+
+  find "${paths[@]}" -type f -print0 \
+    | xargs -0 stat -f '%m %z %N' \
+    | LC_ALL=C sort \
+    | shasum \
+    | awk '{print $1}'
+}
+
+resolve_build_number() {
+  if [[ -n "$BUILD_NUMBER" ]]; then
+    return
+  fi
+
+  local shallow_state
+  shallow_state="$(git -C "$ROOT_DIR" rev-parse --is-shallow-repository 2>/dev/null || printf 'unknown')"
+  if [[ "$shallow_state" == "true" ]]; then
+    echo "STACIO_BUILD_NUMBER or GITHUB_RUN_NUMBER is required for a shallow checkout." >&2
+    exit 1
+  fi
+
+  BUILD_NUMBER="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || true)"
+  if [[ -z "$BUILD_NUMBER" ]]; then
+    echo "Unable to derive STACIO_BUILD_NUMBER; set STACIO_BUILD_NUMBER explicitly." >&2
+    exit 1
+  fi
+}
+
+check_prebuilt_artifact_freshness() {
+  local label="$1"
+  local artifact="$2"
+  shift 2
+
+  python3 - "$label" "$artifact" "$@" <<'PY'
+import os
+import sys
+
+label, artifact, *roots = sys.argv[1:]
+excluded = {".git", ".build", ".swiftpm", "Resources", "dist", "node_modules", "target", "后台", "官网"}
+newest_path = None
+newest_ns = -1
+
+def consider(path):
+    global newest_path, newest_ns
+    try:
+        modified = os.stat(path).st_mtime_ns
+    except OSError:
+        return
+    if modified > newest_ns:
+        newest_path = path
+        newest_ns = modified
+
+for root in roots:
+    if os.path.isfile(root):
+        consider(root)
+        continue
+    if not os.path.isdir(root):
+        continue
+    for current, directories, files in os.walk(root):
+        directories[:] = [name for name in directories if name not in excluded]
+        for filename in files:
+            consider(os.path.join(current, filename))
+
+if newest_path is None:
+    raise SystemExit(f"No source inputs found for {label} freshness verification.")
+try:
+    artifact_ns = os.stat(artifact).st_mtime_ns
+except OSError:
+    raise SystemExit(f"Prebuilt {label} is missing: {artifact}")
+if artifact_ns <= newest_ns:
+    raise SystemExit(f"Prebuilt {label} is older than source input: {newest_path}")
+PY
+}
+
+wait_for_source_quiescence() {
+  if [[ "${STACIO_SKIP_SOURCE_QUIESCENCE:-0}" == "1" ]]; then
+    return
+  fi
+
+  local quiet_seconds="${STACIO_SOURCE_QUIET_SECONDS:-2}"
+  local timeout_seconds="${STACIO_SOURCE_QUIET_TIMEOUT_SECONDS:-30}"
+  local started_at
+  started_at="$(date +%s)"
+
+  while true; do
+    local before after elapsed
+    before="$(source_snapshot)"
+    sleep "$quiet_seconds"
+    after="$(source_snapshot)"
+    if [[ "$before" == "$after" ]]; then
+      return
+    fi
+
+    elapsed=$(($(date +%s) - started_at))
+    if (( elapsed >= timeout_seconds )); then
+    echo "Stacio source files are still changing; wait for concurrent edits to finish before packaging." >&2
+      echo "Set STACIO_SKIP_SOURCE_QUIESCENCE=1 to bypass this guard intentionally." >&2
+      exit 1
+    fi
+    echo "Waiting for Stacio source files to stop changing before packaging..." >&2
+  done
+}
+
+acquire_package_lock
+
+resolve_build_number
+
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "0" && "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
+  echo "STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG must be 0 or 1." >&2
+  exit 1
+fi
+
+if [[ -z "${VERSION//[[:space:]]/}" ]]; then
+  echo "STACIO_VERSION must not be empty." >&2
+  exit 1
+fi
+
+validate_runtime_catalog_source
+
+if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "STACIO_BUILD_NUMBER must be a positive integer." >&2
+  exit 1
+fi
+
+if [[ -n "${STACIO_PREVIOUS_BUILD_NUMBER:-}" ]]; then
+  if [[ ! "$STACIO_PREVIOUS_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STACIO_PREVIOUS_BUILD_NUMBER must be a positive integer." >&2
+    exit 1
+  fi
+  if (( BUILD_NUMBER <= STACIO_PREVIOUS_BUILD_NUMBER )); then
+    echo "STACIO_BUILD_NUMBER must be greater than STACIO_PREVIOUS_BUILD_NUMBER." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$SWIFT_BUILD_TRIPLE" && -z "$CARGO_BUILD_TARGET" ]] \
+  || [[ -z "$SWIFT_BUILD_TRIPLE" && -n "$CARGO_BUILD_TARGET" ]]; then
+  echo "STACIO_SWIFT_BUILD_TRIPLE and STACIO_CARGO_BUILD_TARGET must be set together." >&2
+  exit 1
+fi
+
+EXPECTED_NATIVE_ARCH=""
+SWIFT_BUILD_TARGET_ARGS=()
+if [[ "${STACIO_SWIFT_USE_RESOLVED_CACHE:-0}" == "1" ]]; then
+  SWIFT_BUILD_TARGET_ARGS+=(--skip-update --disable-automatic-resolution)
+fi
+if [[ -n "$SWIFT_BUILD_SYSTEM" ]]; then
+  case "$SWIFT_BUILD_SYSTEM" in
+    native|xcode) SWIFT_BUILD_TARGET_ARGS+=(--build-system "$SWIFT_BUILD_SYSTEM") ;;
+    *) echo "STACIO_SWIFT_BUILD_SYSTEM must be native or xcode." >&2; exit 1 ;;
+  esac
+fi
+if [[ -n "$SWIFT_SCRATCH_PATH" ]]; then
+  SWIFT_BUILD_TARGET_ARGS+=(--scratch-path "$SWIFT_SCRATCH_PATH")
+fi
+CARGO_BUILD_TARGET_ARGS=()
+CORE_TARGET_DIR="$ROOT_DIR/StacioCore/target"
+CORE_LINK_LIBRARY_DIR="$CORE_TARGET_DIR/debug"
+CORE_DYLIB_DEFAULT="$CORE_TARGET_DIR/release/libstacio_core.dylib"
+CORE_LOAD_PATH_DEFAULT="$CORE_TARGET_DIR/debug/deps/libstacio_core.dylib"
+if [[ -n "$SWIFT_BUILD_TRIPLE" ]]; then
+  EXPECTED_NATIVE_ARCH="${SWIFT_BUILD_TRIPLE%%-*}"
+  case "$EXPECTED_NATIVE_ARCH:$CARGO_BUILD_TARGET" in
+    arm64:aarch64-apple-darwin|x86_64:x86_64-apple-darwin)
+      ;;
+    *)
+      echo "Unsupported Stacio cross-build target pair: $SWIFT_BUILD_TRIPLE / $CARGO_BUILD_TARGET" >&2
+      exit 1
+      ;;
+  esac
+  SWIFT_BUILD_TARGET_ARGS+=(--triple "$SWIFT_BUILD_TRIPLE")
+  CARGO_BUILD_TARGET_ARGS=(--target "$CARGO_BUILD_TARGET")
+  CORE_TARGET_DIR="$CORE_TARGET_DIR/$CARGO_BUILD_TARGET"
+  CORE_LINK_LIBRARY_DIR="$CORE_TARGET_DIR/release"
+  CORE_DYLIB_DEFAULT="$CORE_TARGET_DIR/release/libstacio_core.dylib"
+  CORE_LOAD_PATH_DEFAULT="$CORE_TARGET_DIR/release/deps/libstacio_core.dylib"
+fi
+
+if [[ -z "$SPARKLE_UPDATE_ARCHITECTURE" ]]; then
+  SPARKLE_UPDATE_ARCHITECTURE="${EXPECTED_NATIVE_ARCH:-$(uname -m)}"
+fi
+case "$SPARKLE_UPDATE_ARCHITECTURE" in
+  arm64|x86_64)
+    ;;
+  *)
+    echo "STACIO_SPARKLE_ARCHITECTURE must be arm64 or x86_64: $SPARKLE_UPDATE_ARCHITECTURE" >&2
+    exit 1
+    ;;
+esac
+if [[ -z "$SPARKLE_STABLE_APPCAST_URL" ]]; then
+  SPARKLE_STABLE_APPCAST_URL="https://ops.stacio.cn/updates/stacio/stable/$SPARKLE_UPDATE_ARCHITECTURE/appcast.xml"
+fi
+if [[ -z "$SPARKLE_BETA_APPCAST_URL" ]]; then
+  SPARKLE_BETA_APPCAST_URL="https://ops.stacio.cn/updates/stacio/beta/$SPARKLE_UPDATE_ARCHITECTURE/appcast.xml"
+fi
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
+  for appcast_url in "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL"; do
+    if [[ "$appcast_url" != */"$SPARKLE_UPDATE_ARCHITECTURE"/appcast.xml ]]; then
+      echo "Sparkle appcast URLs must target $SPARKLE_UPDATE_ARCHITECTURE packages: $appcast_url" >&2
+      exit 1
+    fi
+  done
+fi
+
+swift_release_build() {
+  if (( ${#SWIFT_BUILD_TARGET_ARGS[@]} == 0 )); then
+    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+      swift build -c release --sdk "$MACOS_SDK_PATH" "${SWIFT_SDK_LINK_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
+  else
+    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+      swift build -c release --sdk "$MACOS_SDK_PATH" "${SWIFT_SDK_LINK_ARGS[@]}" "${SWIFT_BUILD_TARGET_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
+  fi
+}
+
+verify_expected_native_architecture() {
+  local label="$1"
+  local binary_path="$2"
+  [[ -n "$EXPECTED_NATIVE_ARCH" ]] || return 0
+
+  local architectures
+  architectures="$(lipo -archs "$binary_path" 2>/dev/null || true)"
+  if ! tr ' ' '\n' <<<"$architectures" | grep -Fxq "$EXPECTED_NATIVE_ARCH"; then
+    echo "$label does not contain expected $EXPECTED_NATIVE_ARCH architecture: ${architectures:-<unreadable>}" >&2
+    exit 1
+  fi
+}
+
+validate_ed25519_public_key() {
+  local name="$1"
+  local value="$2"
+  local format="$3"
+  python3 - "$name" "$value" "$format" <<'PY'
+import base64
+import binascii
+import sys
+
+name, configured, key_format = sys.argv[1:4]
+spki_prefix = bytes([
+    0x30, 0x2A,
+    0x30, 0x05,
+    0x06, 0x03, 0x2B, 0x65, 0x70,
+    0x03, 0x21, 0x00,
+])
+
+def decode_base64(value):
+    compact = "".join(value.split())
+    return base64.b64decode(compact, validate=True)
+
+def decode_pem(value):
+    body = value.replace("-----BEGIN PUBLIC KEY-----", "").replace("-----END PUBLIC KEY-----", "")
+    return decode_base64(body)
+
+def is_license_key(value):
+    try:
+        if "-----BEGIN PUBLIC KEY-----" in value:
+            decoded = decode_pem(value)
+            return len(decoded) == 44 and decoded.startswith(spki_prefix)
+        decoded = decode_base64(value)
+        if len(decoded) == 32:
+            return True
+        if len(decoded) == 44 and decoded.startswith(spki_prefix):
+            return True
+        try:
+            decoded_text = decoded.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if "-----BEGIN PUBLIC KEY-----" not in decoded_text:
+            return False
+        pem_decoded = decode_pem(decoded_text)
+        return len(pem_decoded) == 44 and pem_decoded.startswith(spki_prefix)
+    except (ValueError, binascii.Error):
+        return False
+
+try:
+    valid = (
+        len(decode_base64(configured)) == 32
+        if key_format == "sparkle"
+        else is_license_key(configured)
+    )
+except (ValueError, binascii.Error):
+    valid = False
+
+if not valid:
+    raise SystemExit(f"{name} must contain a valid Ed25519 public key.")
+PY
+}
+
+validate_x25519_public_key() {
+  local name="$1"
+  local configured="$2"
+  python3 - "$name" "$configured" <<'PY'
+import base64
+import binascii
+import sys
+
+name, configured = sys.argv[1:]
+try:
+    key = base64.b64decode("".join(configured.split()), validate=True)
+except (ValueError, binascii.Error):
+    raise SystemExit(f"{name} must contain a base64-encoded raw X25519 public key.")
+if len(key) != 32:
+    raise SystemExit(f"{name} must contain a 32-byte raw X25519 public key.")
+PY
+}
+
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
+  missing_product_ops_config=()
+  [[ -n "${PRODUCT_OPS_API_BASE_URL//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_PRODUCT_OPS_API_BASE_URL")
+  [[ -n "${FEEDBACK_PRODUCT_API_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_FEEDBACK_PRODUCT_API_KEY")
+  [[ -n "${SPARKLE_PUBLIC_ED_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_SPARKLE_PUBLIC_ED_KEY")
+  [[ -n "${LICENSE_PUBLIC_ED25519_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_LICENSE_PUBLIC_ED25519_KEY")
+  [[ -n "${ONLINE_LICENSE_SIGNATURE_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_ONLINE_LICENSE_SIGNATURE_KEY_ID")
+  [[ -n "${OFFLINE_LICENSE_PUBLIC_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_LICENSE_PUBLIC_KEY")
+  [[ -n "${OFFLINE_LICENSE_EXCHANGE_URL//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_LICENSE_EXCHANGE_URL")
+  [[ -n "${OFFLINE_EXCHANGE_PUBLIC_KEY//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY")
+  [[ -n "${OFFLINE_REQUEST_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_REQUEST_KEY_ID")
+  [[ -n "${OFFLINE_LICENSE_SIGNATURE_KEY_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_OFFLINE_SIGNATURE_KEY_ID")
+  [[ -n "${LICENSE_STORAGE_CONTRACT_ID//[[:space:]]/}" ]] || missing_product_ops_config+=("STACIO_LICENSE_STORAGE_CONTRACT_ID")
+  [[ "$LICENSE_STORAGE_SCHEMA_VERSION" =~ ^[1-9][0-9]*$ ]] || missing_product_ops_config+=("STACIO_LICENSE_STORAGE_SCHEMA_VERSION")
+  if (( ${#missing_product_ops_config[@]} > 0 )); then
+    echo "Required Product Ops packaging configuration is missing:" >&2
+    printf '  %s\n' "${missing_product_ops_config[@]}" >&2
+    echo "Set STACIO_ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG=1 only for a local development smoke build." >&2
+    exit 1
+  fi
+  validate_ed25519_public_key "STACIO_SPARKLE_PUBLIC_ED_KEY" "$SPARKLE_PUBLIC_ED_KEY" sparkle
+  validate_ed25519_public_key "STACIO_LICENSE_PUBLIC_ED25519_KEY" "$LICENSE_PUBLIC_ED25519_KEY" license
+  validate_ed25519_public_key "STACIO_OFFLINE_LICENSE_PUBLIC_KEY" "$OFFLINE_LICENSE_PUBLIC_KEY" license
+  validate_x25519_public_key "STACIO_OFFLINE_EXCHANGE_PUBLIC_KEY" "$OFFLINE_EXCHANGE_PUBLIC_KEY"
+fi
+
+# Keep the Rust cdylib and Swift executable on the same deployment target.
+# Apple ld 27 rejects a cdylib emitted with Rust's default macOS 11 target
+# when it is linked into a macOS 14 application (mis-aligned LINKEDIT string
+# pool). The Swift package already declares macOS 14 as its minimum.
+case "${MACOSX_DEPLOYMENT_TARGET:-14.0}" in
+  14|14.0|14.0.0) ;;
+  *)
+    echo "MACOSX_DEPLOYMENT_TARGET must be 14.0 for all Stacio binaries (received: $MACOSX_DEPLOYMENT_TARGET)." >&2
+    exit 1
+    ;;
+esac
+export MACOSX_DEPLOYMENT_TARGET=14.0
+# Swift's Clang-linker path can pass --sysroot without preserving the SDK
+# version: the main executable then advertises SDK 14 and AppKit renders its
+# older controls. Keep the deployment target and linked SDK explicit.
+MACOS_SDK_PATH="${STACIO_MACOS_SDK_PATH:-$(xcrun --sdk macosx --show-sdk-path)}"
+MACOS_SDK_VERSION="$(python3 "$SCRIPT_ROOT_DIR/scripts/verify-macos-sdk.py" sdk-version "$MACOS_SDK_PATH")"
+SWIFT_SDK_LINK_ARGS=(-Xlinker -platform_version -Xlinker macos -Xlinker "$MACOSX_DEPLOYMENT_TARGET" -Xlinker "$MACOS_SDK_VERSION")
+
+if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
+  wait_for_source_quiescence
+  if [[ ! -f "$SWIFTTERM_CHECKOUT_PATH/Sources/SwiftTerm/Apple/Metal/MetalTerminalRenderer.swift" ]]; then
+    swift package resolve --package-path "$ROOT_DIR"
+  fi
+  "$SWIFTTERM_RESOURCE_PATCHER" "$SWIFTTERM_CHECKOUT_PATH"
+  if (( ${#CARGO_BUILD_TARGET_ARGS[@]} == 0 )); then
+    cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
+  else
+    cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release "${CARGO_BUILD_TARGET_ARGS[@]}"
+  fi
+  swift_release_build --product "$APP_NAME"
+  swift_release_build --product "$CLI_PRODUCT"
+  swift_release_build --product "$VNC_ADAPTER_PRODUCT"
+fi
+
+SWIFT_BIN_PATH="${STACIO_SWIFT_BIN_PATH:-$(swift_release_build --show-bin-path)}"
+EXECUTABLE_SOURCE="$SWIFT_BIN_PATH/$APP_NAME"
+CLI_SOURCE="${STACIO_CLI_PATH:-$SWIFT_BIN_PATH/$CLI_PRODUCT}"
+VNC_ADAPTER_SOURCE="${STACIO_VNC_ADAPTER_PATH:-$SWIFT_BIN_PATH/$VNC_ADAPTER_PRODUCT}"
+SWIFTTERM_RESOURCE_BUNDLE_SOURCE="${STACIO_SWIFTTERM_RESOURCE_BUNDLE_PATH:-$SWIFT_BIN_PATH/$SWIFTTERM_RESOURCE_BUNDLE_NAME}"
+CORE_DYLIB_SOURCE="${STACIO_CORE_DYLIB_PATH:-$CORE_DYLIB_DEFAULT}"
+CORE_LOAD_PATH="${STACIO_CORE_LOAD_PATH:-$CORE_LOAD_PATH_DEFAULT}"
+SPARKLE_FRAMEWORK_SOURCE="${STACIO_SPARKLE_FRAMEWORK_PATH:-$SWIFT_BIN_PATH/Sparkle.framework}"
+
+if [[ ! -x "$EXECUTABLE_SOURCE" ]]; then
+  echo "Stacio executable not found or not executable: $EXECUTABLE_SOURCE" >&2
+  exit 1
+fi
+
+# This check also applies to prebuilt inputs; freshness/signing checks cannot
+# detect a binary linked with the wrong SDK compatibility version.
+python3 "$SCRIPT_ROOT_DIR/scripts/verify-macos-sdk.py" verify "$EXECUTABLE_SOURCE" "$MACOS_SDK_VERSION"
+
+if [[ ! -x "$CLI_SOURCE" ]]; then
+  echo "Stacio CLI helper not found or not executable: $CLI_SOURCE" >&2
+  exit 1
+fi
+
+if [[ ! -f "$CORE_DYLIB_SOURCE" ]]; then
+  echo "Stacio Core dylib not found: $CORE_DYLIB_SOURCE" >&2
+  exit 1
+fi
+
+if [[ ! -x "$VNC_ADAPTER_SOURCE" ]]; then
+  echo "Stacio VNC adapter not found or not executable: $VNC_ADAPTER_SOURCE" >&2
+  exit 1
+fi
+
+# A valid main executable does not establish compatibility of its bundled
+# helpers or Rust library, especially when packaging prebuilt inputs.
+python3 "$SCRIPT_ROOT_DIR/scripts/verify-macos-sdk.py" verify-deployment \
+  "$CORE_DYLIB_SOURCE" "$CLI_SOURCE" "$VNC_ADAPTER_SOURCE"
+
+# SwiftPM's Xcode build plugin can place the SwiftTerm resource bundle in the
+# target-specific .build directory instead of the bin path returned by
+# `swift build --show-bin-path`. Resolve that layout before packaging so a
+# valid release build is not rejected for a missing copied resource.
+if [[ ! -f "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" ]]; then
+  swiftterm_bundle_candidates=()
+  if [[ -n "$SWIFT_BUILD_TRIPLE" ]]; then
+    swiftterm_bundle_candidates+=(
+      "$ROOT_DIR/.build/$SWIFT_BUILD_TRIPLE/release/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+    )
+  fi
+  swiftterm_bundle_candidates+=(
+    "$ROOT_DIR/.build/arm64-apple-macosx/release/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+    "$ROOT_DIR/.build/x86_64-apple-macosx/release/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+  )
+  for swiftterm_candidate in "${swiftterm_bundle_candidates[@]}"; do
+    if [[ -f "$swiftterm_candidate/Shaders.metal" ]]; then
+      SWIFTTERM_RESOURCE_BUNDLE_SOURCE="$swiftterm_candidate"
+      break
+    fi
+  done
+fi
+
+# Older SwiftTerm checkouts keep the shader source in the package checkout but
+# do not emit a resource bundle at all. The app only loads Shaders.metal, so a
+# minimal bundle preserves the runtime resource contract for those builds.
+if [[ ! -f "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" \
+      && -f "$SWIFTTERM_CHECKOUT_PATH/Sources/SwiftTerm/Apple/Metal/Shaders.metal" ]]; then
+  PACKAGE_TMP_DIR="${PACKAGE_TMP_DIR:-$(mktemp -d)}"
+  SWIFTTERM_RESOURCE_BUNDLE_SOURCE="$PACKAGE_TMP_DIR/$SWIFTTERM_RESOURCE_BUNDLE_NAME"
+  mkdir -p "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE"
+  cp "$SWIFTTERM_CHECKOUT_PATH/Sources/SwiftTerm/Apple/Metal/Shaders.metal" \
+    "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal"
+fi
+
+if [[ ! -f "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" ]]; then
+  echo "SwiftTerm shader resource not found: $SWIFTTERM_RESOURCE_BUNDLE_SOURCE/Shaders.metal" >&2
+  exit 1
+fi
+
+if [[ ! -d "$SPARKLE_FRAMEWORK_SOURCE" ]]; then
+  echo "Sparkle.framework not found: $SPARKLE_FRAMEWORK_SOURCE" >&2
+  echo "Run 'swift build -c release --product $APP_NAME' or set STACIO_SPARKLE_FRAMEWORK_PATH." >&2
+  exit 1
+fi
+
+SPARKLE_SOURCE_VERSION_DIR="$SPARKLE_FRAMEWORK_SOURCE/Versions/Current"
+if [[ ! -d "$SPARKLE_SOURCE_VERSION_DIR" ]]; then
+  SPARKLE_SOURCE_VERSION_DIR="$SPARKLE_FRAMEWORK_SOURCE/Versions/B"
+fi
+required_sparkle_components=(
+  "$SPARKLE_FRAMEWORK_SOURCE/Sparkle"
+  "$SPARKLE_SOURCE_VERSION_DIR/Autoupdate"
+  "$SPARKLE_SOURCE_VERSION_DIR/Updater.app/Contents/MacOS/Updater"
+  "$SPARKLE_SOURCE_VERSION_DIR/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+  "$SPARKLE_SOURCE_VERSION_DIR/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+  "$SPARKLE_SOURCE_VERSION_DIR/Resources/Info.plist"
+)
+for sparkle_component in "${required_sparkle_components[@]}"; do
+  if [[ ! -x "$sparkle_component" ]]; then
+    if [[ "$sparkle_component" == *.plist && -f "$sparkle_component" ]]; then
+      continue
+    fi
+    echo "Required Sparkle component missing: $sparkle_component" >&2
+    exit 1
+  fi
+done
+
+SPARKLE_RESOLVED_VERSION="$(python3 - "$ROOT_DIR/Package.resolved" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+for pin in payload.get("pins", []):
+    if pin.get("identity") == "sparkle":
+        version = pin.get("state", {}).get("version")
+        if version:
+            print(version)
+            break
+else:
+    raise SystemExit("Package.resolved does not contain a Sparkle version pin.")
+PY
+)"
+SPARKLE_FRAMEWORK_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SPARKLE_SOURCE_VERSION_DIR/Resources/Info.plist" 2>/dev/null || true)"
+if [[ -z "$SPARKLE_FRAMEWORK_VERSION" || "$SPARKLE_FRAMEWORK_VERSION" != "$SPARKLE_RESOLVED_VERSION" ]]; then
+  echo "Sparkle.framework version ${SPARKLE_FRAMEWORK_VERSION:-<missing>} does not match Package.resolved $SPARKLE_RESOLVED_VERSION." >&2
+  exit 1
+fi
+
+if [[ ! -f "$MONACO_VS_SOURCE/loader.js" ]]; then
+  echo "Monaco Editor resources not found: $MONACO_VS_SOURCE" >&2
+  echo "Run 'npm install' or set STACIO_MONACO_VS_PATH to a monaco-editor/min/vs directory." >&2
+  exit 1
+fi
+
+for font_resource in "$LOCAL_AGENT_FONT_SOURCE" "$LOCAL_AGENT_BOLD_FONT_SOURCE" "$LOCAL_AGENT_FONT_LICENSE_SOURCE" "$HISTORY_BRAND_FONT_SOURCE" "$STACIO_LOGO_SOURCE"; do
+  if [[ ! -f "$font_resource" ]]; then
+    echo "Required packaged resource not found: $font_resource" >&2
+    exit 1
+  fi
+done
+
+for certificate_resource in StacioCertificateIcon.png Lack-Regular.otf; do
+  if [[ ! -s "$LICENSE_CERTIFICATE_SOURCE/$certificate_resource" ]]; then
+    echo "Required license certificate resource not found: $LICENSE_CERTIFICATE_SOURCE/$certificate_resource" >&2
+    exit 1
+  fi
+done
+
+verify_expected_native_architecture "Stacio executable" "$EXECUTABLE_SOURCE"
+verify_expected_native_architecture "Stacio CLI" "$CLI_SOURCE"
+verify_expected_native_architecture "Stacio VNC adapter" "$VNC_ADAPTER_SOURCE"
+verify_expected_native_architecture "Stacio Core dylib" "$CORE_DYLIB_SOURCE"
+verify_expected_native_architecture "Sparkle framework" "$SPARKLE_FRAMEWORK_SOURCE/Sparkle"
+
+if [[ "${STACIO_SKIP_ARTIFACT_FRESHNESS:-0}" != "1" ]]; then
+  check_prebuilt_artifact_freshness \
+    "Stacio executable" \
+    "$EXECUTABLE_SOURCE" \
+    "$ROOT_DIR/Package.swift" \
+    "$ROOT_DIR/Package.resolved" \
+    "$ROOT_DIR/Vendor/SwiftTerm" \
+    "$ROOT_DIR/Stacio" \
+    "$ROOT_DIR/StacioAgentBridge" \
+    "$ROOT_DIR/StacioExecutable"
+  check_prebuilt_artifact_freshness \
+    "Stacio CLI" \
+    "$CLI_SOURCE" \
+    "$ROOT_DIR/Package.swift" \
+    "$ROOT_DIR/Package.resolved" \
+    "$ROOT_DIR/Vendor/SwiftTerm" \
+    "$ROOT_DIR/StacioAgentBridge" \
+    "$ROOT_DIR/StacioCLI"
+  check_prebuilt_artifact_freshness \
+    "Stacio VNC adapter" \
+    "$VNC_ADAPTER_SOURCE" \
+    "$ROOT_DIR/Package.swift" \
+    "$ROOT_DIR/Package.resolved" \
+    "$ROOT_DIR/Vendor/SwiftTerm" \
+    "$ROOT_DIR/StacioAdapters/VNC"
+  check_prebuilt_artifact_freshness \
+    "Stacio Core dylib" \
+    "$CORE_DYLIB_SOURCE" \
+    "$ROOT_DIR/StacioCore/Cargo.toml" \
+    "$ROOT_DIR/StacioCore/Cargo.lock" \
+    "$ROOT_DIR/StacioCore/migrations" \
+    "$ROOT_DIR/StacioCore/src" \
+    "$ROOT_DIR/StacioCore/uniffi-bindgen-swift.rs"
+fi
+
+rm -rf "$APP_DIR"
+mkdir -p "$MACOS_DIR" "$FRAMEWORKS_DIR" "$ADAPTERS_DIR" "$HELPERS_DIR" "$RESOURCES_DIR"
+printf '%s\n' "$SOURCE_PROVENANCE_JSON" > "$RESOURCES_DIR/SourceProvenance.json"
+
+cp "$EXECUTABLE_SOURCE" "$MACOS_DIR/$APP_NAME"
+cp "$CLI_SOURCE" "$HELPERS_DIR/$CLI_HELPER_NAME"
+cp "$CORE_DYLIB_SOURCE" "$FRAMEWORKS_DIR/libstacio_core.dylib"
+cp "$VNC_ADAPTER_SOURCE" "$ADAPTERS_DIR/vnc"
+cp -R "$SWIFTTERM_RESOURCE_BUNDLE_SOURCE" "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
+chmod -R u+w "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
+/usr/bin/xattr -cr "$SWIFTTERM_RESOURCE_BUNDLE_OUTPUT"
+cp -R "$SPARKLE_FRAMEWORK_SOURCE" "$FRAMEWORKS_DIR/Sparkle.framework"
+# BEGIN GENERATED: bundle-resources
+# 由 scripts/bundle_resources.py --apply-package-block 生成，请勿手改。
+# 清单来源：config/bundle-resources.json
+mkdir -p "$RESOURCES_DIR/RuntimeCatalog"
+cp -R "$ROOT_DIR/Stacio/Resources/RuntimeCatalog/." "$RESOURCES_DIR/RuntimeCatalog/"
+/usr/bin/xattr -cr "$RESOURCES_DIR/RuntimeCatalog"
+
+if [[ -d "$ROOT_DIR/Stacio/Resources/About" ]]; then
+  mkdir -p "$RESOURCES_DIR/About"
+  cp -R "$ROOT_DIR/Stacio/Resources/About/." "$RESOURCES_DIR/About/"
+fi
+
+mkdir -p "$RESOURCES_DIR/LicenseCertificate"
+cp -R "$ROOT_DIR/Stacio/Resources/LicenseCertificate/." "$RESOURCES_DIR/LicenseCertificate/"
+/usr/bin/xattr -cr "$RESOURCES_DIR/LicenseCertificate"
+
+cp "$ROOT_DIR/Stacio/Resources/github.svg" "$RESOURCES_DIR/github.svg"
+
+cp "$ROOT_DIR/Stacio/Resources/gitee.svg" "$RESOURCES_DIR/gitee.svg"
+
+mkdir -p "$RESOURCES_DIR/SessionIcons"
+cp -R "$ROOT_DIR/Stacio/Resources/SessionIcons/." "$RESOURCES_DIR/SessionIcons/"
+/usr/bin/xattr -cr "$RESOURCES_DIR/SessionIcons"
+
+mkdir -p "$RESOURCES_DIR/ImportSourceIcons"
+cp -R "$ROOT_DIR/Stacio/Resources/ImportSourceIcons/." "$RESOURCES_DIR/ImportSourceIcons/"
+/usr/bin/xattr -cr "$RESOURCES_DIR/ImportSourceIcons"
+
+mkdir -p "$RESOURCES_DIR/Fonts"
+cp "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf" "$RESOURCES_DIR/Fonts/SarasaTermSC-Regular.ttf"
+
+cp "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Bold.ttf" "$RESOURCES_DIR/Fonts/SarasaTermSC-Bold.ttf"
+
+cp "$ROOT_DIR/Stacio/Resources/Fonts/LICENSE.txt" "$RESOURCES_DIR/Fonts/LICENSE.txt"
+
+cp "$ROOT_DIR/Stacio/Resources/Fonts/lack-regular-2.otf" "$RESOURCES_DIR/Fonts/lack-regular-2.otf"
+
+mkdir -p "$RESOURCES_DIR/MonacoEditor"
+cp -R "${STACIO_MONACO_VS_PATH:-$ROOT_DIR/node_modules/monaco-editor/min/vs}" "$RESOURCES_DIR/MonacoEditor/vs"
+
+cp "$ROOT_DIR/logo/icon-legacy.icns" "$RESOURCES_DIR/Stacio.icns"
+
+cp "$ROOT_DIR/Stacio/Resources/stacio-logo.png" "$RESOURCES_DIR/stacio-logo.png"
+# END GENERATED: bundle-resources
+
+chmod 755 "$MACOS_DIR/$APP_NAME" "$HELPERS_DIR/$CLI_HELPER_NAME" "$FRAMEWORKS_DIR/libstacio_core.dylib" "$ADAPTERS_DIR/vnc"
+
+cat >"$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh-Hans</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>zh-Hans</string>
+    <string>en</string>
+  </array>
+  <key>CFBundleAllowMixedLocalizations</key>
+  <true/>
+  <key>CFBundleExecutable</key>
+  <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>Stacio.icns</string>
+  <key>CFBundleIconName</key>
+  <string>Stacio</string>
+  <key>CFBundleIdentifier</key>
+  <string>$BUNDLE_ID</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>$APP_NAME</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>$BUNDLE_ID</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>stacio</string>
+      </array>
+    </dict>
+  </array>
+  <key>CFBundleShortVersionString</key>
+  <string>$VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>$BUILD_NUMBER</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Stacio 使用蓝牙连接你选择的 BLE Console 设备。</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
+  </dict>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © 2026 Stacio</string>
+  <key>NSQuitAlwaysKeepsWindows</key>
+  <false/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+</dict>
+</plist>
+PLIST
+
+python3 - "$PLIST_PATH" "$PRODUCT_OPS_PRODUCT_ID" "$PRODUCT_OPS_API_BASE_URL" "$PRODUCT_OPS_UPDATE_CHANNEL" "$PRODUCT_OPS_BETA_UPDATES_ENABLED" "$FEEDBACK_PRODUCT_API_KEY" "$SPARKLE_STABLE_APPCAST_URL" "$SPARKLE_BETA_APPCAST_URL" "$SPARKLE_PUBLIC_ED_KEY" "$LICENSE_PUBLIC_ED25519_KEY" "$SPARKLE_UPDATE_ARCHITECTURE" "$OFFLINE_LICENSE_EXCHANGE_URL" "$OFFLINE_EXCHANGE_PUBLIC_KEY" "$OFFLINE_LICENSE_PUBLIC_KEY" "$ONLINE_LICENSE_SIGNATURE_KEY_ID" "$OFFLINE_REQUEST_KEY_ID" "$OFFLINE_LICENSE_SIGNATURE_KEY_ID" "$LICENSE_STORAGE_CONTRACT_ID" "$LICENSE_STORAGE_SCHEMA_VERSION" <<'PY'
+import plistlib
+import sys
+from urllib.parse import urlparse
+
+(
+    plist_path,
+    product_id,
+    api_base_url,
+    update_channel,
+    beta_updates_enabled,
+    feedback_product_api_key,
+    stable_appcast_url,
+    beta_appcast_url,
+    sparkle_public_ed_key,
+    license_public_ed25519_key,
+    sparkle_architecture,
+    offline_license_exchange_url,
+    offline_exchange_public_key,
+    offline_license_public_key,
+    online_license_signature_key_id,
+    offline_request_key_id,
+    offline_license_signature_key_id,
+    license_storage_contract_id,
+    license_storage_schema_version,
+) = sys.argv[1:20]
+product_id = (product_id or "stacio").strip() or "stacio"
+api_base_url = (api_base_url or "").strip()
+update_channel = (update_channel or "stable").strip().lower() or "stable"
+feedback_product_api_key = (feedback_product_api_key or "").strip()
+stable_appcast_url = (stable_appcast_url or "").strip()
+beta_appcast_url = (beta_appcast_url or "").strip()
+license_public_ed25519_key = (license_public_ed25519_key or "").strip()
+sparkle_architecture = (sparkle_architecture or "").strip()
+offline_license_exchange_url = (offline_license_exchange_url or "").strip()
+offline_exchange_public_key = (offline_exchange_public_key or "").strip()
+offline_license_public_key = (offline_license_public_key or "").strip()
+online_license_signature_key_id = (online_license_signature_key_id or "").strip()
+offline_request_key_id = (offline_request_key_id or "").strip()
+offline_license_signature_key_id = (offline_license_signature_key_id or "").strip()
+license_storage_contract_id = (license_storage_contract_id or "").strip()
+license_storage_schema_version = (license_storage_schema_version or "").strip()
+if update_channel not in {"stable", "beta"}:
+    raise SystemExit(f"Invalid STACIO_PRODUCT_OPS_UPDATE_CHANNEL: {update_channel}")
+
+def validate_url(name, value, allow_empty=False):
+    if not value:
+        if allow_empty:
+            return
+        raise SystemExit(f"{name} is required")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SystemExit(f"Invalid {name}: {value}")
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise SystemExit(f"{name} must use HTTPS outside localhost: {value}")
+
+raw_beta = (beta_updates_enabled or "0").strip().lower()
+if raw_beta in {"1", "true", "yes", "on"}:
+    beta_enabled = True
+elif raw_beta in {"0", "false", "no", "off", ""}:
+    beta_enabled = False
+else:
+    raise SystemExit(f"Invalid STACIO_PRODUCT_OPS_BETA_UPDATES_ENABLED: {beta_updates_enabled}")
+
+with open(plist_path, "rb") as handle:
+    payload = plistlib.load(handle)
+
+payload["StacioProductOpsProductID"] = product_id
+payload["StacioProductOpsUpdateChannel"] = update_channel
+payload["StacioProductOpsBetaUpdatesEnabled"] = beta_enabled
+payload["StacioSparkleArchitecture"] = sparkle_architecture
+validate_url("STACIO_SPARKLE_STABLE_APPCAST_URL", stable_appcast_url)
+validate_url("STACIO_SPARKLE_BETA_APPCAST_URL", beta_appcast_url)
+payload["SUFeedURL"] = stable_appcast_url
+payload["StacioSparkleBetaAppcastURL"] = beta_appcast_url
+payload["SUEnableAutomaticChecks"] = True
+payload["SUAutomaticallyUpdate"] = False
+payload["SUAllowsAutomaticUpdates"] = False
+payload["SUScheduledCheckInterval"] = 86400
+
+if api_base_url:
+    validate_url("STACIO_PRODUCT_OPS_API_BASE_URL", api_base_url)
+    payload["StacioProductOpsAPIBaseURL"] = api_base_url
+else:
+    payload.pop("StacioProductOpsAPIBaseURL", None)
+
+if feedback_product_api_key:
+    payload["StacioFeedbackProductAPIKey"] = feedback_product_api_key
+else:
+    payload.pop("StacioFeedbackProductAPIKey", None)
+
+if sparkle_public_ed_key:
+    payload["SUPublicEDKey"] = sparkle_public_ed_key
+else:
+    payload.pop("SUPublicEDKey", None)
+
+if license_public_ed25519_key:
+    payload["StacioLicensePublicEd25519Key"] = license_public_ed25519_key
+else:
+    payload.pop("StacioLicensePublicEd25519Key", None)
+
+if online_license_signature_key_id:
+    payload["StacioOnlineLicenseSignatureKeyID"] = online_license_signature_key_id
+else:
+    payload.pop("StacioOnlineLicenseSignatureKeyID", None)
+
+if offline_license_exchange_url:
+    validate_url("STACIO_OFFLINE_LICENSE_EXCHANGE_URL", offline_license_exchange_url)
+    payload["StacioOfflineLicenseExchangeURL"] = offline_license_exchange_url
+else:
+    payload.pop("StacioOfflineLicenseExchangeURL", None)
+
+if offline_exchange_public_key:
+    payload["StacioOfflineExchangePublicKey"] = offline_exchange_public_key
+else:
+    payload.pop("StacioOfflineExchangePublicKey", None)
+
+if offline_license_public_key:
+    payload["StacioOfflineLicensePublicKey"] = offline_license_public_key
+else:
+    payload.pop("StacioOfflineLicensePublicKey", None)
+
+if offline_request_key_id:
+    payload["StacioOfflineRequestKeyID"] = offline_request_key_id
+else:
+    payload.pop("StacioOfflineRequestKeyID", None)
+
+if offline_license_signature_key_id:
+    payload["StacioOfflineSignatureKeyID"] = offline_license_signature_key_id
+else:
+    payload.pop("StacioOfflineSignatureKeyID", None)
+
+if license_storage_contract_id:
+    payload["StacioLicenseStorageContractID"] = license_storage_contract_id
+else:
+    payload.pop("StacioLicenseStorageContractID", None)
+
+if license_storage_schema_version:
+    try:
+        payload["StacioLicenseStorageSchemaVersion"] = int(license_storage_schema_version)
+    except ValueError:
+        raise SystemExit("STACIO_LICENSE_STORAGE_SCHEMA_VERSION must be an integer")
+else:
+    payload.pop("StacioLicenseStorageSchemaVersion", None)
+
+with open(plist_path, "wb") as handle:
+    plistlib.dump(payload, handle, sort_keys=False)
+PY
+
+if [[ "${STACIO_SKIP_INSTALL_NAME_TOOL:-0}" != "1" ]]; then
+  install_name_tool -id "@rpath/libstacio_core.dylib" "$FRAMEWORKS_DIR/libstacio_core.dylib"
+  install_name_tool \
+    -change "$CORE_LOAD_PATH" \
+    "@executable_path/../Frameworks/libstacio_core.dylib" \
+    "$MACOS_DIR/$APP_NAME"
+  if ! (otool -l "$MACOS_DIR/$APP_NAME" 2>/dev/null || true) \
+    | awk '
+        $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+        in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+      ' \
+    | grep -Fxq "@executable_path/../Frameworks"; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/$APP_NAME"
+  fi
+fi
+
+SPARKLE_VERSION_DIR="$FRAMEWORKS_DIR/Sparkle.framework/Versions/Current"
+if [[ ! -d "$SPARKLE_VERSION_DIR" ]]; then
+  SPARKLE_VERSION_DIR="$FRAMEWORKS_DIR/Sparkle.framework/Versions/B"
+fi
+for sparkle_component in \
+  "$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc" \
+  "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc" \
+  "$SPARKLE_VERSION_DIR/Updater.app" \
+  "$SPARKLE_VERSION_DIR/Autoupdate"
+do
+  codesign "${SPARKLE_CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$sparkle_component"
+done
+
+python3 "$SCRIPT_ROOT_DIR/scripts/verify-source-checkout.py" \
+  --root "$ROOT_DIR" --expected-root "$HOME/Documents/Stacio" \
+  --check-manifest "$RESOURCES_DIR/SourceProvenance.json" >/dev/null
+codesign "${CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$FRAMEWORKS_DIR/libstacio_core.dylib"
+codesign "${SPARKLE_CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$FRAMEWORKS_DIR/Sparkle.framework"
+codesign "${CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$HELPERS_DIR/$CLI_HELPER_NAME"
+codesign "${CODESIGN_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$ADAPTERS_DIR/vnc"
+codesign "${CODESIGN_APP_ARGS[@]}" --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+
+if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" == "1" ]]; then
+  echo "Skipped License package verification by explicit local-smoke mode."
+else
+  "$ROOT_DIR/scripts/verify-license-package.sh" "$APP_DIR" "$LICENSE_TRUST_ANCHORS_PATH"
+fi
+
+# 产物内容校验：逐文件核对 .app 与 config/bundle-resources.json，并扫描内嵌的开发机路径。
+# 这是"打包漏功能"的最后一道闸门——失败了就不允许把包发出去。
+python3 "$ROOT_DIR/scripts/verify-bundle-contents.py" \
+  --app "$APP_DIR" \
+  --root "$ROOT_DIR" \
+  --manifest "$ROOT_DIR/config/bundle-resources.json"
+
+echo "Packaged $APP_DIR"
