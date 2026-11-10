@@ -144,6 +144,7 @@ pub enum CredentialLifecycleError {
 
 pub struct CredentialLifecycleDb {
     connection: Arc<Mutex<Connection>>,
+ #[allow(dead_code)] //保留数据库路径，供诊断与未来排查使用
     path: String,
 }
 

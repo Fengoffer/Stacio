@@ -631,6 +631,12 @@ if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
     swift package resolve --package-path "$ROOT_DIR"
   fi
   "$SWIFTTERM_RESOURCE_PATCHER" "$SWIFTTERM_CHECKOUT_PATH"
+ #重写源码路径前缀：Rust的panic位置与#[track_caller]会把开发机绝对路径
+ #编进二进制（含用户名），strip无法去除，这里重映射为中性值。
+ export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$ROOT_DIR=/stacio --remap-path-prefix=$HOME/.cargo=/cargo"
+ #C依赖（openssl-sys等）用 -fdebug-prefix-map重写，RUSTFLAGS不覆盖C代码。
+ export CFLAGS="${CFLAGS:-} -fdebug-prefix-map=$ROOT_DIR=/stacio -fdebug-prefix-map=$HOME=/build"
+ export CXXFLAGS="${CXXFLAGS:-} -fdebug-prefix-map=$ROOT_DIR=/stacio -fdebug-prefix-map=$HOME=/build"
   if (( ${#CARGO_BUILD_TARGET_ARGS[@]} == 0 )); then
     cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
   else

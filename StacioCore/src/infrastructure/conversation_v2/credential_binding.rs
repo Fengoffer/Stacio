@@ -5,7 +5,7 @@
 //! 四种 RuntimeAuthenticationSnapshot 的 binding/零 binding participant proof。
 
 use rusqlite::{params, Connection};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 const BINDING_INIT_SQL: &str = include_str!("../../../migrations/credential_binding_0001_init.sql");
 
@@ -31,6 +31,7 @@ pub enum CredentialBindingError {
 
 pub struct CredentialBindingDb {
     connection: Arc<Mutex<Connection>>,
+ #[allow(dead_code)] //保留数据库路径，供诊断与未来排查使用
     path: String,
 }
 
@@ -66,11 +67,6 @@ impl CredentialBindingDb {
     fn apply_migrations(&self) -> rusqlite::Result<()> {
         self.connection().execute_batch(BINDING_INIT_SQL)
     }
-}
-
-fn binding_sequence() -> &'static Mutex<i64> {
-    static SEQUENCE: OnceLock<Mutex<i64>> = OnceLock::new();
-    SEQUENCE.get_or_init(|| Mutex::new(0))
 }
 
 pub struct CredentialBindingStore {
