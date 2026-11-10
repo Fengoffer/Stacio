@@ -1,12 +1,16 @@
-name: Stacio CI
-
+# Stacio CI
+#
 #本仓库的代码要求 Xcode27 / macOS26+ SDK（Swift6.4）。GitHub托管的
 # macos-14 runner（Swift5.10 / SDK14）无法构建它，历史上 CI因此长期全红，
-#把真正有用的检查一起埋掉了。所以流水线分成两层：
-# policy ——不依赖工具链的硬性规则检查，托管 runner上必须全绿。
-# build ——完整构建与测试，仅在装了自托管 runner后启用
-# （仓库变量 STACIO_SELF_HOSTED=1时才运行）。
-#构建验证的等价闸门已内置在 scripts/package-app.sh：资源清单一致性、
+#把真正有用的检查一起埋掉了。
+#
+#方案：CI只跑不依赖工具链的规则检查（policy，必须在托管 runner上全绿）。
+#构建与测试放在本地用一条命令执行：./scripts/verify-all.sh --full
+#
+#为什么不用自托管 runner：注册需要仓库管理员权限，且 runner安装包
+#（127MB）从 GitHub Releases下载速度约7KB/s，不具备可行性。
+#
+#构建侧的等价闸门已内置在 scripts/package-app.sh：资源清单一致性、
 #产物内容校验、core符号一致性。本地打包即验证。
 
 on:
@@ -65,43 +69,3 @@ jobs:
           python3 -m py_compile scripts/bundle_resources.py \
             scripts/verify-bundle-contents.py \
             scripts/verify-public-repo-boundary.py
-
-  build:
-    name: Build and test (self-hosted)
-    #只有装了自托管 runner并设置仓库变量 STACIO_SELF_HOSTED=1时才运行。
-    #否则跳过，不会让整个工作流永久处于排队状态。
-    if: vars.STACIO_SELF_HOSTED == '1'
-    needs: policy
-    runs-on: [self-hosted, macOS, stacio]
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Show toolchain versions
-        run: |
-          swift --version
-          rustc --version
-          cargo --version
-
-      - name: Install package resources
-        run: npm ci
-
-      - name: Build Rust core for Swift linkage
-        run: ./scripts/build-core.sh
-
-      - name: Swift build
-        run: swift build
-
-      - name: Swift test
-        run: swift test
-
-      - name: Rust test
-        working-directory: StacioCore
-        run: cargo test
-
-      - name: Verify generated UniFFI bindings are current
-        run: |
-          ./scripts/generate-uniffi.sh
-          git diff --exit-code -- Stacio/Bridge/Generated
