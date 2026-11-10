@@ -600,22 +600,22 @@ import json
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as stream:
- manifest = json.load(stream)
+    manifest = json.load(stream)
 
 names = []
 for entry in manifest["entries"]:
- destination = entry.get("destination", "")
- if not destination.startswith("Fonts/"):
- continue
- if entry.get("container", "Resources") != "Resources":
- continue
- if entry.get("shipped", True) is False:
- continue
- if entry.get("kind") == "file":
- names.append(destination.split("/",1)[1])
+    destination = entry.get("destination", "")
+    if not destination.startswith("Fonts/"):
+        continue
+    if entry.get("container", "Resources") != "Resources":
+        continue
+    if entry.get("shipped", True) is False:
+        continue
+    if entry.get("kind") == "file":
+        names.append(destination.split("/",1)[1])
 
 for name in sorted(names):
- print(name)
+    print(name)
 PY_FONTS_END
 find "$APP_DIR/Contents/Resources/Fonts" -maxdepth 1 -type f -print \
   | sed "s#^$APP_DIR/Contents/Resources/Fonts/##" \
