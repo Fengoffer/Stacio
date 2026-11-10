@@ -593,7 +593,30 @@ test -s "$STACIO_LOGO"
 test ! -e "$OH_MY_ZSH_NERD_FONT"
 EXPECTED_FONT_FILES="$TMP_DIR/expected-font-files.txt"
 ACTUAL_FONT_FILES="$TMP_DIR/actual-font-files.txt"
-printf '%s\n' "LICENSE.txt" "SarasaTermSC-Bold.ttf" "SarasaTermSC-Regular.ttf" "lack-regular-2.otf" >"$EXPECTED_FONT_FILES"
+#期望清单从唯一真源生成，不再手写：本文件此前与 config/bundle-resources.json
+#不同步（漏掉 sort、与 Nerd Font决策不一致），导致打包测试假失败。
+python3 - "$ROOT_DIR/config/bundle-resources.json" >"$EXPECTED_FONT_FILES" <<'PY_FONTS_END'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+ manifest = json.load(stream)
+
+names = []
+for entry in manifest["entries"]:
+ destination = entry.get("destination", "")
+ if not destination.startswith("Fonts/"):
+ continue
+ if entry.get("container", "Resources") != "Resources":
+ continue
+ if entry.get("shipped", True) is False:
+ continue
+ if entry.get("kind") == "file":
+ names.append(destination.split("/",1)[1])
+
+for name in sorted(names):
+ print(name)
+PY_FONTS_END
 find "$APP_DIR/Contents/Resources/Fonts" -maxdepth 1 -type f -print \
   | sed "s#^$APP_DIR/Contents/Resources/Fonts/##" \
   | sort >"$ACTUAL_FONT_FILES"

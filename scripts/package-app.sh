@@ -8,7 +8,7 @@ SOURCE_PROVENANCE_JSON="$(python3 "$SCRIPT_ROOT_DIR/scripts/verify-source-checko
 # 资源清单一致性：package-app.sh 的拷贝片段必须由 config/bundle-resources.json 生成。
 # 不一致时立刻失败，避免"改了清单却忘了重新生成脚本"。
 python3 "$SCRIPT_ROOT_DIR/scripts/bundle_resources.py" \
-  --manifest "$ROOT_DIR/config/bundle-resources.json" \
+  --manifest "$SCRIPT_ROOT_DIR/config/bundle-resources.json" \
   --check-package-block "$SCRIPT_ROOT_DIR/scripts/package-app.sh"
 
 APP_NAME="Stacio"
@@ -1147,6 +1147,6 @@ fi
 python3 "$ROOT_DIR/scripts/verify-bundle-contents.py" \
   --app "$APP_DIR" \
   --root "$ROOT_DIR" \
-  --manifest "$ROOT_DIR/config/bundle-resources.json"
+  --manifest "$SCRIPT_ROOT_DIR/config/bundle-resources.json"
 
 echo "Packaged $APP_DIR"
