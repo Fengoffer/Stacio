@@ -894,6 +894,20 @@ cp "$ROOT_DIR/logo/icon-legacy.icns" "$RESOURCES_DIR/Stacio.icns"
 cp "$ROOT_DIR/Stacio/Resources/stacio-logo.png" "$RESOURCES_DIR/stacio-logo.png"
 # END GENERATED: bundle-resources
 
+#剥离调试符号：发布包不需要调试信息；且 Swift的 #filePath、Rust的 panic位置
+#会把开发机绝对路径（含用户名）编进二进制。
+if [[ "${STACIO_STRIP_BINARIES:-1}" == "1" ]]; then
+ for binary in \
+ "$MACOS_DIR/$APP_NAME" \
+ "$HELPERS_DIR/$CLI_HELPER_NAME" \
+ "$ADAPTERS_DIR/vnc" \
+ "$FRAMEWORKS_DIR/libstacio_core.dylib"; do
+ if [[ -f "$binary" ]]; then
+ strip -S -X "$binary" || true
+ fi
+ done
+fi
+
 chmod 755 "$MACOS_DIR/$APP_NAME" "$HELPERS_DIR/$CLI_HELPER_NAME" "$FRAMEWORKS_DIR/libstacio_core.dylib" "$ADAPTERS_DIR/vnc"
 
 cat >"$PLIST_PATH" <<PLIST

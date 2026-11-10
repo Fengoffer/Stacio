@@ -4480,17 +4480,16 @@ private enum MonacoEditorResourceLocator {
     }
 
     private static func candidateBaseURLs() -> [URL] {
-        let sourceFile = URL(fileURLWithPath: #filePath)
-        let repoRoot = sourceFile
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
         let appResourceURL = Bundle.main.resourceURL?.appendingPathComponent("MonacoEditor")
-        let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("node_modules/monaco-editor/min")
-        let sourceURL = repoRoot.appendingPathComponent("node_modules/monaco-editor/min")
-        return [appResourceURL, cwdURL, sourceURL].compactMap { $0 }
+        #if DEBUG
+            //仅在开发时回退到源码目录；发布包只用 Bundle.main，
+            //避免把工程绝对路径编进二进制（#filePath会把路径写死）。
+            let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("node_modules/monaco-editor/min")
+            return [appResourceURL, cwdURL].compactMap { $0 }
+        #else
+            return [appResourceURL].compactMap { $0 }
+        #endif
     }
 }
 
