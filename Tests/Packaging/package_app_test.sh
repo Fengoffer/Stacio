@@ -619,7 +619,7 @@ for name in sorted(names):
 PY_FONTS_END
 find "$APP_DIR/Contents/Resources/Fonts" -maxdepth 1 -type f -print \
   | sed "s#^$APP_DIR/Contents/Resources/Fonts/##" \
-  | sort >"$ACTUAL_FONT_FILES"
+  | LC_ALL=C sort >"$ACTUAL_FONT_FILES"
 diff -u "$EXPECTED_FONT_FILES" "$ACTUAL_FONT_FILES"
 cmp -s "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf" "$LOCAL_AGENT_FONT"
 cmp -s "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Bold.ttf" "$LOCAL_AGENT_BOLD_FONT"
