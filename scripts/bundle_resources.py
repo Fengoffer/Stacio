@@ -191,6 +191,55 @@ def apply_package_block(script_path: Path, manifest: dict) -> int:
     return 0
 
 
+def package_swift_resources(package_path: Path) -> tuple[list[str], list[str]]:
+    """从 Package.swift的 StacioApp target里抽出 resources声明的源路径。"""
+    text = package_path.read_text(encoding="utf-8")
+    start = text.find('name: "StacioApp"')
+    if start == -1:
+        raise SystemExit("Package.swift里找不到 StacioApp target")
+    end = text.find('name: "StacioExecutable"', start)
+    block = text[start:end if end != -1 else len(text)]
+    declared: list[str] = []
+    for match in re.finditer(r'\.(?:process|copy)\("([^"]+)"\)', block):
+        declared.append(match.group(1))
+    excluded: list[str] = []
+    exclude_match = re.search(r"exclude: \[(.*?)\]", block, re.DOTALL)
+    if exclude_match:
+        excluded = re.findall(r'"([^"]+)"', exclude_match.group(1))
+    return declared, excluded
+
+
+def check_package_swift(package_path: Path, manifest: dict) -> int:
+    """校验 Package.swift的 resources声明与清单一致。"""
+    declared, _excluded = package_swift_resources(package_path)
+    expected: set[str] = set()
+    labels: dict[str, str] = {}
+    for entry in manifest.get("entries", []):
+        if entry.get("container", "Resources") != "Resources":
+            continue
+        if entry.get("kind") not in COPY_KINDS:
+            continue
+        if entry.get("shipped", True) is False:
+            continue
+        source = entry.get("source", "")
+        if source.startswith("Stacio/"):
+            # Package.swift里写的是相对 Stacio/的路径
+            expected.add(source[len("Stacio/"):])
+            labels[source[len("Stacio/"):]] = entry["id"]
+    actual = set(declared)
+    problems: list[str] = []
+    for path in sorted(expected - actual):
+        problems.append(f"清单要求打包但 Package.swift未声明：{path}（条目 {labels[path]}）")
+    for path in sorted(actual - expected):
+        problems.append(f"Package.swift声明了但清单里没有：{path}")
+    if problems:
+        print(f"ERROR: {package_path}与 config/bundle-resources.json不一致：", file=sys.stderr)
+        for problem in problems:
+            print(f" - {problem}", file=sys.stderr)
+        return 1
+    print(f"OK: {package_path}的 resources声明与清单一致（{len(actual)}项）")
+    return 0
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -204,6 +253,12 @@ def main(argv: list[str]) -> int:
     group.add_argument("--apply-package-block", type=Path, metavar="SCRIPT", help="写入 package-app.sh 标记区")
     group.add_argument("--check-package-block", type=Path, metavar="SCRIPT", help="校验标记区与清单一致")
     group.add_argument("--print-entries", action="store_true", help="打印清单条目摘要")
+    group.add_argument(
+        "--check-package-swift",
+        type=Path,
+        metavar="PACKAGE_SWIFT",
+        help="校验 Package.swift的 resources声明与清单一致",
+    )
     args = parser.parse_args(argv)
 
     manifest = load_manifest(args.manifest)
@@ -215,6 +270,8 @@ def main(argv: list[str]) -> int:
         return apply_package_block(args.apply_package_block, manifest)
     if args.check_package_block:
         return check_package_block(args.check_package_block, manifest)
+    if args.check_package_swift:
+        return check_package_swift(args.check_package_swift, manifest)
     if args.print_entries:
         for entry in all_entries(manifest):
             print(

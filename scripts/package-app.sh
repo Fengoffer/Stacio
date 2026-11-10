@@ -10,6 +10,9 @@ SOURCE_PROVENANCE_JSON="$(python3 "$SCRIPT_ROOT_DIR/scripts/verify-source-checko
 python3 "$SCRIPT_ROOT_DIR/scripts/bundle_resources.py" \
   --manifest "$SCRIPT_ROOT_DIR/config/bundle-resources.json" \
   --check-package-block "$SCRIPT_ROOT_DIR/scripts/package-app.sh"
+python3 "$SCRIPT_ROOT_DIR/scripts/bundle_resources.py" \
+  --manifest "$SCRIPT_ROOT_DIR/config/bundle-resources.json" \
+  --check-package-swift "$SCRIPT_ROOT_DIR/Package.swift"
 
 APP_NAME="Stacio"
 BUNDLE_ID="com.stacio.Stacio"

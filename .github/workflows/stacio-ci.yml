@@ -42,6 +42,9 @@ jobs:
       - name: Verify bundle resource manifest is in sync
         run: python3 scripts/bundle_resources.py --check-package-block scripts/package-app.sh
 
+
+      - name: Verify Package.swift resources match the manifest
+        run: python3 scripts/bundle_resources.py --check-package-swift Package.swift
       - name: Verify version source
         run: |
           chmod +x scripts/print-version.sh
