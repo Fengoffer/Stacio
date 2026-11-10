@@ -89,11 +89,14 @@ if [ "$MODE" = "--full" ]; then
     if cargo test --manifest-path StacioCore/Cargo.toml --lib >/tmp/stacio-verify-rust.log 2>&1; then
         SUMMARY=$(grep -oE "test result: ok\. [0-9]+ passed.*" /tmp/stacio-verify-rust.log | tail -1)
         pass "Rust测试：$SUMMARY"
+    elif grep -qE "failed to download|spurious network error|Timeout was reached" /tmp/stacio-verify-rust.log; then
+        #依赖下载失败属于环境问题，不是代码失败
+        printf " [SKIP] Rust测试：依赖下载失败（网络问题，非代码问题）\n"
+        printf "首次运行需联网下载依赖，可稍后重试\n"
     else
         fail "Rust测试"
         tail -15 /tmp/stacio-verify-rust.log | sed "s/^/ /"
     fi
-else
     echo "跳过（加 --full运行4937个 Swift测试 +650个 Rust测试）"
 fi
 echo
