@@ -76,7 +76,7 @@ RELEASE_TREE="$(git rev-parse "$RELEASE_BRANCH^{tree}")"
 
 say ""
 if [[ "$WORK_TREE" == "$RELEASE_TREE" ]]; then
- say "[2/5]发布线已与工作分支一致（树 $WORK_TREE），无需同步"
+ say "[2/5]发布线已与工作分支一致（树 ${WORK_TREE}），无需同步"
  SYNCED=0
 else
  say "[2/5]需要同步"
@@ -132,7 +132,7 @@ if [[ "$RELEASE_TREE_AFTER" != "$WORK_TREE" ]]; then
  git checkout "$WORK_BRANCH" >/dev/null
  fail "发布分支树(${RELEASE_TREE_AFTER})与工作分支树(${WORK_TREE})不一致，已取消推送"
 fi
-say " OK:树一致（$RELEASE_TREE_AFTER）"
+say " OK:树一致（${RELEASE_TREE_AFTER}）"
 say ""
 
 # ----5.推送 ----
