@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-#把本地工作分支的新提交同步到公开仓库（GitHub / Gitee）。
+#把本地工作分支同步到公开仓库（GitHub / Gitee）。
 #
 #用法：
-# ./scripts/publish-snapshot.sh --dry-run #只看会推什么，不实际推
+# ./scripts/publish-snapshot.sh --dry-run #只看会做什么
 # ./scripts/publish-snapshot.sh #执行
 # ./scripts/publish-snapshot.sh --full #额外跑完整验证
 #
-#这个脚本替代了之前需要手工执行的6步流程，避免顺序错误与命令拼接失误。
+#设计说明：
+#发布线（release/snapshot-*）与工作分支历史不同源，用 cherry-pick
+#会重复应用或冲突。真正的要求只有一条：发布线的**文件内容**必须与
+#工作分支一致。所以这里直接同步树，而不是搬运提交。
 #
-#前提：
-#1.工作区必须干净（未提交改动会导致构建不可复现）
-#2.公开仓库边界检查必须通过
-#3.本地改动必须在工作分支上，不能直接改 release分支
-#
-#流程：
-#1.校验工作区、分支、边界
-#2.找出工作分支相对发布线的独有提交
-#3.逐个 cherry-pick到发布线
-#4.验证发布线与工作分支的树完全一致
-#5.推送到 GitHub与 Gitee
-#6.回到工作分支
+#这保证：
+# -发布线不会漏文件（比 cherry-pick可靠）
+# -树一致性有强制校验，不一致就不推送
+# -推送前必须通过边界检查与验证
 
 set -euo pipefail
 
@@ -48,11 +43,11 @@ say "发布分支：$RELEASE_BRANCH"
 say ""
 
 # ----1.前置校验 ----
-say "[1/6]前置校验"
+say "[1/5]前置校验"
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$CURRENT_BRANCH" != "$WORK_BRANCH" ]]; then
- fail "当前在 $CURRENT_BRANCH，必须先切到 $WORK_BRANCH再发布"
+ fail "当前在 $CURRENT_BRANCH，必须先切到 $WORK_BRANCH"
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -60,28 +55,18 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 if ! python3 scripts/verify-public-repo-boundary.py >/dev/null 2>&1; then
- say "边界检查失败："
  python3 scripts/verify-public-repo-boundary.py >&2 || true
- fail "公开仓库边界检查未通过，拒绝发布"
+ fail "公开仓库边界检查未通过"
 fi
 
 if [[ "$RUN_FULL" == "1" ]]; then
- say "运行完整验证……"
- if ! ./scripts/verify-all.sh --full; then
- fail "验证未通过，拒绝发布"
- fi
+ say "运行完整验证（含全部测试）……"
+ ./scripts/verify-all.sh --full || fail "验证未通过"
 else
  say "运行快速验证……"
- if ! ./scripts/verify-all.sh >/dev/null; then
- fail "验证未通过，拒绝发布"
- fi
+ ./scripts/verify-all.sh >/dev/null || fail "验证未通过"
 fi
-
 say " OK:工作区干净、边界通过、验证通过"
-
-# ----2.找出待同步的提交 ----
-say ""
-say "[2/6]计算待同步提交"
 
 git rev-parse --verify "$RELEASE_BRANCH" >/dev/null 2>&1 || \
  fail "发布分支 $RELEASE_BRANCH不存在"
@@ -89,87 +74,85 @@ git rev-parse --verify "$RELEASE_BRANCH" >/dev/null 2>&1 || \
 WORK_TREE="$(git rev-parse "$WORK_BRANCH^{tree}")"
 RELEASE_TREE="$(git rev-parse "$RELEASE_BRANCH^{tree}")"
 
+say ""
 if [[ "$WORK_TREE" == "$RELEASE_TREE" ]]; then
- say " OK:发布线已与工作分支一致（树 $WORK_TREE），无需同步"
- PENDING=""
+ say "[2/5]发布线已与工作分支一致（树 $WORK_TREE），无需同步"
+ SYNCED=0
 else
- #用树差异找出需要搬运的提交（两分支历史不同源，不能直接用 commit范围）
- #取工作分支最近N个提交中，其变更文件涉及当前差异的
- DIFF_FILES="$(git diff --name-only "$RELEASE_BRANCH" "$WORK_BRANCH")"
- say "差异文件："
- printf '%s\n' "$DIFF_FILES" | sed 's/^/ /'
- PENDING="$(git log --oneline -20 --format='%H' "$WORK_BRANCH" -- $DIFF_FILES | head -10)"
+ say "[2/5]需要同步"
+ DIFF_COUNT="$(git diff --name-only "$RELEASE_BRANCH" "$WORK_BRANCH" | wc -l | tr -d ' ')"
+ say "差异文件数：$DIFF_COUNT"
+ SYNCED=1
 fi
-
 say ""
 
-# ----3. cherry-pick ----
-say "[3/6]同步到发布分支"
-
 if [[ "$DRY_RUN" == "1" ]]; then
- say " [dry-run]将执行：git checkout $RELEASE_BRANCH"
- if [[ -n "$PENDING" ]]; then
- say " [dry-run]将 cherry-pick："
- printf '%s\n' "$PENDING" | sed 's/^/ /'
- else
- say " [dry-run]无待搬运提交"
- fi
- say " [dry-run]将推送到 gitee与 origin"
+ say "[3/5] [dry-run]将同步树并推送到 gitee与 origin"
  say ""
  say "=== dry-run结束，未做任何改动 ==="
  exit 0
 fi
 
-git checkout "$RELEASE_BRANCH"
+# ----3.同步树 ----
+if [[ "$SYNCED" == "1" ]]; then
+ say "[3/5]同步树到发布分支"
+ git checkout "$RELEASE_BRANCH" >/dev/null
 
-if [[ -n "$PENDING" ]]; then
- #从旧到新逐个 cherry-pick
- for sha in $(printf '%s\n' "$PENDING" | tail -r); do
- say " cherry-pick ${sha:0:8}"
- git cherry-pick "$sha" >/dev/null || {
- git cherry-pick --abort || true
- git checkout "$WORK_BRANCH" || true
- fail "cherry-pick ${sha:0:8}失败，已回到 $WORK_BRANCH"
- }
+ #用工作分支内容覆盖发布线
+ git checkout "$WORK_BRANCH" -- . >/dev/null 2>&1 || true
+
+ #删除发布线有、工作分支没有的文件
+ DELETED="$(git diff --name-only --diff-filter=D "$WORK_BRANCH" HEAD || true)"
+ if [[ -n "$DELETED" ]]; then
+ printf '%s\n' "$DELETED" | while IFS= read -r f; do
+ [[ -n "$f" ]] || continue
+ git rm -q --cached "$f" >/dev/null 2>&1 || true
+ rm -f "$f"
  done
+ fi
+
+ if git diff --quiet HEAD && [[ -z "$(git status --porcelain)" ]]; then
+ say "无实际变化"
+ else
+ git add -A >/dev/null
+ SUBJECT="$(git log -1 --format='%s' "$WORK_BRANCH")"
+ git commit -q -m "release: sync snapshot from $WORK_BRANCH" \
+ -m "同步内容：$SUBJECT"
+ say "已提交同步"
+ fi
+else
+ say "[3/5]无需同步"
 fi
-
-# ----4.树一致性验证 ----
 say ""
-say "[4/6]验证树一致性"
 
+# ----4.树一致性强制校验 ----
+say "[4/5]验证树一致性"
 RELEASE_TREE_AFTER="$(git rev-parse "$RELEASE_BRANCH^{tree}")"
 if [[ "$RELEASE_TREE_AFTER" != "$WORK_TREE" ]]; then
- git checkout "$WORK_BRANCH"
- fail "发布分支树($RELEASE_TREE_AFTER)与工作分支树($WORK_TREE)不一致，已取消推送"
+ git checkout "$WORK_BRANCH" >/dev/null
+ fail "发布分支树(${RELEASE_TREE_AFTER})与工作分支树(${WORK_TREE})不一致，已取消推送"
 fi
 say " OK:树一致（$RELEASE_TREE_AFTER）"
+say ""
 
 # ----5.推送 ----
-say ""
-say "[5/6]推送到公开仓库"
-
+say "[5/5]推送到公开仓库"
 PUSHED=0
 for remote in gitee origin; do
  say "推送 $remote ……"
- if GIT_TERMINAL_PROMPT=0 git push "$remote" "HEAD:refs/heads/main" 2>&1 | grep -E "->|up-to-date" | sed 's/^/ /'; then
+ if GIT_TERMINAL_PROMPT=0 git push "$remote" "HEAD:refs/heads/main" 2>&1 | grep -E -- "->|up-to-date" | sed 's/^/ /'; then
  PUSHED=$((PUSHED +1))
  else
- say " WARN: $remote推送失败（网络问题？），稍后重试"
+ say " WARN: $remote推送失败（网络？），稍后重试：git push $remote HEAD:main"
  fi
 done
 
-# ----6.回到工作分支 ----
-say ""
-say "[6/6]回到工作分支"
 git checkout "$WORK_BRANCH" >/dev/null
-say " OK:当前在 $WORK_BRANCH"
-
 say ""
+say "当前分支：$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$PUSHED" -eq 2 ]]; then
  say "===完成：两个仓库都已同步 ==="
 else
- say "===部分完成：$PUSHED/2个仓库推送成功 ==="
- say "失败的稍后用 git push <remote> HEAD:main重试"
+ say "===部分完成：$PUSHED/2 ==="
  exit 1
 fi
