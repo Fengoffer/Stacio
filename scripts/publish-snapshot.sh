@@ -124,7 +124,7 @@ git checkout "$RELEASE_BRANCH"
 
 if [[ -n "$PENDING" ]]; then
  #从旧到新逐个 cherry-pick
- for sha in $(printf '%s\n' "$PENDING" | tac); do
+ for sha in $(printf '%s\n' "$PENDING" | tail -r); do
  say " cherry-pick ${sha:0:8}"
  git cherry-pick "$sha" >/dev/null || {
  git cherry-pick --abort || true
