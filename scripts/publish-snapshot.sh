@@ -47,7 +47,7 @@ say "[1/5]前置校验"
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$CURRENT_BRANCH" != "$WORK_BRANCH" ]]; then
- fail "当前在 ${CURRENT_BRANCH}，必须先切到 $WORK_BRANCH"
+ fail "当前在 $CURRENT_BRANCH，必须先切到 $WORK_BRANCH"
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -69,7 +69,7 @@ fi
 say " OK:工作区干净、边界通过、验证通过"
 
 git rev-parse --verify "$RELEASE_BRANCH" >/dev/null 2>&1 || \
- fail "发布分支 ${RELEASE_BRANCH}不存在"
+ fail "发布分支 $RELEASE_BRANCH不存在"
 
 WORK_TREE="$(git rev-parse "$WORK_BRANCH^{tree}")"
 RELEASE_TREE="$(git rev-parse "$RELEASE_BRANCH^{tree}")"
@@ -143,7 +143,7 @@ for remote in gitee origin; do
  if GIT_TERMINAL_PROMPT=0 git push "$remote" "HEAD:refs/heads/main" 2>&1 | grep -E -- "->|up-to-date" | sed 's/^/ /'; then
  PUSHED=$((PUSHED +1))
  else
- say " WARN: ${remote}推送失败（网络？），稍后重试：git push $remote HEAD:main"
+ say " WARN: $remote推送失败（网络？），稍后重试：git push $remote HEAD:main"
  fi
 done
 
