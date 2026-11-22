@@ -305,7 +305,9 @@ extension AISettingsViewController {
     var presentedAddProviderSheetCountForTesting: Int { presentedSheetCount }
     var lastReloadedProviderIDForTesting: UUID? { lastReloadedProviderID }
 
-    func selectTabForTesting(_ tab: Tab) {
+    func selectTabForTesting(_ tab: Tab) { selectTab(tab) }
+
+    func selectTab(_ tab: Tab) {
         selectedTab = tab
         if isViewLoaded {
             tabControl.selectedSegment = tab.rawValue

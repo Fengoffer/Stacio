@@ -191,7 +191,8 @@ public final class ConversationTimelineViewController: NSViewController {
     public var currentFollowState: TimelineFollowState { followState }
 
     // Focused test/diagnostic hooks; they do not mutate the timeline domain state.
-    var backToLatestTitleForTesting: String { backToLatestButton?.title ?? "" }
+    /// The control is icon-only; its label lives in the tooltip now.
+    var backToLatestTitleForTesting: String { backToLatestButton?.toolTip ?? "" }
     var backToLatestVisibleForTesting: Bool { backToLatestButton?.isHidden == false }
     var visibleScrollOriginYForTesting: CGFloat { scrollView?.contentView.bounds.origin.y ?? 0 }
 
@@ -380,17 +381,38 @@ public final class ConversationTimelineViewController: NSViewController {
     }
 
     private func setupBackToLatestButton() {
-        backToLatestButton = NSButton(title: ConversationTimelineScroll.backToLatestLabel(newItemCount: 0), target: self, action: #selector(backToLatest))
+        // A round chevron rather than a text pill: it stays out of the way
+        // while reading and matches the circular control language used
+        // elsewhere in the assistant surface.
+        backToLatestButton = NSButton(title: "", target: self, action: #selector(backToLatest))
         backToLatestButton.translatesAutoresizingMaskIntoConstraints = false
-        backToLatestButton.bezelStyle = .rounded
+        backToLatestButton.isBordered = false
         backToLatestButton.isHidden = true
-        backToLatestButton.font = .systemFont(ofSize: 12, weight: .medium)
-        backToLatestButton.toolTip = "滚动到会话末尾"
-        backToLatestButton.setAccessibilityLabel("回到最新消息")
+        backToLatestButton.image = NSImage(
+                                systemSymbolName: "chevron.down",
+                                accessibilityDescription: "回到最新"
+        )
+        backToLatestButton.imagePosition = .imageOnly
+        backToLatestButton.imageScaling = .scaleProportionallyDown
+        backToLatestButton.contentTintColor = .secondaryLabelColor
+        backToLatestButton.wantsLayer = true
+        backToLatestButton.layer?.cornerRadius = 16
+        backToLatestButton.layer?.cornerCurve = .continuous
+        StacioDesignSystem.setLayerBackgroundColor(
+                                backToLatestButton,
+                                color: NSColor.controlBackgroundColor.withAlphaComponent(0.92)
+        )
+        backToLatestButton.layer?.borderWidth = 1
+        StacioDesignSystem.setLayerBorderColor(
+                                backToLatestButton,
+                                color: NSColor.separatorColor.withAlphaComponent(0.5)
+        )
         view.addSubview(backToLatestButton)
         NSLayoutConstraint.activate([
             backToLatestButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
-            backToLatestButton.centerXAnchor.constraint(equalTo: view.centerXAnchor)
+            backToLatestButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            backToLatestButton.widthAnchor.constraint(equalToConstant: 32),
+            backToLatestButton.heightAnchor.constraint(equalToConstant: 32)
         ])
     }
 
@@ -427,7 +449,11 @@ public final class ConversationTimelineViewController: NSViewController {
             // 用户在阅读：不抢滚动位置，显示「回到最新」
             pendingUpdatedIDs.formUnion(changedIDs)
             pendingNewCount = pendingUpdatedIDs.count
-            backToLatestButton.title = ConversationTimelineScroll.backToLatestLabel(newItemCount: pendingNewCount)
+            // The control is an icon now, so the count moves into its tooltip
+            // and accessibility label rather than the face of the button.
+            let updateLabel = ConversationTimelineScroll.backToLatestLabel(newItemCount: pendingNewCount)
+            backToLatestButton.toolTip = updateLabel
+            backToLatestButton.setAccessibilityLabel(updateLabel)
             backToLatestButton.isHidden = false
         }
     }
@@ -853,6 +879,13 @@ struct TimelineRow: Hashable {
         return String(hash, radix: 16)
     }
 
+    /// A running turn must animate regardless of the exact status wording, so
+    /// the cue is decided by the entry kind rather than by string equality.
+    static func isRunningStatus(entry: TimelineSourceEntry) -> Bool {
+        guard case .planProgress(let text) = entry else { return false }
+        return text.contains("执行中")
+    }
+
     static func displayText(for entry: TimelineSourceEntry) -> String {
         switch entry {
         case .userMessage(let s): return s
@@ -1205,7 +1238,7 @@ private final class TimelineCollectionViewItem: NSCollectionViewItem {
         }
         textView.attributedStringValue = row.attributedText
         textView.setFlowingActivityEffectEnabled(
-            row.displayText == "执行中…",
+            TimelineRow.isRunningStatus(entry: row.entry),
             fallbackColor: StacioDesignSystem.theme.primaryTextColor
         )
         textView.setAccessibilityLabel(row.accessibilityRoleLabel)

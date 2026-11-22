@@ -120,6 +120,32 @@ public struct DefaultAIModelCatalogLoader: AIModelCatalogLoading {
         self.runtimeCatalog = runtimeCatalog
     }
 
+    func discoverReasoning(for provider: AIProviderConfiguration, modelID: String, apiKey: String?) throws -> AIModelCatalogCapabilities {
+        let credential = AIProviderCredentialOriginPolicy.credentialForRequest(apiKey, provider: provider, runtimeCatalog: runtimeCatalog)
+        try validateCredentialOrigin(for: provider, apiKey: credential)
+        let capabilities = try catalog.discoverReasoning(for: provider, modelID: modelID, apiKey: credential)
+        var record: [String: Any] = ["date": Date()]
+        record["vision"] = capabilities.supportsImages
+        record["thinking"] = capabilities.supportsThinking
+        record["efforts"] = capabilities.supportedReasoningEfforts?.map(\.rawValue)
+        UserDefaults.standard.set(record, forKey: Self.reasoningKey(provider, modelID))
+        return capabilities
+    }
+
+    private static func reasoningKey(_ provider: AIProviderConfiguration, _ modelID: String) -> String {
+        "Stacio.model-capabilities.v2.\(provider.id.uuidString).\(provider.baseURL).\(modelID)"
+    }
+
+    static func cachedReasoning(_ provider: AIProviderConfiguration, _ modelID: String) -> AIModelCatalogCapabilities? {
+        guard let record = UserDefaults.standard.dictionary(forKey: reasoningKey(provider, modelID)),
+              let date = record["date"] as? Date, Date().timeIntervalSince(date) < 86_400 else { return nil }
+        var info = AIModelCatalogCapabilities()
+        info.supportsImages = record["vision"] as? Bool
+        info.supportsThinking = record["thinking"] as? Bool
+        info.supportedReasoningEfforts = (record["efforts"] as? [String])?.compactMap(AIReasoningEffortPreference.init(rawValue:))
+        return info
+    }
+
     public func listModels(
         for provider: AIProviderConfiguration,
         apiKey: String?

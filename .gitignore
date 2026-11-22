@@ -48,3 +48,14 @@ dist/
 /.coaligne/
 /.writing/
 /.sync_temp_dir/
+.website-draft/
+.website-seo/
+#官网源码副本：与 website/同源，属于内部内容，禁止进公开仓库
+.website-preview/
+.website-baseline/
+# AI重写交付报告：含内部 provider地址与未验证项，属于内部文档
+AI-REWRITE/
+#图标源素材：仅供设计导出，不进构建也不进公开仓库
+logo素材/
+dist-*
+.stacio-snapshots/

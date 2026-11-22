@@ -26,7 +26,7 @@ public final class AICommandCardView: NSView {
     }
 
     private let statusIconView = NSImageView()
-    private let titleLabel = NSTextField(labelWithString: "工具调用")
+ private let titleLabel = ActivityShimmerLabel(labelWithString: "工具调用")
     private let explanationLabel = NSTextField(labelWithString: "")
     private let riskLabel = NSTextField(labelWithString: "")
     private let commandContainer = NSView()
@@ -229,6 +229,9 @@ public final class AICommandCardView: NSView {
         runButton.isEnabled = proposal.state == .proposed
         skipButton.isEnabled = proposal.state == .proposed
         titleLabel.stringValue = titleText()
+        // A running command animates its title so the card reads as live.
+        titleLabel.setShimmering(proposal.state == .running)
+        titleLabel.syncShimmerText()
         statusIconView.image = NSImage(systemSymbolName: symbolName(), accessibilityDescription: titleLabel.stringValue)
         statusIconView.contentTintColor = tintColor()
         renderCommandText()

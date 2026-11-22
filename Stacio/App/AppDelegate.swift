@@ -1889,6 +1889,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        StyledTerminalRecording.finishAllAndWait()
+        TransferHistoryWriter.shared.ordered(database: nil) {}
         TransferCompletionNotificationPresenter.dismissAllForApplicationTermination()
         licenseNetworkMonitor?.cancel()
         licenseNetworkMonitoringStarted = false
@@ -2268,6 +2270,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         settingsWindowController?.showWindow(sender)
         settingsWindowController?.window?.makeKeyAndOrderFront(sender)
+    }
+
+    func showAIModelSettings() {
+        showSettingsWindow(nil)
+        settingsWindowController?.showAIModels()
+    }
+
+    func showAIExecutionPermissions() {
+        showSettingsWindow(nil)
+        settingsWindowController?.showAIExecutionPermissions()
     }
 
     @objc

@@ -326,6 +326,35 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         )
     }
 
+    func testShortcutGroupsAlignRecordersInSettingsWindow() throws {
+        let controller = AppSettingsWindowController(settingsStore: AppSettingsStore(defaults: UserDefaults()))
+        controller.showWindow(nil)
+        defer { controller.close() }
+        let window = try XCTUnwrap(controller.window)
+        let content = try XCTUnwrap(window.contentView)
+        let navigation = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.nav.shortcuts") as? NSButton)
+        navigation.performClick(nil)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            window.appearance = NSAppearance(named: appearance)
+            content.layoutSubtreeIfNeeded()
+            let groups = try ["sessions", "layout", "panels", "application"].map {
+                try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.shortcuts." + $0))
+            }
+            assertAlignedSettingsGroups(groups)
+            let fields = try StacioShortcutAction.allCases.map {
+                try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.shortcut." + $0.rawValue) as? StacioShortcutRecorderField)
+            }
+            for field in fields.dropFirst() {
+                assertControlsShareFormColumn(fields[0], field, in: content)
+            }
+            if let output = ProcessInfo.processInfo.environment["STACIO_SHORTCUT_PREVIEW"],
+               let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: output + appearance.rawValue + ".png"))
+            }
+        }
+    }
+
     func testSettingsWindowUsesChineseLabelsAndPersistsTerminalPreferences() throws {
         let suiteName = "StacioSettingsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1021,7 +1050,7 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             in: rows
         )
         let riskMatrixIndex = try settingsRowIndex(
-            containing: "Stacio.Settings.agentApprovalRiskMatrix",
+            containing: "Stacio.Settings.agentApprovalSummary",
             in: rows
         )
         let autoRunIndex = try settingsRowIndex(
@@ -1054,20 +1083,16 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             in: content,
             listIdentifier: "Stacio.Settings.group.securityApproval.rows"
         )
-        let policyFieldsIndex = try settingsRowIndex(
-            containing: "Stacio.Settings.securityAgentCommandDenyPatterns",
+        let policyEntryIndex = try settingsRowIndex(
+            containing: "Stacio.Settings.openAIExecutionPermissions",
             in: approvalRows
         )
         let policyHelpIndex = try settingsRowIndex(
             containing: "Stacio.Settings.securityCommandPolicyHelp",
             in: approvalRows
         )
-        let approvalMatrixIndex = try settingsRowIndex(
-            containing: "Stacio.Settings.securityApprovalRiskMatrix",
-            in: approvalRows
-        )
-        XCTAssertEqual(policyHelpIndex, policyFieldsIndex)
-        XCTAssertEqual(approvalMatrixIndex, policyHelpIndex + 1)
+        XCTAssertEqual(policyHelpIndex, policyEntryIndex)
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.securityApprovalRiskMatrix"))
 
         let auditRows = try settingsRows(
             in: content,
@@ -2036,11 +2061,8 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         )
 
         try selectSettingsSection("security", in: content)
-        try assertSettingsFormPair(
-            labelIdentifier: "Stacio.Settings.formLabel.confirmationPolicy",
-            controlIdentifier: "Stacio.Settings.securityAgentConfirmationPolicy",
-            in: content
-        )
+        XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.securityAgentConfirmationPolicy"))
+        XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Settings.openAIExecutionPermissions"))
         try assertSettingsFormPair(
             labelIdentifier: "Stacio.Settings.formLabel.diagnosticsAuditExportLimit",
             controlIdentifier: "Stacio.Settings.diagnosticsAuditExportLimit",
@@ -2120,11 +2142,10 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         XCTAssertEqual(terminalOutputControl.label(forSegment: 0), "保留首尾")
         XCTAssertEqual(terminalOutputControl.label(forSegment: 1), "仅摘要")
         XCTAssertEqual(terminalOutputControl.label(forSegment: 2), "不附带")
-        XCTAssertEqual(confirmationControl.segmentCount, 4)
-        XCTAssertEqual(confirmationControl.label(forSegment: 0), "全部自动")
-        XCTAssertEqual(confirmationControl.label(forSegment: 1), "低风险自动")
-        XCTAssertEqual(confirmationControl.label(forSegment: 2), "只读自动")
-        XCTAssertEqual(confirmationControl.label(forSegment: 3), "每次确认")
+        XCTAssertEqual(confirmationControl.segmentCount, 3)
+        XCTAssertEqual(confirmationControl.label(forSegment: 0), "请求批准")
+        XCTAssertEqual(confirmationControl.label(forSegment: 1), "智能审批")
+        XCTAssertEqual(confirmationControl.label(forSegment: 2), "完全权限")
 
         try selectAISettingsTab("执行与权限", in: content)
         confirmationControl.selectedSegment = 1
@@ -2283,9 +2304,9 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("V2 设置")
         )
         XCTAssertTrue(
-            (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("本地 Agent")
+            (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("本地 CLI 工具")
         )
-        try selectAISettingsTab("本地 Agent", in: content)
+        try selectAISettingsTab("本地 CLI 工具", in: content)
         XCTAssertNotNil(
             content.firstSubview(withIdentifier: "Stacio.Settings.localAgent.unavailable")
         )
@@ -2345,10 +2366,10 @@ final class AppSettingsWindowControllerTests: XCTestCase {
             (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("V2 设置")
         )
         XCTAssertTrue(
-            (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("本地 Agent")
+            (0..<tabs.segmentCount).map { tabs.label(forSegment: $0) }.contains("本地 CLI 工具")
         )
 
-        try selectAISettingsTab("本地 Agent", in: content)
+        try selectAISettingsTab("本地 CLI 工具", in: content)
         XCTAssertNotNil(
             content.firstSubview(withIdentifier: "Stacio.Settings.localAgent.instances")
         )
@@ -2453,9 +2474,9 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         XCTAssertTrue(bridgeSocket.stringValue.contains("agent-bridge.sock"))
         XCTAssertTrue(bridgeHint.stringValue.contains("stacio agent sessions"))
         XCTAssertTrue(bridgeHint.stringValue.contains("stacio 仍作为兼容命令保留"))
-        XCTAssertTrue(executionHelp.stringValue.contains("真实终端"))
-        XCTAssertTrue(executionHelp.stringValue.contains("后台虚拟终端"))
-        XCTAssertTrue(executionHelp.stringValue.contains("审批与审计"))
+        XCTAssertTrue(executionHelp.stringValue.contains("对话框选中的终端"))
+        XCTAssertTrue(executionHelp.stringValue.contains("每条命令都需人工确认"))
+        XCTAssertTrue(executionHelp.stringValue.contains("对话权限和目标终端策略"))
         XCTAssertFalse(executionHelp.stringValue.contains("独立执行 runtime"))
         XCTAssertTrue(commandPatternHelp.stringValue.contains("禁止模式优先"))
         XCTAssertTrue(commandPatternHelp.stringValue.contains("从命令开头匹配"))
@@ -2466,14 +2487,14 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         )
         XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.agentExecutionMode"))
 
-        confirmationControl.selectedSegment = 3
+        confirmationControl.selectedSegment = 0
         confirmationControl.sendAction(confirmationControl.action, to: confirmationControl.target)
 
         XCTAssertEqual(store.snapshot().agentConfirmationPolicy, .requireEveryCommand)
         XCTAssertEqual(store.snapshot().agentExecutionMode, .visibleTerminal)
     }
 
-    func testAIAndSecuritySettingsShowApprovalRiskMatrix() throws {
+    func testApprovalSettingsHaveOneEditorAndExplainBothScopes() throws {
         let suiteName = "StacioApprovalRiskMatrixSettingsTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -2492,8 +2513,12 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         try selectAISettingsTab("执行与权限", in: content)
 
         let aiMatrix = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.agentApprovalRiskMatrix") as? NSTextField
+            content.firstSubview(withIdentifier: "Stacio.Settings.agentApprovalSummary") as? NSTextField
         )
+        XCTAssertTrue(aiMatrix.stringValue.contains("内置助手 · 当前对话权限"))
+        XCTAssertTrue(aiMatrix.stringValue.contains("外部 Agent · 默认审批规则"))
+        XCTAssertTrue(aiMatrix.stringValue.contains("不会切换对话权限"))
+        XCTAssertTrue(aiMatrix.stringValue.contains("少量安全写入"))
         XCTAssertTrue(aiMatrix.stringValue.contains("只读：自动放行"))
         XCTAssertTrue(aiMatrix.stringValue.contains("普通写入：自动放行"))
         XCTAssertTrue(aiMatrix.stringValue.contains("网络操作：需要确认"))
@@ -2502,7 +2527,7 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         let confirmationControl = try XCTUnwrap(
             content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl
         )
-        confirmationControl.selectedSegment = 3
+        confirmationControl.selectedSegment = 0
         confirmationControl.sendAction(confirmationControl.action, to: confirmationControl.target)
         XCTAssertTrue(aiMatrix.stringValue.contains("只读：需要确认"))
         XCTAssertTrue(aiMatrix.stringValue.contains("破坏性：需要确认"))
@@ -2513,13 +2538,40 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         securityNavigation.performClick(nil)
         content.layoutSubtreeIfNeeded()
 
-        let securityMatrix = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.securityApprovalRiskMatrix") as? NSTextField
-        )
-        XCTAssertTrue(securityMatrix.stringValue.contains("只读：需要确认"))
-        XCTAssertTrue(securityMatrix.stringValue.contains("普通写入：需要确认"))
-        XCTAssertTrue(securityMatrix.stringValue.contains("网络操作：需要确认"))
-        XCTAssertTrue(securityMatrix.stringValue.contains("破坏性：需要确认"))
+        for identifier in ["securityAgentConfirmationPolicy", "securityAgentCommandAllowPatterns", "securityAgentCommandDenyPatterns", "securityApprovalRiskMatrix"] {
+            XCTAssertNil(content.firstSubview(withIdentifier: "Stacio.Settings.\(identifier)"))
+        }
+        let summary = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.securitySummary.approval") as? NSTextField)
+        XCTAssertTrue(summary.stringValue.contains("请求批准"))
+        let entry = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.openAIExecutionPermissions") as? NSButton)
+        entry.performClick(nil)
+        content.layoutSubtreeIfNeeded()
+        let reopened = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl)
+        XCTAssertEqual(reopened.selectedSegment, 0)
+        XCTAssertTrue(aiMatrix.stringValue.contains("全局策略要求逐条确认，包括完全权限对话"))
+        let autoRun = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.aiAutoRunProposedCommands") as? NSButton)
+        autoRun.performClick(nil)
+        XCTAssertFalse(store.snapshot().aiAutoRunProposedCommands)
+        XCTAssertTrue(aiMatrix.stringValue.contains("自动审批/执行已关闭"))
+    }
+
+    func testOpeningPermissionSettingsPreservesLegacyReadOnlyPolicy() throws {
+        let suiteName = "StacioLegacyReadOnlyPermissions-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AppSettingsStore(defaults: defaults)
+        store.update { $0.agentConfirmationPolicy = .allowReadOnlyWithoutPrompt }
+        let controller = AppSettingsWindowController(settingsStore: store)
+        controller.showAIExecutionPermissions()
+        defer { controller.close() }
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let control = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl)
+        let summary = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.agentApprovalSummary") as? NSTextField)
+        XCTAssertEqual(control.selectedSegment, -1)
+        control.sendAction(control.action, to: control.target)
+        XCTAssertTrue(summary.stringValue.contains("只读自动策略生效"))
+        XCTAssertEqual(store.snapshot().agentConfirmationPolicy, .allowReadOnlyWithoutPrompt)
+        XCTAssertEqual(AppSettingsStore(defaults: defaults).snapshot().agentConfirmationPolicy, .allowReadOnlyWithoutPrompt)
     }
 
     func testAISettingsRemovesLegacyProviderPopupAndCatalogSurface() throws {
@@ -2684,17 +2736,21 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         securityNavigation.performClick(nil)
         content.layoutSubtreeIfNeeded()
 
+        let entry = try XCTUnwrap(content.firstSubview(withIdentifier: "Stacio.Settings.openAIExecutionPermissions") as? NSButton)
+        entry.performClick(nil)
+        content.layoutSubtreeIfNeeded()
+
         let securityConfirmationControl = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.securityAgentConfirmationPolicy") as? NSSegmentedControl
+            content.firstSubview(withIdentifier: "Stacio.Settings.agentConfirmationPolicy") as? NSSegmentedControl
         )
         let securityAllowPatternsField = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.securityAgentCommandAllowPatterns") as? NSTextField
+            content.firstSubview(withIdentifier: "Stacio.Settings.agentCommandAllowPatterns") as? NSTextField
         )
         let securityDenyPatternsField = try XCTUnwrap(
-            content.firstSubview(withIdentifier: "Stacio.Settings.securityAgentCommandDenyPatterns") as? NSTextField
+            content.firstSubview(withIdentifier: "Stacio.Settings.agentCommandDenyPatterns") as? NSTextField
         )
-        XCTAssertEqual(securityConfirmationControl.segmentCount, 4)
-        securityConfirmationControl.selectedSegment = 3
+        XCTAssertEqual(securityConfirmationControl.segmentCount, 3)
+        securityConfirmationControl.selectedSegment = 0
         securityConfirmationControl.sendAction(
             securityConfirmationControl.action,
             to: securityConfirmationControl.target
@@ -2916,10 +2972,10 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         XCTAssertGreaterThan(securitySummary.frame.height, 42)
         XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Settings.group.securityApproval"))
         XCTAssertNotNil(content.firstSubview(withIdentifier: "Stacio.Settings.group.securityAudit"))
-        XCTAssertTrue(securityApprovalSummary.stringValue.contains("低风险自动"))
+        XCTAssertTrue(securityApprovalSummary.stringValue.contains("智能审批"))
         XCTAssertTrue(securityCredentialSummary.stringValue.contains("Stacio 本地凭据库"))
         XCTAssertTrue(securityAuditSummary.stringValue.contains("本地审计"))
-        XCTAssertTrue(securityCommandPolicyHelp.stringValue.contains("网络与破坏性命令仍需确认"))
+        XCTAssertTrue(securityCommandPolicyHelp.stringValue.contains("AI 助手 → 执行与权限"))
         XCTAssertTrue(securityAuditHelp.stringValue.contains("本地追踪"))
     }
 
@@ -3502,9 +3558,9 @@ final class AppSettingsWindowControllerTests: XCTestCase {
         )
 
         XCTAssertGreaterThan(policyGroup.frame.height, 90)
-        XCTAssertTrue(overrideSummary.stringValue.contains("全局命令确认"))
+        XCTAssertTrue(overrideSummary.stringValue.contains("全局审批策略"))
         XCTAssertTrue(overrideSummary.stringValue.contains("生产环境强制确认"))
-        XCTAssertTrue(overrideSummary.stringValue.contains("会话 AI 执行策略"))
+        XCTAssertTrue(overrideSummary.stringValue.contains("目标终端的 AI 执行策略"))
         XCTAssertTrue(sessionEntry.stringValue.contains("新建/编辑会话"))
     }
 

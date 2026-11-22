@@ -303,7 +303,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
     private var rowContextMenuRow = -1
     private var lastPresentedPropertiesText: String?
     private var transferStatusHeightConstraint: NSLayoutConstraint?
-    private var transferSamplesByJobID: [String: FilesTransferSample] = [:]
+    private var transferSamplesByJobID: [String: TransferRateSampler] = [:]
     private var transferStatusRowViews: [FilesTransferStatusRowView] = []
     private var supplementalTransferStatusRowView: FilesTransferStatusRowView?
     private var transferStatusHasFinishedHistory = false
@@ -957,7 +957,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
             let progressText = Self.formatTransferProgress(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal)
             let directionText = row.direction == .upload ? L10n.Transfers.upload : L10n.Transfers.download
             let fileName = Self.transferDisplayName(for: row)
-            let statusText = L10n.Transfers.status(row.rawStatus)
+            let statusText = L10n.Transfers.displayStatus(row.rawStatus, bytesDone: row.bytesDone, bytesTotal: row.bytesTotal)
             let etaSuffix = metric.etaText.isEmpty ? "" : " · \(L10n.Transfers.remainingPrefix) \(metric.etaText)"
             let speedSuffix = metric.speedText.isEmpty ? "" : " · \(metric.speedText)"
             let rowView = existingRowsByJobID[row.jobID]
@@ -967,7 +967,7 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
                 statusText: "\(directionText) \(fileName) · \(progressText)\(etaSuffix) · \(statusText)\(speedSuffix)",
                 progressValue: Self.transferProgressValue(bytesDone: row.bytesDone, bytesTotal: row.bytesTotal),
                 primaryAction: Self.primaryTransferStatusAction(for: row.rawStatus),
-                secondaryAction: Self.secondaryTransferStatusAction(for: row.rawStatus),
+                secondaryAction: Self.secondaryTransferStatusAction(for: row),
                 canDelete: Self.isFinishedTransferStatus(row.rawStatus),
                 actionLabel: { Self.transferActionLabel(for: $0) },
                 actionImage: { [weak self] action in
@@ -1517,41 +1517,16 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         for row: TransferQueueSnapshot.Row,
         capturedAt: Date
     ) -> FilesTransferMetric {
-        guard row.rawStatus == "running" || row.rawStatus == "resuming" else {
-            transferSamplesByJobID[row.jobID] = FilesTransferSample(
-                bytesDone: row.bytesDone,
-                capturedAt: capturedAt,
-                bytesPerSecond: nil
-            )
-            return .empty
-        }
-
-        let previous = transferSamplesByJobID[row.jobID]
-        var bytesPerSecond = previous?.bytesPerSecond
-        if let previous,
-           row.bytesDone > previous.bytesDone
-        {
-            let elapsed = capturedAt.timeIntervalSince(previous.capturedAt)
-            if elapsed > 0 {
-                bytesPerSecond = Double(row.bytesDone - previous.bytesDone) / elapsed
-            }
-        }
-
-        transferSamplesByJobID[row.jobID] = FilesTransferSample(
-            bytesDone: row.bytesDone,
-            capturedAt: capturedAt,
-            bytesPerSecond: bytesPerSecond
-        )
-
-        guard let bytesPerSecond,
-              bytesPerSecond > 0
-        else {
+        let bytesPerSecond = transferSamplesByJobID[row.jobID, default: TransferRateSampler()]
+            .update(bytesDone: row.bytesDone, status: row.rawStatus, at: capturedAt, baselineID: row.rateBaselineID)
+        guard let bytesPerSecond, row.bytesTotal == 0 || row.bytesDone < row.bytesTotal else {
             return .empty
         }
         let remainingBytes = row.bytesTotal > row.bytesDone ? row.bytesTotal - row.bytesDone : 0
         return FilesTransferMetric(
             speedText: Self.formatTransferSpeed(bytesPerSecond: bytesPerSecond),
-            etaText: Self.formatTransferETA(seconds: Double(remainingBytes) / bytesPerSecond)
+            etaText: bytesPerSecond > 0 && row.bytesTotal > 0
+                ? Self.formatTransferETA(seconds: Double(remainingBytes) / bytesPerSecond) : ""
         )
     }
 
@@ -2556,12 +2531,12 @@ public final class FilesViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
-    private static func secondaryTransferStatusAction(for rawStatus: String?) -> TransferQueueAction? {
-        switch rawStatus {
+    private static func secondaryTransferStatusAction(for row: TransferQueueSnapshot.Row) -> TransferQueueAction? {
+        switch row.rawStatus {
         case "queued", "running", "resuming", "paused":
             .stop
         case "failed", "stopped", "canceled", "cancelled":
-            .retry
+            row.allowsRetry ? .retry : nil
         default:
             nil
         }
@@ -3033,12 +3008,6 @@ struct RemoteFileRow: StacioFileDisplayRow {
         formatter.defaultDate = Calendar(identifier: .gregorian).date(from: DateComponents(year: 2000, month: 1, day: 1))
         return formatter
     }
-}
-
-private struct FilesTransferSample {
-    let bytesDone: UInt64
-    let capturedAt: Date
-    let bytesPerSecond: Double?
 }
 
 private struct FilesTransferMetric {

@@ -6,9 +6,9 @@
     "maximum": "2.0.0"
   },
   "resources": [
-    {"relativePath":"provider.json","sha256":"9a14c9806fdce72d474cd56d4cda3e643fcfb783cd557c8ea3caa1e3849d9d4f","schemaRevision":1},
+    {"relativePath":"provider.json","sha256":"6e9d98d7b227039dd02d8541d9beb73fb4284dd43dc53ed9bcfa6f63628fb221","schemaRevision":1},
     {"relativePath":"coding-plan.json","sha256":"3fbda6c0cdb7c469bb3c6b6e6bffbbe9bb21787c0107381878a674d0b0430b0e","schemaRevision":1},
-    {"relativePath":"local-agent.json","sha256":"44993fab6950d5cc086afec738ea36ea064426099e6eabae765778412e5f7c38","schemaRevision":2},
+    {"relativePath":"local-agent.json","sha256":"530eb092a318cb3e80d514f52db05f8d8d30e132adab98e2c30a54ef6cb40246","schemaRevision":2},
     {"relativePath":"plan-agent-compatibility.json","sha256":"c9e0762ea9041568f2b4ae2b0d83c77eee9938b6fc0de07eaf20aaf9502e3b4f","schemaRevision":1},
     {"relativePath":"website-action.json","sha256":"f10814c39dfeb8b6ab149af48edb1d91df755a3dcfee1c76bc41d899b01386e0","schemaRevision":1},
     {"relativePath":"provider-pricing.json","sha256":"d6d05b5517be7795dbad218e60139c38d4adc09e7a2bdc1f88ed4e32d0feb556","schemaRevision":1},

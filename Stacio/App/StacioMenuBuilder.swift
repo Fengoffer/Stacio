@@ -108,14 +108,8 @@ public struct StacioMenuBuilder {
             target: TerminalRecordingWindowCoordinator.shared
         ))
         submenu.addItem(menuItem(
-            title: "停止录制当前终端",
-            action: #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:)),
-            key: "",
-            target: TerminalRecordingWindowCoordinator.shared
-        ))
-        submenu.addItem(menuItem(
-            title: "保存当前终端录制…",
-            action: #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:)),
+            title: "打开录制文件夹",
+            action: #selector(TerminalRecordingWindowCoordinator.revealRecordingFolder(_:)),
             key: "",
             target: TerminalRecordingWindowCoordinator.shared
         ))

@@ -2611,8 +2611,7 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
 
         let inspectorController = InspectorViewController(
             transferHistoryStore: NoOpSCPTransferHistoryStore(),
-            aiAssistantViewController: makeAIAssistantPanelViewController(),
-            workspaceSessionProtocolProvider: { [weak workspaceViewController] in
+ workspaceSessionProtocolProvider: { [weak workspaceViewController] in
                 workspaceViewController?.currentSessionProtocol ?? .noSession
             },
             tunnelLiveSessionContextProvider: tunnelLiveSessionContextProvider,
@@ -2683,7 +2682,30 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
             transferQueueCoordinatorFactory: transferQueueCoordinatorFactory,
             remoteEditorPresentation: presentation
         )
-        _ = inspectorController.view
+        inspectorController.aiAssistantFactory = { [weak workspaceViewController] () -> AgentPanelViewController? in
+ guard let workspaceViewController else { return nil }
+ let panel = AgentPanelViewController.make(
+ terminalLister: workspaceViewController,
+ executorResolver: workspaceViewController
+ )
+ // The header buttons were wired to callbacks nobody assigned, so the gear and
+ // the full-screen glyph did nothing. Point them at real actions.
+ panel.onRequestSettings = {
+ (NSApp.delegate as? AppDelegate)?.showAIModelSettings()
+ }
+ panel.onRequestPermissionSettings = {
+ (NSApp.delegate as? AppDelegate)?.showAIExecutionPermissions()
+ }
+
+ panel.onAttentionChanged = { [weak inspectorController] marker in
+ inspectorController?.setAIBadge(marker)
+ }
+ panel.onRequestClose = { [weak self] in
+ self?.toggleInspectorFromToolbar(nil)
+ }
+ return panel
+ }
+		_ = inspectorController.view
         workspaceViewController.onRemoteTerminalDirectoryChanged = { [weak inspectorController] pane, directory in
             inspectorController?.followRemoteTerminalDirectoryIfEnabled(
                 runtimeID: pane.runtimeID,
@@ -2794,9 +2816,11 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         workspaceViewController.onAIContextRequest = { [weak self] request in
             self?.showAIAssistantInspector(prefilling: request.selectedText)
         }
-        inspectorController.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+ inspectorController.view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         inspectorController.view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        inspectorViewController = inspectorController
+       
+
+ inspectorViewController = inspectorController
         let inspector = NSSplitViewItem(viewController: inspectorController)
         inspector.minimumThickness = 0
         inspector.maximumThickness = unrestrictedInspectorPanelWidth
@@ -2868,240 +2892,6 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
         _ = alert.runModal()
     }
 
-    private func makeAIAssistantPanelViewController() -> AIAssistantPanelViewController {
-        let modelSelectionSession = AIModelSelectionSession()
-        let assistantSettingsValueStore = assistantSettingsValueStoreProvider()
-        let assistantSettingsProvider: () -> AssistantRuntimeSettingsSnapshot? = {
-            guard let assistantSettingsValueStore else { return nil }
-            return try? AssistantRuntimeSettingsSnapshot.resolve(from: assistantSettingsValueStore)
-        }
-        let productionRuntimeFactory: InspectorConversationRuntimeFactory = { [weak self, weak workspaceViewController] sessionID, terminalContext, modelSelection in
-            guard let self else {
-                throw InspectorConversationAssemblyError.hostUnavailable
-            }
-            let paths = try StacioPaths()
-            let controlPath = paths.applicationSupportDirectory
-                .appendingPathComponent("agent-control.sqlite3").path
-            let controlState = try AgentConversationV2ControlCoordinator(
-                databasePath: controlPath
-            ).controlState()
-            let accessMode: SessionRuntimeBridge.AccessMode = controlState == .enabled
-                ? .interactive
-                : .readOnlyHistory
-            let runtimeSettings = try AssistantRuntimeSettingsSnapshot.resolve(
-                from: assistantSettingsValueStore
-            )
-            guard let catalog = BundledRuntimeCatalog.shared.toolCatalog else {
-                throw InspectorConversationAssemblyError.toolCatalogUnavailable
-            }
-            let terminalTools = catalog.tools.filter {
-                $0.toolID == StacioBuiltinToolID.terminalCommand
-            }
-            guard terminalTools.count == 1 else {
-                throw InspectorConversationAssemblyError.terminalToolUnavailable
-            }
-            let filteredCatalog = StacioToolCatalog(
-                revision: catalog.revision,
-                tools: terminalTools
-            )
-            let storage = try ConversationV2StorageFactory.makeStorageBundle(
-                conversationID: sessionID,
-                paths: paths
-            )
-            var initialState = ConversationV2StorageFactory.makeInitialSessionState(
-                sessionID: sessionID,
-                queueAutoAdvanceEnabled: runtimeSettings.queueAutoAdvanceEnabled,
-                defaultWorkMode: runtimeSettings.defaultWorkMode,
-                defaultReasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
-                memoryScope: terminalContext.historyScopeID,
-                initialTargetContext: terminalContext
-            )
-            let selectedProviderID = modelSelection?.providerID.uuidString
-                ?? runtimeSettings.defaultRuntimeConfigurationID
-            let selectedModelID = modelSelection?.modelID
-            let resolved = LegacyProviderConfigurationAdapter.resolveActiveProvider(
-                settingsStore: self.settingsStore,
-                keyStore: self.aiAPIKeyStore,
-                transport: self.aiHTTPTransport,
-                preferredConfigurationID: selectedProviderID,
-                preferredModelID: selectedModelID,
-                defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
-            )
-            if let resolved {
-                initialState.session.runtimeSelection = AgentRuntimeSelection(
-                    kind: .nativeAPI,
-                    providerConfigurationID: resolved.configuration.runtimeConfigurationKind == .provider
-                        ? resolved.configuration.effectiveConfigurationID : nil,
-                    codingPlanConfigurationID: resolved.configuration.runtimeConfigurationKind == .codingPlan
-                        ? resolved.configuration.effectiveConfigurationID : nil,
-                    modelID: resolved.configuration.model,
-                    reasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
-                    workMode: runtimeSettings.defaultWorkMode
-                )
-            } else if let selectedProviderID {
-                // Preserve an explicit stale selection so `send` fails closed.
-                // An unavailable model must never turn into the global default.
-                initialState.session.runtimeSelection = AgentRuntimeSelection(
-                    kind: .nativeAPI,
-                    providerConfigurationID: selectedProviderID,
-                    modelID: selectedModelID,
-                    reasoningEffort: runtimeSettings.defaultReasoningEffort.rawValue,
-                    workMode: runtimeSettings.defaultWorkMode
-                )
-            }
-            let actor = ConversationActorRegistry.shared.actor(
-                for: sessionID,
-                store: storage.repository,
-                sealing: storage.sealing,
-                initialState: initialState
-            )
-            let executionChoice = TurnExecutionChoice(
-                rawValue: runtimeSettings.defaultTerminalMode
-            ) ?? .realTerminal
-            let executionModeState = InspectorConversationExecutionModeState(
-                choice: executionChoice
-            )
-            let executionCoordinator = AgentExecutionCoordinator(
-                terminalResolver: self.workspaceViewController,
-                authorizer: ConversationBridgeApprovedAgentActionAuthorizer(
-                    settingsStore: self.settingsStore
-                ),
-                auditRecorder: self.makeAgentActionAuditStore(),
-                sessionLister: self.workspaceViewController,
-                executionMode: .visibleTerminal,
-                executionModeResolver: { executionModeState.mode }
-            )
-            let admissionScheduler = try ConversationV2StorageFactory.makeAdmissionScheduler(
-                repository: storage.repository,
-                paths: paths,
-                capacity: runtimeSettings.maxParallelAttempts
-            )
-            let submissionGate: () -> Bool = {
-                do {
-                    let coordinator = try AgentConversationV2ControlCoordinator(
-                        databasePath: controlPath
-                    )
-                    return try coordinator.admissionGateAllowsNewExecution() == .open
-                } catch {
-                    // Control-plane failures must fail closed for new work. An
-                    // already running Attempt continues through its own
-                    // settlement path and is intentionally not gated here.
-                    return false
-                }
-            }
-            let bridge = SessionRuntimeBridge(
-                actor: actor,
-                sessionID: sessionID,
-                initialState: initialState,
-                provider: resolved?.provider,
-                providerConfig: resolved?.configuration,
-                executionCoordinator: executionCoordinator,
-                terminalContextProvider: { [weak workspaceViewController] in
-                    workspaceViewController?.aiTerminalContext(runtimeID: terminalContext.runtimeID)
-                },
-                targetContextResolver: { [weak workspaceViewController] runtimeID in
-                    workspaceViewController?.aiTerminalContext(runtimeID: runtimeID)
-                },
-                executionModeSnapshotHandler: { choice in
-                    executionModeState.applyFrozenTurnChoice(choice)
-                },
-                runtimeSettingsProvider: {
-                    try AssistantRuntimeSettingsSnapshot.resolve(from: assistantSettingsValueStore)
-                },
-                submissionGate: submissionGate,
-                admissionCoordinator: admissionScheduler,
-                toolCatalog: filteredCatalog,
-                providerResolver: {
-                    LegacyProviderConfigurationAdapter.resolveActiveProvider(
-                        settingsStore: self.settingsStore,
-                        keyStore: self.aiAPIKeyStore,
-                        transport: self.aiHTTPTransport,
-                        defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
-                    )
-                },
-                providerConfigurationResolver: { configurationID in
-                    LegacyProviderConfigurationAdapter.resolveActiveProvider(
-                        settingsStore: self.settingsStore,
-                        keyStore: self.aiAPIKeyStore,
-                        transport: self.aiHTTPTransport,
-                        preferredConfigurationID: configurationID,
-                        defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
-                    )
-                },
-                providerSelectionResolver: { configurationID, modelID in
-                    LegacyProviderConfigurationAdapter.resolveActiveProvider(
-                        settingsStore: self.settingsStore,
-                        keyStore: self.aiAPIKeyStore,
-                        transport: self.aiHTTPTransport,
-                        preferredConfigurationID: configurationID,
-                        preferredModelID: modelID,
-                        defaultReasoningEffort: runtimeSettings.defaultReasoningEffort
-                    )
-                },
-                settingsProvider: { self.settingsStore.snapshot() },
-                terminalAutomationPolicyProvider: { [weak workspaceViewController] runtimeID in
-                    guard let runtimeID else { return nil }
-                    return try? workspaceViewController?
-                        .resolveTerminalTarget(.runtimeID(runtimeID))
-                        .agentAutomationPolicy
-                },
-                initialTargetContext: terminalContext,
-                initialExecutionChoice: executionChoice,
-                restorePending: true,
-                accessMode: accessMode,
-                persistsSessionCreationEvent: true
-            )
-            return InspectorConversationRuntime(
-                sessionID: sessionID,
-                bridge: bridge,
-                repository: storage.repository,
-                initialExecutionChoice: executionChoice,
-                executionModeState: executionModeState
-            )
-        }
-        let runtimeFactory = aiConversationRuntimeFactoryOverride ?? productionRuntimeFactory
-        let executionCoordinator = makeAgentExecutionCoordinator(parentWindow: window)
-        return AIAssistantPanelViewController(
-            coordinator: AIAssistantCoordinator(
-                provider: SettingsBackedAIAssistantProvider(
-                    settingsStore: settingsStore,
-                    apiKeyStore: aiAPIKeyStore,
-                    transport: aiHTTPTransport,
-                    selectionSession: modelSelectionSession
-                ),
-                executionCoordinator: executionCoordinator,
-                settingsStore: settingsStore,
-                modelSelectionSession: modelSelectionSession,
-                assistantSettingsProvider: assistantSettingsProvider
-            ),
-            contextProvider: { [weak workspaceViewController] runtimeID in
-                workspaceViewController?.aiTerminalContext(runtimeID: runtimeID)
-            },
-            terminalSessionProvider: { [weak workspaceViewController] in
-                workspaceViewController?.listAgentTerminalSessions() ?? []
-            },
-            settingsStore: settingsStore,
-            modelSelectionSession: modelSelectionSession,
-            assistantSettingsProvider: assistantSettingsProvider,
-            taskRecorder: makeAgentTaskStore(),
-            taskLister: makeAgentTaskStore(),
-            conversationHistoryStore: nil,
-            internalBrowserOpener: { [weak workspaceViewController] url in
-                _ = try? workspaceViewController?.openBrowserSession(
-                    urlString: url.absoluteString,
-                    title: url.host ?? url.absoluteString
-                )
-            },
-            terminalActivator: { [weak workspaceViewController] runtimeID in
-                workspaceViewController?.activateTerminal(runtimeID: runtimeID) ?? false
-            },
-            conversationRuntimeFactory: runtimeFactory,
-            conversationCatalogLoader: aiConversationCatalogLoader,
-            localAgentToolResolver: aiLocalAgentToolResolver,
-            localAgentProcessLauncherFactory: aiLocalAgentProcessLauncherFactory,
-            localAgentRuntimeLaunchAuthorizerProvider: aiLocalAgentRuntimeLaunchAuthorizerProvider
-        )
-    }
 
     private func showAssistantQuickSettings() {
         if let controller = assistantQuickSettingsWindowController {
@@ -6568,14 +6358,14 @@ public final class WorkbenchWindowController: NSWindowController, NSWindowDelega
                 completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
                 queueViewController: queueViewController
             )
-            try? coordinator.restoreHistory()
+            coordinator.loadHistoryWhenOpened()
         } else if let paths = try? StacioPaths() {
             coordinator = TransferQueueCoordinator(
                 historyStore: CoreBridgeSCPTransferHistoryStore(databasePath: paths.databaseURL.path),
                 completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),
                 queueViewController: queueViewController
             )
-            try? coordinator.restoreHistory()
+            coordinator.loadHistoryWhenOpened()
         } else {
             coordinator = TransferQueueCoordinator(
                 completionNotificationPresenter: Self.defaultTransferCompletionNotificationPresenter(),

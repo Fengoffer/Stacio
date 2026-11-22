@@ -339,6 +339,11 @@ public enum V2SettingsPaneFactory {
                     equalTo: document.widthAnchor,
                     constant: -40
                 ).isActive = true
+                // A split view has no intrinsic height, so inside this stack it
+                // collapses to its minimum and squeezes both columns together.
+                localAgentSettingsView.heightAnchor.constraint(
+                    greaterThanOrEqualToConstant: 520
+                ).isActive = true
                 continue
             }
 

@@ -174,10 +174,7 @@ public final class StacioShortcutStore {
     private let defaultsKey = "stacio.shortcuts.v1"
     private var values: [StacioShortcutAction: StacioShortcutBinding]
 
-    @MainActor
-    public init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        let builtIns: [StacioShortcutAction: StacioShortcutBinding] = [
+    private static let builtIns: [StacioShortcutAction: StacioShortcutBinding] = [
             .newSession: .init(key: "n", modifiers: [.command, .shift]),
             .newLocalTerminal: .init(key: "n"),
             .closeTerminal: .init(key: "w"),
@@ -199,15 +196,23 @@ public final class StacioShortcutStore {
             .toggleDeviceDashboard: .init(key: "d", modifiers: [.command, .shift]),
             .showAIAssistant: .init(key: "a", modifiers: [.command, .shift])
         ]
+
+    public func defaultBinding(for action: StacioShortcutAction) -> StacioShortcutBinding {
+        Self.builtIns[action] ?? StacioShortcutBinding(key: "")
+    }
+
+    @MainActor
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         if let data = defaults.data(forKey: defaultsKey),
            let decoded = try? JSONDecoder().decode([String: StacioShortcutBinding].self, from: data) {
-            var merged = builtIns
+            var merged = Self.builtIns
             for (raw, binding) in decoded {
                 if let action = StacioShortcutAction(rawValue: raw) { merged[action] = binding }
             }
             values = merged
         } else {
-            values = builtIns
+            values = Self.builtIns
         }
     }
 
@@ -255,8 +260,7 @@ public final class StacioShortcutStore {
     }
 
     public func reset(_ action: StacioShortcutAction) {
-        let defaultsStore = StacioShortcutStore(defaults: UserDefaults())
-        _ = set(defaultsStore.binding(for: action), for: action)
+        _ = set(defaultBinding(for: action), for: action)
     }
 
     private func persist() {

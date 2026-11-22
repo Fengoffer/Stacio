@@ -24,6 +24,22 @@ pub struct TransferEventRecord {
     pub created_at: String,
 }
 
+impl TransferEventRecord {
+    pub fn new(progress: &ScpTransferProgress, message: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            job_id: progress.job_id.clone(),
+            event_type: progress.status.clone(),
+            message,
+            bytes_done: Some(progress.bytes_done),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+mod pending;
+pub use pending::{open_history, save_change, HistoryChange};
+
 pub struct TransferRepository {
     connection: Connection,
 }
@@ -83,15 +99,14 @@ impl TransferRepository {
         progress: &ScpTransferProgress,
         message: Option<String>,
     ) -> Result<TransferEventRecord, rusqlite::Error> {
-        let event = TransferEventRecord {
-            id: Uuid::new_v4().to_string(),
-            job_id: progress.job_id.clone(),
-            event_type: progress.status.clone(),
-            message,
-            bytes_done: Some(progress.bytes_done),
-            created_at: Utc::now().to_rfc3339(),
-        };
+        let event = TransferEventRecord::new(progress, message);
+        let transaction = self.connection.unchecked_transaction()?;
+        self.insert_event(&event)?;
+        transaction.commit()?;
+        Ok(event)
+    }
 
+    fn insert_event(&self, event: &TransferEventRecord) -> rusqlite::Result<()> {
         self.connection.execute(
             "INSERT INTO transfer_events (id, job_id, event_type, message, bytes_done, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -100,7 +115,7 @@ impl TransferRepository {
                 event.job_id,
                 event.event_type,
                 event.message,
-                progress.bytes_done as i64,
+                event.bytes_done.map(|bytes| bytes as i64),
                 event.created_at
             ],
         )?;
@@ -111,14 +126,14 @@ impl TransferRepository {
                  finished_at = CASE WHEN ?2 IN ('completed', 'failed', 'stopped', 'canceled', 'cancelled') THEN ?4 ELSE finished_at END
              WHERE id = ?1",
             params![
-                progress.job_id,
-                progress.status,
-                progress.bytes_done as i64,
+                event.job_id,
+                event.event_type,
+                event.bytes_done.map(|bytes| bytes as i64),
                 event.created_at
             ],
         )?;
 
-        Ok(event)
+        Ok(())
     }
 
     pub fn list_recent_jobs(&self) -> Result<Vec<TransferJobRecord>, rusqlite::Error> {

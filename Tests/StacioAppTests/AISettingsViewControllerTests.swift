@@ -12,7 +12,7 @@ final class AISettingsViewControllerTests: XCTestCase {
 
         XCTAssertEqual(
             controller.tabTitlesForTesting,
-            ["模型", "本地 Agent", "上下文", "执行与权限", "历史"]
+            ["模型", "本地 CLI 工具", "上下文", "执行与权限", "历史"]
         )
     }
 

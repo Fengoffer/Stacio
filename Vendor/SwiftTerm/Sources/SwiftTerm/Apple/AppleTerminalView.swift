@@ -561,10 +561,14 @@ extension TerminalView {
         return nsattr
     }
     
-    //
-    // Given a vt100 attribute, return the NSAttributedString attributes used to render it
-    //
-    func getAttributes (_ attribute: Attribute, withUrl: Bool) -> [NSAttributedString.Key:Any]?
+    /// Width in points of the pixel-aligned grid used by the renderer.
+    public var renderedCellWidth: CGFloat { cellDimension.width }
+
+    /// Height in points after line spacing and pixel alignment are applied.
+    public var renderedCellHeight: CGFloat { cellDimension.height }
+
+    // Given a vt100 attribute, return the NSAttributedString attributes used to render it.
+    public func getAttributes (_ attribute: Attribute, withUrl: Bool) -> [NSAttributedString.Key:Any]?
     {
         if let result = withUrl ? urlAttributes [attribute] : attributes [attribute] {
             return result

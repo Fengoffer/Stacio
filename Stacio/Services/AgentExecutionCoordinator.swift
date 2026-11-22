@@ -12,8 +12,11 @@ public protocol AgentTerminalTarget: AnyObject {
     var agentTitle: String { get }
     var agentLiveSessionContext: TunnelLiveSessionContext? { get }
     var agentAutomationPolicy: SessionAutomationPolicy { get }
+    var agentBracketedPasteEnabled: Bool { get }
     var agentCommandCompletionGeneration: UInt64 { get }
     var agentTerminalOutputTranscript: String { get }
+    var agentOutputPosition: Int { get }
+    func agentOutput(since position: Int, limit: Int) -> String
     var agentTerminalDisplaySnapshot: String { get }
     var supportsAgentCompletionMarker: Bool { get }
     var isAwaitingSensitiveInput: Bool { get }
@@ -30,8 +33,16 @@ public extension AgentTerminalTarget {
     var agentRuntimeGeneration: UInt64 { 0 }
     var isAgentRuntimeConnected: Bool { true }
     var agentAutomationPolicy: SessionAutomationPolicy { .default }
+    var agentBracketedPasteEnabled: Bool { false }
     var agentCommandCompletionGeneration: UInt64 { 0 }
     var agentTerminalOutputTranscript: String { "" }
+    var agentOutputPosition: Int { agentTerminalOutputTranscript.utf8.count }
+    func agentOutput(since position: Int, limit: Int) -> String {
+        let bytes = agentTerminalOutputTranscript.utf8
+        let count = min(bytes.count - position, limit)
+        guard count > 0 else { return "" }
+        return String(decoding: bytes.suffix(count).drop(while: { $0 & 0xC0 == 0x80 }), as: UTF8.self)
+    }
     var agentTerminalDisplaySnapshot: String { agentTerminalOutputTranscript }
     var supportsAgentCompletionMarker: Bool { false }
     var isAwaitingSensitiveInput: Bool { false }
@@ -94,6 +105,7 @@ public protocol AgentTerminalResolving {
 }
 
 public struct AgentTerminalSessionSummary: Equatable {
+    public var savedSessionID: String?
     public let runtimeID: String
     public let connectionGeneration: UInt64
     public let title: String
@@ -111,8 +123,10 @@ public struct AgentTerminalSessionSummary: Equatable {
         environment: String,
         isCurrent: Bool,
         currentDirectory: String? = nil,
-        subtitle: String? = nil
+        subtitle: String? = nil,
+        savedSessionID: String? = nil
     ) {
+        self.savedSessionID = savedSessionID
         self.runtimeID = runtimeID
         self.connectionGeneration = connectionGeneration
         self.title = title
@@ -3919,6 +3933,7 @@ extension AgentExecutionCoordinator: AgentCommandExecuting, AgentTaskControlling
 extension TerminalPaneViewController: AgentTerminalTarget {
     public var agentRuntimeGeneration: UInt64 { terminalRuntimeGeneration }
     public var isAgentRuntimeConnected: Bool { isTerminalRuntimeConnected }
+    public var agentBracketedPasteEnabled: Bool { terminalView.getTerminal().bracketedPasteMode }
     public var agentCommandCompletionGeneration: UInt64 { commandCompletionGeneration }
     public var agentTerminalOutputTranscript: String { terminalOutputTranscript }
     public var agentTerminalDisplaySnapshot: String { terminalDisplaySnapshotForTesting }
@@ -3950,6 +3965,7 @@ extension TerminalPaneViewController: AgentTerminalTarget {
 extension RemoteTerminalPaneViewController: AgentTerminalTarget {
     public var agentRuntimeGeneration: UInt64 { terminalRuntimeGeneration }
     public var isAgentRuntimeConnected: Bool { isTerminalRuntimeConnected }
+    public var agentBracketedPasteEnabled: Bool { terminalView.getTerminal().bracketedPasteMode }
     public var agentCommandCompletionGeneration: UInt64 { commandCompletionGeneration }
     public var agentTerminalOutputTranscript: String { terminalOutputTranscript }
     public var agentTerminalDisplaySnapshot: String { terminalDisplaySnapshotForTesting }

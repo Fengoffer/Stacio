@@ -10,15 +10,29 @@ const SESSION_SIDEBAR_ORDER_MIGRATION_VERSION: i64 = 6;
 const SESSION_SIDEBAR_ORDER_MIGRATION_NAME: &str = "session_sidebar_order";
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
+    configure_with_timeout(connection, std::time::Duration::from_secs(5))
+}
+
+fn configure_with_timeout(
+    connection: &Connection,
+    timeout: std::time::Duration,
+) -> rusqlite::Result<()> {
+    connection.busy_timeout(timeout)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
-    connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
     Ok(())
 }
 
 pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
-    configure_connection(connection)?;
+    apply_migrations_with_timeout(connection, std::time::Duration::from_secs(5))
+}
+
+pub(super) fn apply_migrations_with_timeout(
+    connection: &Connection,
+    timeout: std::time::Duration,
+) -> rusqlite::Result<()> {
+    configure_with_timeout(connection, timeout)?;
     connection.execute_batch(INIT_SQL)?;
     connection.execute_batch(AGENT_ACTIONS_SQL)?;
     connection.execute_batch(AGENT_TASKS_SQL)?;

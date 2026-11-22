@@ -93,7 +93,10 @@ use infrastructure::{
     terminal_macro_repository::{
         TerminalMacroRecord, TerminalMacroRepository, TerminalMacroRepositoryError,
     },
-    transfer_repository::{TransferEventRecord, TransferJobRecord, TransferRepository},
+    transfer_repository::{
+        open_history, save_change, HistoryChange, TransferEventRecord, TransferJobRecord,
+        TransferRepository,
+    },
     tunnel::libssh2_channel::{
         DynamicSocksTunnelWorker, Libssh2DirectTcpIpOpener, Libssh2RemoteForwardListener,
         LocalTunnelWorker, RemoteTunnelWorker, TcpTunnelClientAcceptor, TcpTunnelTargetConnector,
@@ -534,16 +537,7 @@ fn pump_live_shells_once() -> LiveShellPumpWaitState {
         };
     }
 
-    let statuses = manager.poll_all(&mut registry);
-    if let Err(error) = statuses {
-        for runtime_id in manager.active_runtime_ids() {
-            let _ = registry.record_output(
-                runtime_id.clone(),
-                format!("Stacio live shell pump error: {error}\n").into_bytes(),
-            );
-            let _ = manager.close(&mut registry, runtime_id);
-        }
-    }
+    manager.poll_all(&mut registry);
     LiveShellPumpWaitState {
         has_active_workers: manager.active_count() > 0,
         has_pending_input: manager.has_pending_input(),
@@ -568,12 +562,8 @@ fn wait_for_live_shell_activity(
         return signal.wait_for_next_tick(marker, true, fallback_wait);
     }
 
-    let observed = wait_for_shell_wait_interests(wait_state.wait_interests, fallback_wait);
-    if observed {
-        marker
-    } else {
-        signal.wait_for_next_tick(marker, true, fallback_wait)
-    }
+    wait_for_shell_wait_interests(wait_state.wait_interests, fallback_wait);
+    signal.marker()
 }
 
 #[cfg(unix)]
@@ -603,7 +593,10 @@ fn wait_for_shell_wait_interests(
         return false;
     }
 
-    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+    // Socket readiness is not the only work: idle sessions still have
+    // keepalive, echo-filter and input retry deadlines.
+    let timeout_ms = fallback_wait.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
     live_shell_wake_pipe().drain();
     if result < 0 {
         thread::sleep(fallback_wait);
@@ -686,7 +679,15 @@ pub fn take_terminal_input_batch(
 pub fn take_terminal_output_batch(
     runtime_id: String,
 ) -> Result<TerminalOutputBatch, TerminalRuntimeError> {
-    recover_global_lock(terminal_registry()).take_output_batch(runtime_id)
+    let (batch, was_full) = {
+        let mut registry = recover_global_lock(terminal_registry());
+        let was_full = registry.available_output_capacity(&runtime_id)? == 0;
+        (registry.take_output_batch(runtime_id)?, was_full)
+    };
+    if was_full && !batch.bytes.is_empty() {
+        notify_live_shell_pump();
+    }
+    Ok(batch)
 }
 
 #[uniffi::export]
@@ -1478,7 +1479,12 @@ pub fn run_live_scp_transfer_with_resume(
             &resume_options,
             RemoteTransferProtocol::Scp,
         )? {
-            return Ok(parallel_transfer_progress(&job, &report));
+            return Ok(completed_transfer_progress(
+                &job,
+                report.bytes_total,
+                report.bytes_done,
+                report.resumed_from,
+            ));
         }
         let transport = Libssh2Transport::new();
         let session = transport.connect_with_secret_and_expected_transfer_session(
@@ -1487,14 +1493,14 @@ pub fn run_live_scp_transfer_with_resume(
             expected_fingerprint_sha256,
         )?;
         let engine = Libssh2ScpEngine::new();
-        let bytes_done = match job.direction {
+        let (bytes_done, resumed_from) = match job.direction {
             domain::scp::ScpDirection::Upload => engine
                 .upload_file_with_resume(&session, &job, &resume_options)
-                .map(|report| report.bytes_written)
+                .map(|report| (report.bytes_written, report.resumed_from))
                 .map_err(files_error_to_ssh_runtime)?,
             domain::scp::ScpDirection::Download => engine
                 .download_file_with_resume(&session, &job, &resume_options)
-                .map(|report| report.bytes_read)
+                .map(|report| (report.bytes_read, report.resumed_from))
                 .map_err(files_error_to_ssh_runtime)?,
         };
         let bytes_total = if job.bytes_total == 0 {
@@ -1502,30 +1508,12 @@ pub fn run_live_scp_transfer_with_resume(
         } else {
             job.bytes_total
         };
-        let start_status = if resume_options.requested_offset > 0 && !resume_options.force_restart {
-            "resuming"
-        } else {
-            "running"
-        };
-
-        Ok(vec![
-            ScpTransferProgress {
-                job_id: job.id.clone(),
-                bytes_done: if start_status == "resuming" {
-                    resume_options.requested_offset.min(bytes_total)
-                } else {
-                    0
-                },
-                bytes_total,
-                status: start_status.to_string(),
-            },
-            ScpTransferProgress {
-                job_id: job.id,
-                bytes_done,
-                bytes_total,
-                status: "completed".to_string(),
-            },
-        ])
+        Ok(completed_transfer_progress(
+            &job,
+            bytes_total,
+            bytes_done,
+            resumed_from,
+        ))
     })
 }
 
@@ -1563,10 +1551,15 @@ pub fn run_live_sftp_transfer_with_resume(
             &resume_options,
             RemoteTransferProtocol::Sftp,
         )? {
-            return Ok(parallel_transfer_progress(&job, &report));
+            return Ok(completed_transfer_progress(
+                &job,
+                report.bytes_total,
+                report.bytes_done,
+                report.resumed_from,
+            ));
         }
         let session = connect_live_sftp_session(&config, secret, expected_fingerprint_sha256)?;
-        let bytes_done = Libssh2SftpEngine::new()
+        let (bytes_done, resumed_from) = Libssh2SftpEngine::new()
             .transfer_with_resume(&session, &job, &resume_options)
             .map_err(files_error_to_ssh_runtime)?;
         let bytes_total = if job.bytes_total == 0 {
@@ -1574,29 +1567,12 @@ pub fn run_live_sftp_transfer_with_resume(
         } else {
             job.bytes_total
         };
-        Ok(vec![
-            ScpTransferProgress {
-                job_id: job.id.clone(),
-                bytes_done: if resume_options.requested_offset > 0 && !resume_options.force_restart
-                {
-                    resume_options.requested_offset.min(bytes_total)
-                } else {
-                    0
-                },
-                bytes_total,
-                status: if resume_options.requested_offset > 0 && !resume_options.force_restart {
-                    "resuming".to_string()
-                } else {
-                    "running".to_string()
-                },
-            },
-            ScpTransferProgress {
-                job_id: job.id,
-                bytes_done,
-                bytes_total,
-                status: "completed".to_string(),
-            },
-        ])
+        Ok(completed_transfer_progress(
+            &job,
+            bytes_total,
+            bytes_done,
+            resumed_from,
+        ))
     })
 }
 
@@ -1664,6 +1640,8 @@ fn run_parallel_local_remote_transfer(
     };
     let job_id = job.id.clone();
     let progress_job_id = job.id.clone();
+    let is_resume = resume_options.requested_offset > 0 && !resume_options.force_restart;
+    let first_progress = std::sync::atomic::AtomicBool::new(true);
     let transfer = match job.direction {
         ScpDirection::Upload => {
             let destination_config = config.clone();
@@ -1688,7 +1666,13 @@ fn run_parallel_local_remote_transfer(
                         job_id: progress_job_id.clone(),
                         bytes_done,
                         bytes_total: source_size,
-                        status: "running".to_string(),
+                        status: if first_progress.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            && (is_resume || bytes_done > 0)
+                        {
+                            "resuming".to_string()
+                        } else {
+                            "running".to_string()
+                        },
                     });
                 },
             )
@@ -1716,7 +1700,13 @@ fn run_parallel_local_remote_transfer(
                         job_id: progress_job_id.clone(),
                         bytes_done,
                         bytes_total: source_size,
-                        status: "running".to_string(),
+                        status: if first_progress.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            && (is_resume || bytes_done > 0)
+                        {
+                            "resuming".to_string()
+                        } else {
+                            "running".to_string()
+                        },
                     });
                 },
             )
@@ -1729,16 +1719,18 @@ fn run_parallel_local_remote_transfer(
         })
 }
 
-fn parallel_transfer_progress(
+fn completed_transfer_progress(
     job: &ScpTransferJob,
-    report: &RemoteFileTransferReport,
+    bytes_total: u64,
+    bytes_done: u64,
+    resumed_from: u64,
 ) -> Vec<ScpTransferProgress> {
     vec![
         ScpTransferProgress {
             job_id: job.id.clone(),
-            bytes_done: report.resumed_from,
-            bytes_total: report.bytes_total,
-            status: if report.resumed_from > 0 {
+            bytes_done: resumed_from,
+            bytes_total,
+            status: if resumed_from > 0 {
                 "resuming".to_string()
             } else {
                 "running".to_string()
@@ -1746,8 +1738,8 @@ fn parallel_transfer_progress(
         },
         ScpTransferProgress {
             job_id: job.id.clone(),
-            bytes_done: report.bytes_done,
-            bytes_total: report.bytes_total,
+            bytes_done,
+            bytes_total,
             status: "completed".to_string(),
         },
     ]
@@ -1799,6 +1791,7 @@ pub fn run_live_remote_to_remote_transfer(
             force_restart: request.force_restart,
         };
         let bytes_total = job.bytes_total;
+        let first_progress = std::sync::atomic::AtomicBool::new(true);
         let job_id = job.id.clone();
         let result = transfer_remote_file_ranges(
             source_factory,
@@ -1817,7 +1810,13 @@ pub fn run_live_remote_to_remote_transfer(
                         job_id: job_id.clone(),
                         bytes_done,
                         bytes_total,
-                        status: "running".to_string(),
+                        status: if first_progress.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            && bytes_done > 0
+                        {
+                            "resuming".to_string()
+                        } else {
+                            "running".to_string()
+                        },
                     });
                 }
             },
@@ -2186,6 +2185,18 @@ pub fn cancel_live_scp_transfer(job_id: String) -> Result<bool, SshRuntimeError>
     Ok(cancel_live_scp_transfer_target(&job_id))
 }
 
+/// The direct-transfer coordinator still owns the route here. A cancel racing
+/// the worker's return must not be seen by the next attempt on that route.
+#[uniffi::export]
+pub fn retire_remote_transfer_attempt(job_id: String) {
+    services::scp_service::clear_live_scp_transfer_cancellation(&job_id);
+}
+
+#[uniffi::export]
+pub fn pause_live_scp_transfer(job_id: String) -> Option<Vec<ScpTransferProgress>> {
+    services::scp_service::pause_with_progress(&job_id)
+}
+
 #[uniffi::export]
 pub fn cancel_live_ftp_transfer(job_id: String) -> Result<bool, SshRuntimeError> {
     Ok(cancel_live_scp_transfer_target(&job_id))
@@ -2206,10 +2217,16 @@ pub fn record_scp_transfer_job(
     status: String,
     bytes_done: u64,
 ) -> Result<(), SshRuntimeError> {
-    let repository = transfer_repository_for_path(database_path)?;
-    repository
-        .upsert_job(session_id, &job, &status, bytes_done)
-        .map_err(transfer_db_error_to_ssh_runtime)
+    save_change(
+        &database_path,
+        HistoryChange::Job {
+            session_id,
+            job,
+            status,
+            bytes_done,
+        },
+    )
+    .map_err(transfer_db_error_to_ssh_runtime)
 }
 
 #[uniffi::export]
@@ -2226,11 +2243,10 @@ pub fn append_scp_transfer_progress_with_message(
     progress: ScpTransferProgress,
     message: Option<String>,
 ) -> Result<ScpTransferEventRecord, SshRuntimeError> {
-    let repository = transfer_repository_for_path(database_path)?;
-    repository
-        .append_progress_with_message(&progress, message)
-        .map(ScpTransferEventRecord::from)
-        .map_err(transfer_db_error_to_ssh_runtime)
+    let event = TransferEventRecord::new(&progress, message);
+    save_change(&database_path, HistoryChange::Event(event.clone()))
+        .map_err(transfer_db_error_to_ssh_runtime)?;
+    Ok(event.into())
 }
 
 #[uniffi::export]
@@ -2261,11 +2277,29 @@ pub fn list_scp_transfer_events(
         .map_err(transfer_db_error_to_ssh_runtime)
 }
 
+/// Preserve the clear's order relative to new jobs even while the database is locked.
+#[uniffi::export]
+pub fn request_clear_finished_scp_transfer_jobs(
+    database_path: String,
+) -> Result<(), SshRuntimeError> {
+    save_change(&database_path, HistoryChange::ClearFinished)
+        .map_err(transfer_db_error_to_ssh_runtime)
+}
+
 #[uniffi::export]
 pub fn clear_finished_scp_transfer_jobs(database_path: String) -> Result<u32, SshRuntimeError> {
     let repository = transfer_repository_for_path(database_path)?;
     repository
         .delete_finished_jobs()
+        .map_err(transfer_db_error_to_ssh_runtime)
+}
+
+#[uniffi::export]
+pub fn request_delete_finished_scp_transfer_job(
+    database_path: String,
+    job_id: String,
+) -> Result<(), SshRuntimeError> {
+    save_change(&database_path, HistoryChange::DeleteFinished(job_id))
         .map_err(transfer_db_error_to_ssh_runtime)
 }
 
@@ -2794,12 +2828,13 @@ pub fn copy_live_ftp_path(
 fn transfer_repository_for_path(
     database_path: String,
 ) -> Result<TransferRepository, SshRuntimeError> {
-    let connection = Connection::open(database_path).map_err(transfer_db_error_to_ssh_runtime)?;
-    apply_migrations(&connection).map_err(transfer_db_error_to_ssh_runtime)?;
-    Ok(TransferRepository::new(connection))
+    open_history(&database_path).map_err(transfer_db_error_to_ssh_runtime)
 }
 
 fn transfer_db_error_to_ssh_runtime(error: rusqlite::Error) -> SshRuntimeError {
+    if matches!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)) {
+        return SshRuntimeError::Transport { message: "TRANSFER_HISTORY_BUSY".into() };
+    }
     SshRuntimeError::Transport {
         message: redact_ssh_diagnostic(&format!("transfer database error: {error}")),
     }
@@ -3743,6 +3778,26 @@ uniffi::setup_scaffolding!();
 #[cfg(test)]
 mod tests {
     use super::health;
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_socket_wait_returns_in_time_to_service_keepalives() {
+        use std::{io::Write, os::fd::AsRawFd, os::unix::net::UnixStream, time::{Duration, Instant}};
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        // Bound the test even if socket waiting accidentally becomes infinite.
+        let rescue = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = writer.write_all(b"wake");
+        });
+        let start = Instant::now();
+        super::wait_for_shell_wait_interests(
+            vec![super::ShellWaitInterest::readable(reader.as_raw_fd())],
+            Duration::from_millis(20),
+        );
+        let elapsed = start.elapsed();
+        rescue.join().unwrap();
+        assert!(elapsed < Duration::from_millis(250), "idle wait blocked for {elapsed:?}");
+    }
 
     #[test]
     fn health_contains_app_version_and_architecture() {

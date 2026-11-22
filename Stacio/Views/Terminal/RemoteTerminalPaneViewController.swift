@@ -254,6 +254,8 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     public private(set) var automationPolicy: SessionAutomationPolicy
     public private(set) var currentRemoteDirectory: String = "~"
     public let terminalView: StacioRemoteTerminalView
+    var styledRecording: StyledTerminalRecording?
+    var canStartStyledRecording: Bool { !didClose && styledRecording == nil }
     public var keyboardFocusView: NSView { terminalView }
     public private(set) var lifecycleState: RemoteTerminalLifecycleState = .running
     private var isNormalTelnetDisconnection = false
@@ -668,6 +670,9 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     }
 
     private func startOutputPollingIfNeeded() {
+        // Polling belongs to the live session, including hidden tabs. Stopping
+        // consumption on view disappearance fills the SSH receive window and
+        // blocks the remote command. Only session teardown stops this timer.
         guard startsPollingAutomatically,
               lifecycleState == .running,
               outputPollTimer == nil
@@ -762,11 +767,6 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
                 completion?(didReceiveOutput)
             }
         }
-    }
-
-    public override func viewWillDisappear() {
-        super.viewWillDisappear()
-        stopOutputPolling()
     }
 
     private func stopOutputPolling() {
@@ -964,6 +964,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
 
     public func closeTerminal() {
         guard didClose == false else { return }
+        styledRecording?.finish()
         let closedEstablishedRuntime = hasEstablishedRuntime
         didClose = true
         sensitiveInputState.reset()
@@ -1549,7 +1550,7 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         }
         setLifecycle(.running, message: "")
         onMultiExecPresentationChanged?(self)
-        if startsPollingAutomatically, view.window != nil {
+        if isViewLoaded {
             startOutputPollingIfNeeded()
         }
         writePostConnectScriptIfNeeded()
@@ -1738,6 +1739,12 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
     private func copyTerminalPathToPasteboard(_ path: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(path, forType: .string)
+    }
+
+    public var agentOutputPosition: Int { transcriptRecorder.outputPosition }
+
+    public func agentOutput(since position: Int, limit: Int) -> String {
+        transcriptRecorder.output(since: position, limit: limit)
     }
 
     public var terminalOutputTranscript: String {
@@ -1984,6 +1991,10 @@ public final class RemoteTerminalPaneViewController: NSViewController, TerminalV
         droppedByteCount: UInt32,
         bufferedByteCount: UInt32
     ) {
+        guard outputProtectionActive != protectionActive
+            || outputProtectionDroppedByteCount != droppedByteCount
+            || outputProtectionBufferedByteCount != bufferedByteCount
+        else { return }
         outputProtectionActive = protectionActive
         outputProtectionDroppedByteCount = droppedByteCount
         outputProtectionBufferedByteCount = bufferedByteCount

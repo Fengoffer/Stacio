@@ -55,6 +55,7 @@ struct ScpResumeMetadata {
 pub struct Libssh2ScpUploadReport {
     pub remote_path: String,
     pub bytes_written: u64,
+    pub resumed_from: u64,
 }
 
 impl Libssh2ScpUploadReport {
@@ -62,6 +63,7 @@ impl Libssh2ScpUploadReport {
         Self {
             remote_path,
             bytes_written,
+            resumed_from: 0,
         }
     }
 }
@@ -70,6 +72,7 @@ impl Libssh2ScpUploadReport {
 pub struct Libssh2ScpDownloadReport {
     pub local_path: String,
     pub bytes_read: u64,
+    pub resumed_from: u64,
 }
 
 impl Libssh2ScpDownloadReport {
@@ -77,6 +80,7 @@ impl Libssh2ScpDownloadReport {
         Self {
             local_path,
             bytes_read,
+            resumed_from: 0,
         }
     }
 }
@@ -183,6 +187,7 @@ impl Libssh2ScpEngine {
         let bytes_total = self.validate_upload_source(job)?;
         let request = self.prepare_request(job)?;
         let local_path = Path::new(&request.local_path);
+        let mut resumed_from = 0;
         let bytes_written = if local_path.is_dir() {
             self.upload_directory_recursive(
                 session,
@@ -199,13 +204,15 @@ impl Libssh2ScpEngine {
                 &request.remote_path,
                 bytes_total,
                 resume_options,
+                &mut resumed_from,
             )?
         };
 
-        Ok(Libssh2ScpUploadReport::new(
-            request.remote_path,
+        Ok(Libssh2ScpUploadReport {
+            remote_path: request.remote_path,
             bytes_written,
-        ))
+            resumed_from,
+        })
     }
 
     pub fn download_file(
@@ -228,8 +235,15 @@ impl Libssh2ScpEngine {
 
         let request = self.prepare_request(job)?;
         let local_path = Path::new(&request.local_path);
+        let mut resumed_from = 0;
         let bytes_read = if self.remote_path_is_directory(session, &request.remote_path)? {
-            self.download_directory_recursive(session, job, &request.remote_path, local_path)?
+            self.download_directory_recursive(
+                session,
+                job,
+                &request.remote_path,
+                local_path,
+                &mut resumed_from,
+            )?
         } else {
             self.download_single_file(
                 session,
@@ -240,6 +254,7 @@ impl Libssh2ScpEngine {
                 0,
                 request.bytes_total,
                 resume_options,
+                &mut resumed_from,
             )?
         };
 
@@ -247,10 +262,11 @@ impl Libssh2ScpEngine {
             return Err("FILES_SIZE_MISMATCH".to_string());
         }
 
-        Ok(Libssh2ScpDownloadReport::new(
-            request.local_path,
+        Ok(Libssh2ScpDownloadReport {
+            local_path: request.local_path,
             bytes_read,
-        ))
+            resumed_from,
+        })
     }
 
     pub fn read_file_bytes(
@@ -339,6 +355,7 @@ impl Libssh2ScpEngine {
         job: &ScpTransferJob,
         remote_root: &str,
         local_root: &Path,
+        resumed_from: &mut u64,
     ) -> Result<u64, String> {
         std::fs::create_dir_all(local_root).map_err(|_| "FILES_LOCAL_WRITE_FAILED".to_string())?;
         let remote_root = resolve_existing_remote_directory_path(session, remote_root)?;
@@ -352,6 +369,7 @@ impl Libssh2ScpEngine {
             &remote_root,
             local_root,
             &mut bytes_read,
+            resumed_from,
         )?;
         Ok(bytes_read)
     }
@@ -365,6 +383,7 @@ impl Libssh2ScpEngine {
         remote_directory: &str,
         local_root: &Path,
         bytes_read: &mut u64,
+        resumed_from: &mut u64,
     ) -> Result<(), String> {
         if is_live_scp_transfer_cancelled(&job.id) {
             return Err("FILES_TRANSFER_CANCELED".to_string());
@@ -388,6 +407,7 @@ impl Libssh2ScpEngine {
                         &entry.path,
                         local_root,
                         bytes_read,
+                        resumed_from,
                     )?;
                 }
                 RemoteFileKind::File | RemoteFileKind::Symlink => {
@@ -400,6 +420,7 @@ impl Libssh2ScpEngine {
                         *bytes_read,
                         job.bytes_total,
                         &ScpResumeOptions::fresh(),
+                        resumed_from,
                     )?;
                     *bytes_read = bytes_read.saturating_add(copied);
                 }
@@ -418,6 +439,7 @@ impl Libssh2ScpEngine {
         progress_base: u64,
         progress_total: u64,
         resume_options: &ScpResumeOptions,
+        resumed_from: &mut u64,
     ) -> Result<u64, String> {
         validate_remote_path(remote_path)?;
         let remote_path = resolve_remote_file_path_for_scp(session, remote_path)?;
@@ -437,6 +459,7 @@ impl Libssh2ScpEngine {
             std::fs::create_dir_all(parent).map_err(|_| "FILES_LOCAL_WRITE_FAILED".to_string())?;
         }
         if resume_offset > 0 {
+            *resumed_from = resume_offset;
             let remote_identity =
                 remote_identity.ok_or_else(|| "FILES_TRANSFER_INTERRUPTED".to_string())?;
             return self.download_single_file_from_offset(
@@ -530,11 +553,10 @@ impl Libssh2ScpEngine {
                 &mut local_writer,
                 || is_live_scp_transfer_cancelled(&job.id),
                 |bytes_done| {
-                    record_transfer_progress_with_status(
+                    record_transfer_progress(
                         job,
                         resume_offset.saturating_add(bytes_done),
                         remote_identity.source_size,
-                        "resuming",
                     )
                 },
                 &self.tuning,
@@ -644,6 +666,7 @@ impl Libssh2ScpEngine {
         remote_path: &str,
         expected_size: u64,
         resume_options: &ScpResumeOptions,
+        resumed_from: &mut u64,
     ) -> Result<u64, String> {
         validate_remote_path(remote_path)?;
         let remote_path = resolve_remote_file_path_for_scp(session, remote_path)?;
@@ -659,6 +682,7 @@ impl Libssh2ScpEngine {
         );
 
         if resume_offset > 0 {
+            *resumed_from = resume_offset;
             return self.upload_single_file_from_offset(
                 session,
                 job,
@@ -761,11 +785,10 @@ impl Libssh2ScpEngine {
                 resume_offset,
                 || is_live_scp_transfer_cancelled(&job.id),
                 |bytes_done| {
-                    record_transfer_progress_with_status(
+                    record_transfer_progress(
                         job,
                         resume_offset.saturating_add(bytes_done),
                         local_identity.source_size,
-                        "resuming",
                     )
                 },
                 &self.tuning,

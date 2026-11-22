@@ -1229,7 +1229,10 @@ final class V2ProductionAssemblyTests: XCTestCase {
         XCTAssertTrue(try! store.loadUnsettledOutbox().isEmpty)
     }
 
-    func testStructuredLocalAgentTurnPersistsManagedProfileKind() async {
+    /// The local agent is a terminal, not a chat transcript of tool calls, so a
+    /// configuration that still carries an RPC protocol must still land on the
+    /// PTY path.
+    func testManagedProfileConfigurationStillPersistsTerminalMode() async {
         let store = InMemoryConversationSessionStore()
         let (bridge, actor, _) = await Self.makeBridge(
             provider: nil,
@@ -1237,35 +1240,39 @@ final class V2ProductionAssemblyTests: XCTestCase {
             skipProvider: true
         )
         let configuration = Self.makeLocalAgentConfiguration(structuredProtocol: .rpc)
+        XCTAssertFalse(
+            configuration.isReadyForStructuredRuntime,
+            "Structured mode is retired: a local agent always gets a terminal"
+        )
         let selected = await bridge.selectLocalAgentRuntime(configuration: configuration)
         XCTAssertTrue(selected)
 
+        var deliveredToPTY = false
         let result = await bridge.sendToLocalAgent(
             text: "inspect nginx",
             configuration: configuration,
-            deliver: { XCTFail("managed Runtime must not write to the PTY"); return .notRunning }
+            deliver: {
+                deliveredToPTY = true
+                return .accepted
+            }
         )
 
         guard case .accepted = result else {
-            return XCTFail("A durable managed Local Agent turn should be accepted")
+            return XCTFail("A durable Local Agent turn should be accepted")
         }
+        XCTAssertTrue(deliveredToPTY, "The terminal receives the text, not a managed protocol")
         let submitted = store.committed
             .flatMap(\.candidates)
             .first(where: { $0.kind == .turnSubmitted })
             .flatMap { EventPayloadCodec.decode(TurnSubmittedPayload.self, from: $0.payload) }
-        XCTAssertEqual(submitted?.terminalMode, LocalAgentExecutionProfileKind.managed.rawValue)
+        XCTAssertEqual(
+            submitted?.terminalMode,
+            LocalAgentExecutionProfileKind.terminalPassthrough.rawValue
+        )
         XCTAssertEqual(
             actor.latestPublishedState?.activeAttempt?.terminalModeSnapshot,
-            LocalAgentExecutionProfileKind.managed.rawValue
+            LocalAgentExecutionProfileKind.terminalPassthrough.rawValue
         )
-        guard let workspaceSnapshot = actor.latestPublishedState?.activeAttempt?.agentProcessWorkingDirectorySnapshot,
-              let workspacePath = workspaceSnapshot.localPathReference
-        else {
-            return XCTFail("Structured Local Agent must persist a session workspace")
-        }
-        XCTAssertEqual(workspaceSnapshot.mode, .managedWorkspace)
-        XCTAssertTrue(workspacePath.hasSuffix("/AgentWorkspace/sessions/c-1"))
-        XCTAssertEqual(workspaceSnapshot.allowedFilesystemScope, [workspacePath])
     }
 
     func testLocalAgentTurnCommitFailureNeverWritesPTY() async {

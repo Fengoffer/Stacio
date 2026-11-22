@@ -72,6 +72,7 @@ let package = Package(
                 .process("Resources/gitee.svg"),
                 .process("Resources/SessionIcons"),
                 .process("Resources/ImportSourceIcons"),
+                .copy("Resources/AIModelIcons"),
                 .process("Resources/RuntimeCatalog"),
                 .copy("Resources/Fonts/SarasaTermSC-Regular.ttf"),
                 .copy("Resources/Fonts/SarasaTermSC-Bold.ttf"),

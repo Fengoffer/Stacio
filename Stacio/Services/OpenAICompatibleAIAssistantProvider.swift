@@ -597,6 +597,26 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
                 if event.isDone {
                     continue
                 }
+                // Reasoning text streams before the answer; keep it visible so a long
+                if let reasoning = event.reasoningDelta, reasoning.isEmpty == false {
+                    let merged = rawContent + reasoning
+                    let projectedReasoning = Self.visibleAssistantMessage(fromPartialContent: merged)
+                    if projectedReasoning.hasPrefix(visibleText), projectedReasoning.count > visibleText.count {
+                        let suffix = String(projectedReasoning.dropFirst(visibleText.count))
+                        visibleText = projectedReasoning
+                        rawContent = merged
+                        emittedVisibleText = true
+                        onPartial(suffix)
+                    } else if projectedReasoning != visibleText {
+                        // The projection was rewritten rather than extended; replace it
+                        // wholesale instead of cutting out a meaningless suffix.
+                        visibleText = projectedReasoning
+                        rawContent = merged
+                        emittedVisibleText = true
+                        onPartial(projectedReasoning)
+                    }
+                    continue
+                }
                 guard let delta = event.contentDelta,
                       delta.isEmpty == false
                 else {
@@ -604,10 +624,14 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
                 }
                 rawContent += delta
                 let projected = Self.visibleAssistantMessage(fromPartialContent: rawContent)
-                guard projected.count > visibleText.count else {
+                // A rewrite (not an extension) must replace the whole projection;
+                // slicing by length would emit a meaningless fragment.
+                guard projected != visibleText else {
                     continue
                 }
-                let suffix = String(projected.dropFirst(visibleText.count))
+                let suffix = projected.hasPrefix(visibleText)
+                    ? String(projected.dropFirst(visibleText.count))
+                    : projected
                 visibleText = projected
                 if suffix.isEmpty == false {
                     emittedVisibleText = true
@@ -617,6 +641,20 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
         }
         for event in parser.finish() {
             if event.isDone {
+                continue
+            }
+            // Reasoning text streams before the answer; keep it visible so a long
+            // thinking turn is not silent.
+            if let reasoning = event.reasoningDelta, reasoning.isEmpty == false {
+                let merged = rawContent + reasoning
+                let projectedReasoning = Self.visibleAssistantMessage(fromPartialContent: merged)
+                if projectedReasoning.count > visibleText.count {
+                    let suffix = String(projectedReasoning.dropFirst(visibleText.count))
+                    visibleText = projectedReasoning
+                    rawContent = merged
+                    emittedVisibleText = true
+                    onPartial(suffix)
+                }
                 continue
             }
             guard let delta = event.contentDelta,
@@ -1094,8 +1132,38 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
                 }
             )
         }
-        throw AIAssistantProviderError.malformedAssistantPayload
+        // Models do not always honour the JSON envelope, and a relay may drop a
+        // field the strict model requires. Never echo the raw envelope at the user:
+        // extract the message text when a JSON body is present, and only fall back
+        // to the prose when there is no JSON at all.
+        let stripped = stripCodeFence(content).trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped.hasPrefix("{") {
+            // Only a structurally complete object may be salvaged. A truncated
+            // body would yield a partial message, so surface the error instead of
+            // showing half an answer as if it were the whole reply.
+            guard AIJSONStructure.isCompleteObject(stripped) else {
+                throw AIAssistantProviderError.malformedAssistantPayload
+            }
+            if let extracted = partialJSONStringValue(named: "message", in: stripped),
+                extracted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                return AIAssistantResponse(
+                    message: partialMessageWithoutEmbeddedProtocol(extracted) + salvagedCommandSection(from: stripped),
+                    commandProposals: []
+                )
+            }
+            throw AIAssistantProviderError.malformedAssistantPayload
+        }
+        guard stripped.isEmpty == false else {
+            throw AIAssistantProviderError.malformedAssistantPayload
+        }
+        // A bare JSON array is a machine payload, not prose: surfacing it would
+        // show the reader an error object as if it were an answer.
+        guard stripped.hasPrefix("[") == false else {
+            throw AIAssistantProviderError.malformedAssistantPayload
+        }
+        return AIAssistantResponse(message: stripped, commandProposals: [])
     }
+
 
     private static func normalizedUserFacingMessage(for payload: AssistantPayload) -> String {
         guard let embedded = embeddedAssistantPayload(in: payload.message) else {
@@ -1190,9 +1258,17 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
         guard let data = trimmed.data(using: .utf8) else {
             return nil
         }
-        return try? JSONDecoder().decode(AssistantPayload.self, from: data)
+        if let payload = try? JSONDecoder().decode(AssistantPayload.self, from: data) {
+            return payload
+        }
+        // Some OpenAI-compatible relays emit raw newlines inside JSON strings
+        // instead of the required escapes. That is invalid JSON and the strict
+        // decoder rejects an otherwise usable answer, so repair and retry once.
+        guard let repaired = AIJSONControlCharacterRepair.repair(trimmed)
+                .data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(AssistantPayload.self, from: repaired)
     }
-
     private static func stripCodeFence(_ content: String) -> String {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("```") else {
@@ -1228,16 +1304,39 @@ public struct OpenAICompatibleAIAssistantProvider: AIAssistantProviding, AIAssis
         return captured.isEmpty ? nil : captured.joined(separator: "\n")
     }
 
+
+    /// Exposes the streaming projection so the never-show-raw-JSON contract can
+    /// be asserted directly.
+    static func visibleProjectionForTesting(_ content: String) -> String {
+        visibleAssistantMessage(fromPartialContent: content)
+    }
+
     private static func visibleAssistantMessage(fromPartialContent content: String) -> String {
         if let payload = decodeAssistantPayload(from: content) {
             return normalizedUserFacingMessage(for: payload)
         }
         let trimmed = stripCodeFence(content).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.first == "{" || trimmed.first == "[" else {
-            return content
+        // A JSON envelope whose message field has not arrived yet must render
+        // as nothing rather than as the raw envelope; showing braces and
+        // escapes mid-stream is the defect this guards against.
+        guard let partial = partialJSONStringValue(named: "message", in: trimmed) else {
+            return ""
         }
-        let partial = partialJSONStringValue(named: "message", in: trimmed) ?? ""
         return partialMessageWithoutEmbeddedProtocol(partial)
+    }
+
+    /// Recovers command text from a body that failed strict decoding so the reader
+    /// still receives something runnable instead of losing it entirely.
+    private static func salvagedCommandSection(from json: String) -> String {
+        guard let command = partialJSONStringValue(named: "command", in: json) else {
+            return ""
+        }
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return "" }
+        var lines = [ "", "## 建议的命令", "", "以下命令来自一次未能解析的回复，尚未执行：", "", "```sh" ]
+        lines.append(contentsOf: trimmed.components(separatedBy: .newlines))
+        lines.append("```")
+        return lines.joined(separator: "\n")
     }
 
     private static func partialMessageWithoutEmbeddedProtocol(_ message: String) -> String {
@@ -1643,7 +1742,15 @@ private struct FailingAIAssistantProvider: AIAssistantProviding {
 
 struct OpenAICompatibleSSEEvent: Equatable {
     let contentDelta: String?
+    /// Public chain-of-thought delta emitted before the answer begins.
+    let reasoningDelta: String?
     let isDone: Bool
+
+    init(contentDelta: String?, reasoningDelta: String? = nil, isDone: Bool) {
+        self.contentDelta = contentDelta
+        self.reasoningDelta = reasoningDelta
+        self.isDone = isDone
+    }
 }
 
 struct OpenAICompatibleSSEParser {
@@ -1708,11 +1815,19 @@ struct OpenAICompatibleSSEParser {
             return nil
         }
         if let chat = try? JSONDecoder().decode(ChatCompletionStreamChunk.self, from: data) {
+            // A single chunk can carry reasoning and answer text together, and
+            // a relay may also emit empty on either side. Drop only when both are
+            // empty; otherwise one of them would be lost on the transition chunk.
+            let reasoning = chat.choices.compactMap(\.delta.reasoningContent).joined()
             let delta = chat.choices.compactMap(\.delta.content).joined()
-            guard delta.isEmpty == false else {
+            guard reasoning.isEmpty == false || delta.isEmpty == false else {
                 return nil
             }
-            return OpenAICompatibleSSEEvent(contentDelta: delta, isDone: false)
+            return OpenAICompatibleSSEEvent(
+                contentDelta: delta.isEmpty ? nil : delta,
+                reasoningDelta: reasoning.isEmpty ? nil : reasoning,
+                isDone: false
+            )
         }
         if let response = try? JSONDecoder().decode(ResponsesStreamChunk.self, from: data) {
             let delta = response.contentDelta
@@ -1729,8 +1844,14 @@ private struct ChatCompletionStreamChunk: Decodable {
     struct Choice: Decodable {
         struct Delta: Decodable {
             let content: String?
-        }
+            /// Reasoning models stream their thinking here before any answer text.
+            let reasoningContent: String?
 
+            private enum CodingKeys: String, CodingKey {
+                case content
+                case reasoningContent = "reasoning_content"
+            }
+        }
         let delta: Delta
     }
 
@@ -1975,6 +2096,10 @@ private struct ResponsesResponse: Decodable {
 
 private struct AssistantPayload: Decodable {
     struct Command: Decodable {
+        // Both fields are required on purpose: a proposal without a command is
+        // meaningless, and the explanation is what the approval UI shows. A model
+        // that omits either one loses its command proposals, but its message still
+        // reaches the reader through the extraction path in parseAssistantContent.
         let toolID: String?
         let schemaRevision: Int?
         let command: String

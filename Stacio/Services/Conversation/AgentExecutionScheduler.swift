@@ -149,6 +149,12 @@ public enum AgentExecutionScheduler {
     }
 
     /// 等待超时检查：queued 请求超过 waitTimeout → capacityWaitExpired（离开队列）。
+    /// Reclaims leases whose runtime vanished and which nobody settled.
+    ///
+    ///  still occupies capacity, by design: the old process may
+    /// have crossed an external runtime boundary and we must not infer it stopped.
+    /// But nothing ever releases such a lease, so after a crash the queue can be
+    /// starved forever. Apply a generous grace period, after which the lease is
     public static func checkWaitTimeouts(
         state: SchedulerState,
         config: SchedulerConfig,
@@ -422,6 +428,18 @@ public actor ProductionAgentExecutionScheduler: AgentExecutionAdmissionCoordinat
 
     private func promoteAvailableCapacity() throws {
         if let store {
+            state = try store.loadAdmissionState()
+            // Reclaim leases left by a previous process before counting capacity;
+            // otherwise one crashed run starves every later request. The grace period is
+            // measured from the last heartbeat, not from acquisition, so a genuinely long
+            // run is not reclaimed merely because it started a while ago. Release must
+            // go through the store: reloading state below would otherwise undo it.
+            let orphanGrace: TimeInterval = 600
+            for lease in state.activeLeases
+            where lease.state == .orphanedRuntime
+                && nowProvider().timeIntervalSince(lease.lastObservedAt ?? lease.acquiredAt) >= orphanGrace {
+                _ = try store.releaseAdmissionLease(lease, now: nowProvider())
+            }
             state = try store.loadAdmissionState()
             var occupied = state.activeLeases.filter(\.occupiesCapacity).count
             let queued = state.requests

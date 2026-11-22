@@ -17,6 +17,9 @@ const OSC7_BOOTSTRAP_ECHO_MAX_BYTES: usize = 64 * 1024;
 const OSC7_BOOTSTRAP_ECHO_HEADER: &[u8] = b"{ __stacio_with_timeout() { ";
 const OSC7_BOOTSTRAP_ECHO_TAIL: &[u8] = b"__stacio_report_cwd 2>/dev/null || true";
 const RAPID_LINE_SUBMIT_PROMPT_WAIT_TIMEOUT: Duration = Duration::from_millis(120);
+// All sessions share the pump and registry lock. A continuously readable
+// transport must yield so peers can process input, resize and keepalives.
+const MAX_OUTPUT_BYTES_PER_POLL: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct LiveShellStatus {
@@ -90,15 +93,34 @@ pub struct LiveShellWorker<C: ShellChannel> {
     runtime_id: String,
     channel: C,
     observed_resize_revision: u64,
+    pending_resize: Option<PendingPtyResize>,
     pending_input: Vec<u8>,
+    // Echo filtering can release a prefix from an earlier read. Keep that
+    // bounded remainder until the SSH output queue has room again.
+    pending_output: VecDeque<u8>,
+    output_backpressured: bool,
     queued_input_chunks: VecDeque<Vec<u8>>,
     bootstrap_input: Vec<u8>,
     initial_input_echo_filters: Vec<InitialInputEchoFilter>,
+    /// Carries a partial bootstrap echo across output chunks. The stateful
+    /// filter above only runs while it is armed; a shell may echo the injected
+    /// line later (resume, slow login, busy session), and that echo must never
+    /// reach the reader.
+    bootstrap_echo_carry: Vec<u8>,
+    /// The newline that ended the injected line may arrive in the next chunk.
+    bootstrap_echo_pending_newline: bool,
     rapid_line_submit_prompt_wait_until: Option<Instant>,
     last_keepalive_at: Option<Instant>,
     keepalive_interval: Option<Duration>,
     consecutive_keepalive_failures: u8,
     closed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPtyResize {
+    cols: u32,
+    rows: u32,
+    revision: u64,
 }
 
 struct InitialInputEchoFilter {
@@ -565,10 +587,15 @@ impl<C: ShellChannel> LiveShellWorker<C> {
             runtime_id,
             channel,
             observed_resize_revision: 0,
+            pending_resize: None,
             pending_input,
+            pending_output: VecDeque::new(),
+            output_backpressured: false,
             queued_input_chunks,
             bootstrap_input: Vec::new(),
             initial_input_echo_filters,
+            bootstrap_echo_carry: Vec::new(),
+            bootstrap_echo_pending_newline: false,
             rapid_line_submit_prompt_wait_until: None,
             last_keepalive_at: Some(now),
             keepalive_interval: Some(Duration::from_secs(20)),
@@ -589,10 +616,15 @@ impl<C: ShellChannel> LiveShellWorker<C> {
             runtime_id,
             channel,
             observed_resize_revision: 0,
+            pending_resize: None,
             pending_input: Vec::new(),
+            pending_output: VecDeque::new(),
+            output_backpressured: false,
             queued_input_chunks: VecDeque::new(),
             bootstrap_input,
             initial_input_echo_filters,
+            bootstrap_echo_carry: Vec::new(),
+            bootstrap_echo_pending_newline: false,
             rapid_line_submit_prompt_wait_until: None,
             last_keepalive_at: Some(now),
             keepalive_interval: Some(Duration::from_secs(20)),
@@ -628,16 +660,36 @@ impl<C: ShellChannel> LiveShellWorker<C> {
         }
 
         let snapshot = registry.runtime_snapshot(self.runtime_id.clone())?;
+        let backpressure_output = snapshot.kind == "remote_ssh";
+        self.flush_pending_output(registry)?;
         let restored = self.set_initial_echo_terminal_size(snapshot.cols, snapshot.rows);
         if !restored.is_empty() {
-            registry.record_output(self.runtime_id.clone(), restored)?;
+            self.record_visible_output(registry, restored)?;
         }
-        if snapshot.resize_revision != self.observed_resize_revision {
-            if let Err(error) = self.channel.resize_pty(snapshot.cols, snapshot.rows) {
-                self.record_pending_initial_echo(registry)?;
-                return Err(map_channel_io_error(error));
+        if self.pending_resize.is_none()
+            && snapshot.resize_revision != self.observed_resize_revision
+        {
+            self.pending_resize = Some(PendingPtyResize {
+                cols: snapshot.cols,
+                rows: snapshot.rows,
+                revision: snapshot.resize_revision,
+            });
+        }
+        if let Some(resize) = self.pending_resize {
+            // libssh2 retains its original PTY request across WouldBlock.
+            // Retry those dimensions and acknowledge only that revision;
+            // any newer size will be sent on the next poll.
+            match self.channel.resize_pty(resize.cols, resize.rows) {
+                Ok(()) => {
+                    self.observed_resize_revision = resize.revision;
+                    self.pending_resize = None;
+                }
+                Err(error) if is_transient_channel_io_error(&error) => {}
+                Err(error) => {
+                    self.record_pending_initial_echo(registry)?;
+                    return Err(map_channel_io_error(error));
+                }
             }
-            self.observed_resize_revision = snapshot.resize_revision;
         }
 
         let (input_chunks, input_dropped_byte_count) =
@@ -672,9 +724,27 @@ impl<C: ShellChannel> LiveShellWorker<C> {
             return Ok(self.status("closed", "keepalive_failed"));
         }
 
+        let mut output_backpressured = false;
+        let mut bytes_read = 0;
+        let mut read_budget_exhausted = false;
         loop {
-            let output = match self.channel.read_output(16 * 1024) {
+            if bytes_read >= MAX_OUTPUT_BYTES_PER_POLL {
+                read_budget_exhausted = true;
+                break;
+            }
+            let read_limit = if backpressure_output {
+                let available = registry.available_output_capacity(&self.runtime_id)?;
+                if available == 0 || !self.pending_output.is_empty() {
+                    output_backpressured = true;
+                    break;
+                }
+                available.min(16 * 1024)
+            } else {
+                16 * 1024
+            };
+            let output = match self.channel.read_output(read_limit) {
                 Ok(output) => output,
+                Err(error) if is_transient_channel_io_error(&error) => break,
                 Err(error) => {
                     self.record_pending_initial_echo(registry)?;
                     return Err(map_channel_io_error(error));
@@ -683,6 +753,7 @@ impl<C: ShellChannel> LiveShellWorker<C> {
             if output.is_empty() {
                 break;
             }
+            bytes_read += output.len();
             let visible_output = self.filter_initial_input_echo(output);
             if !visible_output.is_empty() {
                 if self.rapid_line_submit_prompt_wait_until.is_some()
@@ -690,16 +761,22 @@ impl<C: ShellChannel> LiveShellWorker<C> {
                 {
                     self.rapid_line_submit_prompt_wait_until = None;
                 }
-                registry.record_output(self.runtime_id.clone(), visible_output)?;
+                self.record_visible_output(registry, visible_output)?;
             }
         }
 
         let expired_output = self.filter_initial_input_echo(Vec::new());
         if !expired_output.is_empty() {
-            registry.record_output(self.runtime_id.clone(), expired_output)?;
+            self.record_visible_output(registry, expired_output)?;
         }
-        if self.channel.is_eof() {
+        self.output_backpressured = backpressure_output
+            && (registry.available_output_capacity(&self.runtime_id)? == 0
+                || !self.pending_output.is_empty());
+        if !output_backpressured && !read_budget_exhausted && self.channel.is_eof() {
             self.record_pending_initial_echo(registry)?;
+            if !self.pending_output.is_empty() {
+                return Ok(self.status("running", "running"));
+            }
             self.closed = true;
             let _ = self.channel.close();
             let _ = registry.close(self.runtime_id.clone())?;
@@ -722,7 +799,31 @@ impl<C: ShellChannel> LiveShellWorker<C> {
 
     fn record_pending_initial_echo(&mut self, registry: &mut TerminalRuntimeRegistry) -> Result<(), TerminalRuntimeError> {
         let pending = self.finish_initial_input_echo();
-        if !pending.is_empty() { registry.record_output(self.runtime_id.clone(), pending)?; }
+        if !pending.is_empty() { self.record_visible_output(registry, pending)?; }
+        Ok(())
+    }
+
+    fn record_visible_output(
+        &mut self,
+        registry: &mut TerminalRuntimeRegistry,
+        bytes: Vec<u8>,
+    ) -> Result<(), TerminalRuntimeError> {
+        if registry.runtime_snapshot(self.runtime_id.clone())?.kind != "remote_ssh" {
+            return registry.record_output(self.runtime_id.clone(), bytes);
+        }
+        self.pending_output.extend(bytes);
+        self.flush_pending_output(registry)
+    }
+
+    fn flush_pending_output(
+        &mut self,
+        registry: &mut TerminalRuntimeRegistry,
+    ) -> Result<(), TerminalRuntimeError> {
+        let count = registry.available_output_capacity(&self.runtime_id)?.min(self.pending_output.len());
+        if count > 0 {
+            let bytes = self.pending_output.drain(..count).collect();
+            registry.record_output(self.runtime_id.clone(), bytes)?;
+        }
         Ok(())
     }
 
@@ -810,11 +911,16 @@ impl<C: ShellChannel> LiveShellWorker<C> {
         {
             return false;
         }
-        if self.channel.keepalive().is_err() {
+        //单次失败可能只是网络抖动或对端短暂繁忙。按20秒间隔，
+        //5次约100秒容错，接近 OpenSSH的 ServerAliveCountMax做法。
+        if let Err(error) = self.channel.keepalive() {
             self.last_keepalive_at = Some(now);
+            if is_transient_channel_io_error(&error) {
+                return false;
+            }
             self.consecutive_keepalive_failures =
                 self.consecutive_keepalive_failures.saturating_add(1);
-            return self.consecutive_keepalive_failures >= 2;
+            return self.consecutive_keepalive_failures >= 5;
         }
         self.consecutive_keepalive_failures = 0;
         self.last_keepalive_at = Some(now);
@@ -869,9 +975,88 @@ impl<C: ShellChannel> LiveShellWorker<C> {
         Ok(())
     }
 
+    /// Removes the injected shell bootstrap from the reader's view even when no
+    /// stateful filter is armed.
+    ///
+    /// The line is typed into the remote shell to install the cwd reporter, so
+    /// the tty echoes it back. The stateful filter above handles the common
+    /// case, but it is time-boxed and only exists while armed; a resumed
+    /// session, a busy shell or a slow login can echo the same line later. The
+    /// script is a single line with no newlines of its own, so a contiguous
+    /// header-to-tail span is unambiguously that echo and can be dropped
+    /// without touching anything the user asked for.
+    fn strip_late_bootstrap_echo(&mut self, output: Vec<u8>) -> Vec<u8> {
+        let mut combined = std::mem::take(&mut self.bootstrap_echo_carry);
+        combined.extend_from_slice(&output);
+        if self.bootstrap_echo_pending_newline {
+            let mut skip = 0;
+            while matches!(combined.get(skip), Some(b'\r') | Some(b'\n')) {
+                skip += 1;
+            }
+            if skip == combined.len() {
+                // Nothing but the line ending so far; wait for the rest.
+                self.bootstrap_echo_carry = combined;
+                return Vec::new();
+            }
+            combined.drain(..skip);
+            self.bootstrap_echo_pending_newline = false;
+        }
+        let mut visible = Vec::with_capacity(combined.len());
+        let mut cursor = 0;
+        while let Some(relative) = find_subsequence(&combined[cursor..], OSC7_BOOTSTRAP_ECHO_HEADER) {
+            let start = cursor + relative;
+            visible.extend_from_slice(&combined[cursor..start]);
+            let body_start = start + OSC7_BOOTSTRAP_ECHO_HEADER.len();
+            let Some(tail_offset) = find_subsequence(&combined[body_start..], OSC7_BOOTSTRAP_ECHO_TAIL)
+            else {
+                // The echo may still be arriving. Hold from the header and wait
+                // for the rest, bounded so a stray match cannot grow forever.
+                if combined.len() - start <= OSC7_BOOTSTRAP_ECHO_MAX_BYTES {
+                    self.bootstrap_echo_carry = combined[start..].to_vec();
+                    return visible;
+                }
+                visible.extend_from_slice(&combined[start..]);
+                return visible;
+            };
+            let tail_end = body_start + tail_offset + OSC7_BOOTSTRAP_ECHO_TAIL.len();
+            // Only a span that carries every marker of the injected line is
+            // that echo. A short look-alike, or one interrupted by a real
+            // banner, is user content and stays.
+            if combined[start..tail_end].contains(&b'\n')
+                || !is_stacio_osc7_bootstrap_echo_pattern(&combined[start..tail_end]) {
+                visible.extend_from_slice(&combined[start..tail_end]);
+                cursor = tail_end;
+                continue;
+            }
+            let mut end = tail_end;
+            while matches!(combined.get(end), Some(b'\r') | Some(b'\n')) {
+                end += 1;
+            }
+            if end == combined.len() {
+                // The reader's next line ending may still be in flight.
+                self.bootstrap_echo_pending_newline = true;
+            }
+            cursor = end;
+        }
+        // Hold a trailing partial header. Without this, a header split across
+        // chunks is emitted piece by piece and the echo leaks.
+        let rest = &combined[cursor..];
+        let hold = (1..OSC7_BOOTSTRAP_ECHO_HEADER.len())
+            .rev()
+            .find(|&len| len <= rest.len() && rest[rest.len() - len..] == OSC7_BOOTSTRAP_ECHO_HEADER[..len])
+            .unwrap_or(0);
+        visible.extend_from_slice(&rest[..rest.len() - hold]);
+        if hold > 0 {
+            self.bootstrap_echo_carry = rest[rest.len() - hold..].to_vec();
+        }
+        visible
+    }
+
     fn filter_initial_input_echo(&mut self, output: Vec<u8>) -> Vec<u8> {
         if self.initial_input_echo_filters.is_empty() {
-            return output;
+            // No stateful filter is armed. A late echo of the injected line
+            // still must not reach the reader.
+            return self.strip_late_bootstrap_echo(output);
         }
 
         let now = Instant::now();
@@ -1155,13 +1340,25 @@ impl<C: ShellChannel> LiveShellManager<C> {
     pub fn poll_all(
         &mut self,
         registry: &mut TerminalRuntimeRegistry,
-    ) -> Result<Vec<LiveShellStatus>, TerminalRuntimeError> {
+    ) -> Vec<LiveShellStatus> {
         let runtime_ids = self.workers.keys().cloned().collect::<Vec<_>>();
         let mut statuses = Vec::with_capacity(runtime_ids.len());
         for runtime_id in runtime_ids {
-            statuses.push(self.poll(registry, runtime_id)?);
+            match self.poll(registry, runtime_id.clone()) {
+                Ok(status) => statuses.push(status),
+                Err(error) => {
+                    // One transport failure must never tear down healthy peers.
+                    let diagnostic = redact_ssh_diagnostic(&error.to_string());
+                    let _ = registry.record_output(
+                        runtime_id.clone(),
+                        format!("Stacio live shell error: {diagnostic}\n").into_bytes(),
+                    );
+                    let _ = self.close(registry, runtime_id.clone());
+                    statuses.push(LiveShellStatus::failed(runtime_id, &diagnostic));
+                }
+            }
         }
-        Ok(statuses)
+        statuses
     }
 
     pub fn active_runtime_ids(&self) -> Vec<String> {
@@ -1198,6 +1395,9 @@ impl<C: ShellChannel> LiveShellManager<C> {
         }
         self.workers
             .values()
+            // A readable socket cannot make progress while its output queue
+            // is full. Wait for the consumer wakeup instead of spinning.
+            .filter(|worker| !worker.output_backpressured)
             .filter_map(|worker| worker.channel.wait_interest())
             .collect()
     }
@@ -1501,7 +1701,10 @@ impl ShellChannel for FakeShellChannel {
             return Ok(Vec::new());
         }
         let mut chunk = self.read_chunks.remove(0);
-        chunk.truncate(max_bytes);
+        if chunk.len() > max_bytes {
+            let remainder = chunk.split_off(max_bytes);
+            self.read_chunks.insert(0, remainder);
+        }
         Ok(chunk)
     }
 
@@ -1515,7 +1718,7 @@ impl ShellChannel for FakeShellChannel {
     }
 
     fn is_eof(&self) -> bool {
-        self.eof_after_poll && self.read_count > 0
+        self.eof_after_poll && self.read_count > 0 && self.read_chunks.is_empty()
     }
 
     fn wait_interest(&self) -> Option<ShellWaitInterest> {
@@ -1530,6 +1733,239 @@ impl ShellChannel for FakeShellChannel {
 #[cfg(test)]
 mod live_shell_tests {
     use super::*;
+
+    struct FaultingShellChannel {
+        inner: FakeShellChannel,
+        operation: &'static str,
+        errors: VecDeque<io::ErrorKind>,
+    }
+
+    impl FaultingShellChannel {
+        fn fail(&mut self, operation: &str) -> io::Result<()> {
+            if self.operation == operation {
+                if let Some(kind) = self.errors.pop_front() {
+                    return Err(io::Error::new(kind, "injected transport error"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl ShellChannel for FaultingShellChannel {
+        fn write_input(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.fail("write")?;
+            self.inner.write_input(bytes)
+        }
+        fn read_output(&mut self, max: usize) -> io::Result<Vec<u8>> {
+            self.fail("read")?;
+            self.inner.read_output(max)
+        }
+        fn resize_pty(&mut self, cols: u32, rows: u32) -> io::Result<()> {
+            self.fail("resize")?;
+            self.inner.resize_pty(cols, rows)
+        }
+        fn keepalive(&mut self) -> io::Result<()> { self.fail("keepalive") }
+        fn close(&mut self) -> io::Result<()> { self.inner.close() }
+        fn is_eof(&self) -> bool { self.inner.is_eof() }
+    }
+
+    // Like libssh2's reqPTY_packet, retain the original request across a
+    // temporary send failure even if a later call supplies different sizes.
+    struct RetainedResizeShellChannel {
+        inner: FakeShellChannel,
+        errors: VecDeque<io::ErrorKind>,
+        pending_resize: Option<(u32, u32)>,
+        resize_calls: Vec<(u32, u32)>,
+        keepalive_count: usize,
+    }
+
+    impl RetainedResizeShellChannel {
+        fn new(errors: Vec<io::ErrorKind>) -> Self {
+            Self {
+                inner: FakeShellChannel::new(),
+                errors: errors.into(),
+                pending_resize: None,
+                resize_calls: Vec::new(),
+                keepalive_count: 0,
+            }
+        }
+    }
+
+    impl ShellChannel for RetainedResizeShellChannel {
+        fn write_input(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.inner.write_input(bytes)
+        }
+        fn read_output(&mut self, max: usize) -> io::Result<Vec<u8>> {
+            self.inner.read_output(max)
+        }
+        fn resize_pty(&mut self, cols: u32, rows: u32) -> io::Result<()> {
+            self.resize_calls.push((cols, rows));
+            let (cols, rows) = *self.pending_resize.get_or_insert((cols, rows));
+            if let Some(kind) = self.errors.pop_front() {
+                return Err(io::Error::new(kind, "resize request still pending"));
+            }
+            self.pending_resize = None;
+            self.inner.resize_pty(cols, rows)
+        }
+        fn keepalive(&mut self) -> io::Result<()> {
+            self.keepalive_count += 1;
+            Ok(())
+        }
+        fn close(&mut self) -> io::Result<()> { self.inner.close() }
+        fn is_eof(&self) -> bool { self.inner.is_eof() }
+    }
+
+    #[test]
+    fn resize_retry_acknowledges_only_the_in_flight_request() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            let mut registry = TerminalRuntimeRegistry::new(4096);
+            let runtime = registry.open_remote_ssh("host".into(), 22, "user".into(), 80, 24);
+            let mut worker = LiveShellWorker::new(
+                runtime.id.clone(), RetainedResizeShellChannel::new(vec![kind]),
+            );
+            registry.record_resize(runtime.id.clone(), 100, 30).unwrap();
+            assert_eq!(worker.poll(&mut registry).unwrap().status, "running");
+            registry.record_resize(runtime.id, 120, 40).unwrap();
+            for _ in 0..3 {
+                assert_eq!(worker.poll(&mut registry).unwrap().status, "running");
+            }
+            assert_eq!(worker.channel.inner.pty_resizes(), &[(100, 30), (120, 40)]);
+            assert_eq!(worker.channel.resize_calls, [(100, 30), (100, 30), (120, 40)]);
+        }
+    }
+
+    #[test]
+    fn repeated_resize_backpressure_coalesces_updates_without_stalling_sessions() {
+        let mut registry = TerminalRuntimeRegistry::new(4096);
+        let resizing = registry.open_remote_ssh("resizing".into(), 22, "user".into(), 80, 24);
+        let peer = registry.open_remote_ssh("peer".into(), 22, "user".into(), 80, 24);
+        let mut manager = LiveShellManager::new();
+        manager.register(LiveShellWorker::new(resizing.id.clone(),
+            RetainedResizeShellChannel::new(vec![
+                io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock,
+            ])));
+        manager.register(LiveShellWorker::new(peer.id.clone(), RetainedResizeShellChannel::new(vec![])));
+        let sizes = [(100, 30), (120, 40), (140, 45), (160, 50)];
+        for round in 0..5 {
+            if let Some(&(cols, rows)) = sizes.get(round) {
+                registry.record_resize(resizing.id.clone(), cols, rows).unwrap();
+            }
+            for runtime in [&resizing, &peer] {
+                registry.write_input(runtime.id.clone(), b"input".to_vec()).unwrap();
+                let worker = manager.workers.get_mut(&runtime.id).unwrap();
+                worker.channel.inner.read_chunks.push(b"output".to_vec());
+                worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(21));
+            }
+            let statuses = manager.poll_all(&mut registry);
+            assert_eq!(statuses.len(), 2);
+            assert!(statuses.iter().all(|status| status.status == "running"));
+            for runtime in [&resizing, &peer] {
+                assert_eq!(registry.take_output_batch(runtime.id.clone()).unwrap().bytes, b"output");
+                let worker = &manager.workers[&runtime.id];
+                assert_eq!(worker.channel.inner.written_bytes(), b"input".repeat(round + 1));
+                assert_eq!(worker.channel.keepalive_count, round + 1);
+            }
+        }
+        let channel = &manager.workers[&resizing.id].channel;
+        assert_eq!(channel.inner.pty_resizes(), &[(100, 30), (160, 50)]);
+        assert_eq!(channel.resize_calls, [(100, 30), (100, 30), (100, 30), (100, 30), (160, 50)]);
+    }
+
+    #[test]
+    fn transient_read_resize_and_write_errors_preserve_connection_and_retry() {
+        for operation in ["read", "resize", "write"] {
+            for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+                let mut registry = TerminalRuntimeRegistry::new(4096);
+                let runtime = registry.open_remote_ssh("host".into(), 22, "user".into(), 80, 24);
+                registry.record_resize(runtime.id.clone(), 100, 30).unwrap();
+                registry.write_input(runtime.id.clone(), b"input".to_vec()).unwrap();
+                let channel = FaultingShellChannel {
+                    inner: FakeShellChannel::new().with_read_chunks(vec![b"output".to_vec()]),
+                    operation, errors: VecDeque::from([kind]),
+                };
+                let mut worker = LiveShellWorker::new(runtime.id.clone(), channel);
+                for _ in 0..2 {
+                    assert_eq!(worker.poll(&mut registry).unwrap().status, "running", "{operation} {kind:?}");
+                }
+                assert_eq!(worker.channel.inner.written_bytes(), b"input");
+                assert_eq!(worker.channel.inner.pty_resizes().last(), Some(&(100, 30)));
+                assert_eq!(registry.take_output_batch(runtime.id).unwrap().bytes, b"output");
+            }
+        }
+    }
+
+    #[test]
+    fn transient_keepalive_errors_never_count_as_peer_failure() {
+        let mut registry = TerminalRuntimeRegistry::new(4096);
+        let runtime = registry.open_remote_ssh("host".into(), 22, "user".into(), 80, 24);
+        let channel = FaultingShellChannel {
+            inner: FakeShellChannel::new(), operation: "keepalive",
+            errors: VecDeque::from(vec![io::ErrorKind::WouldBlock; 8]),
+        };
+        let mut worker = LiveShellWorker::new(runtime.id, channel);
+        for _ in 0..8 {
+            worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(21));
+            assert_eq!(worker.poll(&mut registry).unwrap().status, "running");
+            assert_eq!(worker.consecutive_keepalive_failures, 0);
+        }
+    }
+
+    #[test]
+    fn one_transport_failure_does_not_close_other_protocols() {
+        let mut registry = TerminalRuntimeRegistry::new(4096);
+        let failed = registry.open_remote_ssh("bad".into(), 22, "user".into(), 80, 24);
+        let peers = [
+            registry.open_remote_ssh("good".into(), 22, "user".into(), 80, 24),
+            registry.open_remote_telnet("good".into(), 23, None, 80, 24),
+            registry.open_serial("/dev/test-console".into(), 115_200, 80, 24),
+        ];
+        let mut manager = LiveShellManager::new();
+        manager.register(LiveShellWorker::new(failed.id.clone(), FaultingShellChannel {
+            inner: FakeShellChannel::new(), operation: "read",
+            errors: VecDeque::from([io::ErrorKind::ConnectionReset]),
+        }));
+        for peer in &peers {
+            registry.write_input(peer.id.clone(), b"input".to_vec()).unwrap();
+            manager.register(LiveShellWorker::new(peer.id.clone(), FaultingShellChannel {
+                inner: FakeShellChannel::new().with_read_chunks(vec![b"still alive".to_vec()]),
+                operation: "", errors: VecDeque::new(),
+            }));
+        }
+        let statuses = manager.poll_all(&mut registry);
+        assert!(statuses.iter().any(|s| s.runtime_id == failed.id && s.status == "failed"));
+        assert_eq!(registry.runtime_snapshot(failed.id).unwrap().status, "closed");
+        assert_eq!(manager.active_count(), peers.len());
+        for peer in peers {
+            assert_eq!(registry.runtime_snapshot(peer.id.clone()).unwrap().status, "running");
+            assert_eq!(registry.take_output_batch(peer.id.clone()).unwrap().bytes, b"still alive");
+            assert_eq!(manager.workers[&peer.id].channel.inner.written_bytes(), b"input");
+        }
+    }
+
+    #[test]
+    fn busy_transport_yields_before_eof_and_preserves_all_bytes() {
+        let mut registry = TerminalRuntimeRegistry::new(512 * 1024);
+        let busy = registry.open_remote_telnet("busy".into(), 23, None, 80, 24);
+        let peer = registry.open_remote_ssh("peer".into(), 22, "user".into(), 80, 24);
+        let payload = vec![b'x'; MAX_OUTPUT_BYTES_PER_POLL * 3 + 7];
+        let mut manager = LiveShellManager::new();
+        manager.register(LiveShellWorker::new(busy.id.clone(),
+            FakeShellChannel::new().with_read_chunks(vec![payload.clone()]).with_eof_after_poll(true)));
+        manager.register(LiveShellWorker::new(peer.id.clone(),
+            FakeShellChannel::new().with_read_chunks(vec![b"peer reply".to_vec()])));
+        manager.poll_all(&mut registry);
+        assert_eq!(registry.runtime_snapshot(busy.id.clone()).unwrap().status, "running");
+        let mut received = registry.take_output_batch(busy.id.clone()).unwrap().bytes;
+        assert_eq!(received.len(), MAX_OUTPUT_BYTES_PER_POLL);
+        assert_eq!(registry.take_output_batch(peer.id.clone()).unwrap().bytes, b"peer reply");
+        for _ in 0..4 {
+            manager.poll_all(&mut registry);
+            received.extend(registry.take_output_batch(busy.id.clone()).unwrap().bytes);
+        }
+        assert_eq!(received, payload);
+        assert_eq!(registry.runtime_snapshot(busy.id).unwrap().status, "closed");
+        assert_eq!(registry.runtime_snapshot(peer.id).unwrap().status, "running");
+    }
     use crate::services::terminal_service::TerminalRuntimeRegistry;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1562,6 +1998,81 @@ mod live_shell_tests {
         assert_eq!(status.status, "running");
         assert_eq!(worker.channel().written_bytes(), b"whoami\n".to_vec());
         assert_eq!(output.bytes, b"deploy\n".to_vec());
+    }
+
+    #[test]
+    fn ssh_burst_waits_for_consumer_without_losing_bytes_or_blocking_input() {
+        let mut registry = TerminalRuntimeRegistry::new(64);
+        let runtime = registry.open_remote_ssh("test".into(), 22, "test".into(), 80, 24);
+        let payload: Vec<u8> = (0..100_000).map(|index| (index % 251) as u8).collect();
+        let channel = FakeShellChannel::new()
+            .with_read_chunks(vec![payload.clone()])
+            .with_eof_after_poll(true);
+        let mut worker = LiveShellWorker::new(runtime.id.clone(), channel);
+        registry.set_output_paused(runtime.id.clone(), true).unwrap();
+        assert_eq!(worker.poll(&mut registry).unwrap().status, "running");
+        let reads = worker.channel().read_count;
+        registry.write_input(runtime.id.clone(), vec![3]).unwrap();
+        registry.record_resize(runtime.id.clone(), 100, 30).unwrap();
+        worker.poll(&mut registry).unwrap();
+        assert_eq!(worker.channel().read_count, reads, "A full queue must stop transport reads");
+        assert_eq!(worker.channel().written_bytes(), vec![3], "Ctrl-C must still be sent");
+        assert_eq!(worker.channel().pty_resizes().last(), Some(&(100, 30)));
+        let paused = registry.take_output_batch(runtime.id.clone()).unwrap();
+        assert!(paused.bytes.is_empty());
+        assert_eq!(paused.buffered_byte_count, 64);
+        assert_eq!(paused.dropped_byte_count, 0);
+
+        registry.set_output_paused(runtime.id.clone(), false).unwrap();
+        let mut received = Vec::new();
+        let mut closed = false;
+        for _ in 0..2_000 {
+            let batch = registry.take_output_batch(runtime.id.clone()).unwrap();
+            assert_eq!(batch.dropped_byte_count, 0);
+            assert!(batch.bytes.len() <= 64);
+            received.extend(batch.bytes);
+            if worker.poll(&mut registry).unwrap().status == "closed" {
+                received.extend(registry.take_output_batch(runtime.id.clone()).unwrap().bytes);
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "EOF should be reported after the final buffered bytes");
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn ssh_echo_filter_remainder_survives_a_full_output_queue() {
+        let mut registry = TerminalRuntimeRegistry::new(8);
+        let runtime = registry.open_remote_ssh("test".into(), 22, "test".into(), 80, 24);
+        let channel = FakeShellChannel::new()
+            .with_read_chunks(vec![b"abcdefgh".to_vec(), b"Y0123456".to_vec()])
+            .with_eof_after_poll(true);
+        let mut worker = LiveShellWorker::new_with_initial_input_chunks(
+            runtime.id.clone(), channel, vec![b"abcdefghX\n".to_vec()],
+        );
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            worker.poll(&mut registry).unwrap();
+            let batch = registry.take_output_batch(runtime.id.clone()).unwrap();
+            assert_eq!(batch.dropped_byte_count, 0);
+            assert!(batch.bytes.len() <= 8);
+            received.extend(batch.bytes);
+        }
+        assert_eq!(received, b"abcdefghY0123456");
+        assert!(worker.pending_output.is_empty());
+    }
+
+    #[test]
+    fn ssh_backpressure_does_not_change_telnet_overflow_policy() {
+        let mut registry = TerminalRuntimeRegistry::new(4);
+        let runtime = registry.open_remote_telnet("test".into(), 23, None, 80, 24);
+        let channel = FakeShellChannel::new().with_read_chunks(vec![b"0123456789".to_vec()]);
+        let mut worker = LiveShellWorker::new(runtime.id.clone(), channel);
+        worker.poll(&mut registry).unwrap();
+        let batch = registry.take_output_batch(runtime.id).unwrap();
+        assert_eq!(batch.bytes, b"0123");
+        assert_eq!(batch.dropped_byte_count, 6);
     }
 
     #[test]
@@ -2123,6 +2634,65 @@ mod live_shell_tests {
     }
 
     #[test]
+    fn late_bootstrap_echo_never_reaches_the_reader() {
+        let bootstrap = ssh_osc7_bootstrap_input_chunks().concat();
+        let echo = trim_ascii_line_ending(&bootstrap).to_vec();
+        let prompt = b"root@host:~$ ".to_vec();
+
+        // A resumed or busy session echoes the line after the stateful filter
+        // window has closed. Nothing of it may reach the reader, in any chunk
+        // split, and the prompt around it must survive untouched.
+        for chunk_size in [1, 7, 128, 4096, echo.len()] {
+            let mut worker = LiveShellWorker::new_with_initial_input_chunks(
+                "late".into(),
+                FakeShellChannel::new(),
+                Vec::new(),
+            );
+            let mut raw = prompt.clone();
+            raw.extend_from_slice(&echo);
+            raw.extend_from_slice(b"\r\n");
+            raw.extend_from_slice(b"root@host:~$ ls\r\nlost+found\r\nroot@host:~$ ");
+            let mut visible = Vec::new();
+            for chunk in raw.chunks(chunk_size) {
+                visible.extend(worker.filter_initial_input_echo(chunk.to_vec()));
+            }
+            assert_eq!(
+                visible,
+                b"root@host:~$ root@host:~$ ls\r\nlost+found\r\nroot@host:~$ ".to_vec(),
+                "chunk_size={chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_bootstrap_echo_keeps_look_alikes_and_interrupted_text() {
+        let bootstrap = ssh_osc7_bootstrap_input_chunks().concat();
+        let pattern = trim_ascii_line_ending(&bootstrap);
+        for ordinary in [
+            // Short look-alike with header and tail but none of the markers.
+            b"{ __stacio_with_timeout() { __stacio_report_cwd 2>/dev/null || true\r\n".to_vec(),
+            // A real banner splits the echo; deleting across it would eat it.
+            {
+                let mut raw = pattern[..200].to_vec();
+                raw.extend_from_slice(b"\r\nIMPORTANT LOGIN MESSAGE\r\n");
+                raw.extend_from_slice(&pattern[200..]);
+                raw
+            },
+        ] {
+            let mut worker = LiveShellWorker::new_with_initial_input_chunks(
+                "late".into(),
+                FakeShellChannel::new(),
+                Vec::new(),
+            );
+            let mut visible = Vec::new();
+            for chunk in ordinary.chunks(3) {
+                visible.extend(worker.filter_initial_input_echo(chunk.to_vec()));
+            }
+            assert_eq!(visible, ordinary);
+        }
+    }
+
+    #[test]
     fn bootstrap_echo_preserves_no_echo_user_output_and_near_matches() {
         let bootstrap = ssh_osc7_bootstrap_input_chunks().concat();
         for ordinary in [
@@ -2469,7 +3039,7 @@ mod live_shell_tests {
             if mode == "write" { registry.write_input(runtime.id.clone(), b"user\n".to_vec()).unwrap(); }
             if mode == "resize" { registry.record_resize(runtime.id.clone(), 81, 25).unwrap(); }
             if mode == "keepalive" {
-                worker.consecutive_keepalive_failures = 1;
+                worker.consecutive_keepalive_failures = 4;
                 worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(21));
                 assert_eq!(worker.poll(&mut registry).unwrap().diagnostic, "keepalive_failed");
             } else {
@@ -3007,7 +3577,7 @@ mod live_shell_tests {
             FakeShellChannel::new().with_read_chunks(vec![b"two\n".to_vec()]),
         ));
 
-        let statuses = manager.poll_all(&mut registry).expect("poll all");
+        let statuses = manager.poll_all(&mut registry);
         let first_output = registry
             .take_output_batch(first.id.clone())
             .expect("first output");
@@ -3031,7 +3601,7 @@ mod live_shell_tests {
             FakeShellChannel::new().with_eof_after_poll(true),
         ));
 
-        let statuses = manager.poll_all(&mut registry).expect("poll all");
+        let statuses = manager.poll_all(&mut registry);
 
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].status, "closed");
@@ -3111,6 +3681,31 @@ mod live_shell_tests {
             manager.wait_interests(),
             vec![ShellWaitInterest::readable(42)]
         );
+    }
+
+    #[test]
+    fn manager_omits_only_full_ssh_queues_from_socket_readiness_waits() {
+        let mut registry = TerminalRuntimeRegistry::new(8);
+        let full = registry.open_remote_ssh("test".into(), 22, "test".into(), 80, 24);
+        let idle = registry.open_remote_ssh("test".into(), 22, "test".into(), 80, 24);
+        let mut manager = LiveShellManager::new();
+        manager.register(LiveShellWorker::new(
+            full.id.clone(),
+            FakeShellChannel::new().with_read_chunks(vec![b"0123456789".to_vec()])
+                .with_wait_interest(ShellWaitInterest::readable(42)),
+        ));
+        manager.register(LiveShellWorker::new(
+            idle.id,
+            FakeShellChannel::new().with_wait_interest(ShellWaitInterest::readable(43)),
+        ));
+        manager.poll_all(&mut registry);
+        assert_eq!(manager.wait_interests(), vec![ShellWaitInterest::readable(43)]);
+        let first = registry.take_output_batch(full.id.clone()).unwrap();
+        manager.poll(&mut registry, full.id.clone()).unwrap();
+        let last = registry.take_output_batch(full.id).unwrap();
+        assert_eq!([first.bytes, last.bytes].concat(), b"0123456789");
+        assert!(manager.wait_interests().contains(&ShellWaitInterest::readable(42)));
+        assert!(manager.wait_interests().contains(&ShellWaitInterest::readable(43)));
     }
 
     #[test]
@@ -3201,25 +3796,32 @@ mod live_shell_tests {
     }
 
     #[test]
-    fn fake_shell_worker_closes_runtime_after_two_keepalive_failures() {
+    fn fake_shell_worker_tolerates_keepalive_failures_before_closing_runtime() {
+        //单次保活失败不应立即断开：多会话并发时，网络抖动或对端短暂繁忙
+        //都可能造成偶发失败。按5次阈值，恢复窗口约100秒。
         let mut registry = TerminalRuntimeRegistry::new(4096);
         let runtime =
-            registry.open_remote_ssh("example.com".to_string(), 22, "deploy".to_string(), 80, 24);
+            registry.open_remote_ssh("example.com".to_string(),22, "deploy".to_string(),80,24);
         let channel = KeepaliveFailingShellChannel::new();
         let mut worker = LiveShellWorker::new(runtime.id.clone(), channel);
 
-        worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(31));
-        let first_status = worker
-            .poll(&mut registry)
-            .expect("first idle poll after keepalive failure");
-        worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(31));
-        let second_status = worker
-            .poll(&mut registry)
-            .expect("second idle poll after keepalive failure");
+        //前4次失败都应保持运行。
+        for attempt in 1..=4 {
+            worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(31));
+            let status = worker
+                .poll(&mut registry)
+                .unwrap_or_else(|_| panic!("第{attempt}次保活失败不应中断轮询"));
+            assert_eq!(status.status, "running", "第{attempt}次失败后应仍在运行");
+        }
 
-        assert_eq!(first_status.status, "running");
-        assert_eq!(second_status.status, "closed");
-        assert_eq!(worker.channel().keepalive_count, 2);
+        //第5次失败才关闭。
+        worker.last_keepalive_at = Some(Instant::now() - Duration::from_secs(31));
+        let final_status = worker
+            .poll(&mut registry)
+            .expect("fifth idle poll after keepalive failure");
+
+        assert_eq!(final_status.status, "closed");
+        assert_eq!(worker.channel().keepalive_count, 5);
         assert_eq!(
             registry
                 .runtime_snapshot(runtime.id)

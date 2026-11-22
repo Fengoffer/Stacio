@@ -8,6 +8,7 @@ import SwiftTerm
         public var semanticHighlightProfile: TerminalSemanticHighlightProfile = .generalPurpose
         public var semanticHighlightThemeOverride: TerminalColorTheme?
         public private(set) var isProcessingRemoteOutput = false
+        private var pendingOutputScroll: (terminal: Terminal, yDisp: Int)?
         public var acceptsLocalFileDrops: (() -> Bool)? {
             didSet {
                 LocalFileDropHandler.register(self)
@@ -93,10 +94,18 @@ import SwiftTerm
             ) { [weak self] displayBytes in
                 guard let self else { return }
                 self.isProcessingRemoteOutput = true
-                defer { self.isProcessingRemoteOutput = false }
+                defer { self.finishRemoteOutputDelivery() }
                 self.feed(byteArray: ArraySlice(displayBytes))
-                self.onSearchViewportChanged?()
             }
+        }
+
+        private func finishRemoteOutputDelivery() {
+            isProcessingRemoteOutput = false
+            if let scroll = pendingOutputScroll {
+                pendingOutputScroll = nil
+                super.scrolled(source: scroll.terminal, yDisp: scroll.yDisp)
+            }
+            onSearchViewportChanged?()
         }
 
         func cancelPendingSemanticOutput() {
@@ -118,6 +127,13 @@ import SwiftTerm
     }
 
     public override func scrolled(source terminal: Terminal, yDisp: Int) {
+        // Parsing one output batch can scroll thousands of lines. The parser
+        // still advances every line; update AppKit's scroller, gutter and search
+        // only after the final viewport is known. User scrolling stays immediate.
+        if isProcessingRemoteOutput {
+            pendingOutputScroll = (terminal, yDisp)
+            return
+        }
         super.scrolled(source: terminal, yDisp: yDisp)
         onSearchViewportChanged?()
     }

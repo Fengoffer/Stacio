@@ -780,6 +780,50 @@ struct TerminalSemanticHighlightConfiguration {
     }
 }
 
+/// Tracks only native formatting boundaries, without buffering or delaying any
+/// output. Never insert semantic SGR/OSC markup inside a split control sequence.
+private struct TerminalNativeFormattingState {
+    private enum State { case ground, escape, intermediate, csi, string, stringEscape }
+    private var state = State.ground
+    private var stringEndsWithBell = false
+
+    mutating func protects(_ bytes: [UInt8]) -> Bool {
+        let protected = state != .ground
+        for byte in bytes {
+            if byte == 0x18 || byte == 0x1a { state = .ground; continue }
+            switch state {
+            case .ground:
+                if byte == 0x1b { state = .escape }
+            case .escape:
+                switch byte {
+                case 0x5b: state = .csi
+                case 0x5d: state = .string; stringEndsWithBell = true
+                case 0x50, 0x5f, 0x5e, 0x58: state = .string; stringEndsWithBell = false
+                case 0x20...0x2f: state = .intermediate
+                case 0x1b: break
+                default:
+                    state = .ground
+                }
+            case .intermediate:
+                if byte == 0x1b { state = .escape }
+                else if (0x30...0x7e).contains(byte) { state = .ground }
+            case .csi:
+                if byte == 0x1b { state = .escape }
+                else if (0x40...0x7e).contains(byte) {
+                    state = .ground
+                }
+            case .string:
+                if byte == 7 && stringEndsWithBell { state = .ground }
+                else if byte == 0x1b { state = .stringEscape }
+            case .stringEscape:
+                if byte == 0x5c || (byte == 7 && stringEndsWithBell) { state = .ground }
+                else if byte != 0x1b { state = .string }
+            }
+        }
+        return protected || state != .ground
+    }
+}
+
 final class TerminalSemanticOutputProcessor {
     typealias Delivery = ([UInt8]) -> Void
 
@@ -803,6 +847,7 @@ final class TerminalSemanticOutputProcessor {
     private var outstandingByteCount = 0
     private var bypassHighlightingUntilDrained = false
     private var pendingMainDeliveryBatchCount = 0
+    private var nativeFormatting = TerminalNativeFormattingState()
 
     init(label: String) {
         workerQueue = DispatchQueue(label: label, qos: .userInitiated)
@@ -821,12 +866,12 @@ final class TerminalSemanticOutputProcessor {
 
         if Thread.isMainThread,
            bytes.count < Self.asynchronousByteThreshold,
-           let reservedGeneration = reserveSynchronousRequest(byteCount: bytes.count) {
-            let displayBytes = configuration?.apply(to: bytes) ?? bytes
-            if isCurrentGeneration(reservedGeneration) {
+           let reservation = reserveSynchronousRequest(bytes: bytes) {
+            let displayBytes = reservation.protected ? bytes : (configuration?.apply(to: bytes) ?? bytes)
+            if isCurrentGeneration(reservation.generation) {
                 delivery(displayBytes)
             }
-            finishSynchronousRequest(byteCount: bytes.count, generation: reservedGeneration)
+            finishSynchronousRequest(byteCount: bytes.count, generation: reservation.generation)
             return
         }
 
@@ -840,10 +885,11 @@ final class TerminalSemanticOutputProcessor {
         pendingRequestIndex = 0
         outstandingByteCount = 0
         bypassHighlightingUntilDrained = false
+        nativeFormatting = TerminalNativeFormattingState()
         stateLock.unlock()
     }
 
-    private func reserveSynchronousRequest(byteCount: Int) -> UInt64? {
+    private func reserveSynchronousRequest(bytes: [UInt8]) -> (generation: UInt64, protected: Bool)? {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard workerIsRunning == false,
@@ -854,8 +900,8 @@ final class TerminalSemanticOutputProcessor {
             return nil
         }
         synchronousRequestIsRunning = true
-        outstandingByteCount += byteCount
-        return generation
+        outstandingByteCount += bytes.count
+        return (generation, nativeFormatting.protects(bytes))
     }
 
     private func finishSynchronousRequest(byteCount: Int, generation requestGeneration: UInt64) {
@@ -895,7 +941,7 @@ final class TerminalSemanticOutputProcessor {
         }
         pendingRequests.append(Request(
             bytes: bytes,
-            configuration: bypassHighlightingUntilDrained ? nil : configuration,
+            configuration: nativeFormatting.protects(bytes) || bypassHighlightingUntilDrained ? nil : configuration,
             generation: generation,
             delivery: delivery
         ))

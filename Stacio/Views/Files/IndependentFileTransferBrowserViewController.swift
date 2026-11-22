@@ -1335,7 +1335,9 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
         contentViewController.onTransferAction = { [weak coordinator] action, jobID in
             switch action {
             case .retry:
-                _ = coordinator?.retryFailedTransfer(jobID: jobID)
+                if coordinator?.retryFailedTransfer(jobID: jobID) != true {
+                    coordinator?.onRetryRequested?(jobID)
+                }
             case .pause:
                 _ = coordinator?.pauseTransfer(jobID: jobID)
             case .resume:
@@ -1350,10 +1352,10 @@ public final class IndependentFileTransferBrowserViewController: NSViewControlle
             _ = coordinator?.cancelTransfer(jobID: jobID)
         }
         contentViewController.onRemoveFinishedTransfer = { [weak coordinator] jobID in
-            _ = coordinator?.removeFinishedTransfer(jobID: jobID)
+            coordinator?.removeFinishedTransfer(jobID: jobID)
         }
         contentViewController.onClearFinished = { [weak coordinator] in
-            _ = coordinator?.clearFinishedTransfers()
+            coordinator?.clearFinishedTransfers()
         }
         contentViewController.onCollapseRequested = { [weak self] in
             self?.transferQueuePopover?.close()

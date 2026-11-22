@@ -8,7 +8,7 @@
 
 Terminal · SCP/SFTP · Remote Files · SSH Tunnels · Device Metrics · AI Agent
 
-[![Version](https://img.shields.io/badge/version-0.14.2%20Stable-2dd4bf)](https://www.stacio.cn/)
+[![Version](https://img.shields.io/badge/version-0.15.3%20Stable-2dd4bf)](https://www.stacio.cn/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-000000)](https://www.stacio.cn/)
 [![License](https://img.shields.io/badge/license-Source%20Available%20NC-blue)](LICENSE)
 [![Swift](https://img.shields.io/badge/Swift-5-F05138)](https://www.swift.org/)
@@ -108,10 +108,28 @@ Terminal · SCP/SFTP · Remote Files · SSH Tunnels · Device Metrics · AI Agen
 
 ### AI Agent
 
-- **Context-aware**: Reads terminal context to generate troubleshooting suggestions
-- **Command cards**: Generates executable commands — **requires user confirmation before execution**
-- **Local agent integration**: Codex, Claude, OpenCode, Qwen Code
-- **Safety first**: AI never executes commands, downloads, or installs silently
+- **Rewritten assistant (0.15.3)**: Single-column session panel with a collapsible rail and a draggable width that is remembered.
+- **Three permission levels**: confirm every command, smart approval for recognized read-only commands, or full access behind an explicit risk gate.
+- **Approval cards**: Show the command and its purpose, grant per command, and expire after ten minutes instead of locking the composer.
+- **Real terminal execution**: Commands run in the bound terminal and are judged by the real exit code, never by an echoed command line.
+- **Streaming replies**: Incremental rendering, Markdown caching, streaming table placeholders, foldable reasoning, and explicit errors instead of endless spinners.
+- **Model management**:35 brand icons, automatic capability detection, prompt enhancement, in-order screenshot sending, and paste support.
+- **Local agent integration**: Codex, Claude, OpenCode, and Qwen Code can launch inside the panel and take over the terminal.
+- **Safety first**: AI never executes commands, downloads, or installs silently.
+
+### Terminal Performance (0.15.3)
+
+- **Batched output**: Remote terminal refresh runs per batch instead of per line. Three rounds of864KB produced zero dropped bytes where the previous build lost84-160KB.
+- **Higher frame rate**:17.9-34.7 FPS during heavy output (previously2.4-4.7 FPS), with about16% less CPU time.
+- **Stable sessions**: Hidden tabs keep consuming output, reconnect automatically, and isolate failures per session; keepalive tolerance was raised from40s to100s.
+- **Theme fix**: Low-intensity text was invisible on12 of14 built-in themes; all themes now render it readably.
+- **Recording**: Styled terminal recording (RTF) plus asciinema v2 import and playback.
+
+### Resumable Transfers (0.15.3)
+
+- **Breakpoint resume**: SCP/SFTP transfers resume after interruption with atomic checkpoint metadata and rollback on failure.
+- **Accurate progress**: Real transfer rates (a previous build could report absurd values such as12732 MB/s) and no delay on large files.
+- **Verified overwrite**: Existing remote files are checksum-verified before being replaced, and mismatches are reported instead of silently overwritten.
 
 ### Professional
 
@@ -153,14 +171,14 @@ Each platform uses its native UI (macOS: Swift/AppKit, Windows: WinUI 3, Linux: 
 
 | Platform | Status | Tech Stack |
 |----------|--------|------------|
-| macOS | Available now (0.14.2) | Swift + AppKit + Rust Core |
+| macOS | Available now (0.15.3) | Swift + AppKit + Rust Core |
 | Windows | In development | WinUI 3 / .NET 8 + Rust Core |
 | Linux | Architecture baseline ready | GTK4 / libadwaita + Rust Core |
 | Domestic OS | Planned | UOS · Deepin · Kylin · openEuler · HarmonyOS |
 
 ## Quick Facts
 
-- **Current Version:** Stacio 0.14.2 Stable (Build 333)
+- **Current Version:** Stacio0.15.3 Stable (Build889)
 - **System Requirements:** macOS 14 or later
 - **Installer:** Separate downloads for Apple Silicon and Intel Macs
 - **First Launch:** Installer is not yet notarized. If macOS blocks first launch, right-click `Stacio.app` in Finder → Open

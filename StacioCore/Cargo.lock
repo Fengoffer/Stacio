@@ -3308,6 +3308,7 @@ dependencies = [
  "ironrdp-session",
  "ironrdp-svc",
  "libc",
+ "libssh2-sys",
  "rusqlite",
  "serde",
  "serde_json",

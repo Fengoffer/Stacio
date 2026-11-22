@@ -10,6 +10,8 @@ struct AddAIProviderDraft {
     var defaultModelID: String?
     var lastModelSyncAt: Date?
     var confirmedCredentialOrigin: String?
+    /// Chosen per provider; catalog drafts start at chatCompletions.
+    var compatibilityProtocol: AICompatibilityProtocolPreference
 
     func makeConfiguration(id: UUID) -> AIProviderConfiguration? {
         guard let descriptor,
@@ -29,6 +31,8 @@ struct AddAIProviderDraft {
         configuration.isEnabled = false
         configuration.lastModelSyncAt = lastModelSyncAt
         configuration.confirmedCredentialOrigin = confirmedCredentialOrigin
+
+        configuration.compatibilityProtocol = compatibilityProtocol
 
         let suggestedURL = descriptor.suggestedBaseURL?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -104,12 +108,24 @@ final class AddAIProviderSheetController: NSViewController,
         models: [],
         defaultModelID: nil,
         lastModelSyncAt: nil,
-        confirmedCredentialOrigin: nil
+        confirmedCredentialOrigin: nil,
+        compatibilityProtocol: .chatCompletions
     )
 
     private let profilePopup = NSPopUpButton()
     private let displayNameField = NSTextField()
     private let baseURLField = NSTextField()
+    /// Per-provider wire protocol. The catalog only describes endpoints;
+    /// whether an endpoint speaks Chat Completions or Responses is a
+    /// per-provider choice, so it cannot live in the global settings panel.
+    private let protocolLabel = NSTextField(labelWithString: L10n.Settings.aiCompatibilityProtocol)
+    private let protocolControl = NSSegmentedControl(
+        labels: ["Chat", "Responses"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let apiKeyHintLabel = NSTextField(labelWithString: "")
     private let apiKeyLabel = NSTextField(labelWithString: L10n.Settings.apiKey)
     private let apiKeyField = NSSecureTextField()
     private let websiteButton = NSButton()
@@ -196,12 +212,20 @@ final class AddAIProviderSheetController: NSViewController,
         websiteRow.alignment = .centerY
         websiteRow.spacing = 8
 
+        // API Key row: keep it visible and disabled until a template is chosen, so
+        // the form never implies a credential is optional when it is not.
+        let apiKeyFieldContainer = NSStackView(views: [apiKeyField, apiKeyHintLabel])
+        apiKeyFieldContainer.orientation = .vertical
+        apiKeyFieldContainer.alignment = .leading
+        apiKeyFieldContainer.spacing = 2
+        
         let form = NSGridView(views: [
             [makeLabel(L10n.Settings.addAIProviderTemplate), profilePopup],
             [makeLabel(L10n.Settings.addAIProviderDisplayName), displayNameField],
             [makeLabel(L10n.Settings.baseURL), baseURLField],
             [makeLabel(L10n.Settings.addAIProviderOfficialEntry), websiteRow],
-            [apiKeyLabel, apiKeyField]
+            [protocolLabel, protocolControl],
+            [apiKeyLabel, apiKeyFieldContainer]
         ])
         form.column(at: 0).xPlacement = .trailing
         form.column(at: 1).xPlacement = .fill
@@ -211,7 +235,7 @@ final class AddAIProviderSheetController: NSViewController,
         form.setContentHuggingPriority(.required, for: .vertical)
         form.setContentCompressionResistancePriority(.required, for: .vertical)
         websiteGridRow = form.row(at: 3)
-        apiKeyGridRow = form.row(at: 4)
+        apiKeyGridRow = form.row(at: 5)
 
         let modelScrollView = NSScrollView()
         modelScrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -349,6 +373,20 @@ final class AddAIProviderSheetController: NSViewController,
         apiKeyLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
         apiKeyLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
 
+        protocolLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        protocolLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        protocolControl.selectedSegment = 0
+        protocolControl.target = self
+        protocolControl.action = #selector(protocolChanged(_:))
+        protocolControl.setAccessibilityIdentifier("Stacio.Settings.addAIProvider.protocol")
+        StacioDesignSystem.styleSegmentedControl(protocolControl)
+        protocolControl.toolTip = "该供应商使用哪种请求协议；不同供应商可以不同。"
+
+        apiKeyHintLabel.textColor = StacioDesignSystem.theme.secondaryTextColor
+        apiKeyHintLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        apiKeyHintLabel.isHidden = true
+        apiKeyHintLabel.setAccessibilityIdentifier("Stacio.Settings.addAIProvider.apiKeyHint")
+
         websiteButton.image = NSImage(
             systemSymbolName: "arrow.up.right.square",
             accessibilityDescription: L10n.Settings.addAIProviderOfficialEntry
@@ -377,7 +415,7 @@ final class AddAIProviderSheetController: NSViewController,
         modelSearchField.action = #selector(modelSearchChanged(_:))
         modelSearchField.translatesAutoresizingMaskIntoConstraints = false
         modelSearchField.setAccessibilityIdentifier("Stacio.Settings.addAIProvider.modelSearch")
-        StacioDesignSystem.styleTextField(modelSearchField)
+        StacioDesignSystem.styleSearchField(modelSearchField)
 
         configureModelTable()
 
@@ -469,6 +507,8 @@ final class AddAIProviderSheetController: NSViewController,
         displayNameField.stringValue = draft.displayName
         baseURLField.stringValue = draft.baseURL
         apiKeyField.stringValue = draft.apiKey
+        protocolControl.selectedSegment = draft.compatibilityProtocol == .responses ? 1 : 0
+        protocolControl.isEnabled = !isSaving && !didClose
         saveButton.isEnabled = canSave && !isSaving && !didClose
         profilePopup.isEnabled = !isSaving && !didClose
         displayNameField.isEnabled = !isSaving && !didClose
@@ -476,7 +516,18 @@ final class AddAIProviderSheetController: NSViewController,
         apiKeyField.isEnabled = !isSaving && !didClose
         let noCredential = draft.descriptor?.permitsNoCredential == true
             || draft.descriptor?.authenticationKind == CatalogAuthenticationKind.none
-        apiKeyGridRow?.isHidden = noCredential || draft.descriptor == nil
+        // Keep the credential row present so the form never looks like it accepts
+        // a provider with no key. Hide it only when the chosen template genuinely
+        // needs no credential; otherwise disable it and explain what is missing.
+        let descriptorMissing = draft.descriptor == nil
+        let credentialNotRequired = noCredential && descriptorMissing == false
+        apiKeyGridRow?.isHidden = credentialNotRequired
+        let credentialUsable = descriptorMissing == false && credentialNotRequired == false
+        apiKeyField.isEnabled = credentialUsable && !isSaving && !didClose
+        apiKeyHintLabel.stringValue = descriptorMissing
+            ? L10n.Settings.addAIProviderChooseTemplateForCredential
+            : ""
+        apiKeyHintLabel.isHidden = descriptorMissing == false
 
         let discoveryStrategy = draft.descriptor?.modelDiscoveryStrategy
         fetchModelsButton.isHidden = discoveryStrategy == .manualOnly
@@ -672,6 +723,10 @@ final class AddAIProviderSheetController: NSViewController,
             : nil
         applyCatalogEntry(descriptor)
         render()
+    }
+
+    @objc private func protocolChanged(_ sender: NSSegmentedControl) {
+        draft.compatibilityProtocol = sender.selectedSegment == 1 ? .responses : .chatCompletions
     }
 
     @objc private func openWebsitePressed(_ sender: NSButton) {
@@ -1234,9 +1289,21 @@ extension AddAIProviderSheetController {
     var catalogIDForTesting: String? { draft.descriptor?.catalogID }
     var modelEnabledStatesForTesting: [Bool] { draft.models.map(\.isEnabled) }
     var isAPIKeyHiddenForTesting: Bool { apiKeyGridRow?.isHidden ?? apiKeyField.isHidden }
+    var isAPIKeyEnabledForTesting: Bool { apiKeyField.isEnabled }
+    var apiKeyHintForTesting: String { apiKeyHintLabel.isHidden ? "" : apiKeyHintLabel.stringValue }
+    func makeConfigurationForTesting(id: UUID) -> AIProviderConfiguration? {
+        draft.makeConfiguration(id: id)
+    }
+    var protocolForTesting: AICompatibilityProtocolPreference { draft.compatibilityProtocol }
+    func selectProtocolForTesting(_ choice: AICompatibilityProtocolPreference) {
+        protocolControl.selectedSegment = choice == .responses ? 1 : 0
+        protocolChanged(protocolControl)
+    }
     var isManualModelEntryHiddenForTesting: Bool { manualModelRow.isHidden }
     var canFetchModelsForTesting: Bool { canFetchModels }
     var fetchModelsButtonEnabledForTesting: Bool { fetchModelsButton.isEnabled }
+    var fetchModelsButtonHiddenForTesting: Bool { fetchModelsButton.isHidden }
+    var manualModelInputEnabledForTesting: Bool { manualModelRow.isHidden == false }
     var websiteButtonTitleForTesting: String? {
         websiteGridRow?.isHidden == true ? nil : websiteButton.title
     }

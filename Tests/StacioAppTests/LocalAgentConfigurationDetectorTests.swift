@@ -344,6 +344,32 @@ final class LocalAgentConfigurationDetectorTests: XCTestCase {
         )
     }
 
+    /// A GUI app inherits a short PATH that never contains a version
+    /// manager bin directory, so detection has to look there as well.
+    func testDetectionFindsExecutableOutsideTheInheritedPath() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-agent-extra-\(UUID().uuidString)", isDirectory: true)
+        let binDirectory = root.appendingPathComponent(".hermes/node/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = binDirectory.appendingPathComponent("codex")
+        try writeExecutable("#!/bin/sh\nexit 0\n", to: executable)
+
+        let executor = RecordingProbeExecutor(results: [
+            .init(exitCode: 0, standardOutput: "codex-cli0.31.0\n", standardError: "")
+        ])
+        let detector = LocalAgentConfigurationDetector(
+            executor: executor,
+            // An empty PATH models the minimal environment a GUI app gets.
+            environment: {["HOME": root.path, "PATH": "/usr/bin:/bin"]},
+            homeDirectory: { root.path }
+        )
+
+        let report = try detector.detect(catalogID: "local-agent.codex")
+        XCTAssertFalse(report.candidates.isEmpty, "必须能从版本管理器的 bin目录检测到 CLI")
+        XCTAssertEqual(report.candidates.first?.executablePath, executable.path)
+    }
+
     private func makeFixture(executableName: String = "codex") throws -> DetectorFixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("local-agent-detector-\(UUID().uuidString)", isDirectory: true)

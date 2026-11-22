@@ -482,7 +482,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     private var sessionIconHeightConstraint: NSLayoutConstraint?
     private var serialAdvancedLabels: [NSTextField] = []
     private let saveButton = NSButton(title: L10n.Common.save, target: nil, action: nil)
-    private let saveAndConnectButton = NSButton(title: L10n.Common.saveAndConnect, target: nil, action: nil)
     private let connectButton = NSButton(title: L10n.Common.connect, target: nil, action: nil)
     private let cancelButton = NSButton(title: L10n.Common.cancel, target: nil, action: nil)
     private let footerSeparator = NSBox()
@@ -513,7 +512,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     private var sessionIconPickerWindow: NSWindow?
 
     var onSave: ((SessionDraft) -> Void)?
-    var onSaveAndConnect: ((SessionDraft) -> Void)?
     var onConnect: ((SessionDraft, String?) -> Void)?
     var onCancel: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -697,12 +695,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         connectButton.setAccessibilityIdentifier("Stacio.SessionSettings.connectButton")
         StacioDesignSystem.styleSheetButton(connectButton)
 
-        saveAndConnectButton.bezelStyle = .rounded
-        saveAndConnectButton.target = self
-        saveAndConnectButton.action = #selector(saveAndConnectButtonPressed(_:))
-        saveAndConnectButton.translatesAutoresizingMaskIntoConstraints = false
-        saveAndConnectButton.setAccessibilityIdentifier("Stacio.SessionSettings.saveAndConnectButton")
-        StacioDesignSystem.styleSheetButton(saveAndConnectButton)
 
         cancelButton.bezelStyle = .rounded
         cancelButton.keyEquivalent = "\u{1b}"
@@ -715,7 +707,7 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         }
         StacioDesignSystem.styleSheetButton(cancelButton)
 
-        let footer = NSStackView(views: [NSView(), cancelButton, connectButton, saveButton, saveAndConnectButton])
+        let footer = NSStackView(views: [NSView(), cancelButton, connectButton, saveButton])
         footer.orientation = .horizontal
         footer.spacing = 8
         footer.alignment = .centerY
@@ -807,7 +799,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             footer.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18),
             footer.heightAnchor.constraint(equalToConstant: 32),
             saveButton.widthAnchor.constraint(equalToConstant: 86),
-            saveAndConnectButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 114),
             connectButton.widthAnchor.constraint(equalToConstant: 86),
             cancelButton.widthAnchor.constraint(equalToConstant: 86)
         ])
@@ -878,17 +869,11 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
     }
 
     @objc private func connectButtonPressed(_ sender: NSButton) {
+        //「连接」即保存并连接：先把会话落盘，再建立连接。
+        //凭据随会话持久化，用户无需再单独点保存。
         do {
-            guard selectedProtocol.isAvailableForSaving,
-                  let draft = try connectionDraft(persistCredential: false)
-            else {
-                return
-            }
-            let values = sshForm.currentValues
-            let transientPassword = values.authMode != .agent && !values.credentialSecret.isEmpty
-                ? values.credentialSecret
-                : nil
-            onConnect?(draft, transientPassword)
+            guard let draft = try connectionDraft(persistCredential: true) else { return }
+            onConnect?(draft, nil)
         } catch {
             onError?(error)
         }
@@ -1502,15 +1487,6 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
         }
     }
 
-    @objc private func saveAndConnectButtonPressed(_ sender: NSButton) {
-        do {
-            guard let draft = try draft(persistCredential: true) else { return }
-            onSaveAndConnect?(draft)
-        } catch {
-            onError?(error)
-        }
-    }
-
     @objc private func cancelButtonPressed(_ sender: NSButton) {
         onCancel?()
     }
@@ -1619,12 +1595,10 @@ final class SessionSettingsViewController: NSViewController, NSTableViewDataSour
             let canSave = sshForm.isValidForSaving && (selectedProtocol != .console || consoleConfig != nil)
             let canConnect = sshForm.isValidForConnecting && (selectedProtocol != .console || consoleConfig != nil)
             saveButton.isEnabled = canSave
-            saveAndConnectButton.isEnabled = canSave
             connectButton.isEnabled = canConnect
             testingSaveButton?.isEnabled = canSave
         } else {
             saveButton.isEnabled = false
-            saveAndConnectButton.isEnabled = false
             connectButton.isEnabled = false
             testingSaveButton?.isEnabled = false
         }
@@ -2723,12 +2697,6 @@ final class SessionSettingsWindowController: NSWindowController, NSWindowDelegat
             self?.result = draft
             self?.shouldConnect = true
             self?.transientPassword = password
-            NSApplication.shared.stopModal(withCode: .OK)
-        }
-        settingsViewController.onSaveAndConnect = { [weak self] draft in
-            self?.result = draft
-            self?.shouldConnect = true
-            self?.transientPassword = nil
             NSApplication.shared.stopModal(withCode: .OK)
         }
         settingsViewController.onCancel = {

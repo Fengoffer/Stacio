@@ -236,6 +236,14 @@ enum RuntimeDiagnosticFormatter {
             return "磁盘空间不足"
         case "FILES_SIZE_MISMATCH":
             return "文件大小不一致"
+        case "FILES_CHECKSUM_MISMATCH":
+            return "源文件和目标文件的 SHA-256 不一致，未替换目标文件"
+        case "FILES_REMOTE_RENAME_FAILED":
+            return "远端未确认将暂存文件改为目标文件名，请检查同名文件和目录权限"
+        case "FILES_REMOTE_CHECKSUM_UNAVAILABLE":
+            return "无法取得远端文件的 SHA-256"
+        case "FILES_SOURCE_CHANGED":
+            return "传输期间源文件发生变化，未替换目标文件"
         case "FILES_UNSAFE_PATH":
             return "远程路径不安全"
         case "FILES_UNSAFE_MODE":

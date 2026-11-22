@@ -3,6 +3,19 @@ import Foundation
 import XCTest
 
 final class AIProviderModelCatalogTests: XCTestCase {
+    func testImageProbeDistinguishesRejectionFromUnverifiedAnswers() throws {
+        for (status, response, expected) in [(400, #"{"error":{"message":"model does not support image input"}}"#, false as Bool?), (200, #"{"choices":[{"message":{"content":"unknown"}}]}"#, nil), (429, "{}", nil)] {
+            let transport = CatalogRecordingTransport(responses: [(200, #"{"data":[{"id":"probe","supported_reasoning_efforts":["high"]}]}"#), (status, response)])
+            let result = try OpenAICompatibleAIModelCatalog(transport: transport).discoverReasoning(for: makeCatalogProvider(), modelID: "probe", apiKey: "test")
+            XCTAssertEqual(result.supportsImages, expected)
+            XCTAssertEqual(transport.requests.count, 2)
+            let request = try XCTUnwrap(transport.requests.last?.httpBody)
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request) as? [String: Any])
+            let parts = try XCTUnwrap((body["messages"] as? [[String: Any]])?.first?["content"] as? [[String: Any]])
+            XCTAssertEqual(parts.compactMap { $0["type"] as? String }, ["text", "image_url", "image_url"])
+        }
+    }
+
     func testCatalogPreservesExplicitModelCapabilitiesWithoutGuessingMissingFields() throws {
         let transport = CatalogRecordingTransport(responses: [
             (

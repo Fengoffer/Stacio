@@ -68,7 +68,7 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
     private let detailTextView = NSTextView()
     private var rows: [TransferRow] = []
     private var hasBulkPauseableTransfers = false
-    private var samplesByJobID: [String: TransferSample] = [:]
+    private var samplesByJobID: [String: TransferRateSampler] = [:]
     private let nowProvider: () -> Date
 
     public init(nowProvider: @escaping () -> Date = Date.init) {
@@ -117,7 +117,8 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
                 bytesDone: 0,
                 bytesTotal: 0,
                 rawStatus: row.rawStatus,
-                diagnostic: row.detailText.isEmpty ? nil : row.detailText
+                diagnostic: row.detailText.isEmpty ? nil : row.detailText,
+                allowsRetry: row.allowsRetry
             )
         })
     }
@@ -346,14 +347,19 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
         eventLogsByJobID: [String: [TransferEventLogEntry]] = [:],
         retryableJobIDs: Set<String>? = nil,
         requeueableJobIDs: Set<String>? = nil,
-        bulkPauseableJobIDs: Set<String>? = nil
+        resumableJobIDs: Set<String>? = nil,
+        bulkPauseableJobIDs: Set<String>? = nil,
+        capturedAt: Date? = nil,
+        rateBaselineIDsByJobID: [String: UUID] = [:]
     ) {
         let selectedJobID = rows.indices.contains(tableView.selectedRow) ? rows[tableView.selectedRow].jobID : nil
         let progressByJob = Dictionary(grouping: progressEvents, by: \.jobId)
-        let now = nowProvider()
+        let now = capturedAt ?? nowProvider()
+        let jobIDs = Set(jobs.map(\.id))
+        samplesByJobID = samplesByJobID.filter { jobIDs.contains($0.key) }
         rows = jobs.map { job in
             let latest = progressByJob[job.id]?.last
-            let metric = metric(for: job, latestProgress: latest, now: now)
+            let metric = metric(for: job, latestProgress: latest, now: now, baselineID: rateBaselineIDsByJobID[job.id])
             let logEntries = eventLogsByJobID[job.id] ?? Self.logEntries(
                 for: job,
                 progressEvents: progressByJob[job.id] ?? []
@@ -365,7 +371,8 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
                 detailText: diagnosticsByJobID[job.id] ?? "",
                 logEntries: logEntries,
                 allowsRetry: retryableJobIDs?.contains(job.id) ?? true,
-                canRequeue: requeueableJobIDs?.contains(job.id) ?? true
+                canRequeue: requeueableJobIDs?.contains(job.id) ?? true,
+                allowsResume: (resumableJobIDs ?? requeueableJobIDs)?.contains(job.id) ?? true
             )
         }
         hasBulkPauseableTransfers = bulkPauseableJobIDs.map { $0.isEmpty == false }
@@ -578,46 +585,24 @@ public final class TransferQueueViewController: NSViewController, NSTableViewDat
     private func metric(
         for job: ScpTransferJob,
         latestProgress: ScpTransferProgress?,
-        now: Date
+        now: Date,
+        baselineID: UUID?
     ) -> TransferMetric {
-        guard let latestProgress,
-              latestProgress.status == "running" || latestProgress.status == "resuming",
-              latestProgress.bytesDone > 0
-        else {
-            samplesByJobID[job.id] = latestProgress.map {
-                TransferSample(bytesDone: $0.bytesDone, capturedAt: now, bytesPerSecond: nil)
-            }
+        guard let latestProgress else {
+            samplesByJobID[job.id] = nil
             return .empty
         }
-
-        let previous = samplesByJobID[job.id]
-        var bytesPerSecond = previous?.bytesPerSecond
-        if let previous,
-           latestProgress.bytesDone > previous.bytesDone
-        {
-            let elapsed = now.timeIntervalSince(previous.capturedAt)
-            if elapsed > 0 {
-                bytesPerSecond = Double(latestProgress.bytesDone - previous.bytesDone) / elapsed
-            }
-        }
-
-        samplesByJobID[job.id] = TransferSample(
-            bytesDone: latestProgress.bytesDone,
-            capturedAt: now,
-            bytesPerSecond: bytesPerSecond
-        )
-
-        guard let bytesPerSecond,
-              bytesPerSecond > 0
-        else {
-            return .empty
-        }
-
+        let bytesPerSecond = samplesByJobID[job.id, default: TransferRateSampler()]
+            .update(bytesDone: latestProgress.bytesDone, status: latestProgress.status, at: now, baselineID: baselineID)
         let bytesTotal = latestProgress.bytesTotal > 0 ? latestProgress.bytesTotal : job.bytesTotal
+        guard let bytesPerSecond, bytesTotal == 0 || latestProgress.bytesDone < bytesTotal else {
+            return .empty
+        }
         let remainingBytes = bytesTotal > latestProgress.bytesDone ? bytesTotal - latestProgress.bytesDone : 0
         return TransferMetric(
             speedText: TransferRow.formatSpeed(bytesPerSecond: bytesPerSecond),
-            etaText: TransferRow.formatETA(seconds: Double(remainingBytes) / bytesPerSecond)
+            etaText: bytesPerSecond > 0 && bytesTotal > 0
+                ? TransferRow.formatETA(seconds: Double(remainingBytes) / bytesPerSecond) : "-"
         )
     }
 
@@ -683,6 +668,7 @@ private struct TransferRow {
     let rawStatus: String
     let allowsRetry: Bool
     let canRequeue: Bool
+    let allowsResume: Bool
 
     init(
         job: ScpTransferJob,
@@ -691,7 +677,8 @@ private struct TransferRow {
         detailText: String = "",
         logEntries: [TransferEventLogEntry] = [],
         allowsRetry: Bool = true,
-        canRequeue: Bool = true
+        canRequeue: Bool = true,
+        allowsResume: Bool = true
     ) {
         jobID = job.id
         direction = switch job.direction {
@@ -704,7 +691,7 @@ private struct TransferRow {
         let bytesTotal = latestProgress?.bytesTotal ?? job.bytesTotal
         rawStatus = latestProgress?.status ?? "queued"
         let baseProgressText = TransferRow.formatProgress(bytesDone: bytesDone, bytesTotal: bytesTotal)
-        status = L10n.Transfers.status(rawStatus)
+        status = L10n.Transfers.displayStatus(rawStatus, bytesDone: bytesDone, bytesTotal: bytesTotal)
         speedText = metric.speedText
         etaText = metric.etaText
         progressText = (rawStatus == "running" || rawStatus == "resuming") && etaText != "-"
@@ -714,6 +701,7 @@ private struct TransferRow {
         self.logEntries = logEntries
         self.allowsRetry = allowsRetry
         self.canRequeue = canRequeue
+        self.allowsResume = allowsResume
     }
 
     var visibleValues: [String] {
@@ -808,7 +796,7 @@ private struct TransferRow {
     }
 
     var canResume: Bool {
-        canRequeue && rawStatus == "paused"
+        allowsResume && rawStatus == "paused"
     }
 
     var canStop: Bool {
@@ -902,12 +890,6 @@ private struct TransferRow {
         }
         return String(format: "%.1f", rounded)
     }
-}
-
-private struct TransferSample {
-    let bytesDone: UInt64
-    let capturedAt: Date
-    let bytesPerSecond: Double?
 }
 
 private struct TransferMetric {

@@ -256,9 +256,19 @@ public enum LocalAgentLaunchEnvironmentBuilder {
         let policyEntries: [String]
         switch pathPolicy {
         case .controlled:
+            // Node based CLIs need the interpreter on PATH, and a version
+            // manager keeps it outside the system directories. Include the
+            // usual runtime roots or the probe cannot even start the tool.
             policyEntries = [
                 executableDirectory,
-                "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"
+                NSHomeDirectory() + "/.hermes/node/bin",
+                NSHomeDirectory() + "/.local/bin",
+                NSHomeDirectory() + "/.cargo/bin",
+                NSHomeDirectory() + "/.bun/bin",
+                NSHomeDirectory() + "/.volta/bin",
+                "/opt/homebrew/bin", "/opt/homebrew/sbin",
+                "/usr/local/bin", "/usr/local/sbin",
+                "/usr/bin", "/bin", "/usr/sbin", "/sbin"
             ]
         case .loginShell, .custom:
             guard !customPATHEntries.isEmpty else { throw BuildError.emptyCustomPATH }

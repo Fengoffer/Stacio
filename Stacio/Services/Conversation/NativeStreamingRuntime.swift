@@ -337,17 +337,25 @@ public final class NativeStreamingRuntime {
                 }
             }
             do {
-                let response = try await provider.value.respondStreaming(to: assistantRequest) { partial in
+                let coalescer = StreamingDeltaCoalescer() { text in
                     Task { @MainActor [weak self] in
-                        self?.deliverDelta(
-                            partial,
-                            generation: generation,
-                            callback: callbacks.onDelta
-                        )
+                        self?.deliverDelta(text, generation: generation, callback: callbacks.onDelta)
                     }
+                }
+                // A buffered tail must reach the transcript before any terminal event:
+                // the terminal guard rejects later deltas, so it would otherwise vanish.
+                // The defer still covers failure paths that never reach the flush below.
+                defer { coalescer.finish() }
+                let response = try await provider.value.respondStreaming(to: assistantRequest) { partial in
+                    coalescer.append(partial)
                 }
                 // A provider may swallow CancellationError and return normally.
                 // The user's cancellation must still win over that late response.
+                coalescer.flush()
+                // The emit closure hops to the main actor; yield so the tail lands
+                // before the terminal event closes this generation.
+                await Task.yield()
+                await MainActor.run {}
                 try Task.checkCancellation()
                 await MainActor.run { [weak self] in
                     self?.deliverTerminal(
@@ -388,6 +396,7 @@ public final class NativeStreamingRuntime {
         streamTask?.cancel()
     }
 
+    /// Flushes buffered deltas and lets the queued main-actor hops run, so the
     private func deliverDelta(
         _ delta: String,
         generation: UInt64,

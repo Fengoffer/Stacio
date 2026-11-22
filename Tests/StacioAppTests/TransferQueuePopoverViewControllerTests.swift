@@ -241,6 +241,80 @@ final class TransferQueuePopoverViewControllerTests: XCTestCase {
             XCTAssertTrue(controller.backgroundButtonForTesting.isHidden == false)
         }
     }
+
+ func testSpeedNeverExplodesWhenSamplesArriveTooCloseTogether() throws {
+ //回归：采样间隔极小时，瞬时除法会把速度放大到上万MB/s。
+ var now = Date(timeIntervalSince1970:100)
+ let controller = TransferQueuePopoverViewController(nowProvider: { now })
+ controller.loadView()
+ controller.apply(snapshot: TransferQueueSnapshot(rows: [
+ TransferQueueSnapshot.Row(
+ jobID: "burst",
+ direction: .upload,
+ sourcePath: "/tmp/big.iso",
+ destinationPath: "/srv/big.iso",
+ bytesDone: 0,
+ bytesTotal:100_000_000,
+ rawStatus: "running",
+ diagnostic: nil,
+ runtimeID: "s",
+ elapsedTime:0,
+ finishedAt: nil
+ )
+ ], capturedAt: now))
+
+ now = now.addingTimeInterval(0.001)
+ controller.apply(snapshot: TransferQueueSnapshot(rows: [
+ TransferQueueSnapshot.Row(
+ jobID: "burst",
+ direction: .upload,
+ sourcePath: "/tmp/big.iso",
+ destinationPath: "/srv/big.iso",
+ bytesDone:50_000_000,
+ bytesTotal:100_000_000,
+ rawStatus: "running",
+ diagnostic: nil,
+ runtimeID: "s",
+ elapsedTime:0.001,
+ finishedAt: nil
+ )
+ ], capturedAt: now))
+
+ let text = try XCTUnwrap(controller.rowsForTesting.first).speedText
+ XCTAssertFalse(text.contains("GB/s"), "间隔过小时速度被放大：\(text)")
+ if text.contains("MB/s"),
+ let value = Double(text.split(separator: " ").first ?? ""),
+ value > 1000 {
+ XCTFail("间隔过小时速度被放大到 \(text)")
+ }
+ }
+
+ func testActiveTransferWithoutProgressShowsPreparingInsteadOfZero() throws {
+ //回归：大文件刚开始传输时还没有进度回调，
+ //界面应明确显示「准备中」，而不是0 B/s或---。
+ let now = Date(timeIntervalSince1970:200)
+ let controller = TransferQueuePopoverViewController(nowProvider: { now })
+ controller.loadView()
+ controller.apply(snapshot: TransferQueueSnapshot(rows: [
+ TransferQueueSnapshot.Row(
+ jobID: "starting",
+ direction: .upload,
+ sourcePath: "/tmp/big.iso",
+ destinationPath: "/srv/big.iso",
+ bytesDone: 0,
+ bytesTotal:4_000_000_000,
+ rawStatus: "running",
+ diagnostic: nil,
+ runtimeID: "s",
+ elapsedTime:3,
+ finishedAt: nil
+ )
+ ], capturedAt: now))
+
+ let presentation = try XCTUnwrap(controller.rowsForTesting.first)
+ XCTAssertEqual(presentation.speedText, "准备中")
+ XCTAssertEqual(presentation.percentText, "0%", "进度条应立即出现并从0%开始")
+ }
 }
 
 private extension NSView {

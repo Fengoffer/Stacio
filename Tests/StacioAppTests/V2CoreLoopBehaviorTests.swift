@@ -132,7 +132,9 @@ final class V2CoreLoopBehaviorTests: XCTestCase {
 
         await fulfillment(of: [completeReceived], timeout: 5, enforceOrder: false)
         XCTAssertEqual(collectedComplete, "你好世界", "完成回调应返回完整消息")
-        XCTAssertEqual(collectedDeltas, ["你", "好", "世界"], "应收到全部 delta")
+        // Deltas are coalesced for repaint efficiency, so fragments may arrive
+        // merged; their concatenation must still be exact and ordered.
+        XCTAssertEqual(collectedDeltas.joined(), "你好世界", "全部 delta必须完整且有序")
     }
 
     /// Provider 抛错 → onError 映射为稳定 reasonCode。

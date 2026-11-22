@@ -31,6 +31,8 @@ public enum AIModelCapabilitySource: String, Codable, Equatable {
 }
 
 public struct AIModelCatalogCapabilities: Equatable {
+    public var supportsImages: Bool? = nil
+    public var supportsThinking: Bool? = nil
     public var contextWindowTokens: Int?
     public var supportedReasoningEfforts: [AIReasoningEffortPreference]?
 
@@ -62,6 +64,8 @@ public struct AIModelCapabilityConfiguration: Codable, Equatable {
     private static let estimatedCharactersPerToken = 4
     public static let maximumContextCharacterLimit = maximumContextWindowTokens * estimatedCharactersPerToken
 
+    public var supportsImages: Bool? = nil
+    public var supportsThinking: Bool? = nil
     public var contextWindowTokens: Int?
     public var contextCharacterLimit: Int?
     public var contextCharacterLimitSource: AIModelCapabilitySource
@@ -111,6 +115,8 @@ public struct AIModelCapabilityConfiguration: Codable, Equatable {
     }
 
     public mutating func applyCatalogCapabilities(_ catalog: AIModelCatalogCapabilities) {
+        supportsImages = catalog.supportsImages ?? supportsImages
+        supportsThinking = catalog.supportsThinking ?? catalog.supportedReasoningEfforts.flatMap { $0.isEmpty ? nil : true }
         if let contextWindowTokens = Self.normalizedContextWindowTokens(catalog.contextWindowTokens) {
             self.contextWindowTokens = contextWindowTokens
             if contextCharacterLimitSource != .manual {

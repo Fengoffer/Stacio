@@ -23,27 +23,8 @@ public enum LocalAgentExecutionMode: String, Codable, CaseIterable, Equatable, S
 
 // MARK: - 当前 Turn 工作方式（Local Agent 是 Runtime，不是第四种工作方式）
 
-public enum TurnWorkMode: String, Codable, CaseIterable, Equatable, Sendable {
-    case agent
-    case planFirst
-    case answerOnly
-
-    public var displayName: String {
-        switch self {
-        case .agent: return "Agent"
-        case .planFirst: return "先规划"
-        case .answerOnly: return "仅回答"
-        }
-    }
-}
 
 /// 当前 Turn 执行选择（每次询问/真实终端/后台虚拟终端），不与模型菜单混为一项。
-public enum TurnExecutionChoice: String, Codable, CaseIterable, Equatable, Sendable {
-    /// Settings 选择 `ask` 时的未决状态；不能被写入一个新的 Turn。
-    case ask
-    case realTerminal
-    case backgroundVirtualTerminal
-}
 
 // MARK: - 布局度量
 
@@ -144,33 +125,6 @@ public enum AgentComposerSemantics {
 
 // MARK: - 运行中语义表（§12.4）
 
-public enum ComposerRunPhase: String, Codable, CaseIterable, Equatable, Sendable {
-    case idle
-    case preparing
-    case waitingForCapacity
-    case startingRuntime
-    case streaming
-    case toolProposed
-    case executingTool
-    case pausing
-    case paused
-    case awaitingUser
-    case awaitingApproval
-    case takeoverPending
-    case editingQueuedItem
-    case stopping
-    case takenOver
-
-    /// 活动 Turn（显示 Stop 的相位集合）。
-    public var showsStop: Bool {
-        switch self {
-        case .idle, .editingQueuedItem, .takenOver:
-            return false
-        default:
-            return true
-        }
-    }
-}
 
 public enum AgentComposerRunStateMachine {
     /// Send 在活动 Turn 中用于排入下一轮；仅 Stopping 暂缓新提交。

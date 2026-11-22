@@ -222,6 +222,18 @@ impl TerminalRuntimeRegistry {
         Ok(runtime.clone())
     }
 
+    /// Space available to a producer that can defer reading its transport.
+    /// The caller holds the registry lock through the read and enqueue.
+    pub fn available_output_capacity(&self, runtime_id: &str) -> Result<usize, TerminalRuntimeError> {
+        if !self.runtimes.contains_key(runtime_id) {
+            return Err(TerminalRuntimeError::RuntimeNotFound {
+                runtime_id: runtime_id.to_string(),
+            });
+        }
+        let buffered = self.output_buffers.get(runtime_id).map_or(0, VecDeque::len);
+        Ok(self.max_buffer_bytes.saturating_sub(buffered))
+    }
+
     pub fn record_output(
         &mut self,
         runtime_id: String,

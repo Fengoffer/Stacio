@@ -640,9 +640,14 @@ public final class LocalAgentConfigurationDetector {
             return [path]
         }
 
-        let pathDirectories = (environment["PATH"] ?? "")
+        // A GUI app inherits a short PATH, so a CLI installed by a version
+        // manager or a package manager is never on it. Search the usual
+        // install roots too, or detection reports nothing on a machine where
+        // the tool is plainly present.
+        let pathDirectories = ((environment["PATH"] ?? "")
             .split(separator: ":", omittingEmptySubsequences: true)
             .map(String.init)
+            + Self.additionalExecutableDirectories(homeDirectory: homeDirectory))
             .filter(isCanonicalAbsolutePath)
         var unresolved: [String] = []
         for candidate in descriptor.executableCandidates {
@@ -663,6 +668,24 @@ public final class LocalAgentConfigurationDetector {
         }
         var seen = Set<String>()
         return unresolved.compactMap(verifiedRealExecutablePath).filter { seen.insert($0).inserted }
+    }
+
+    /// Directories a CLI commonly lands in that a GUI PATH never includes.
+    static func additionalExecutableDirectories(homeDirectory: String) -> [String] {
+        [
+            homeDirectory + "/.hermes/node/bin",
+            homeDirectory + "/.local/bin",
+            homeDirectory + "/.cargo/bin",
+            homeDirectory + "/.bun/bin",
+            homeDirectory + "/.volta/bin",
+            homeDirectory + "/.npm-global/bin",
+            homeDirectory + "/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/opt/local/bin"
+        ]
     }
 
     private func verifiedRealExecutablePath(_ value: String) -> String? {

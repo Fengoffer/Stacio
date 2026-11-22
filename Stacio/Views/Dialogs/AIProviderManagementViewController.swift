@@ -653,6 +653,8 @@ final class AIProviderManagementViewController: NSViewController,
             draft: draft.contextCharacterLimitSource,
             latest: latest.contextCharacterLimitSource
         )
+        result.supportsImages = locallyEditedValue(base: base.supportsImages, draft: draft.supportsImages, latest: latest.supportsImages)
+        result.supportsThinking = locallyEditedValue(base: base.supportsThinking, draft: draft.supportsThinking, latest: latest.supportsThinking)
         result.supportedReasoningEfforts = locallyEditedValue(
             base: base.supportedReasoningEfforts,
             draft: draft.supportedReasoningEfforts,
@@ -1352,6 +1354,15 @@ final class AIProviderManagementViewController: NSViewController,
         providerStatusLabel.font = .systemFont(ofSize: 12, weight: .medium)
         providerStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         providerStatusLabel.setAccessibilityIdentifier("Stacio.Settings.aiProviders.status")
+        // The status line carries long diagnostics, including a request id.
+        // Without wrapping and a low compression resistance it reports its full
+        // single-line width as intrinsic size, which stretches the whole window.
+        providerStatusLabel.maximumNumberOfLines = 3
+        providerStatusLabel.lineBreakMode = .byTruncatingTail
+        providerStatusLabel.cell?.wraps = true
+        providerStatusLabel.cell?.isScrollable = false
+        providerStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        providerStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         configureCommandButton(
             providerActivationButton,
@@ -2348,7 +2359,7 @@ final class AIProviderManagementViewController: NSViewController,
             label.font = .systemFont(ofSize: 10.5)
             label.textColor = modelStatusColor(model)
             label.lineBreakMode = .byTruncatingTail
-            label.toolTip = modelStatusText(model)
+            label.toolTip = modelStatusText(model) + " · " + (model.capabilities.supportsImages.map { $0 ? "支持图片输入" : "不支持图片输入" } ?? "图片能力未确认")
             label.translatesAutoresizingMaskIntoConstraints = false
             let cell = NSTableCellView()
             cell.textField = label
@@ -3274,7 +3285,9 @@ final class AIProviderManagementViewController: NSViewController,
         }
         draft.provider.isEnabled = false
         draft.provider.lastVerifiedAt = nil
-        save(draft: draft, apiKeyUpdate: .unchanged, impact: .connection)
+        save(draft: draft, apiKeyUpdate: .unchanged, impact: .connection) { [weak self] result in
+            if enabled, case .success = result { self?.discoverReasoning(for: draft.provider, modelID: modelID) }
+        }
     }
 
     private func toggleSelectedProviderActivation() {
@@ -3358,7 +3371,43 @@ final class AIProviderManagementViewController: NSViewController,
         }
         selectedModelID = modelID
         manualModelField.stringValue = ""
-        save(draft: draft, apiKeyUpdate: .unchanged, impact: .none)
+        save(draft: draft, apiKeyUpdate: .unchanged, impact: .none) { [weak self] result in
+            if case .success = result { self?.discoverReasoning(for: draft.provider, modelID: modelID) }
+        }
+    }
+
+    private func discoverReasoning(for provider: AIProviderConfiguration, modelID: String) {
+        guard let existing = provider.models.first(where: { $0.id == modelID })?.capabilities,
+              existing.supportedReasoningEfforts == nil || existing.supportsImages == nil,
+              let catalog = modelCatalogLoader as? DefaultAIModelCatalogLoader else { return }
+        readCredential(for: provider) { [weak self] outcome in
+            guard let self else { return }
+            let key: String?
+            switch outcome {
+            case .available(let value): key = value
+            case .missing where !self.requiresCredential(for: provider): key = nil
+            default: return
+            }
+            self.authorizeCredentialUseAsync(for: provider, purpose: L10n.Settings.aiCredentialOriginModelDiscoveryPurpose) { authorization in
+                guard case .authorized(let snapshot) = authorization, snapshot.baseURL == provider.baseURL else { return }
+                let main = self.mainExecutor
+                self.backgroundExecutor { [weak self] in
+                    guard let info = try? catalog.discoverReasoning(for: snapshot, modelID: modelID, apiKey: key),
+                          info.supportsImages != nil || info.supportsThinking != nil || info.supportedReasoningEfforts != nil else { return }
+                    main { [weak self] in
+                        guard let self, var draft = self.draft(for: snapshot.id), draft.provider.baseURL == snapshot.baseURL,
+                              let index = draft.provider.models.firstIndex(where: { $0.id == modelID }) else { return }
+                        if let images = info.supportsImages { draft.provider.models[index].capabilities.supportsImages = images }
+                        if let thinking = info.supportsThinking { draft.provider.models[index].capabilities.supportsThinking = thinking }
+                        if let efforts = info.supportedReasoningEfforts, draft.provider.models[index].capabilities.supportedReasoningEfforts == nil {
+                            draft.provider.models[index].capabilities.supportedReasoningEfforts = efforts
+                            draft.provider.models[index].capabilities.supportedReasoningEffortsSource = .catalog
+                        }
+                        self.save(draft: draft, apiKeyUpdate: .unchanged, impact: .none)
+                    }
+                }
+            }
+        }
     }
 
     private func setSelectedProviderAsDefault() {

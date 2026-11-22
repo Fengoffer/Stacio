@@ -1396,7 +1396,8 @@ final class FilesViewControllerTests: XCTestCase {
                         bytesDone: 512,
                         bytesTotal: 2_048,
                         rawStatus: "stopped",
-                        diagnostic: nil
+                        diagnostic: nil,
+                        allowsRetry: true
                     )
                 ],
                 capturedAt: Date(timeIntervalSince1970: 101)
@@ -1430,7 +1431,8 @@ final class FilesViewControllerTests: XCTestCase {
                         bytesDone: 512,
                         bytesTotal: 2_048,
                         rawStatus: "stopped",
-                        diagnostic: nil
+                        diagnostic: nil,
+                        allowsRetry: true
                     )
                 ],
                 capturedAt: Date(timeIntervalSince1970: 101)
@@ -2804,7 +2806,7 @@ private struct InspectorEditorHarness {
 @MainActor
 private func makeInspectorEditorHarness(
     testName: String,
-    aiPanel: AIAssistantPanelViewController? = nil,
+    aiPanel: AgentPanelViewController? = nil,
     closeDecision: RemoteTextEditorCloseDecision = .discard,
     tunnelLiveSessionContextProvider: @escaping () -> TunnelLiveSessionContext? = { nil },
     remoteFilesBridge: RemoteFilesBridging = CoreBridgeRemoteFilesBridge()

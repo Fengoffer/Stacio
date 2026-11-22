@@ -1052,6 +1052,27 @@ public final class WorkspaceViewController: NSViewController {
         return localTerminal.currentLocalDirectory
     }
 
+    /// Stable history scope for one pane.
+    ///
+    /// The scope must survive a reconnect, so it cannot be the runtime id:
+    /// every connect mints a new one, which orphaned the history of a pane
+    /// that was reopened. Use the saved session when the pane knows it, and
+    /// fall back to the connection identity, which is also stable.
+    private func historyScopeID(for pane: AgentTerminalTarget, runtimeID: String) -> String {
+        if let explicit = aiHistoryScopeIDs[runtimeID], explicit.isEmpty == false {
+            return explicit
+        }
+        if let savedID = savedSessionIDsByPane[ObjectIdentifier(pane)], savedID.isEmpty == false {
+            return "session:\(savedID)"
+        }
+        if let remote = pane as? RemoteTerminalPaneViewController,
+            let context = remote.liveSessionContext {
+            let config = context.config
+            return "host:\(config.host):\(config.port):\(config.username)"
+        }
+        return runtimeID
+    }
+
     public func aiTerminalContext(runtimeID: String?) -> AITerminalContext? {
         syncCurrentTerminalPaneWithFirstResponder()
         let terminalPane: AgentTerminalTarget?
@@ -1066,7 +1087,7 @@ public final class WorkspaceViewController: NSViewController {
                 runtimeID: remoteTerminal.runtimeID,
                 connectionGeneration: remoteTerminal.terminalRuntimeGeneration,
                 isConnected: remoteTerminal.isTerminalRuntimeConnected,
-                historyScopeID: aiHistoryScopeIDs[remoteTerminal.runtimeID],
+                historyScopeID: historyScopeID(for: remoteTerminal, runtimeID: remoteTerminal.runtimeID),
                 title: remoteTerminal.terminalTitle,
                 currentDirectory: remoteTerminal.currentRemoteDirectory,
                 recentTranscript: remoteTerminal.terminalOutputTranscript
@@ -1077,7 +1098,7 @@ public final class WorkspaceViewController: NSViewController {
                 runtimeID: localTerminal.runtimeID,
                 connectionGeneration: localTerminal.terminalRuntimeGeneration,
                 isConnected: localTerminal.isTerminalRuntimeConnected,
-                historyScopeID: aiHistoryScopeIDs[localTerminal.runtimeID],
+                historyScopeID: historyScopeID(for: localTerminal, runtimeID: localTerminal.runtimeID),
                 title: title(for: localTerminal),
                 currentDirectory: localTerminal.currentLocalDirectory,
                 recentTranscript: localTerminal.terminalOutputTranscript
@@ -2566,15 +2587,21 @@ public final class WorkspaceViewController: NSViewController {
         return firstResponder.acceptsFirstResponder
     }
 
-    private func focusCurrentTerminalPaneOnce() {
-        guard let pane = currentTerminalPane,
-              let terminal = pane as? TerminalCommandHandling,
-              let window = terminal.keyboardFocusView.window,
-              terminal.keyboardFocusView.acceptsFirstResponder,
-              window.firstResponder !== terminal.keyboardFocusView
-        else { return }
-        window.makeFirstResponder(terminal.keyboardFocusView)
-    }
+ private func focusCurrentTerminalPaneOnce() {
+ guard let pane = currentTerminalPane,
+ let terminal = pane as? TerminalCommandHandling,
+ let window = terminal.keyboardFocusView.window,
+ terminal.keyboardFocusView.acceptsFirstResponder,
+ window.firstResponder !== terminal.keyboardFocusView
+ else { return }
+ // The assistant panel is a peer editor in the same window. Stealing focus
+ // from it on a tab sync made typing land in the shell instead of the
+ // composer, so an editable text view that already owns focus is respected.
+ if let responder = window.firstResponder as? NSTextView, responder.isEditable {
+ return
+ }
+ window.makeFirstResponder(terminal.keyboardFocusView)
+ }
 
     @discardableResult
     private func close(pane: NSViewController, force: Bool = false) -> Bool {
@@ -4053,7 +4080,8 @@ extension WorkspaceViewController: AgentTerminalSessionListing {
                 environment: environment(for: pane),
                 isCurrent: runtimeID(for: pane) == currentID,
                 currentDirectory: directory,
-                subtitle: subtitle.isEmpty ? nil : subtitle
+                subtitle: subtitle.isEmpty ? nil : subtitle,
+                savedSessionID: savedSessionIDsByPane[ObjectIdentifier(pane)]
             )
         }
     }

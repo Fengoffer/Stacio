@@ -651,6 +651,10 @@ where
             .filter_map(|(done, range)| done.then_some(range.length))
             .sum(),
     ));
+    // Live counters include successful writes in unfinished ranges. Checkpoint
+    // counters below still include only fully flushed, recoverable ranges.
+    let written_bytes = Arc::new(std::sync::Mutex::new(resumed_from));
+    report_progress(resumed_from);
     let shared_buffer_tracker = Arc::new(SharedBufferTracker::default());
     // Initialize the partial file before range workers start.  In particular,
     // a late-scheduled first-range worker must never truncate data that a
@@ -683,6 +687,7 @@ where
             let is_cancelled = Arc::clone(&is_cancelled);
             let report_progress = Arc::clone(&report_progress);
             let completed_bytes = Arc::clone(&completed_bytes);
+            let written_bytes = Arc::clone(&written_bytes);
             let shared_buffer_tracker = Arc::clone(&shared_buffer_tracker);
             scope.spawn(move || loop {
                 if is_cancelled() {
@@ -754,7 +759,19 @@ where
                         let is_cancelled = Arc::clone(&is_cancelled);
                         move || is_cancelled()
                     },
-                    |_| {},
+                    {
+                        let written_bytes = Arc::clone(&written_bytes);
+                        let report_progress = Arc::clone(&report_progress);
+                        let previous_offset = AtomicU64::new(range.start);
+                        move |offset| {
+                            let previous = previous_offset.swap(offset, Ordering::SeqCst);
+                            let mut total = written_bytes.lock().expect("written bytes");
+                            *total += offset.saturating_sub(previous);
+                            // Serialize publication too, so concurrent workers cannot
+                            // publish older totals after newer ones.
+                            report_progress(*total);
+                        }
+                    },
                     Some(Arc::clone(&shared_buffer_tracker)),
                 ) {
                     Ok(value) if value.bytes_copied == range.length => value,
@@ -782,7 +799,6 @@ where
                         Some(transfer_state_error("FILES_CHECKPOINT_FAILED", bytes));
                     break;
                 }
-                report_progress(bytes);
                 let _ = relay;
             });
         }
@@ -869,6 +885,42 @@ fn transfer_state_error(code: impl Into<String>, committed_offset: u64) -> Remot
 fn remote_checkpoint_staging_path(path: &str) -> Result<String, String> {
     validate_remote_transfer_path(path)?;
     Ok(format!("{path}.tmp"))
+}
+
+fn recover_checkpoint_replacement<B: RemoteFileTransferBackend>(
+    backend: &mut B, path: &str,
+) -> Result<(), String> {
+    let backup = format!("{path}.previous");
+    if backend.file_identity(path)?.is_none() && backend.file_identity(&backup)?.is_some() {
+        backend.promote(&backup, path)?;
+    } else if backend.file_identity(path)?.is_some() {
+        backend.remove_file_if_exists(&backup)?;
+    }
+    Ok(())
+}
+
+fn promote_checkpoint<B: RemoteFileTransferBackend>(
+    backend: &mut B, staging: &str, path: &str,
+) -> Result<(), String> {
+    match backend.promote(staging, path) {
+        Ok(()) => backend.remove_file_if_exists(&format!("{path}.previous")),
+        Err(error) => {
+            // SFTP v3 servers may reject rename over an existing file even
+            // with OVERWRITE requested. Keep the previous valid checkpoint
+            // until its replacement is installed; interruption is recoverable.
+            if backend.file_identity(path)?.is_none() {
+                return Err(error);
+            }
+            let backup = format!("{path}.previous");
+            backend.remove_file_if_exists(&backup)?;
+            backend.promote(path, &backup)?;
+            if let Err(error) = backend.promote(staging, path) {
+                let _ = backend.promote(&backup, path);
+                return Err(error);
+            }
+            backend.remove_file_if_exists(&backup)
+        }
+    }
 }
 
 pub fn resolve_remote_resume(
@@ -1284,6 +1336,9 @@ impl RemoteFileTransferBackend for Libssh2RemoteTransferBackend {
     }
 
     fn read_checkpoint(&mut self, path: &str) -> Result<Option<RemoteTransferCheckpoint>, String> {
+        if self.protocol == RemoteTransferProtocol::Sftp {
+            recover_checkpoint_replacement(self, path)?;
+        }
         let Some(contents) = self.read_small_file(path)? else {
             return Ok(None);
         };
@@ -1319,7 +1374,12 @@ impl RemoteFileTransferBackend for Libssh2RemoteTransferBackend {
             let _ = self.remove_file_if_exists(&staging_path);
             return Err(error);
         }
-        if let Err(error) = self.promote(&staging_path, path) {
+        let promotion = if self.protocol == RemoteTransferProtocol::Sftp {
+            promote_checkpoint(self, &staging_path, path)
+        } else {
+            self.promote(&staging_path, path)
+        };
+        if let Err(error) = promotion {
             let _ = self.remove_file_if_exists(&staging_path);
             return Err(error);
         }
@@ -1471,9 +1531,43 @@ impl RemoteFileTransferBackend for Libssh2RemoteTransferBackend {
                     .map_err(|_| "FILES_REMOTE_COMMAND_FAILED".to_string())?;
                 let from = Self::sftp_path(&session, partial_path)?;
                 let to = Self::sftp_path(&session, destination_path)?;
-                sftp.rename(&from, &to, Some(RenameFlags::OVERWRITE))
-                    .map_err(|_| "FILES_REMOTE_COMMAND_FAILED".to_string())
+                match sftp.rename(&from, &to, Some(RenameFlags::OVERWRITE)) {
+                    Ok(()) => Ok(()),
+                    Err(error) if matches!(error.code(), ssh2::ErrorCode::SFTP(4 | 11))
+                        && sftp.lstat(&to).is_ok_and(|stat| stat.file_type().is_file()) => {
+                        drop(sftp);
+                        sftp_posix_replace(session.session(), &from, &to)
+                    }
+                    Err(error) if error.code() == ssh2::ErrorCode::SFTP(3) => Err("FILES_PERMISSION_DENIED".into()),
+                    Err(_) => Err("FILES_REMOTE_RENAME_FAILED".into()),
+                }
             }
+        }
+    }
+}
+
+// SFTP v3 rename cannot replace an existing entry on OpenSSH. ssh2 0.9
+// does not expose the negotiated posix-rename extension from libssh2.
+fn sftp_posix_replace(session: &ssh2::Session, from: &Path, to: &Path) -> Result<(), String> {
+    unsafe extern "C" {
+        fn libssh2_sftp_posix_rename_ex(sftp: *mut libssh2_sys::LIBSSH2_SFTP,
+            from: *const libc::c_char, from_len: usize, to: *const libc::c_char, to_len: usize) -> libc::c_int;
+    }
+    let from = from.as_os_str().as_encoded_bytes();
+    let to = to.as_os_str().as_encoded_bytes();
+    let mut locked = session.raw();
+    // SAFETY: the lock is held through shutdown, both slices live through the
+    // blocking call, and only this scope owns the new subsystem handle.
+    unsafe {
+        let sftp = libssh2_sys::libssh2_sftp_init(&mut *locked);
+        if sftp.is_null() { return Err("FILES_REMOTE_RENAME_FAILED".into()); }
+        let rc = libssh2_sftp_posix_rename_ex(sftp, from.as_ptr().cast(), from.len(), to.as_ptr().cast(), to.len());
+        let status = libssh2_sys::libssh2_sftp_last_error(sftp);
+        libssh2_sys::libssh2_sftp_shutdown(sftp);
+        match (rc, status) {
+            (0, _) => Ok(()),
+            (_, 3) => Err("FILES_PERMISSION_DENIED".into()),
+            _ => Err("FILES_REMOTE_RENAME_FAILED".into()),
         }
     }
 }
@@ -1724,16 +1818,30 @@ where
                     committed_offset: consumer_committed_offset.load(Ordering::SeqCst),
                 });
             }
-            if writer.write_all(&chunk.bytes).is_err() {
-                return Err(RemoteRelayError {
-                    code: "FILES_DESTINATION_WRITE_FAILED".to_string(),
-                    committed_offset: consumer_committed_offset.load(Ordering::SeqCst),
-                });
+            let mut written = 0;
+            while written < chunk.bytes.len() {
+                if consumer_is_cancelled() {
+                    return Err(RemoteRelayError {
+                        code: "FILES_TRANSFER_CANCELED".to_string(),
+                        committed_offset: consumer_committed_offset.load(Ordering::SeqCst),
+                    });
+                }
+                let count = match writer.write(&chunk.bytes[written..]) {
+                    Ok(count) if count > 0 => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        return Err(RemoteRelayError {
+                            code: "FILES_DESTINATION_WRITE_FAILED".to_string(),
+                            committed_offset: consumer_committed_offset.load(Ordering::SeqCst),
+                        })
+                    }
+                };
+                written += count;
+                let offset = consumer_committed_offset
+                    .fetch_add(count as u64, Ordering::SeqCst)
+                    .saturating_add(count as u64);
+                consumer_report_progress(offset);
             }
-            let offset = consumer_committed_offset
-                .fetch_add(chunk.bytes.len() as u64, Ordering::SeqCst)
-                .saturating_add(chunk.bytes.len() as u64);
-            consumer_report_progress(offset);
         }
         writer.flush().map_err(|_| RemoteRelayError {
             code: "FILES_DESTINATION_WRITE_FAILED".to_string(),
@@ -1779,7 +1887,8 @@ mod remote_transfer_tests {
     use super::{
         build_remote_sha256_command, build_scp_destination_command, build_scp_source_command,
         parse_remote_checkpoint_contents, parse_remote_sha256_output, plan_remote_transfer_ranges,
-        remote_checkpoint_staging_path, remote_partial_paths, resolve_remote_resume, sha256_reader,
+        promote_checkpoint, recover_checkpoint_replacement, remote_checkpoint_staging_path,
+        remote_partial_paths, resolve_remote_resume, sha256_reader,
         stream_with_bounded_pipeline, transfer_remote_file, transfer_remote_file_ranges,
         LocalFileTransferBackend, RemoteFileIdentity, RemoteFileTransferBackend,
         RemoteFileTransferRequest, RemoteRelayOptions, RemoteTransferCheckpoint,
@@ -1850,6 +1959,8 @@ mod remote_transfer_tests {
         mutate_source_after_sha256: bool,
         corrupt_checksum: bool,
         delay_stale_checkpoint_writes: bool,
+        rejects_overwrite: bool,
+        rejects_staged_promotion: bool,
         flush_count: usize,
     }
 
@@ -2049,6 +2160,12 @@ mod remote_transfer_tests {
 
         fn promote(&mut self, partial_path: &str, destination_path: &str) -> Result<(), String> {
             let mut state = self.state.lock().expect("memory backend");
+            if state.rejects_overwrite && state.files.contains_key(destination_path) {
+                return Err("FILES_REMOTE_COMMAND_FAILED".into());
+            }
+            if state.rejects_staged_promotion && partial_path.ends_with(".tmp") {
+                return Err("FILES_TRANSFER_INTERRUPTED".into());
+            }
             let bytes = state
                 .files
                 .remove(partial_path)
@@ -2154,6 +2271,75 @@ mod remote_transfer_tests {
         let shortest = ranges.iter().map(|range| range.length).min().unwrap();
         let longest = ranges.iter().map(|range| range.length).max().unwrap();
         assert!(longest - shortest <= chunk_size);
+    }
+
+    #[test]
+    fn bounded_pipeline_reports_partial_writes_before_a_whole_buffer_is_sent() {
+        struct PartialWriter;
+        impl Write for PartialWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len().min(4096))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        stream_with_bounded_pipeline(
+            io::Cursor::new(vec![0x55; 64 * 1024]),
+            PartialWriter,
+            128 * 1024,
+            RemoteRelayOptions {
+                chunk_size_bytes: 64 * 1024,
+                queue_depth: 2,
+            },
+            || false,
+            move |count| observed.lock().unwrap().push(count),
+        )
+        .unwrap();
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 16);
+        assert_eq!(updates[0], 128 * 1024 + 4096);
+        assert_eq!(*updates.last().unwrap(), 192 * 1024);
+    }
+
+    #[test]
+    fn range_progress_reports_written_chunks_before_any_range_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let bytes = vec![0x71; 8 * 1024 * 1024];
+        std::fs::write(&source, &bytes).unwrap();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        transfer_remote_file_ranges(
+            || Ok(LocalFileTransferBackend::new()),
+            || Ok(LocalFileTransferBackend::new()),
+            &RemoteFileTransferRequest {
+                job_id: "chunk-progress".into(),
+                source_path: source.to_string_lossy().into_owned(),
+                destination_path: destination.to_string_lossy().into_owned(),
+                expected_size: bytes.len() as u64,
+                requested_offset: 0,
+                force_restart: false,
+            },
+            64 * 1024,
+            4,
+            || false,
+            move |count| observed.lock().unwrap().push(count),
+        )
+        .unwrap();
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.first(), Some(&0));
+        assert_eq!(updates.iter().copied().find(|n| *n > 0), Some(64 * 1024));
+        assert!(updates.len() >= 129, "each written chunk must be reported");
+        assert!(
+            updates.windows(2).all(|pair| pair[1] > pair[0]),
+            "concurrent progress must be monotonic"
+        );
+        assert_eq!(updates.last(), Some(&(bytes.len() as u64)));
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
     }
 
     #[test]
@@ -2286,6 +2472,45 @@ mod remote_transfer_tests {
             Some(b"old".as_slice())
         );
         assert!(destination_state.promoted.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_replacement_supports_servers_that_reject_overwrite() {
+        let mut backend = MemoryBackend::with_file("/checkpoint.meta", b"old", 1);
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.files.insert("/checkpoint.meta.tmp".into(), b"new".to_vec());
+            state.rejects_overwrite = true;
+        }
+        promote_checkpoint(&mut backend, "/checkpoint.meta.tmp", "/checkpoint.meta").unwrap();
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.files["/checkpoint.meta"], b"new");
+        assert!(!state.files.contains_key("/checkpoint.meta.previous"));
+    }
+
+    #[test]
+    fn checkpoint_replacement_restores_previous_state_on_failed_promotion() {
+        let mut backend = MemoryBackend::with_file("/checkpoint.meta", b"old", 1);
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.files.insert("/checkpoint.meta.tmp".into(), b"new".to_vec());
+            state.rejects_overwrite = true;
+            state.rejects_staged_promotion = true;
+        }
+        assert!(promote_checkpoint(&mut backend, "/checkpoint.meta.tmp", "/checkpoint.meta").is_err());
+        assert_eq!(backend.state.lock().unwrap().files["/checkpoint.meta"], b"old");
+    }
+
+    #[test]
+    fn checkpoint_replacement_recovers_after_connection_loss_between_renames() {
+        let mut backend = MemoryBackend::with_file("/checkpoint.meta.previous", b"old", 1);
+        recover_checkpoint_replacement(&mut backend, "/checkpoint.meta").unwrap();
+        assert_eq!(backend.state.lock().unwrap().files["/checkpoint.meta"], b"old");
+        backend.state.lock().unwrap().files.insert("/checkpoint.meta.previous".into(), b"stale".to_vec());
+        recover_checkpoint_replacement(&mut backend, "/checkpoint.meta").unwrap();
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.files["/checkpoint.meta"], b"old");
+        assert!(!state.files.contains_key("/checkpoint.meta.previous"));
     }
 
     #[test]

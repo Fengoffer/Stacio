@@ -274,6 +274,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
                 self?.refreshMetrics()
             }
         }
+        refreshTimer?.tolerance = interval * 0.2
     }
 
     public override func viewWillDisappear() {
@@ -300,6 +301,7 @@ public final class DeviceMetricsDashboardViewController: NSViewController, NSPop
                     self?.refreshMetrics()
                 }
             }
+            refreshTimer?.tolerance = interval * 0.2
         }
         // Applying a preference to a hidden dashboard must not start polling or
         // load its view. Reuse every chart, history buffer, and inventory panel.

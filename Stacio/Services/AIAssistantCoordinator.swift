@@ -149,12 +149,19 @@ public final class AIAssistantCoordinator {
             do {
                 let response: AIAssistantResponse
                 if let streamingProvider = providerBox.provider as? AIAssistantStreamingProviding {
+                    // Coalesce token-level fragments before touching the main actor: a
+                    // relay can emit one character per event, and one main-actor hop per
+                    // character is what makes an answer appear to crawl out.
+                    let deltaCoalescer = StreamingDeltaCoalescer() { text in
+                        Task { @MainActor in
+                            stream(text)
+                        }
+                    }
+                    defer { deltaCoalescer.finish() }
                     response = try await streamingProvider.respondStreaming(
                         to: aiRequest,
                         onPartial: { delta in
-                            Task { @MainActor in
-                                stream(delta)
-                            }
+                            deltaCoalescer.append(delta)
                         }
                     )
                 } else {
@@ -507,9 +514,12 @@ public final class AIAssistantCoordinator {
         else {
             return ""
         }
-        let redactedTranscript = AgentProtocolRedaction.redactPreservingLineBreaks(
-            context.recentTranscript
-        )
+        return agentTerminalContext(context.recentTranscript, limit: characterLimit, mode: mode, compress: automaticCompressionEnabled)
+    }
+
+    static func agentTerminalContext(_ text: String, limit characterLimit: Int, mode: String, compress automaticCompressionEnabled: Bool) -> String {
+        guard mode != "excluded", characterLimit > 0 else { return "" }
+        let redactedTranscript = AgentProtocolRedaction.redactPreservingLineBreaks(text)
         if mode == "summaryOnly" {
             let header = "[Stacio 终端输出摘要]\n"
             let summaryBudget = max(0, characterLimit - header.count)

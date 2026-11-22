@@ -123,7 +123,8 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
             runtimeID: "runtime_two",
             status: .failed,
             title: "文件传输失败",
-            body: "下载“two.tar”失败。"
+            body: "下载“two.tar”失败。",
+            diagnostic: "文件传输权限不足"
         ))
 
         presenter.dismiss(runtimeID: "runtime_one")
@@ -131,6 +132,7 @@ final class TransferCompletionNotificationPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.visibleNotificationCountForTesting, 1)
         XCTAssertEqual(presenter.visiblePanelCountForTesting, 1)
         XCTAssertEqual(presenter.visibleListRowsForTesting.map(\.itemName), ["文件传输失败"])
+        XCTAssertTrue(presenter.visibleListRowsForTesting[0].detailText.hasPrefix("文件传输权限不足"))
         XCTAssertEqual(delivery.removedIdentifierBatches, [["Stacio.transfer.job_one"]])
         XCTAssertEqual(delivery.deliveredPayloads.map(\.identifier), [
             "Stacio.transfer.job_one",

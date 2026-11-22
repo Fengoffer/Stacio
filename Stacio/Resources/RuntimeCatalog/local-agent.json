@@ -190,7 +190,8 @@
     "rawIdentity": "opencode",
     "displayName": "OpenCode",
     "aliases": ["opencode", "OpenCode"],
-    "executableCandidates": [{"kind":"pathLookup","value":"opencode"}],
+    "executableCandidates": [
+ {"kind": "homeRelative", "value": ".opencode/bin/opencode"},{"kind":"pathLookup","value":"opencode"}],
     "supportedOSVersions": ["macOS 14+"],
     "supportedArchitectures": ["arm64", "x86_64"],
     "versionArgv": ["--version"],
@@ -310,7 +311,9 @@
     "rawIdentity": "kimiCode",
     "displayName": "Kimi Code",
     "aliases": ["Kimi", "Kimi Code"],
-    "executableCandidates": [{"kind":"pathLookup","value":"kimi-code"},{"kind":"pathLookup","value":"kimi"}],
+    "executableCandidates": [
+ {"kind": "homeRelative", "value": ".kimi-code/bin/kimi"},
+ {"kind": "homeRelative", "value": ".kimi-code/bin/kimi-code"},{"kind":"pathLookup","value":"kimi-code"},{"kind":"pathLookup","value":"kimi"}],
     "supportedOSVersions": ["macOS 14+"],
     "supportedArchitectures": ["arm64", "x86_64"],
     "versionArgv": ["--version"],

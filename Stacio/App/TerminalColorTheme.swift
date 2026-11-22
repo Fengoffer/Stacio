@@ -70,7 +70,7 @@ public struct TerminalColorTheme: Codable, Equatable {
         cursorHex: "#F5F5F5",
         selectionBackgroundHex: "#264F78",
         ansiColorHexes: [
-            "#000000", "#C23621", "#25BC24", "#ADAD27",
+            "#3A3A3D", "#C23621", "#25BC24", "#ADAD27",
             "#492EE1", "#D338D3", "#33BBC8", "#CBCCCD",
             "#818383", "#FC391F", "#31E722", "#EAEC23",
             "#5833FF", "#F935F8", "#14F0F0", "#E9EBEB"
@@ -433,7 +433,16 @@ public struct TerminalColorTheme: Codable, Equatable {
     }
 
     public var swiftTermAnsiColors: [SwiftTerm.Color] {
-        ansiColorHexes.map { TerminalThemeColor.swiftTermColor(from: $0) ?? SwiftTerm.Color(red: 0, green: 0, blue: 0) }
+        //索引0是ANSI30（black）。若它与背景过近，低亮度提示文字会完全看不见
+        //（部分主题把背景色直接填进了black色位，Stacio Dark背景又是纯黑）。
+        //这里只在渲染时提亮，不改主题本身的数据，导入主题的原始色值保持不变。
+        ansiColorHexes.enumerated().map { index, hex in
+            let resolved = index == 0
+                ? (TerminalColorTheme.liftedBlack(hex, backgroundHex: backgroundHex) ?? hex)
+                : hex
+            return TerminalThemeColor.swiftTermColor(from: resolved)
+                ?? SwiftTerm.Color(red: 0, green: 0, blue: 0)
+        }
     }
 
     private static func normalizedAnsiColors(_ colors: [String]) -> [String] {
@@ -448,8 +457,31 @@ public struct TerminalColorTheme: Codable, Equatable {
         return normalized
     }
 
+    ///让ANSI black与背景保持可见对比度；差异已经足够大时保持原值。
+    private static func liftedBlack(_ blackHex: String, backgroundHex: String) -> String? {
+        guard let black = TerminalThemeColor.rgbComponents(blackHex),
+              let background = TerminalThemeColor.rgbComponents(backgroundHex)
+        else {
+            return nil
+        }
+        let delta = max(
+            abs(black.red - background.red),
+            max(abs(black.green - background.green), abs(black.blue - background.blue))
+        )
+        if delta >= 40 {
+            return nil
+        }
+        //亮度用整数加权近似，避免浮点类型转换。
+        let backgroundLuma = (2126 * background.red + 7152 * background.green + 722 * background.blue) / 10000
+        let step = backgroundLuma < 128 ? 56 : -56
+        let liftedR = min(255, max(0, black.red + step))
+        let liftedG = min(255, max(0, black.green + step))
+        let liftedB = min(255, max(0, black.blue + step))
+        return String(format: "#%02X%02X%02X", liftedR, liftedG, liftedB)
+    }
+
     private static let portDeskAnsiFallback = [
-        "#000000", "#C23621", "#25BC24", "#ADAD27",
+        "#3A3A3D", "#C23621", "#25BC24", "#ADAD27",
         "#492EE1", "#D338D3", "#33BBC8", "#CBCCCD",
         "#818383", "#FC391F", "#31E722", "#EAEC23",
         "#5833FF", "#F935F8", "#14F0F0", "#E9EBEB"
@@ -876,7 +908,7 @@ public enum TerminalThemeColor {
         return String(format: "#%02X%02X%02X", r, g, b)
     }
 
-    private static func rgbComponents(_ hex: String) -> (red: Int, green: Int, blue: Int)? {
+    fileprivate static func rgbComponents(_ hex: String) -> (red: Int, green: Int, blue: Int)? {
         guard let normalized = normalizeHex(hex) else { return nil }
         let raw = String(normalized.dropFirst())
         guard let value = Int(raw, radix: 16) else { return nil }

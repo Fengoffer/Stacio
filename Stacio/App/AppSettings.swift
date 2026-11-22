@@ -156,6 +156,15 @@ public enum AgentConfirmationPolicyPreference: String, Equatable {
     case requireEveryCommand
     case allowReadOnlyWithoutPrompt
 
+    public var displayName: String {
+        switch self {
+        case .requireEveryCommand: return L10n.Settings.requireEveryCommand
+        case .allowLowRiskWithoutPrompt: return L10n.Settings.allowLowRisk
+        case .allowAllWithoutPrompt: return L10n.Settings.allowAllCommands
+        case .allowReadOnlyWithoutPrompt: return L10n.Settings.allowReadOnly
+        }
+    }
+
     public var authorizationPolicy: AgentAuthorizationPolicy {
         switch self {
         case .allowAllWithoutPrompt:

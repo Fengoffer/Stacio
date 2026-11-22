@@ -44,6 +44,7 @@ private struct TranscriptRenderFingerprint: Equatable {
     let processGroupID: UUID?
     let isCollapsed: Bool
     let executionCard: ExecutionCardPresentation?
+    let isStreaming: Bool
 
     init(_ entry: AITranscriptEntry) {
         id = entry.id
@@ -63,15 +64,26 @@ private struct TranscriptRenderFingerprint: Equatable {
         processGroupID = entry.processGroupID
         isCollapsed = entry.isCollapsed
         executionCard = entry.executionCard
+        isStreaming = entry.isStreaming
     }
+}
+
+/// A label that never takes the pointer. The composer placeholder sits
+/// above the text view, so if it answered hit testing the field beneath
+/// would ignore clicks and never take focus.
+private final class PassthroughLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 public final class AIAssistantPanelViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate {
     private static let defaultMessagePreferredWidth: CGFloat = 260
     private static let panelHorizontalInset: CGFloat = 14
-    private static let minimumQuestionHeight: CGFloat = 48
+ private static let minimumQuestionHeight: CGFloat = 66
     private static let maximumQuestionHeight: CGFloat = 112
-    private static let compactComposerHeight: CGFloat = 124
+ private static let compactComposerHeight: CGFloat = 124
+    /// Toolbar only: the model switcher and the permission chip. Sized to the
+    /// 34pt button row plus its 8pt insets, so no empty band is left above it.
+    private static let agentModeComposerHeight: CGFloat = 50
     private static let contextComposerHeight: CGFloat = 132
     private static let attachmentComposerHeight: CGFloat = 188
     private static let maxAttachmentBytes = 4 * 1024 * 1024
@@ -120,7 +132,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let headerStatusDot = NSView()
     private let headerStatusLabel = NSTextField(labelWithString: "")
     private let contextLabel = NSTextField(labelWithString: "")
-    private let targetButton = NSButton(title: L10n.AI.targetPicker, target: nil, action: nil)
+    private let targetButton = AIHoverButton(title: L10n.AI.targetPicker, target: nil, action: nil)
     private let collapseButton = NSButton(title: L10n.AI.collapse, target: nil, action: nil)
     private let conversationPopUpButton = NSPopUpButton()
     private let newConversationButton = NSButton()
@@ -128,15 +140,18 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private let conversationControlsLabel = NSTextField(labelWithString: "排查会话")
     private let questionField = AgentComposerTextView()
     private let questionScrollView = NSScrollView()
-    private let questionPlaceholderLabel = NSTextField(labelWithString: L10n.AI.placeholder)
+    private let questionPlaceholderLabel = PassthroughLabel(labelWithString: L10n.AI.placeholder)
     private let composer = AIComposerDropPasteView()
     private let composerAttachmentStack = NSStackView()
     private let composerContextLabel = NSTextField(labelWithString: "")
+        /// Quiet readings under the button row inside the card.
     private let composerToolbar = NSStackView()
-    private let composerAddButton = NSButton()
+ private let composerAddButton = AIHoverButton()
     private let contextUsageRing = AIContextUsageRingView()
-    private let composerPermissionButton = NSButton()
-    private let composerModelButton = NSButton()
+    private let composerPermissionButton = AIHoverButton()
+    /// Symbol currently drawn on the chip, kept for assertions.
+    private(set) var composerPermissionSymbolName: String?
+    private let composerModelButton = AIHoverButton()
     private let askButton = AIComposerPrimaryActionButton(
         title: L10n.AI.ask,
         target: nil,
@@ -183,6 +198,16 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var lastNonProcessTranscriptFingerprint: [TranscriptRenderFingerprint]?
     private var transcriptWidthConstraintsByViewID: [ObjectIdentifier: NSLayoutConstraint] = [:]
     private var pendingTranscriptScrollWorkItem: DispatchWorkItem?
+    /// Tracks whether the transcript keeps following new content.
+    /// Scrolling away from the bottom opts the reader out until they return,
+    /// so streamed tokens never yank the viewport while someone reads history.
+    private var isTranscriptPinnedToBottom = true
+    /// Distance from the bottom, in points, still treated as at-the-bottom.
+    private static let transcriptBottomPinThreshold: CGFloat = 24
+    private var transcriptJumpToLatestButton: NSButton?
+    /// Tail-of-transcript liveness cue. It stays in the transcript stack (a
+    /// render pass exempts it) and is hidden unless the turn is working.
+    private let thinkingIndicator = AIThinkingIndicatorView(frame: .zero)
     private var streamingTranscriptRenderTimer: Timer?
     private var sensitiveInputRefreshTimer: Timer?
     private var traceEventsByRequestID: [String: [AgentTraceEvent]] = [:]
@@ -218,6 +243,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var loadedConversationHistoryRuntimeID: String?
     private var conversationHistoryWriteStorageID: String?
     private var activeConversationIDs: [String: String] = [:]
+    /// Scope IDs whose active session was just created and must not be
+    /// replaced by the restore-last heuristic while the catalog has no entry
+    /// for the brand-new session yet.
+    private var freshlyCreatedScopeIDs: Set<String> = []
     private var composerDraftsByStorageID: [String: InspectorComposerDraft] = [:]
     private var activeComposerDraftStorageID: String?
     private var shouldFollowCurrentTerminalAfterActivity = false
@@ -238,8 +267,16 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var composerPermissionPickerPopover: NSPopover?
     private var composerPermissionPickerViewController: AIComposerPermissionPickerViewController?
     private var composerPreviewWindow: NSWindow?
+    /// True while an agent owns the panel. Only the toolbar of the
+    /// composer stays: the model switcher and the permission chip.
+    private var isAgentTerminalActive = false
+
+    /// Toolbar anchors for the two modes.
+    private var composerToolbarBelowInputConstraint: NSLayoutConstraint?
+    private var composerToolbarAtTopConstraint: NSLayoutConstraint?
     private var composerHeightConstraint: NSLayoutConstraint?
     private var questionHeightConstraint: NSLayoutConstraint?
+    private var localAgentTerminalBottomToComposer: NSLayoutConstraint?
     private var transcriptMinimumHeightConstraint: NSLayoutConstraint?
     private var conversationBottomToCommandCardsConstraint: NSLayoutConstraint?
     private var conversationBottomToComposerConstraint: NSLayoutConstraint?
@@ -266,6 +303,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private var isInspectorInteractiveResizeActive = false
     private var conversationRuntime: InspectorConversationRuntime?
     private var localAgentTerminalBlockViewController: LocalAgentTerminalBlockViewController?
+    /// Hosts the local agent terminal when it owns the whole panel.
+    ///
+    /// The assistant transcript and the agent terminal are separate
+    /// experiences: while an agent runs, nothing of the conversation
+    /// view stays on screen.
+    private let localAgentTerminalHost = NSView()
     private var conversationRuntimeLoadTask: Task<Void, Never>?
     private var conversationRuntimeRestoreInFlight = false
     private var conversationRunPhase: ComposerRunPhase = .idle
@@ -375,6 +418,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         conversationRuntimeLoadTask?.cancel()
         activeManualCommandTask?.cancel()
         streamingTranscriptRenderTimer?.invalidate()
+        thinkingIndicator.stopAnimating()
         sensitiveInputRefreshTimer?.invalidate()
         pendingTranscriptScrollWorkItem?.cancel()
         if let traceObserver {
@@ -398,7 +442,6 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         container.setContentHuggingPriority(.defaultLow, for: .horizontal)
         StacioDesignSystem.applyInspectorSurface(container)
         container.layer?.cornerRadius = 0
-
         questionField.delegate = self
         questionField.setAccessibilityIdentifier("Stacio.AI.question")
         questionField.font = .systemFont(ofSize: 14)
@@ -451,7 +494,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composerContextLabel.setAccessibilityIdentifier("Stacio.AI.composer.context")
         composerContextLabel.isHidden = true
         composerToolbar.orientation = .horizontal
-        composerToolbar.spacing = 8
+ composerToolbar.spacing = 6
         composerToolbar.alignment = .centerY
         composerToolbar.distribution = .fill
         composerToolbar.translatesAutoresizingMaskIntoConstraints = false
@@ -583,6 +626,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         transcriptStack.distribution = .fill
         transcriptStack.translatesAutoresizingMaskIntoConstraints = false
         transcriptStack.setAccessibilityIdentifier("Stacio.AI.transcript")
+        thinkingIndicator.isHidden = true
+        transcriptStack.addArrangedSubview(thinkingIndicator)
+        thinkingIndicator.widthAnchor.constraint(equalTo: transcriptStack.widthAnchor).isActive = true
         planWorkspaceContainer.orientation = .vertical
         planWorkspaceContainer.spacing = 7
         planWorkspaceContainer.alignment = .leading
@@ -770,6 +816,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         conversationContainer.addSubview(transcriptScrollView)
         transcriptDocumentView.addSubview(transcriptContentStack)
         transcriptScrollView.documentView = transcriptDocumentView
+        // Observe the clip view so the pin follows real user scrolling rather
+        // than only our own programmatic moves.
+        transcriptScrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleTranscriptClipViewBoundsChanged(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: transcriptScrollView.contentView
+        )
         [planWorkspaceHeaderLabel, planWorkspaceBodyLabel].forEach { view in
             planWorkspaceContainer.addArrangedSubview(view)
             view.leadingAnchor.constraint(equalTo: planWorkspaceContainer.leadingAnchor, constant: 12).isActive = true
@@ -860,25 +915,49 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         )
         composerSurface.translatesAutoresizingMaskIntoConstraints = false
         composerSurface.setAccessibilityElement(false)
+        // The reference card is lifted by a soft shadow rather than a stroke;
+        // without it the composer reads as flat beside the transcript.
+        composerSurface.wantsLayer = true
+        composerSurface.layer?.shadowColor = NSColor.black.cgColor
+        composerSurface.layer?.shadowOpacity = 0.10
+        composerSurface.layer?.shadowOffset = CGSize(width: 0, height: 2)
+        composerSurface.layer?.shadowRadius = 10
         composer.addSubview(composerSurface)
         composer.addSubview(questionScrollView)
         composer.addSubview(questionPlaceholderLabel)
         composer.addSubview(composerAttachmentStack)
-        composer.addSubview(composerContextLabel)
         composer.addSubview(composerToolbar)
 
+        // Added before the conversation stack so the agent terminal
+        // can cover the whole panel when it takes over.
+        localAgentTerminalHost.isHidden = true
+        localAgentTerminalHost.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(localAgentTerminalHost)
         container.addSubview(conversationContainer)
         container.addSubview(commandCardsStack)
         container.addSubview(composer)
 
         let questionMinimumWidth = questionScrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 160)
         questionMinimumWidth.priority = .defaultLow
+        // The terminal stops above the composer so the CLI's own last lines
+        // stay visible; covering the full panel would hide them behind the
+        // toolbar.
+        localAgentTerminalBottomToComposer = localAgentTerminalHost.bottomAnchor.constraint(
+            equalTo: composer.topAnchor,
+            constant: -8
+        )
+        NSLayoutConstraint.activate([
+                localAgentTerminalHost.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                localAgentTerminalHost.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                localAgentTerminalHost.topAnchor.constraint(equalTo: container.topAnchor),
+                localAgentTerminalBottomToComposer!
+        ])
         let transcriptMinimumHeight = transcriptScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 132)
         transcriptMinimumHeight.priority = .defaultHigh
         transcriptMinimumHeightConstraint = transcriptMinimumHeight
         questionTopWithoutAttachmentsConstraint = questionScrollView.topAnchor.constraint(
             equalTo: composer.topAnchor,
-            constant: 12
+            constant: 8
         )
         questionTopWithAttachmentsConstraint = questionScrollView.topAnchor.constraint(
             equalTo: composerAttachmentStack.bottomAnchor,
@@ -906,6 +985,18 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             greaterThanOrEqualToConstant: Self.compactDecisionCardMinimumHeight
         )
         decisionCardMinimumHeightConstraint?.priority = .required
+        // Normal mode hangs the toolbar under the input. Agent mode pins it
+        // to the composer top, because the collapsed input sits at a
+        // negative y and would drag the toolbar out of the composer.
+        composerToolbarBelowInputConstraint = composerToolbar.topAnchor.constraint(
+                equalTo: questionScrollView.bottomAnchor,
+                constant: 8
+        )
+        composerToolbarAtTopConstraint = composerToolbar.topAnchor.constraint(
+                equalTo: composer.topAnchor,
+                constant: 8
+        )
+
         NSLayoutConstraint.activate([
             composer.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.panelHorizontalInset),
             composer.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.panelHorizontalInset),
@@ -940,17 +1031,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             questionPlaceholderLabel.topAnchor.constraint(equalTo: questionScrollView.topAnchor, constant: 8),
             questionPlaceholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: questionScrollView.trailingAnchor, constant: -8),
 
-            composerContextLabel.leadingAnchor.constraint(equalTo: questionScrollView.leadingAnchor, constant: 3),
-            composerContextLabel.trailingAnchor.constraint(equalTo: questionScrollView.trailingAnchor, constant: -3),
-            composerContextLabel.topAnchor.constraint(equalTo: questionScrollView.bottomAnchor, constant: 2),
+            // The mode summary line is gone; the space it used now belongs to
+            // the input area, and the button row sits directly under it.
 
             composerToolbar.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 12),
             composerToolbar.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -12),
-            composerToolbar.topAnchor.constraint(greaterThanOrEqualTo: composerContextLabel.bottomAnchor, constant: 6),
-            composerToolbar.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),
+            composerToolbarBelowInputConstraint!,
             composerToolbar.heightAnchor.constraint(equalToConstant: Self.primaryActionSize),
 
-            commandCardsStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.panelHorizontalInset),
+            // The readings sit inside the card, under the button row.
             commandCardsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.panelHorizontalInset),
             commandCardsStack.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -10),
             commandCardsCollapsedHeightConstraint!,
@@ -1021,6 +1110,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptScrollView.trailingAnchor.constraint(equalTo: conversationContainer.trailingAnchor),
             transcriptScrollView.topAnchor.constraint(equalTo: contextLabel.bottomAnchor, constant: 8),
             transcriptScrollView.bottomAnchor.constraint(equalTo: conversationContainer.bottomAnchor),
+
             transcriptMinimumHeight,
 
             transcriptDocumentView.leadingAnchor.constraint(equalTo: transcriptScrollView.contentView.leadingAnchor),
@@ -1035,8 +1125,64 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             transcriptContentStack.bottomAnchor.constraint(equalTo: transcriptDocumentView.bottomAnchor)
         ])
 
+        // Floating affordance: appears only while the reader is scrolled away,
+        // so the transcript can keep streaming without hijacking the viewport.
+        // A round chevron instead of a text label: it stays quiet while the
+        // reader is scrolled away and matches the circular controls used
+        // elsewhere in the assistant surface.
+        let jumpToLatestButton = AIHoverButton(
+            title: "",
+            target: self,
+            action: #selector(jumpTranscriptToLatest)
+        )
+        jumpToLatestButton.isBordered = false
+        jumpToLatestButton.image = NSImage(
+            systemSymbolName: "chevron.down",
+            accessibilityDescription: "跳到最新"
+        )
+        jumpToLatestButton.imagePosition = .imageOnly
+        jumpToLatestButton.imageScaling = .scaleProportionallyDown
+        jumpToLatestButton.contentTintColor = StacioDesignSystem.theme.secondaryTextColor
+        jumpToLatestButton.isHidden = true
+        jumpToLatestButton.translatesAutoresizingMaskIntoConstraints = false
+        jumpToLatestButton.setAccessibilityIdentifier("Stacio.AI.transcript.jumpToLatest")
+        jumpToLatestButton.setAccessibilityLabel("跳到最新")
+        jumpToLatestButton.wantsLayer = true
+        jumpToLatestButton.layer?.cornerRadius = 18
+        jumpToLatestButton.layer?.cornerCurve = .continuous
+        // No hairline outline: a ring reads as a hard border on a floating
+        // control. A soft shadow lifts it without drawing an edge, and the
+        // fill follows the window so both appearances work unchanged.
+        StacioDesignSystem.setLayerBackgroundColor(
+            jumpToLatestButton,
+            color: NSColor.controlBackgroundColor
+        )
+        jumpToLatestButton.layer?.borderWidth = 0
+        jumpToLatestButton.layer?.shadowColor = NSColor.black.cgColor
+        jumpToLatestButton.layer?.shadowOpacity = 0.14
+        jumpToLatestButton.layer?.shadowOffset = CGSize(width: 0, height: 1)
+        jumpToLatestButton.layer?.shadowRadius = 6
+        jumpToLatestButton.restingFillColor = NSColor.controlBackgroundColor
+        jumpToLatestButton.hoverFillColor = NSColor.controlAccentColor.withAlphaComponent(0.10)
+        StacioDesignSystem.setLayerBackgroundColor(
+            jumpToLatestButton,
+            color: jumpToLatestButton.restingFillColor
+        )
+        conversationContainer.addSubview(jumpToLatestButton)
+        transcriptJumpToLatestButton = jumpToLatestButton
+        NSLayoutConstraint.activate([
+            jumpToLatestButton.centerXAnchor.constraint(equalTo: transcriptScrollView.centerXAnchor),
+            jumpToLatestButton.bottomAnchor.constraint(
+             equalTo: transcriptScrollView.bottomAnchor,
+             constant: -StacioDesignSystem.theme.spacingCompact
+            ),
+            jumpToLatestButton.widthAnchor.constraint(equalToConstant: 36),
+            jumpToLatestButton.heightAnchor.constraint(equalToConstant: 36)
+        ])
+        
         view = container
         observeTerminalTraceNotifications()
+        observeComposerComposition()
         observeSettingsChanges()
         observeAssistantSettingsChanges()
         refreshAssistantComposerSettings()
@@ -1122,8 +1268,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
+    /// A placeholder must vanish as soon as the reader commits anything, including
+    /// an in-progress input-method composition, whose characters live in marked text
+    /// and not in string until the candidate is confirmed.
+    private func shouldShowComposerPlaceholder(for text: String) -> Bool {
+        guard text.isEmpty else { return false }
+        return questionField.hasMarkedText == false
+    }
+
+
     public func textDidChange(_ notification: Notification) {
-        questionPlaceholderLabel.isHidden = questionField.string.isEmpty == false
+        questionPlaceholderLabel.isHidden = shouldShowComposerPlaceholder(for: questionField.string) == false
         if conversationRuntimeFactory != nil,
            conversationContextRefreshPending || shouldFollowCurrentTerminalAfterActivity {
             pendingConversationPrefill = questionField.string
@@ -1563,18 +1718,19 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
-    private func localAgentConfiguration(
-        matching selection: AgentRuntimeSelection
-    ) -> LocalAgentPassthroughConfiguration? {
-        guard selection.kind == .localAgent,
-              let configurationID = selection.localAgentConfigurationID
-        else { return nil }
-        return configuredLocalAgentConfigurations.first {
-            $0.configurationID == configurationID
-                && $0.executionProfileID == selection.localAgentExecutionProfileID
+        private func localAgentConfiguration(
+                matching selection: AgentRuntimeSelection
+        ) -> LocalAgentPassthroughConfiguration? {
+                guard selection.kind == .localAgent,
+                                let configurationID = selection.localAgentConfigurationID
+                else { return nil }
+                // The profile is always resolved to the terminal one, while a stored
+                // selection may still name the managed profile. Comparing the two
+                // rejected a configuration that is perfectly usable.
+                return configuredLocalAgentConfigurations.first {
+                        $0.configurationID == configurationID
+                }
         }
-    }
-
     private func ensureLocalAgentTerminalBlock() -> LocalAgentTerminalBlockViewController {
         if let localAgentTerminalBlockViewController {
             return localAgentTerminalBlockViewController
@@ -1605,44 +1761,107 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             self.resumeDeferredConversationContextChangeIfPossible()
         }
         addChild(block)
-        let insertionIndex = transcriptContentStack.arrangedSubviews.firstIndex {
-            $0 === transcriptBottomSpacer
-        } ?? transcriptContentStack.arrangedSubviews.count
-        transcriptContentStack.insertArrangedSubview(block.view, at: insertionIndex)
-        block.view.widthAnchor.constraint(equalTo: transcriptContentStack.widthAnchor).isActive = true
-        block.view.setContentHuggingPriority(.required, for: .vertical)
+        // The agent owns the panel while it runs, so the terminal fills the
+        // whole content area instead of sitting inside the transcript.
+        localAgentTerminalHost.addSubview(block.view)
+        block.view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+                block.view.leadingAnchor.constraint(equalTo: localAgentTerminalHost.leadingAnchor),
+                block.view.trailingAnchor.constraint(equalTo: localAgentTerminalHost.trailingAnchor),
+                block.view.topAnchor.constraint(equalTo: localAgentTerminalHost.topAnchor),
+                block.view.bottomAnchor.constraint(equalTo: localAgentTerminalHost.bottomAnchor)
+        ])
+        // Do not touch visibility here; the swap owns it.
         localAgentTerminalBlockViewController = block
         return block
     }
 
-    private func synchronizeLocalAgentPresentation(with selection: AgentRuntimeSelection) {
-        guard selection.kind == .localAgent else {
-            legacyLocalAgentTool = nil
-            _ = localAgentTerminalBlockViewController?.deactivateIfStopped()
-            return
-        }
-        legacyLocalAgentTool = nil
+        private func synchronizeLocalAgentPresentation(with selection: AgentRuntimeSelection) {
+                guard selection.kind == .localAgent else {
+                        legacyLocalAgentTool = nil
+                        _ = localAgentTerminalBlockViewController?.deactivateIfStopped()
+                        setAgentTerminalActive(false)
+                        return
+                }
+                legacyLocalAgentTool = nil
         guard let configuration = localAgentConfiguration(matching: selection) else {
-            let block = ensureLocalAgentTerminalBlock()
-            block.view.isHidden = false
-            block.showNotice("所选 Local Agent 配置已失效，请在设置中重新检测并确认。")
-            return
+                // No usable profile: fall back to a CLI installed on this machine.
+                // Prefer the CLI the stored selection actually named, so a stale
+                // profile does not silently switch the reader to a different
+                // agent that happens to sort earlier.
+                let namedTool = selection.localAgentConfigurationID.flatMap {
+                        localAgentToolResolver.recordedTool(forConfigurationID: $0)
+                }
+                let tool = [namedTool].compactMap { $0 }.first(where: {
+                        localAgentToolResolver.legacyExecutablePath(for: $0) != nil
+                }) ?? LocalAgentTool.allCases.first(where: {
+                        localAgentToolResolver.legacyExecutablePath(for: $0) != nil
+                })
+                if let tool {
+                        let block = ensureLocalAgentTerminalBlock()
+                        // Set the selection before launching: the launch emits a
+                        // state change that refreshes the picker, and the label
+                        // must already name the CLI at that point.
+                        legacyLocalAgentTool = tool
+                        _ = block.activateLegacy(tool: tool)
+                        setAgentTerminalActive(true)
+                        refreshComposerControls()
+                        refreshComposerModelPicker()
+                        updateQuestionControlState()
+                        return
+                }
+                let stale = ensureLocalAgentTerminalBlock()
+                setAgentTerminalActive(true)
+                stale.showNotice("未检测到可用的本地 Agent，请先安装 CLI。")
+                return
         }
-        if configuration.isReadyForStructuredRuntime {
-            // Managed Codex/Claude output belongs to the transcript. If a
-            // previous compatibility session left a terminal block behind,
-            // release it when stopped so the Inspector keeps its original
-            // single-column conversation layout.
-            if let block = localAgentTerminalBlockViewController {
-                _ = block.deactivateIfStopped()
-                block.view.isHidden = true
-            }
-            return
-        }
+        // Build the block first: the swap needs a view to show, and creating
+        // it afterwards used to leave the panel blank for one pass.
         let block = ensureLocalAgentTerminalBlock()
-        _ = block.select(configuration: configuration)
-        block.refreshBridgeContext()
-    }
+        let launched = block.activate(tool: configuration.tool)
+        if launched == false {
+                // The stored profile could not start. Use the same CLI through
+                // the compatibility entry instead of dead ending on an empty
+                // panel, and name it in the picker.
+                legacyLocalAgentTool = configuration.tool
+                _ = block.activateLegacy(tool: configuration.tool)
+        }
+        setAgentTerminalActive(true)
+        refreshComposerControls()
+        refreshComposerModelPicker()
+        updateQuestionControlState()
+        }
+        
+        /// Swaps between the assistant transcript and the agent terminal.
+        private func setAgentTerminalActive(_ isActive: Bool) {
+        isAgentTerminalActive = isActive
+        // Move the toolbar to the composer top while the input is gone;
+        // otherwise a collapsed input at a negative y drags it away.
+        composerToolbarBelowInputConstraint?.isActive = isActive == false
+        composerToolbarAtTopConstraint?.isActive = isActive
+        localAgentTerminalHost.isHidden = isActive == false
+        // Keep the composer visible: its toolbar holds the model switcher,
+        // and hiding it left no way back to the assistant.
+        conversationContainer.isHidden = isActive
+        if isActive {
+            questionHeightConstraint?.constant = 0
+        } else {
+            questionHeightConstraint?.constant = Self.minimumQuestionHeight
+        }
+        questionPlaceholderLabel.isHidden = isActive
+        // Hiding the scroll view is what actually removes the empty input box;
+        // a zero height alone still lets its rounded background paint.
+        questionScrollView.isHidden = isActive
+        composerAttachmentStack.isHidden = isActive
+        commandCardsStack.isHidden = isActive
+        view.needsLayout = true
+        if isActive {
+                localAgentTerminalBlockViewController?.view.isHidden = false
+                localAgentTerminalBlockViewController?.setFillsPanel(true)
+        } else {
+                localAgentTerminalBlockViewController?.setFillsPanel(false)
+        }
+        }
 
     private func makeLocalAgentBridgeContext() -> LocalAgentBridgeContext? {
         guard let cliPath = LocalAgentBridgeToolInstaller.defaultCLIExecutablePath(),
@@ -1666,9 +1885,52 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     private func applyConversationRunPhase(_ phase: ComposerRunPhase) {
         conversationRunPhase = phase
+        if phase != .streaming, phase != .startingRuntime,
+           v2ProjectedEntryIDs.isEmpty == false,
+           let index = activeStreamingAssistantIndex,
+           transcriptEntries.indices.contains(index) {
+            transcriptEntries[index].isStreaming = false
+            flushPendingStreamingTranscriptRender()
+            activeStreamingAssistantIndex = nil
+        }
         settleConversationStopLatchIfPossible()
         isAsking = phase != .idle && phase != .editingQueuedItem && phase != .takenOver
         isExecuting = phase == .executingTool
+        updateThinkingIndicator(for: phase)
+    }
+
+    /// Shows a tail indicator only while the assistant is working and the
+    /// transcript has produced no text for this turn yet. A turn that already
+    /// streamed a partial answer does not need the cue.
+    private func updateThinkingIndicator(for phase: ComposerRunPhase) {
+        // Phases where the turn is waiting on something other than the model:
+        // these always deserve a cue, because the reader is waiting on an action
+        // rather than on streamed prose.
+        let isActionPhase = phase == .executingTool
+            || phase == .toolProposed
+            || phase == .awaitingApproval
+            || phase == .awaitingUser
+        let isThinkingPhase = phase == .preparing
+            || phase == .waitingForCapacity
+            || phase == .startingRuntime
+            || phase == .streaming
+        // A turn that already streamed prose does not need a thinking cue, but an
+        // action phase must stay visible even when prose preceded it.
+        let hasVisibleAnswer = transcriptEntries.last(where: { entry in
+            entry.role == .assistant || entry.role == .user
+        }).map { entry in
+            entry.role == .assistant
+                && entry.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        } ?? false
+        let shouldShow = isActionPhase || (isThinkingPhase && hasVisibleAnswer == false)
+        thinkingIndicator.isHidden = shouldShow == false
+        guard shouldShow else {
+            thinkingIndicator.stopAnimating()
+            return
+        }
+        thinkingIndicator.apply(caption: isActionPhase ? "执行中" : "思考中")
+        thinkingIndicator.startAnimating()
+        scheduleTranscriptScrollToBottom()
     }
 
     private func settleConversationStopLatchIfPossible() {
@@ -1691,7 +1953,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
 
     private func applyConversationTimeline(_ entries: [TimelineSourceEntry]) {
         var counts: [String: Int] = [:]
-        let projected: [AITranscriptEntry] = entries.map { source in
+        var projected: [AITranscriptEntry] = entries.map { source in
             let projection = transcriptProjection(for: source)
             let ordinal = counts[projection.kind, default: 0]
             counts[projection.kind] = ordinal + 1
@@ -1714,10 +1976,40 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             (0..<count).map { "\(kind):\($0)" }
         })
         v2ProjectedEntryIDs = v2ProjectedEntryIDs.filter { activeKeys.contains($0.key) }
-        activeStreamingAssistantIndex = nil
+        let lastUserIndex = projected.lastIndex(where: { $0.role == .user })
+        let streamingIndex: Int?
+        if conversationRunPhase == .streaming || conversationRunPhase == .startingRuntime,
+           let lastUserIndex,
+           let answerIndex = projected.lastIndex(where: { $0.role == .assistant }),
+           answerIndex > lastUserIndex {
+            streamingIndex = answerIndex
+            projected[answerIndex].isStreaming = true
+        } else {
+            streamingIndex = nil
+        }
+        let previousFingerprint = transcriptEntries.map(TranscriptRenderFingerprint.init)
+        let nextFingerprint = projected.map(TranscriptRenderFingerprint.init)
+        let canUpdateOnlyStreamingAnswer = streamingIndex.map { index in
+            activeStreamingAssistantIndex == index
+                && previousFingerprint.count == nextFingerprint.count
+                && previousFingerprint.indices.allSatisfy { candidate in
+                    candidate == index
+                        ? previousFingerprint[candidate].id == nextFingerprint[candidate].id
+                        : previousFingerprint[candidate] == nextFingerprint[candidate]
+                }
+        } ?? false
+        activeStreamingAssistantIndex = streamingIndex
         transcriptEntries = projected
         messageLabel.isHidden = projected.isEmpty == false
-        renderTranscriptEntries()
+        guard previousFingerprint != nextFingerprint else { return }
+        if canUpdateOnlyStreamingAnswer {
+            // V2 sends complete snapshots for each checkpoint. Keep those
+            // snapshots current, but paint only the active answer at the same
+            // cadence used by the legacy Inspector streaming path.
+            schedulePendingStreamingTranscriptRender()
+        } else {
+            renderTranscriptEntries()
+        }
     }
 
     private func transcriptProjection(
@@ -2751,6 +3043,13 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         taskControlContainer.isHidden = true
     }
 
+    /// True while an autonomous agent run owns a process group. Used to decide
+    /// whether new narration joins that run instead of standing alone, replacing
+    /// the previous implicit read of the mutable activeProcessGroupID.
+    private var isAutonomousRunInFlight: Bool {
+        activeProcessGroupID != nil
+    }
+    
     private func beginAutonomousRun() -> UUID {
         let runID = UUID()
         activeAutonomousRunID = runID
@@ -3073,6 +3372,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 self.messageLabel.stringValue = self.pendingConversationComposerNotice
                     ?? "V2 会话目录无法读取，本次输入已禁用。"
                 self.messageLabel.isHidden = false
+                // A failed catalog read must not pin the scope to a session that will
+                // never appear in it.
+                self.freshlyCreatedScopeIDs.remove(context.historyScopeID)
                 self.updateQuestionControlState()
                 return
             }
@@ -3080,22 +3382,37 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                   generation == self.conversationContextGeneration
             else { return }
             self.conversationCatalogEntries = entries.filter {
-                $0.session.memoryScope == context.historyScopeID
+                // Nothing in the codebase ever writes memoryScope, so every stored
+                // session carries nil there. Requiring an exact match hid the whole
+                // history from the picker; a session without a scope belongs to the
+                // terminal it was opened from.
+                ($0.session.memoryScope == nil
+                    || $0.session.memoryScope == context.historyScopeID)
                     && $0.session.archivedAt == nil
             }
             let requestedID = self.activeConversationIDs[context.historyScopeID]
             let restoreLast = self.assistantSettingsProvider()?.restoreLastConversationEnabled ?? true
+            let isFreshlyCreated = self.freshlyCreatedScopeIDs.contains(context.historyScopeID)
             let selectedID: String
-            if let requestedID,
-               self.conversationCatalogEntries.contains(where: { $0.session.id == requestedID }) {
+            if let requestedID, isFreshlyCreated {
+                // A brand-new session has no catalog entry yet; honour the requested ID
+                // instead of jumping back to the most recent history entry.
+                selectedID = requestedID
+            } else if let requestedID,
+                self.conversationCatalogEntries.contains(where: { $0.session.id == requestedID }) {
                 selectedID = requestedID
             } else if restoreLast,
-                      let latest = self.conversationCatalogEntries
-                        .filter({ $0.isCorrupted == false })
-                        .max(by: { $0.updatedAt < $1.updatedAt }) {
+                let latest = self.conversationCatalogEntries
+                    .filter({ $0.isCorrupted == false })
+                    .max(by: { $0.updatedAt < $1.updatedAt }) {
                 selectedID = latest.session.id
             } else {
                 selectedID = UUID().uuidString.lowercased()
+            }
+            if isFreshlyCreated, requestedID == selectedID {
+                // Keep the marker until the new session appears in the catalog.
+            } else {
+                self.freshlyCreatedScopeIDs.remove(context.historyScopeID)
             }
             self.activeConversationIDs[context.historyScopeID] = selectedID
             self.refreshV2ConversationPicker(activeID: selectedID)
@@ -3232,6 +3549,21 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                   let context = resolvedTargetContext()
             else { return }
             activeConversationIDs[context.historyScopeID] = UUID().uuidString.lowercased()
+            freshlyCreatedScopeIDs.insert(context.historyScopeID)
+            // Keep whatever the reader had typed: starting a new conversation is not
+            // a request to discard their draft, and the other path preserves it too.
+            saveActiveComposerDraft()
+            // Drop the old transcript immediately: the replacement runtime takes a
+            // round trip to build, and leaving stale entries visible reads as if the
+            // new conversation already contains them.
+            cancelPendingStreamingTranscriptRender()
+            activeStreamingAssistantIndex = nil
+            transcriptEntries = []
+            processGroupTimings = [:]
+            v2ProjectedEntryIDs = [:]
+            renderTranscriptEntries()
+            questionField.string = ""
+            questionPlaceholderLabel.isHidden = false
             refreshConversationRuntimeForCurrentContext()
             return
         }
@@ -3255,6 +3587,8 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                   let sessionID = conversationPopUpButton.selectedItem?.representedObject as? String
             else { return }
             activeConversationIDs[context.historyScopeID] = sessionID
+            // An explicit selection supersedes a pending new conversation.
+            freshlyCreatedScopeIDs.remove(context.historyScopeID)
             refreshConversationRuntimeForCurrentContext()
             return
         }
@@ -4196,24 +4530,40 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         return ([question, ""] + contextLines).joined(separator: "\n")
     }
 
+    ///
+    /// Only values this surface can observe are shown. Token throughput and
+    /// cache hits are not tracked by the runtime, so they are omitted rather
+    /// than invented.
     private func refreshComposerControls() {
         if conversationRuntimeFactory != nil {
             let summary = "工作方式：\(currentTurnWorkMode.displayName) · \(executionDestinationTitle)"
             composerAddButton.toolTip = summary
             composerAddButton.setAccessibilityLabel(summary)
         }
-        composerPermissionButton.title = permissionTitle(for: settingsStore.snapshot().agentConfirmationPolicy)
-        composerPermissionButton.toolTip = "修改 AI 命令审批权限"
-        composerPermissionButton.setAccessibilityLabel(composerPermissionButton.title)
+        let permissionPolicy = settingsStore.snapshot().agentConfirmationPolicy
+        composerPermissionButton.title = permissionTitle(for: permissionPolicy)
+        // The glyph follows the level so the chip reads at a glance.
+    let permissionSymbolName = permissionSymbol(for: permissionPolicy)
+    composerPermissionSymbolName = permissionSymbolName
+        composerPermissionButton.image = NSImage(
+                                                systemSymbolName: permissionSymbolName,
+                                accessibilityDescription: composerPermissionButton.title
+        )
+        // Fully autonomous mode is dangerous enough to warrant a standing
+        // visual warning, not just a different label.
+        let isFullyAutonomous = permissionPolicy == .allowAllWithoutPrompt
+        composerPermissionButton.contentTintColor = isFullyAutonomous
+                                ? .systemOrange
+                                : .secondaryLabelColor
+        composerPermissionButton.toolTip = isFullyAutonomous
+                                ? "完全自主执行已开启，仅破坏性命令会请求确认"
+                                : "修改 AI命令审批权限"
         composerModelButton.title = currentModelTitle()
         composerModelButton.toolTip = hasConfiguredConversationRuntime
             ? composerModelButton.title
             : Self.unconfiguredProviderMessage
         composerModelButton.setAccessibilityLabel(composerModelButton.title)
         renderComposerAttachments()
-        let context = composerContextItems()
-        composerContextLabel.stringValue = context.joined(separator: " · ")
-        composerContextLabel.isHidden = context.isEmpty
         updateComposerHeight()
         updateQuestionControlState()
     }
@@ -4259,11 +4609,19 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func updateComposerHeight() {
         let questionHeight = questionHeightConstraint?.constant ?? Self.minimumQuestionHeight
         let expandedQuestionHeight = max(0, questionHeight - Self.minimumQuestionHeight)
+        // needs room for its toolbar.
+        // In agent mode the input area is gone, so the composer only needs
+        // room for its toolbar.
+        if isAgentTerminalActive {
+                collapseComposerForAgentMode()
+                return
+        }
+
         let baseHeight: CGFloat
         if composerAttachments.isEmpty == false {
             baseHeight = Self.attachmentComposerHeight
-        } else if composerContextItems().isEmpty == false {
-            baseHeight = Self.contextComposerHeight
+        // The mode line is gone, so no extra height is reserved for it;
+        // the space it used belongs to the input area instead.
         } else {
             baseHeight = Self.compactComposerHeight
         }
@@ -4272,6 +4630,16 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             composerHeightConstraint?.constant = targetHeight
             view.needsLayout = true
         }
+    }
+
+    /// Leaves only the composer toolbar on screen while an agent runs.
+    private func collapseComposerForAgentMode() {
+        let target = Self.agentModeComposerHeight
+        guard composerHeightConstraint?.constant != target else {
+            return
+        }
+        composerHeightConstraint?.constant = target
+        view.needsLayout = true
     }
 
     private func updateQuestionDocumentFrame() {
@@ -4294,6 +4662,16 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         textContainer.widthTracksTextView = true
         layoutManager.ensureLayout(for: textContainer)
 
+        // The agent owns the panel, so the input must not claim height back.
+        // This pass used to restore the 66pt minimum right after the swap
+        // collapsed it, which left an empty input box above the toolbar.
+        if isAgentTerminalActive {
+            if (questionHeightConstraint?.constant ?? 0) != 0 {
+                questionHeightConstraint?.constant = 0
+            }
+            updateComposerHeight()
+            return
+        }
         let font = questionField.font ?? .systemFont(ofSize: 14)
         let lineHeight = layoutManager.defaultLineHeight(for: font)
         let textWidth = max(
@@ -4419,7 +4797,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             modelSelectionSession.select(initialComposerModelSelection)
         }
         reconcileTemporaryModelSelection()
-        questionPlaceholderLabel.isHidden = questionField.string.isEmpty == false
+        questionPlaceholderLabel.isHidden = shouldShowComposerPlaceholder(for: questionField.string) == false
         updateQuestionDocumentFrame()
         refreshComposerControls()
     }
@@ -4496,16 +4874,36 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         return efforts.map { (reasoningTitle(for: $0), $0) }
     }
 
+    /// Label shown on the composer permission chip.
+    ///
+    /// The three levels describe how a command is approved, not which
+    /// commands are allowed.
+        /// Glyph for the permission chip, matching the reference level marks:
+        /// a raised hand for asking, a shield for guarded, a warning shield for
+        /// fully autonomous execution.
+        private func permissionSymbol(for policy: AgentConfirmationPolicyPreference) -> String {
+                                switch policy {
+                                case .requireEveryCommand:
+                                                                return "hand.raised"
+                                case .allowLowRiskWithoutPrompt:
+                                                                return "checkmark.shield"
+                                case .allowAllWithoutPrompt:
+                                                                return "exclamationmark.shield"
+                                case .allowReadOnlyWithoutPrompt:
+                                                                return "book"
+                                }
+        }
+
     private func permissionTitle(for policy: AgentConfirmationPolicyPreference) -> String {
         switch policy {
-        case .allowAllWithoutPrompt:
-            return "完全访问"
+        case .requireEveryCommand:
+            return L10n.Settings.requireEveryCommand
         case .allowLowRiskWithoutPrompt:
-            return "低风险自动"
+            return L10n.Settings.allowLowRisk
+        case .allowAllWithoutPrompt:
+            return L10n.Settings.allowAllCommands
         case .allowReadOnlyWithoutPrompt:
             return "只读自动"
-        case .requireEveryCommand:
-            return "每条确认"
         }
     }
 
@@ -4747,7 +5145,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func composerPermissionMenu() -> NSMenu {
         let menu = NSMenu()
         let current = settingsStore.snapshot().agentConfirmationPolicy
-        for (title, policy) in composerPermissionItems() {
+        for (title, policy, _) in composerPermissionItems() {
             let item = makeComposerMenuItem(
                 title: title,
                 action: #selector(selectComposerPermissionPressed(_:)),
@@ -4759,12 +5157,17 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         return menu
     }
 
-    private func composerPermissionItems() -> [(title: String, policy: AgentConfirmationPolicyPreference)] {
+    /// The three permission levels offered next to the composer.
+    ///
+    ///请求批准: every command waits for the reader.
+    ///智能审批: routine operations run automatically, risky ones still ask.
+    ///完全权限: only a command that would destroy the host still asks.
+    private func composerPermissionItems()
+        -> [(title: String, policy: AgentConfirmationPolicyPreference, symbol: String)] {
         [
-            ("完全访问", .allowAllWithoutPrompt),
-            ("低风险自动", .allowLowRiskWithoutPrompt),
-            ("只读自动", .allowReadOnlyWithoutPrompt),
-            ("每条确认", .requireEveryCommand)
+            (L10n.Settings.requireEveryCommand, .requireEveryCommand, "hand.raised"),
+            (L10n.Settings.allowLowRisk, .allowLowRiskWithoutPrompt, "checkmark.shield"),
+            (L10n.Settings.allowAllCommands, .allowAllWithoutPrompt, "exclamationmark.shield")
         ]
     }
 
@@ -5223,7 +5626,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             updateQuestionControlState()
             return
         }
-        if localAgentTerminalBlockViewController?.state.preventsRuntimeChange == true {
+        // A compatibility CLI owns no durable Runtime, so it does not have to
+        // freeze the Composer. The assistant and the CLI are independent: the
+        // terminal keeps running in the background while a cloud model answers.
+        if localAgentTerminalBlockViewController?.state.preventsRuntimeChange == true,
+           legacyLocalAgentTool == nil {
             messageLabel.stringValue = "请先停止当前 Local Agent 终端会话，再切换供应商或模型。"
             messageLabel.isHidden = false
             updateQuestionControlState()
@@ -5261,6 +5668,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             if switched {
                 self.legacyLocalAgentTool = nil
                 _ = self.localAgentTerminalBlockViewController?.deactivateIfStopped()
+                // Coming back from a CLI must give the transcript back;
+                // otherwise the terminal keeps the panel after the switch.
+                self.setAgentTerminalActive(false)
                 self.applyModelSelectionFromConversationRuntime(bridge.currentRuntimeSelection)
                 self.messageLabel.stringValue = ""
                 self.messageLabel.isHidden = self.transcriptEntries.isEmpty == false
@@ -5375,6 +5785,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     private func selectLegacyLocalAgentRuntime(_ tool: LocalAgentTool) {
+        let terminal = ensureLocalAgentTerminalBlock()
         guard conversationRuntimeFactory != nil,
               conversationSubmissionInFlight == false,
               conversationRuntimeSelectionInFlight == false,
@@ -5383,9 +5794,20 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
               conversationRunPhase == .idle,
               let bridge = conversationRuntime?.bridge,
               bridge.isSessionUsable,
-              bridge.allowsAlternateRuntimeSelection,
-              localAgentTerminalBlockViewController?.state.preventsRuntimeChange != true
+              bridge.allowsAlternateRuntimeSelection
         else { return }
+        // A compatibility CLI that is already running is not a reason to
+        // refuse: its terminal kept running while the assistant answered, and
+        // picking it again just brings that same PTY back. A different CLI does
+        // need the running one stopped, and saying so beats a click that does
+        // nothing at all.
+        if terminal.state.preventsRuntimeChange,
+           terminal.isRunningLegacy(tool: tool) == false {
+            messageLabel.stringValue = "请先停止正在运行的终端，再切换到 \(tool.displayName)。"
+            messageLabel.isHidden = false
+            updateQuestionControlState()
+            return
+        }
         guard compatibleLocalAgentTools.contains(tool) else {
             messageLabel.stringValue = "该本地 CLI 已不可用，或已有需要在设置中处理的 V2 配置。"
             messageLabel.isHidden = false
@@ -5393,17 +5815,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             updateQuestionControlState()
             return
         }
-        let terminal = ensureLocalAgentTerminalBlock()
         guard terminal.selectLegacy(tool: tool) else {
             messageLabel.stringValue = "未找到可用的 \(tool.displayName) 本地命令，请先安装或在设置中完成配置。"
             messageLabel.isHidden = false
             updateQuestionControlState()
             return
         }
+        // Run it now. Selecting a CLI replaces the assistant with that CLI's
+        // terminal, so an idle prompt waiting for a Composer submission is not
+        // the mode the reader asked for.
+        _ = terminal.activateLegacy(tool: tool)
         legacyLocalAgentTool = tool
         planModeEnabled = false
         answerOnlyModeEnabled = false
         goalModeEnabled = false
+        // Hand the whole Inspector to the terminal. Showing the block only made
+        // its own view visible, which sits inside a hidden host, so the
+        // transcript stayed on screen and picking a CLI looked like nothing had
+        // happened.
+        setAgentTerminalActive(true)
         messageLabel.stringValue = "已切换到 \(tool.displayName) 本地 CLI 兼容模式。"
         messageLabel.isHidden = false
         statusLabel.stringValue = "兼容模式仅使用受管终端，不写入 V2 Runtime 配置。"
@@ -5418,12 +5848,38 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 && conversationRuntimeSelectionInFlight == false) else {
             return
         }
+        // Turning on fully autonomous execution removes the reader from the
+        // loop for every command except a host-destroying one, so it needs an
+        // explicit acknowledgement rather than a single menu click.
+        if policy == .allowAllWithoutPrompt,
+                                                                                                settingsStore.snapshot().agentConfirmationPolicy != .allowAllWithoutPrompt,
+                                                                                                confirmFullyAutonomousExecution() == false {
+                                                                                                refreshComposerPermissionPicker()
+                                                                                                return
+        }
         settingsStore.update { settings in
             settings.agentConfirmationPolicy = policy
         }
         refreshComposerControls()
         refreshComposerPermissionPicker()
     }
+
+        /// Asks the reader to acknowledge what full autonomy means before it is
+        /// enabled. Returns true only on an explicit confirmation.
+        private func confirmFullyAutonomousExecution() -> Bool {
+                                let alert = NSAlert()
+                                alert.alertStyle = .warning
+                                alert.messageText = "开启「完全权限」？"
+                                alert.informativeText = """
+                                AI助手将自动执行几乎所有命令，不再逐条询问。
+                                
+                                仍会被拦截：rm -rf /、mkfs、dd写入磁盘设备等会直接损坏系统且不可恢复的命令。
+                                除此之外的删除、覆盖、重启等操作都不会再确认。
+                                """
+                                alert.addButton(withTitle: "我已了解，开启")
+                                alert.addButton(withTitle: "取消")
+                                return alert.runModal() == .alertFirstButtonReturn
+        }
 
     private func selectComposerReasoning(_ effort: AIReasoningEffortPreference) {
         guard conversationRuntimeFactory == nil
@@ -5742,6 +6198,21 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
+    /// IME composition changes never reach textDidChange, so observe the
+    /// composer directly to keep the placeholder honest while typing.
+    private func observeComposerComposition() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleComposerCompositionChanged(_:)),
+            name: AgentComposerTextView.compositionDidChangeNotification,
+            object: questionField
+        )
+    }
+
+    @objc private func handleComposerCompositionChanged(_ notification: Notification) {
+        questionPlaceholderLabel.isHidden = shouldShowComposerPlaceholder(for: questionField.string) == false
+    }
+
     private func observeTerminalTraceNotifications() {
         if traceObserver == nil {
             traceObserver = NotificationCenter.default.addObserver(
@@ -5942,7 +6413,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             guard appendedExecutionResultRequestIDs.insert(event.requestID).inserted else { return }
             appendSystemTranscript(
                 "本次执行失败：\(event.message)",
-                isProcessEntry: activeProcessGroupID != nil
+                // A failure raised while an autonomous run is in flight belongs to
+                // that run narration; outside a run it is a standalone notice.
+                isProcessEntry: isAutonomousRunInFlight
             )
         case .queued, .awaitingApproval, .approved, .typing, .paused, .cancelled, .takenOver:
             return
@@ -6059,7 +6532,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         )
     }
 
-    private static func boundedTerminalHistoryText(
+    nonisolated static func boundedTerminalHistoryText(
         _ text: String,
         characterLimit: Int
     ) -> String {
@@ -6361,6 +6834,10 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             )
             transcriptEntries.append(entry)
             activeStreamingAssistantIndex = transcriptEntries.count - 1
+            // Mark the entry as still streaming so table layout is deferred until
+            // the answer settles; rebuilding a table per delta is what made long
+            // replies feel sluggish.
+            transcriptEntries[transcriptEntries.count - 1].isStreaming = true
             messageLabel.isHidden = true
             createdEntry = true
         }
@@ -6390,9 +6867,44 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         return true
     }
 
+    /// Characters currently shown for the streaming answer.
+    private func activeStreamingCharacterCount() -> Int {
+        guard let index = activeStreamingAssistantIndex,
+                transcriptEntries.indices.contains(index)
+        else { return 0 }
+        return transcriptEntries[index].displayText.count
+    }
+
+    /// Repaint spacing that keeps layout bounded as an answer grows.
+    ///
+    /// A repaint costs roughly one millisecond per thousand characters, so a
+    /// fixed cadence would spend an ever larger fraction of the frame budget
+    /// on layout. Holding a target of about one sixth of the wall clock keeps
+    /// the tail of a long reply moving at a steady, readable rate.
+    /// Repaint spacing for a streaming answer.
+    ///
+    /// The cell now appends only the new tail, so one repaint no longer costs
+    /// more as the answer grows and the display cadence is safe to keep. A
+    /// modest ceiling still guards a pathological case (an extremely long
+    /// answer on a slow machine) from monopolising the frame budget.
+    static func streamingRepaintInterval(forCharacterCount count: Int) -> TimeInterval {
+        let base: TimeInterval = 0.016
+        let ceiling: TimeInterval = 0.05
+        let freeLength = 20_000
+        guard count > freeLength else { return base }
+        return min(ceiling, base * Double(count) / Double(freeLength))
+    }
+
     private func schedulePendingStreamingTranscriptRender() {
         guard streamingTranscriptRenderTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.1, repeats: false) { [weak self] _ in
+        // One repaint re-lays out the whole answer, so its cost grows with the
+        // text already on screen. A fixed16 ms cadence then spends an ever
+        // larger share of each second inside layout, which is what made the
+        // tail of a long reply crawl. Space repaints by the current length:
+        // short answers keep display cadence, long ones drop to a steady rate.
+        let characters = activeStreamingCharacterCount()
+        let interval = Self.streamingRepaintInterval(forCharacterCount: characters)
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
             guard let self else { return }
             self.streamingTranscriptRenderTimer = nil
             self.renderActiveStreamingTranscriptEntry()
@@ -6542,6 +7054,9 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
            transcriptEntries.indices.contains(index),
            transcriptEntries[index].role == .assistant {
             transcriptEntries[index].text = canonicalText
+            // The answer is final now: allow table layout so the deferred table
+            // can render on this pass.
+            transcriptEntries[index].isStreaming = false
             transcriptEntries[index].isProcessEntry = transcriptEntries[index].isProcessEntry || isProcessEntry
             if isProcessEntry {
                 transcriptEntries[index].processGroupID = activeProcessGroupID
@@ -6598,7 +7113,22 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
     }
 
+    /// Clears  on entries that are no longer the active stream.
+    private func settleStaleStreamingFlags() {
+        for index in transcriptEntries.indices {
+            guard transcriptEntries[index].isStreaming else { continue }
+            if index != activeStreamingAssistantIndex {
+                transcriptEntries[index].isStreaming = false
+            }
+        }
+    }
+
     private func renderTranscriptEntries() {
+        // Only the entry actively receiving text may defer table layout. Any
+        // other entry is finished by definition, which also recovers the flag
+        // after a cancel or a failure that skipped the completion path.
+        settleStaleStreamingFlags()
+
         cancelPendingStreamingTranscriptRender()
 
         let hasProcessEntries = transcriptEntries.contains(where: { $0.isProcessEntry })
@@ -6673,13 +7203,23 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         }
 
         reconcileTranscriptViews(desiredViews)
-        scrollTranscriptToBottom()
+        // renderTranscriptEntries runs for every structural change, including
+        // renders triggered while the reader is scrolled up. Respect the pin so
+        // a background transcript update cannot steal their position.
+        if isTranscriptPinnedToBottom {
+            scrollTranscriptToBottom()
+        } else {
+            updateTranscriptJumpToLatestButton()
+        }
     }
 
     private func reconcileTranscriptViews(_ desiredViews: [NSView]) {
         let desiredViewIDs = Set(desiredViews.map(ObjectIdentifier.init))
         let existingViews = transcriptStack.arrangedSubviews
-        for view in existingViews
+        // The thinking indicator lives in this stack but is not part of the
+        // transcript model, so a render pass must not evict it.
+        let countableViews = existingViews.filter { $0 !== thinkingIndicator }
+        for view in countableViews
         where desiredViewIDs.contains(ObjectIdentifier(view)) == false {
             removeTranscriptView(view)
         }
@@ -6704,8 +7244,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
             widthConstraint.isActive = true
             transcriptWidthConstraintsByViewID[ObjectIdentifier(view)] = widthConstraint
         }
-    }
+        // Keep the liveness cue after every transcript row regardless of how
+        // many views were inserted above it.
+        if transcriptStack.arrangedSubviews.last !== thinkingIndicator {
+                transcriptStack.removeArrangedSubview(thinkingIndicator)
+                transcriptStack.addArrangedSubview(thinkingIndicator)
+        }
 
+
+    }
     private func removeTranscriptView(_ view: NSView) {
         if transcriptStack.arrangedSubviews.contains(where: { $0 === view }) {
             transcriptStack.removeArrangedSubview(view)
@@ -7056,7 +7603,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
                 && conversationRuntimeSelectionInFlight == false
                 && (conversationRuntime?.bridge.allowsAlternateRuntimeSelection ?? false)
                 && (localAgentTerminalBlockViewController?.state.preventsRuntimeChange ?? false) == false
-            composerPermissionButton.isHidden = true
+            // The permission chip belongs in the composer for V2 sessions too.
+            // It used to be hidden here and only configurable from Settings, which
+            // left the reader with no way to see or change the level while working.
+            composerPermissionButton.isHidden = false
+            composerPermissionButton.isEnabled = frozenControlsEnabled
             refreshContextUsageRing()
             return
         }
@@ -7297,6 +7848,15 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         compatibleLocalAgentTools.map { "\($0.displayName) · 兼容本地 CLI" }
     }
 
+    /// Whether the assistant conversation view is on screen.
+    var conversationContainerVisibleForTesting: Bool { conversationContainer.isHidden == false }
+
+    /// Whether the composer is on screen.
+    var composerVisibleForTesting: Bool { composer.isHidden == false }
+
+    /// Whether the agent terminal fills the panel.
+    var agentTerminalVisibleForTesting: Bool { localAgentTerminalHost.isHidden == false }
+
     var localAgentTerminalStateForTesting: LocalAgentTerminalBlockState? {
         localAgentTerminalBlockViewController?.state
     }
@@ -7315,6 +7875,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         guard compatibleLocalAgentTools.contains(tool) else { return false }
         selectLegacyLocalAgentRuntime(tool)
         return legacyLocalAgentTool == tool
+    }
+
+    /// Drives the same presentation used when a stored Runtime selection is
+    /// restored, so the fallback path can be asserted without relaunching.
+    func synchronizeLocalAgentPresentationForTesting(_ selection: AgentRuntimeSelection) {
+        synchronizeLocalAgentPresentation(with: selection)
     }
 
     var conversationRuntimeIdleForTesting: Bool {
@@ -7464,17 +8030,25 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     var transcriptViewObjectIdentifiersForTesting: [ObjectIdentifier] {
-        transcriptStack.arrangedSubviews.map(ObjectIdentifier.init)
+        // The liveness cue is chrome, not a transcript row; tests count rows.
+        transcriptStack.arrangedSubviews
+            .filter { $0 !== thinkingIndicator }
+            .map(ObjectIdentifier.init)
     }
 
     var transcriptActiveWidthConstraintCountForTesting: Int {
-        let arrangedViewIDs = Set(transcriptStack.arrangedSubviews.map(ObjectIdentifier.init))
+        // The liveness cue has its own width constraint but is not a row.
+        let arrangedViewIDs = Set(
+            transcriptStack.arrangedSubviews
+                .filter { $0 !== thinkingIndicator }
+                .map(ObjectIdentifier.init)
+        )
         return transcriptStack.constraints.filter { constraint in
             guard constraint.isActive,
-                  constraint.firstAttribute == .width,
-                  constraint.secondAttribute == .width,
-                  let firstView = constraint.firstItem as? NSView,
-                  let secondView = constraint.secondItem as? NSView
+                constraint.firstAttribute == .width,
+                constraint.secondAttribute == .width,
+                let firstView = constraint.firstItem as? NSView,
+                let secondView = constraint.secondItem as? NSView
             else {
                 return false
             }
@@ -7741,9 +8315,44 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         selectExecutionChoice(choice)
     }
 
+    var thinkingIndicatorVisibleForTesting: Bool { thinkingIndicator.isHidden == false }
+    var thinkingIndicatorAnimatingForTesting: Bool { thinkingIndicator.isAnimatingForTesting }
+    var thinkingIndicatorCaptionForTesting: String { thinkingIndicator.captionForTesting }
+    /// Inserts a settled assistant answer so the liveness contract can be
+    /// asserted with real transcript content in place.
+    func appendSettledAssistantTextForTesting(_ text: String) {
+        appendTranscript(.assistant, text, persistHistory: false)
+    }
+    var composerPlaceholderHiddenForTesting: Bool { questionPlaceholderLabel.isHidden }
+    /// Exposes the composer so a test can drive a real input-method session.
+    /// The agent owns the panel, so the Composer must carry its toolbar only.
+    var composerMetricsForTesting: (height: CGFloat, inputHidden: Bool) {
+        (composerHeightConstraint?.constant ?? -1, questionScrollView.isHidden)
+    }
+
+    var agentTerminalFrameForTesting: NSRect { localAgentTerminalHost.frame }
+
+    var agentTerminalFillsPanelForTesting: Bool {
+        localAgentTerminalBlockViewController?.fillsPanelForTesting ?? false
+    }
+
+    var composerTextViewForTesting: AgentComposerTextView { questionField }
+    /// Posts the composition notification the way the input method would, so the
+    /// placeholder contract can be asserted without a live IME session.
+    func simulateCompositionChangeForTesting() {
+        NotificationCenter.default.post(
+            name: AgentComposerTextView.compositionDidChangeNotification,
+            object: questionField
+        )
+    }
+
     func setConversationRunPhaseForTesting(_ phase: ComposerRunPhase) {
         applyConversationRunPhase(phase)
         updateQuestionControlState()
+    }
+
+    func applyConversationTimelineForTesting(_ entries: [TimelineSourceEntry]) {
+        applyConversationTimeline(entries)
     }
 
     var composerModelTitleForTesting: String {
@@ -7794,6 +8403,11 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         composerPermissionButton.title
     }
 
+    /// Symbol name currently drawn on the permission chip.
+    var composerPermissionSymbolNameForTesting: String? {
+        composerPermissionSymbolName
+    }
+
     var composerPermissionPickerTitlesForTesting: [String] {
         makeComposerPermissionPicker().policyTitlesForTesting
     }
@@ -7807,7 +8421,7 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     }
 
     var composerContextTextForTesting: String {
-        composerContextLabel.stringValue
+        composerContextItems().joined(separator: " · ")
     }
 
     var composerAttachmentCardCountForTesting: Int {
@@ -8154,9 +8768,12 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
     private func scrollTranscriptToBottom() {
         pendingTranscriptScrollWorkItem?.cancel()
         pendingTranscriptScrollWorkItem = nil
-        applyTranscriptScrollPosition(forceLayout: true)
+        // Laying out the whole subtree on every append is O(history): the cost
+        // grows with the answer, which is why long replies scroll ever slower.
+        // Pinning only needs the document height, which the layout below yields.
+        applyTranscriptScrollPosition(forceLayout: false)
         DispatchQueue.main.async { [weak self] in
-            self?.applyTranscriptScrollPosition(forceLayout: true)
+            self?.applyTranscriptScrollPosition(forceLayout: false)
         }
     }
 
@@ -8165,189 +8782,72 @@ public final class AIAssistantPanelViewController: NSViewController, NSTextField
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingTranscriptScrollWorkItem = nil
-            self.applyTranscriptScrollPosition(forceLayout: true)
+            // The streamed path runs this on every frame, so a full
+            // subtree layout here is O(history) per repaint.
+            self.applyTranscriptScrollPosition(forceLayout: false)
         }
         pendingTranscriptScrollWorkItem = workItem
         DispatchQueue.main.async(execute: workItem)
     }
 
     private func applyTranscriptScrollPosition(forceLayout: Bool) {
-        if forceLayout {
-            view.layoutSubtreeIfNeeded()
-            transcriptDocumentView.layoutSubtreeIfNeeded()
-        }
-        let contentHeight = transcriptDocumentView.bounds.height
-        let visibleHeight = transcriptScrollView.contentView.bounds.height
+     if forceLayout {
+     view.layoutSubtreeIfNeeded()
+     transcriptDocumentView.layoutSubtreeIfNeeded()
+     }
+     // Only follow new content while the reader sits at the bottom. Once they
+     // scroll up to read history, streamed tokens must not drag them back.
+     guard isTranscriptPinnedToBottom else {
+     updateTranscriptJumpToLatestButton()
+     return
+     }
+     let contentHeight = transcriptDocumentView.bounds.height
+     let visibleHeight = transcriptScrollView.contentView.bounds.height
         guard contentHeight > 0, visibleHeight > 0 else { return }
-        let y = max(0, contentHeight - visibleHeight)
-        let clipView = transcriptScrollView.contentView
+     let y = max(0, contentHeight - visibleHeight)
+     let clipView = transcriptScrollView.contentView
         guard abs(clipView.bounds.origin.y - y) > 0.5 else { return }
-        // AppKit can defer `scroll(to:)` while an approval card is changing
-        // its intrinsic height. Set the clip origin synchronously as well so
-        // the final layout pass cannot leave the queue at the Composer edge.
-        let targetOrigin = NSPoint(x: clipView.bounds.origin.x, y: y)
-        clipView.setBoundsOrigin(targetOrigin)
-        clipView.scroll(to: targetOrigin)
-        transcriptScrollView.reflectScrolledClipView(clipView)
+     // AppKit can defer scroll(to:) while an approval card is changing
+     // its intrinsic height. Set the clip origin synchronously as well so
+     // the final layout pass cannot leave the queue at the Composer edge.
+     let targetOrigin = NSPoint(x: clipView.bounds.origin.x, y: y)
+     clipView.setBoundsOrigin(targetOrigin)
+     clipView.scroll(to: targetOrigin)
+     transcriptScrollView.reflectScrolledClipView(clipView)
+    }
+    
+    /// Recomputes the pin from the live scroll offset.
+    private func refreshTranscriptPinFromScrollOffset() {
+     let clipView = transcriptScrollView.contentView
+     let contentHeight = transcriptDocumentView.bounds.height
+     let visibleHeight = clipView.bounds.height
+        guard contentHeight > 0, visibleHeight > 0 else { return }
+     let distanceFromBottom = contentHeight - visibleHeight - clipView.bounds.origin.y
+     let pinned = distanceFromBottom <= Self.transcriptBottomPinThreshold
+     guard pinned != isTranscriptPinnedToBottom else {
+     updateTranscriptJumpToLatestButton()
+     return
+     }
+     isTranscriptPinnedToBottom = pinned
+     updateTranscriptJumpToLatestButton()
+    }
+    
+    /// Shows the jump-to-latest affordance only while the reader is scrolled away.
+    private func updateTranscriptJumpToLatestButton() {
+     transcriptJumpToLatestButton?.isHidden = isTranscriptPinnedToBottom
+    }
+    
+    @objc private func handleTranscriptClipViewBoundsChanged(_ notification: Notification) {
+     refreshTranscriptPinFromScrollOffset()
+    }
+    
+    @objc private func jumpTranscriptToLatest() {
+     isTranscriptPinnedToBottom = true
+     updateTranscriptJumpToLatestButton()
+     applyTranscriptScrollPosition(forceLayout: true)
     }
 }
 
-private final class AIAssistantFlippedView: NSView {
-    override var isFlipped: Bool { true }
-}
-
-private final class AIAssistantFlippedStackView: NSStackView {
-    override var isFlipped: Bool { true }
-}
-
-private struct AIProcessGroupTiming {
-    let startedAt: Date
-    var completedAt: Date?
-}
-
-private final class AITranscriptProcessGroupView: NSView {
-    private var entries: [AITranscriptEntry]
-    private var elapsedText: String
-    private let onToggle: () -> Void
-    private let disclosureButton = NSButton()
-    private let detailLabel = NSTextField(labelWithString: "")
-    private let separator = NSBox()
-    private var renderedDetailMarkdown = ""
-    private var detailTopConstraint: NSLayoutConstraint?
-    private var separatorTopToDisclosureConstraint: NSLayoutConstraint?
-    private var separatorTopToDetailConstraint: NSLayoutConstraint?
-    private var lastAppliedCollapsedState: Bool?
-
-    init(
-        entries: [AITranscriptEntry],
-        elapsedText: String,
-        onToggle: @escaping () -> Void
-    ) {
-        self.entries = entries
-        self.elapsedText = elapsedText
-        self.onToggle = onToggle
-        super.init(frame: .zero)
-        configure()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private var isCollapsed: Bool {
-        entries.isEmpty == false && entries.allSatisfy(\.isCollapsed)
-    }
-
-    var summaryTextForTesting: String {
-        disclosureButton.title
-    }
-
-    var detailAttributedStringForTesting: NSAttributedString {
-        detailLabel.attributedStringValue
-    }
-
-    func update(entries: [AITranscriptEntry], elapsedText: String) {
-        self.entries = entries
-        self.elapsedText = elapsedText
-        updateDetailContentIfNeeded()
-        updatePresentation()
-    }
-
-    private func configure() {
-        setAccessibilityIdentifier("Stacio.AI.transcript.processGroup")
-        translatesAutoresizingMaskIntoConstraints = false
-
-        disclosureButton.font = .systemFont(ofSize: 12, weight: .medium)
-        disclosureButton.contentTintColor = .secondaryLabelColor
-        disclosureButton.imagePosition = .imageTrailing
-        disclosureButton.imageScaling = .scaleProportionallyDown
-        disclosureButton.alignment = .left
-        disclosureButton.isBordered = false
-        disclosureButton.bezelStyle = .inline
-        disclosureButton.target = self
-        disclosureButton.action = #selector(togglePressed(_:))
-        disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
-        disclosureButton.translatesAutoresizingMaskIntoConstraints = false
-
-        detailLabel.maximumNumberOfLines = 0
-        detailLabel.lineBreakMode = .byCharWrapping
-        detailLabel.cell?.wraps = true
-        detailLabel.cell?.usesSingleLineMode = false
-        detailLabel.isSelectable = true
-        detailLabel.allowsEditingTextAttributes = true
-        detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-
-        addSubview(disclosureButton)
-        addSubview(detailLabel)
-        addSubview(separator)
-        let detailTop = detailLabel.topAnchor.constraint(equalTo: disclosureButton.bottomAnchor, constant: 8)
-        let separatorTopToDisclosure = separator.topAnchor.constraint(
-            equalTo: disclosureButton.bottomAnchor,
-            constant: 8
-        )
-        let separatorTopToDetail = separator.topAnchor.constraint(equalTo: detailLabel.bottomAnchor, constant: 8)
-        detailTopConstraint = detailTop
-        separatorTopToDisclosureConstraint = separatorTopToDisclosure
-        separatorTopToDetailConstraint = separatorTopToDetail
-        NSLayoutConstraint.activate([
-            disclosureButton.leadingAnchor.constraint(equalTo: leadingAnchor),
-            disclosureButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
-            disclosureButton.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            detailLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
-            detailLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
-            detailTop,
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
-            separatorTopToDisclosure,
-            separatorTopToDetail,
-            separator.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
-        ])
-        updateDetailContentIfNeeded()
-        updatePresentation()
-    }
-
-    private func updateDetailContentIfNeeded() {
-        let detailMarkdown = entries.map(\.text).joined(separator: "\n\n")
-        guard detailMarkdown != renderedDetailMarkdown else { return }
-        renderedDetailMarkdown = detailMarkdown
-        detailLabel.attributedStringValue = AIAssistantMarkdownRenderer.attributedString(
-            from: detailMarkdown,
-            baseFont: .systemFont(ofSize: 11),
-            textColor: .secondaryLabelColor
-        )
-        detailLabel.invalidateIntrinsicContentSize()
-        invalidateIntrinsicContentSize()
-        needsLayout = true
-    }
-
-    private func updatePresentation() {
-        let collapsed = isCollapsed
-        if disclosureButton.title != elapsedText {
-            disclosureButton.title = elapsedText
-        }
-        guard lastAppliedCollapsedState != collapsed else { return }
-        lastAppliedCollapsedState = collapsed
-        disclosureButton.image = NSImage(
-            systemSymbolName: collapsed ? "chevron.right" : "chevron.down",
-            accessibilityDescription: collapsed ? "展开处理过程" : "折叠处理过程"
-        )
-        disclosureButton.toolTip = collapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
-        detailLabel.isHidden = collapsed
-        detailTopConstraint?.priority = collapsed ? .defaultLow : .required
-        separatorTopToDisclosureConstraint?.priority = collapsed ? .required : .defaultLow
-        separatorTopToDetailConstraint?.priority = collapsed ? .defaultLow : .required
-        needsLayout = true
-    }
-
-    @objc private func togglePressed(_ sender: Any?) {
-        onToggle()
-    }
-}
 
 enum AIAssistantLinkDestination: Equatable {
     case stacioBrowser
@@ -8363,2367 +8863,5 @@ enum AIAssistantLinkRouter {
             return .stacioBrowser
         }
         return .systemBrowser
-    }
-}
-
-private final class AITranscriptLinkLabel: NSTextField {
-    var onOpenLink: ((URL) -> Void)?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        configureAsLabel()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        configureAsLabel()
-    }
-
-    private func configureAsLabel() {
-        isEditable = false
-        isSelectable = true
-        isBordered = false
-        isBezeled = false
-        drawsBackground = false
-        focusRingType = .none
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard let url = link(at: convert(event.locationInWindow, from: nil)) else {
-            super.mouseDown(with: event)
-            return
-        }
-        onOpenLink?(url)
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        var containsLink = false
-        attributedStringValue.enumerateAttribute(
-            .link,
-            in: NSRange(location: 0, length: attributedStringValue.length)
-        ) { value, _, stop in
-            if value != nil {
-                containsLink = true
-                stop.pointee = true
-            }
-        }
-        guard containsLink else { return }
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-
-    private func link(at point: NSPoint) -> URL? {
-        guard attributedStringValue.length > 0 else { return nil }
-        let textRect = cell?.drawingRect(forBounds: bounds) ?? bounds
-        guard textRect.contains(point) else { return nil }
-        let storage = NSTextStorage(attributedString: attributedStringValue)
-        let layoutManager = NSLayoutManager()
-        let container = NSTextContainer(containerSize: textRect.size)
-        container.lineFragmentPadding = 0
-        storage.addLayoutManager(layoutManager)
-        layoutManager.addTextContainer(container)
-        let localPoint = NSPoint(
-            x: point.x - textRect.minX,
-            y: isFlipped ? point.y - textRect.minY : textRect.maxY - point.y
-        )
-        let glyphIndex = layoutManager.glyphIndex(for: localPoint, in: container)
-        guard layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIndex, length: 1), in: container)
-            .insetBy(dx: -2, dy: -2).contains(localPoint)
-        else { return nil }
-        let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-        let value = attributedStringValue.attribute(.link, at: characterIndex, effectiveRange: nil)
-        if let url = value as? URL { return url }
-        if let string = value as? String { return URL(string: string) }
-        return nil
-    }
-}
-
-private final class AITranscriptBubbleView: NSView {
-    private var entry: AITranscriptEntry
-    private let onToggle: () -> Void
-    private let bubbleView = NSView()
-    private let label = AITranscriptLinkLabel(frame: .zero)
-    private let attachmentStack = NSStackView()
-    private let disclosureButton = NSButton()
-    private var executionCardView: ExecutionCardView?
-    private var executionExpanded: Bool
-    private let onOpenTerminal: (String) -> Void
-    private let onCancelExecution: (String) -> Void
-    private let onSaveRedactedLog: (TerminalArtifactPresentation) -> Void
-    private let onExecutionExpandedChange: (Bool) -> Void
-    private var renderedAssistantString: NSAttributedString?
-    private var bubbleWidthConstraint: NSLayoutConstraint?
-    private var lastAppliedBubbleWidth: CGFloat?
-    private var lastAppliedLabelWidth: CGFloat?
-
-    var preferredTextWidth: CGFloat = 240 {
-        didSet {
-            guard abs(preferredTextWidth - oldValue) > 0.5 else { return }
-            updatePreferredWidth()
-        }
-    }
-
-    init(
-        entry: AITranscriptEntry,
-        onOpenLink: @escaping (URL) -> Void = { _ in },
-        onToggle: @escaping () -> Void = {},
-        executionExpanded: Bool = false,
-        onOpenTerminal: @escaping (String) -> Void = { _ in },
-        onCancelExecution: @escaping (String) -> Void = { _ in },
-        onSaveRedactedLog: @escaping (TerminalArtifactPresentation) -> Void = { _ in },
-        onExecutionExpandedChange: @escaping (Bool) -> Void = { _ in }
-    ) {
-        self.entry = entry
-        self.onToggle = onToggle
-        self.executionExpanded = executionExpanded
-        self.onOpenTerminal = onOpenTerminal
-        self.onCancelExecution = onCancelExecution
-        self.onSaveRedactedLog = onSaveRedactedLog
-        self.onExecutionExpandedChange = onExecutionExpandedChange
-        super.init(frame: .zero)
-        label.onOpenLink = onOpenLink
-        configure()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    var isAssistantForTesting: Bool {
-        entry.role == .assistant
-    }
-
-    var attributedStringForTesting: NSAttributedString {
-        label.attributedStringValue
-    }
-
-    var attachmentTitlesForTesting: [String] {
-        attachmentStack.arrangedSubviews.compactMap {
-            ($0 as? AITranscriptAttachmentCardView)?.titleForTesting
-        }
-    }
-
-    var executionCardForTesting: ExecutionCardView? { executionCardView }
-
-    @discardableResult
-    func update(entry newEntry: AITranscriptEntry) -> Bool {
-        guard entry.role == newEntry.role,
-              entry.isProcessEntry == newEntry.isProcessEntry,
-              entry.attachments == newEntry.attachments,
-              (entry.executionCard == nil) == (newEntry.executionCard == nil)
-        else {
-            return false
-        }
-
-        let displayTextChanged = entry.displayText != newEntry.displayText
-        entry = newEntry
-        if let presentation = newEntry.executionCard {
-            executionCardView?.apply(presentation, expanded: executionExpanded)
-            invalidateIntrinsicContentSize()
-            needsLayout = true
-            return true
-        }
-        setAccessibilityIdentifier(entry.bubbleAccessibilityIdentifier)
-        bubbleView.layer?.cornerRadius = entry.bubbleCornerRadius
-        StacioDesignSystem.setLayerBackgroundColor(bubbleView, color: entry.bubbleColor)
-        StacioDesignSystem.setLayerBorderColor(bubbleView, color: entry.borderColor)
-        bubbleView.layer?.borderWidth = entry.borderColor == nil ? 0 : 1
-        label.setAccessibilityIdentifier(entry.textAccessibilityIdentifier)
-        label.font = entry.font
-        label.textColor = entry.textColor
-
-        if displayTextChanged {
-            if entry.role == .assistant {
-                let renderedString = AIAssistantMarkdownRenderer.attributedString(
-                    from: entry.displayText,
-                    baseFont: entry.font,
-                    textColor: entry.textColor
-                )
-                renderedAssistantString = renderedString
-                label.attributedStringValue = renderedString
-            } else {
-                renderedAssistantString = nil
-                label.stringValue = entry.displayText
-            }
-            label.invalidateIntrinsicContentSize()
-            bubbleView.invalidateIntrinsicContentSize()
-            invalidateIntrinsicContentSize()
-        }
-        updateDisclosureButton()
-        updatePreferredWidth()
-        needsLayout = true
-        return true
-    }
-
-    override func layout() {
-        restoreAssistantFormattingIfNeeded()
-        super.layout()
-        updatePreferredWidth()
-    }
-
-    override func viewDidMoveToSuperview() {
-        super.viewDidMoveToSuperview()
-        restoreAssistantFormattingIfNeeded()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        restoreAssistantFormattingIfNeeded()
-    }
-
-    private func configure() {
-        setAccessibilityIdentifier(entry.bubbleAccessibilityIdentifier)
-        translatesAutoresizingMaskIntoConstraints = false
-        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        bubbleView.translatesAutoresizingMaskIntoConstraints = false
-        bubbleView.wantsLayer = true
-        bubbleView.layer?.cornerRadius = entry.bubbleCornerRadius
-        bubbleView.layer?.cornerCurve = .continuous
-        StacioDesignSystem.setLayerBackgroundColor(bubbleView, color: entry.bubbleColor)
-        StacioDesignSystem.setLayerBorderColor(bubbleView, color: entry.borderColor)
-        bubbleView.layer?.borderWidth = entry.borderColor == nil ? 0 : 1
-
-        label.stringValue = entry.displayText
-        label.isSelectable = true
-        label.allowsEditingTextAttributes = true
-        label.setAccessibilityIdentifier(entry.textAccessibilityIdentifier)
-        label.maximumNumberOfLines = 0
-        label.lineBreakMode = .byCharWrapping
-        label.font = entry.font
-        label.textColor = entry.textColor
-        if entry.role == .assistant {
-            let renderedString = AIAssistantMarkdownRenderer.attributedString(
-                from: entry.displayText,
-                baseFont: entry.font,
-                textColor: entry.textColor
-            )
-            renderedAssistantString = renderedString
-            label.attributedStringValue = renderedString
-        }
-        label.preferredMaxLayoutWidth = preferredTextWidth
-        label.cell?.wraps = true
-        label.cell?.usesSingleLineMode = false
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        addSubview(bubbleView)
-        if let presentation = entry.executionCard {
-            let card = ExecutionCardView()
-            executionCardView = card
-            card.onOpenTerminal = onOpenTerminal
-            card.onCancel = onCancelExecution
-            card.onSaveRedactedLog = onSaveRedactedLog
-            card.onExpandedChange = { [weak self] expanded in
-                guard let self else { return }
-                self.executionExpanded = expanded
-                self.invalidateIntrinsicContentSize()
-                self.bubbleView.invalidateIntrinsicContentSize()
-                self.needsLayout = true
-                self.onExecutionExpandedChange(expanded)
-            }
-            bubbleView.addSubview(card)
-            bubbleWidthConstraint = bubbleView.widthAnchor.constraint(
-                lessThanOrEqualToConstant: preferredTextWidth
-            )
-            bubbleWidthConstraint?.isActive = true
-            NSLayoutConstraint.activate([
-                bubbleView.topAnchor.constraint(equalTo: topAnchor, constant: entry.verticalInset),
-                bubbleView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -entry.verticalInset),
-                bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor),
-                bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor),
-                card.topAnchor.constraint(equalTo: bubbleView.topAnchor),
-                card.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor),
-                card.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor),
-                card.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor)
-            ])
-            card.apply(presentation, expanded: executionExpanded)
-            return
-        }
-        bubbleView.addSubview(label)
-        if entry.attachments.isEmpty == false {
-            attachmentStack.orientation = .vertical
-            attachmentStack.spacing = 6
-            attachmentStack.alignment = .leading
-            attachmentStack.distribution = .fill
-            attachmentStack.translatesAutoresizingMaskIntoConstraints = false
-            attachmentStack.setAccessibilityIdentifier("Stacio.AI.transcript.attachments")
-            bubbleView.addSubview(attachmentStack)
-            for (index, attachment) in entry.attachments.enumerated() {
-                let card = AITranscriptAttachmentCardView(attachment: attachment, index: index)
-                attachmentStack.addArrangedSubview(card)
-                card.widthAnchor.constraint(equalTo: attachmentStack.widthAnchor).isActive = true
-                card.heightAnchor.constraint(equalToConstant: 50).isActive = true
-            }
-        }
-        if entry.isProcessEntry {
-            disclosureButton.title = ""
-            disclosureButton.isBordered = false
-            disclosureButton.imageScaling = .scaleProportionallyDown
-            disclosureButton.target = self
-            disclosureButton.action = #selector(togglePressed(_:))
-            disclosureButton.setAccessibilityIdentifier("Stacio.AI.transcript.processDisclosure")
-            disclosureButton.translatesAutoresizingMaskIntoConstraints = false
-            updateDisclosureButton()
-            bubbleView.addSubview(disclosureButton)
-        }
-
-        bubbleWidthConstraint = bubbleView.widthAnchor.constraint(lessThanOrEqualToConstant: preferredTextWidth)
-        bubbleWidthConstraint?.isActive = true
-
-        var constraints: [NSLayoutConstraint] = [
-            bubbleView.topAnchor.constraint(equalTo: topAnchor, constant: entry.verticalInset),
-            bubbleView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -entry.verticalInset),
-            label.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: entry.horizontalPadding),
-            label.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -entry.verticalPadding)
-        ]
-        if entry.attachments.isEmpty {
-            constraints.append(
-                label.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: entry.verticalPadding)
-            )
-        } else {
-            constraints += [
-                attachmentStack.leadingAnchor.constraint(
-                    equalTo: bubbleView.leadingAnchor,
-                    constant: entry.horizontalPadding
-                ),
-                attachmentStack.trailingAnchor.constraint(
-                    equalTo: bubbleView.trailingAnchor,
-                    constant: -entry.horizontalPadding
-                ),
-                attachmentStack.topAnchor.constraint(
-                    equalTo: bubbleView.topAnchor,
-                    constant: entry.verticalPadding
-                ),
-                label.topAnchor.constraint(equalTo: attachmentStack.bottomAnchor, constant: 8)
-            ]
-        }
-        if entry.isProcessEntry {
-            constraints += [
-                disclosureButton.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -8),
-                disclosureButton.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: 7),
-                disclosureButton.widthAnchor.constraint(equalToConstant: 18),
-                disclosureButton.heightAnchor.constraint(equalToConstant: 18),
-                label.trailingAnchor.constraint(equalTo: disclosureButton.leadingAnchor, constant: -6)
-            ]
-        } else {
-            constraints.append(
-                label.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -entry.horizontalPadding)
-            )
-        }
-
-        switch entry.role {
-        case .user:
-            constraints += [
-                bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor),
-                bubbleView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 44)
-            ]
-        case .assistant:
-            constraints += [
-                bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor),
-                bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor)
-            ]
-        case .system:
-            constraints += [
-                bubbleView.centerXAnchor.constraint(equalTo: centerXAnchor),
-                bubbleView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 20),
-                bubbleView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20)
-            ]
-        case .command, .terminal, .plan, .step:
-            constraints += [
-                bubbleView.leadingAnchor.constraint(equalTo: leadingAnchor),
-                bubbleView.trailingAnchor.constraint(equalTo: trailingAnchor)
-            ]
-        }
-        NSLayoutConstraint.activate(constraints)
-    }
-
-    @objc private func togglePressed(_ sender: Any?) {
-        onToggle()
-    }
-
-    private func updateDisclosureButton() {
-        guard entry.isProcessEntry else { return }
-        disclosureButton.image = NSImage(
-            systemSymbolName: entry.isCollapsed ? "chevron.right" : "chevron.down",
-            accessibilityDescription: entry.isCollapsed ? "展开过程" : "折叠过程"
-        )
-        disclosureButton.toolTip = entry.isCollapsed ? "展开思考和执行过程" : "折叠思考和执行过程"
-    }
-
-    func resetAssistantAttributedStringForTesting() {
-        guard let renderedAssistantString else { return }
-        label.stringValue = renderedAssistantString.string
-    }
-
-    private func restoreAssistantFormattingIfNeeded() {
-        guard let renderedAssistantString,
-              label.attributedStringValue.isEqual(to: renderedAssistantString) == false
-        else {
-            return
-        }
-        label.attributedStringValue = renderedAssistantString
-    }
-
-    private func updatePreferredWidth() {
-        let width = max(80, preferredTextWidth)
-        let maxBubbleWidth: CGFloat
-        switch entry.role {
-        case .user:
-            maxBubbleWidth = min(width * 0.86, 420)
-        case .assistant:
-            maxBubbleWidth = width
-        case .system:
-            maxBubbleWidth = min(width * 0.78, 360)
-        case .command, .terminal, .plan, .step:
-            maxBubbleWidth = width
-        }
-        let disclosureWidth: CGFloat = entry.isProcessEntry ? 28 : 0
-        let labelWidth = max(40, maxBubbleWidth - entry.horizontalPadding * 2 - disclosureWidth)
-        if lastAppliedBubbleWidth.map({ abs($0 - maxBubbleWidth) > 0.5 }) ?? true {
-            bubbleWidthConstraint?.constant = maxBubbleWidth
-            lastAppliedBubbleWidth = maxBubbleWidth
-        }
-        if lastAppliedLabelWidth.map({ abs($0 - labelWidth) > 0.5 }) ?? true {
-            label.preferredMaxLayoutWidth = labelWidth
-            lastAppliedLabelWidth = labelWidth
-        }
-    }
-}
-
-private final class AITranscriptAttachmentCardView: NSView {
-    private let attachment: AITranscriptAttachment
-
-    init(attachment: AITranscriptAttachment, index: Int) {
-        self.attachment = attachment
-        super.init(frame: .zero)
-        configure(index: index)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    var titleForTesting: String {
-        attachment.filename
-    }
-
-    private func configure(index: Int) {
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.cornerCurve = .continuous
-        layer?.borderWidth = 1
-        StacioDesignSystem.setLayerBackgroundColor(self, color: NSColor.white.withAlphaComponent(0.13))
-        StacioDesignSystem.setLayerBorderColor(self, color: NSColor.white.withAlphaComponent(0.18))
-        setAccessibilityIdentifier("Stacio.AI.transcript.attachment.\(index)")
-        setAccessibilityLabel("附件：\(attachment.filename)，\(attachment.metadataText)")
-
-        let icon = NSImageView()
-        icon.image = NSImage(
-            systemSymbolName: attachment.isImage ? "photo" : "doc.text",
-            accessibilityDescription: attachment.filename
-        )
-        icon.contentTintColor = NSColor.white.withAlphaComponent(0.92)
-        icon.imageScaling = .scaleProportionallyDown
-        icon.translatesAutoresizingMaskIntoConstraints = false
-
-        let title = NSTextField(labelWithString: attachment.filename)
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-        title.textColor = .white
-        title.lineBreakMode = .byTruncatingMiddle
-        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        title.translatesAutoresizingMaskIntoConstraints = false
-
-        let metadata = NSTextField(labelWithString: attachment.metadataText)
-        metadata.font = .systemFont(ofSize: 10, weight: .medium)
-        metadata.textColor = NSColor.white.withAlphaComponent(0.72)
-        metadata.lineBreakMode = .byTruncatingTail
-        metadata.translatesAutoresizingMaskIntoConstraints = false
-
-        [icon, title, metadata].forEach(addSubview)
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 22),
-            icon.heightAnchor.constraint(equalToConstant: 22),
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            metadata.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            metadata.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            metadata.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2)
-        ])
-    }
-}
-
-private final class AIComposerDropPasteView: NSView {
-    var onPasteAttachments: ((NSPasteboard) -> Bool)?
-    var onDropAttachments: ((NSPasteboard) -> Bool)?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL, .URL, .tiff, .png])
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        registerForDraggedTypes([.fileURL, .URL, .tiff, .png])
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let isPaste = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-            && event.charactersIgnoringModifiers?.lowercased() == "v"
-        if isPaste, onPasteAttachments?(NSPasteboard.general) == true {
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        canAccept(sender.draggingPasteboard) ? .copy : []
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        onDropAttachments?(sender.draggingPasteboard) ?? false
-    }
-
-    private func canAccept(_ pasteboard: NSPasteboard) -> Bool {
-        pasteboard.canReadObject(forClasses: [NSURL.self], options: nil)
-            || NSImage(pasteboard: pasteboard) != nil
-    }
-}
-
-private final class AIComposerAttachmentCardView: NSView {
-    var onDelete: ((Int) -> Void)?
-    var onPreview: ((Int) -> Void)?
-
-    private let attachment: AIAssistantAttachment
-    private let index: Int
-    private let previewButton = NSButton()
-    private let deleteButton = NSButton()
-
-    init(attachment: AIAssistantAttachment, index: Int) {
-        self.attachment = attachment
-        self.index = index
-        super.init(frame: .zero)
-        setup()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private func setup() {
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.cornerCurve = .continuous
-        if attachment.isImage {
-            StacioDesignSystem.setLayerBackgroundColor(self, color: .clear)
-            setupImageCard()
-        } else {
-            StacioDesignSystem.setLayerBackgroundColor(
-                self,
-                color: NSColor.controlBackgroundColor.withAlphaComponent(0.62)
-            )
-            layer?.borderWidth = 1
-            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
-            setupFileCard()
-        }
-        setupDeleteButton()
-    }
-
-    private func setupImageCard() {
-        previewButton.title = ""
-        previewButton.isBordered = false
-        previewButton.image = attachment.previewImage ?? NSImage(systemSymbolName: "photo", accessibilityDescription: attachment.filename)
-        previewButton.imageScaling = .scaleAxesIndependently
-        previewButton.target = self
-        previewButton.action = #selector(previewPressed(_:))
-        previewButton.toolTip = attachment.filename
-        previewButton.translatesAutoresizingMaskIntoConstraints = false
-        previewButton.wantsLayer = true
-        previewButton.layer?.cornerRadius = 9
-        previewButton.layer?.cornerCurve = .continuous
-        previewButton.layer?.masksToBounds = true
-        previewButton.setAccessibilityIdentifier("Stacio.AI.composer.attachment.\(index)")
-        addSubview(previewButton)
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 54),
-            previewButton.leadingAnchor.constraint(equalTo: leadingAnchor),
-            previewButton.trailingAnchor.constraint(equalTo: trailingAnchor),
-            previewButton.topAnchor.constraint(equalTo: topAnchor),
-            previewButton.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
-    }
-
-    private func setupFileCard() {
-        previewButton.title = ""
-        previewButton.isBordered = false
-        previewButton.target = self
-        previewButton.action = #selector(previewPressed(_:))
-        previewButton.translatesAutoresizingMaskIntoConstraints = false
-        previewButton.setAccessibilityIdentifier("Stacio.AI.composer.attachment.\(index)")
-        addSubview(previewButton)
-
-        let iconBox = NSView()
-        iconBox.translatesAutoresizingMaskIntoConstraints = false
-        iconBox.wantsLayer = true
-        iconBox.layer?.cornerRadius = 9
-        iconBox.layer?.cornerCurve = .continuous
-        StacioDesignSystem.setLayerBackgroundColor(
-            iconBox,
-            color: NSColor.controlBackgroundColor.withAlphaComponent(0.92)
-        )
-        let icon = NSImageView()
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: attachment.filename)
-        icon.contentTintColor = .secondaryLabelColor
-        icon.imageScaling = .scaleProportionallyDown
-        iconBox.addSubview(icon)
-
-        let titleLabel = NSTextField(labelWithString: attachment.filename)
-        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        titleLabel.textColor = .labelColor
-        titleLabel.lineBreakMode = .byTruncatingMiddle
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let typeLabel = NSTextField(labelWithString: attachment.displayKind)
-        typeLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        typeLabel.textColor = .secondaryLabelColor
-        typeLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        [iconBox, titleLabel, typeLabel].forEach(addSubview)
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 210),
-            previewButton.leadingAnchor.constraint(equalTo: leadingAnchor),
-            previewButton.trailingAnchor.constraint(equalTo: trailingAnchor),
-            previewButton.topAnchor.constraint(equalTo: topAnchor),
-            previewButton.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            iconBox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            iconBox.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconBox.widthAnchor.constraint(equalToConstant: 36),
-            iconBox.heightAnchor.constraint(equalToConstant: 36),
-            icon.centerXAnchor.constraint(equalTo: iconBox.centerXAnchor),
-            icon.centerYAnchor.constraint(equalTo: iconBox.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 20),
-            icon.heightAnchor.constraint(equalToConstant: 20),
-
-            titleLabel.leadingAnchor.constraint(equalTo: iconBox.trailingAnchor, constant: 10),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -32),
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            typeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            typeLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            typeLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3)
-        ])
-    }
-
-    private func setupDeleteButton() {
-        deleteButton.title = ""
-        deleteButton.isBordered = false
-        deleteButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "删除附件")
-        deleteButton.imageScaling = .scaleProportionallyDown
-        deleteButton.contentTintColor = .labelColor
-        deleteButton.target = self
-        deleteButton.action = #selector(deletePressed(_:))
-        deleteButton.toolTip = "删除附件"
-        deleteButton.translatesAutoresizingMaskIntoConstraints = false
-        deleteButton.wantsLayer = true
-        deleteButton.layer?.cornerRadius = 12
-        deleteButton.layer?.cornerCurve = .continuous
-        StacioDesignSystem.setLayerBackgroundColor(
-            deleteButton,
-            color: NSColor.windowBackgroundColor.withAlphaComponent(0.94)
-        )
-        deleteButton.setAccessibilityIdentifier("Stacio.AI.composer.attachment.delete.\(index)")
-        addSubview(deleteButton)
-        NSLayoutConstraint.activate([
-            deleteButton.widthAnchor.constraint(equalToConstant: 24),
-            deleteButton.heightAnchor.constraint(equalToConstant: 24),
-            deleteButton.topAnchor.constraint(equalTo: topAnchor, constant: -3),
-            deleteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: 3)
-        ])
-    }
-
-    @objc
-    private func deletePressed(_ sender: NSButton) {
-        onDelete?(index)
-    }
-
-    @objc
-    private func previewPressed(_ sender: NSButton) {
-        onPreview?(index)
-    }
-}
-
-private final class AIComposerAttachmentPreviewView: NSView {
-    private let attachment: AIAssistantAttachment
-
-    init(attachment: AIAssistantAttachment) {
-        self.attachment = attachment
-        super.init(frame: NSRect(x: 0, y: 0, width: 880, height: 620))
-        setup()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private func setup() {
-        wantsLayer = true
-        StacioDesignSystem.setLayerBackgroundColor(self, color: NSColor.windowBackgroundColor)
-        if attachment.isImage, let image = attachment.previewImage {
-            let imageView = NSImageView(image: image)
-            imageView.imageScaling = .scaleProportionallyUpOrDown
-            imageView.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(imageView)
-            NSLayoutConstraint.activate([
-                imageView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
-                imageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
-                imageView.topAnchor.constraint(equalTo: topAnchor, constant: 54),
-                imageView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -28)
-            ])
-        } else {
-            let scrollView = NSScrollView()
-            scrollView.translatesAutoresizingMaskIntoConstraints = false
-            scrollView.hasVerticalScroller = true
-            scrollView.drawsBackground = false
-            let text = NSTextView()
-            text.isEditable = false
-            text.drawsBackground = false
-            text.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-            text.textColor = .labelColor
-            text.string = attachment.textPreview ?? attachment.promptSummary
-            scrollView.documentView = text
-            addSubview(scrollView)
-            NSLayoutConstraint.activate([
-                scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
-                scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
-                scrollView.topAnchor.constraint(equalTo: topAnchor, constant: 72),
-                scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -28)
-            ])
-        }
-
-        let title = NSTextField(labelWithString: attachment.filename)
-        title.font = .systemFont(ofSize: 15, weight: .semibold)
-        title.textColor = .labelColor
-        title.lineBreakMode = .byTruncatingMiddle
-        title.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(title)
-        NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 24)
-        ])
-    }
-}
-
-private extension AIAssistantAttachment {
-    var previewImage: NSImage? {
-        if let localFileURL,
-           let image = NSImage(contentsOf: localFileURL) {
-            return image
-        }
-        guard let base64Data,
-              let data = Data(base64Encoded: base64Data)
-        else {
-            return nil
-        }
-        return NSImage(data: data)
-    }
-
-    var displayKind: String {
-        let ext = (filename as NSString).pathExtension
-        if ext.isEmpty == false {
-            return ext.uppercased()
-        }
-        return mimeType
-    }
-}
-
-private final class AIComposerAddPickerViewController: NSViewController {
-    var onAddFiles: (() -> Void)?
-    var onAddCurrentFile: (() -> Void)?
-    var onTogglePlan: (() -> Void)?
-    var onToggleGoal: (() -> Void)?
-
-    private let stack = NSStackView()
-    private let addFilesButton = NSButton()
-    private let addCurrentFileButton = NSButton()
-    private let planButton = NSButton()
-    private let goalButton = NSButton()
-    private var planModeEnabled: Bool
-    private var goalModeEnabled: Bool
-    private var currentFileEnabled: Bool
-    private let showsAttachments: Bool
-    private let showsGoalMode: Bool
-    private static let rowHeight: CGFloat = 28
-    private static let rowSpacing: CGFloat = 4
-    private static let inset: CGFloat = 10
-
-    init(
-        planModeEnabled: Bool,
-        goalModeEnabled: Bool,
-        currentFileEnabled: Bool,
-        showsAttachments: Bool = true,
-        showsGoalMode: Bool = true
-    ) {
-        self.planModeEnabled = planModeEnabled
-        self.goalModeEnabled = goalModeEnabled
-        self.currentFileEnabled = currentFileEnabled
-        self.showsAttachments = showsAttachments
-        self.showsGoalMode = showsGoalMode
-        super.init(nibName: nil, bundle: nil)
-        let visibleRowCount = (showsAttachments ? 2 : 0) + 1 + (showsGoalMode ? 1 : 0)
-        let contentInset = showsAttachments && showsGoalMode ? CGFloat(4) : Self.inset
-        let height = contentInset * 2
-            + CGFloat(visibleRowCount) * Self.rowHeight
-            + CGFloat(max(0, visibleRowCount - 1)) * Self.rowSpacing
-        preferredContentSize = NSSize(width: 172, height: height)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override func loadView() {
-        let container = NSView()
-        container.wantsLayer = true
-        StacioDesignSystem.setLayerBackgroundColor(container, color: NSColor.windowBackgroundColor)
-
-        stack.orientation = .vertical
-        stack.spacing = Self.rowSpacing
-        stack.alignment = .leading
-        stack.distribution = .fill
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        configureActionButton(
-            addFilesButton,
-            title: "添加照片和文件",
-            symbolName: "paperclip",
-            action: #selector(addFilesPressed(_:))
-        )
-        configureActionButton(
-            addCurrentFileButton,
-            title: "附加当前文件",
-            symbolName: "doc.text.magnifyingglass",
-            action: #selector(addCurrentFilePressed(_:))
-        )
-        configureActionButton(
-            planButton,
-            title: "计划模式",
-            symbolName: "list.bullet.rectangle",
-            action: #selector(planPressed(_:))
-        )
-        configureActionButton(
-            goalButton,
-            title: "追求目标",
-            symbolName: "scope",
-            action: #selector(goalPressed(_:))
-        )
-
-        var visibleButtons: [NSButton] = []
-        if showsAttachments {
-            visibleButtons.append(contentsOf: [addFilesButton, addCurrentFileButton])
-        }
-        visibleButtons.append(planButton)
-        if showsGoalMode {
-            visibleButtons.append(goalButton)
-        }
-        visibleButtons.forEach { button in
-            stack.addArrangedSubview(button)
-            button.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            button.heightAnchor.constraint(equalToConstant: Self.rowHeight).isActive = true
-        }
-        container.addSubview(stack)
-
-        let contentInset = showsAttachments && showsGoalMode ? CGFloat(4) : Self.inset
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.inset),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.inset),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: contentInset),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -contentInset)
-        ])
-
-        view = container
-        update(
-            planModeEnabled: planModeEnabled,
-            goalModeEnabled: goalModeEnabled,
-            currentFileEnabled: currentFileEnabled
-        )
-    }
-
-    func update(planModeEnabled: Bool, goalModeEnabled: Bool, currentFileEnabled: Bool) {
-        self.planModeEnabled = planModeEnabled
-        self.goalModeEnabled = goalModeEnabled
-        self.currentFileEnabled = currentFileEnabled
-        guard isViewLoaded else { return }
-        addCurrentFileButton.isEnabled = currentFileEnabled
-        addCurrentFileButton.contentTintColor = currentFileEnabled ? .labelColor : .disabledControlTextColor
-        updateToggleButton(planButton, isOn: planModeEnabled)
-        if showsGoalMode {
-            updateToggleButton(goalButton, isOn: goalModeEnabled)
-        }
-    }
-
-    private func configureActionButton(
-        _ button: NSButton,
-        title: String,
-        symbolName: String,
-        action: Selector
-    ) {
-        button.title = title
-        button.target = self
-        button.action = action
-        button.bezelStyle = .regularSquare
-        button.isBordered = false
-        button.alignment = .left
-        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title)
-        button.imagePosition = .imageLeading
-        button.imageScaling = .scaleProportionallyDown
-        button.font = .systemFont(ofSize: 11, weight: .medium)
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 8
-        button.layer?.cornerCurve = .continuous
-        button.contentTintColor = .labelColor
-        StacioDesignSystem.setLayerBackgroundColor(
-            button,
-            color: NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-        )
-    }
-
-    private func updateToggleButton(_ button: NSButton, isOn: Bool) {
-        button.state = isOn ? .on : .off
-        button.contentTintColor = isOn ? .controlAccentColor : .labelColor
-        StacioDesignSystem.setLayerBackgroundColor(
-            button,
-            color: isOn
-                ? NSColor.controlAccentColor.withAlphaComponent(0.16)
-                : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-        )
-    }
-
-    @objc
-    private func addFilesPressed(_ sender: NSButton) {
-        onAddFiles?()
-    }
-
-    @objc
-    private func addCurrentFilePressed(_ sender: NSButton) {
-        onAddCurrentFile?()
-    }
-
-    @objc
-    private func planPressed(_ sender: NSButton) {
-        onTogglePlan?()
-    }
-
-    @objc
-    private func goalPressed(_ sender: NSButton) {
-        onToggleGoal?()
-    }
-
-    var actionTitlesForTesting: [String] {
-        loadViewIfNeeded()
-        var titles: [String] = []
-        if showsAttachments {
-            titles.append(contentsOf: [addFilesButton.title, addCurrentFileButton.title])
-        }
-        titles.append(planButton.title)
-        if showsGoalMode { titles.append(goalButton.title) }
-        return titles
-    }
-
-    var currentFileEnabledForTesting: Bool {
-        loadViewIfNeeded()
-        return addCurrentFileButton.isEnabled
-    }
-
-    var preferredSizeForTesting: NSSize {
-        preferredContentSize
-    }
-
-    var actionButtonHeightsForTesting: [CGFloat] {
-        loadViewIfNeeded()
-        view.frame = NSRect(origin: .zero, size: preferredContentSize)
-        view.layoutSubtreeIfNeeded()
-        var buttons: [NSButton] = []
-        if showsAttachments {
-            buttons.append(contentsOf: [addFilesButton, addCurrentFileButton])
-        }
-        buttons.append(planButton)
-        if showsGoalMode { buttons.append(goalButton) }
-        return buttons.map(\.frame.height)
-    }
-}
-
-private struct AIComposerPermissionPickerState {
-    let currentPolicy: AgentConfirmationPolicyPreference
-    let items: [(title: String, policy: AgentConfirmationPolicyPreference)]
-}
-
-private final class AIComposerPermissionPickerViewController: NSViewController {
-    var onSelectPolicy: ((AgentConfirmationPolicyPreference) -> Void)?
-
-    private let stack = NSStackView()
-    private var buttons: [AIComposerPermissionButton] = []
-    private var state: AIComposerPermissionPickerState
-    private static let rowHeight: CGFloat = 28
-    private static let rowSpacing: CGFloat = 4
-    private static let inset: CGFloat = 10
-
-    init(state: AIComposerPermissionPickerState) {
-        self.state = state
-        super.init(nibName: nil, bundle: nil)
-        preferredContentSize = NSSize(width: 168, height: 144)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override func loadView() {
-        let container = NSView()
-        container.wantsLayer = true
-        StacioDesignSystem.setLayerBackgroundColor(container, color: NSColor.windowBackgroundColor)
-
-        stack.orientation = .vertical
-        stack.spacing = Self.rowSpacing
-        stack.alignment = .leading
-        stack.distribution = .fill
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.setAccessibilityIdentifier("Stacio.AI.composer.permissionPicker")
-        container.addSubview(stack)
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.inset),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Self.inset),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: Self.inset),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -Self.inset)
-        ])
-
-        view = container
-        update(state: state)
-    }
-
-    func update(state: AIComposerPermissionPickerState) {
-        self.state = state
-        guard isViewLoaded else { return }
-        stack.arrangedSubviews.forEach { view in
-            stack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        buttons = state.items.map { item in
-            let button = AIComposerPermissionButton(
-                title: item.title,
-                target: self,
-                action: #selector(policyPressed(_:))
-            )
-            button.policy = item.policy
-            button.bezelStyle = .regularSquare
-            button.isBordered = false
-            button.alignment = .left
-            button.font = .systemFont(ofSize: 11, weight: .medium)
-            button.image = item.policy == state.currentPolicy
-                ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "当前权限")
-                : NSImage(systemSymbolName: "circle", accessibilityDescription: "可选权限")
-            button.imagePosition = .imageLeading
-            button.imageScaling = .scaleProportionallyDown
-            button.contentTintColor = item.policy == state.currentPolicy
-                ? .controlAccentColor
-                : .secondaryLabelColor
-            button.toolTip = item.title
-            button.setAccessibilityIdentifier("Stacio.AI.composer.permissionPicker.\(item.policy.rawValue)")
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.wantsLayer = true
-            button.layer?.cornerRadius = 8
-            button.layer?.cornerCurve = .continuous
-            StacioDesignSystem.setLayerBackgroundColor(
-                button,
-                color: item.policy == state.currentPolicy
-                    ? NSColor.controlAccentColor.withAlphaComponent(0.13)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-            )
-            stack.addArrangedSubview(button)
-            button.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            button.heightAnchor.constraint(equalToConstant: Self.rowHeight).isActive = true
-            return button
-        }
-    }
-
-    @objc
-    private func policyPressed(_ sender: AIComposerPermissionButton) {
-        onSelectPolicy?(sender.policy)
-    }
-
-    var policyTitlesForTesting: [String] {
-        loadViewIfNeeded()
-        return buttons.map(\.title)
-    }
-
-    var preferredSizeForTesting: NSSize {
-        preferredContentSize
-    }
-
-    var buttonHeightsForTesting: [CGFloat] {
-        loadViewIfNeeded()
-        view.frame = NSRect(origin: .zero, size: preferredContentSize)
-        view.layoutSubtreeIfNeeded()
-        return buttons.map(\.frame.height)
-    }
-}
-
-private final class AIComposerPrimaryActionButton: NSButton {
-    override var alignmentRectInsets: NSEdgeInsets {
-        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-    }
-}
-
-private final class AIComposerPermissionButton: NSButton {
-    var policy: AgentConfirmationPolicyPreference = .requireEveryCommand
-}
-
-private struct AIComposerModelPickerGroup {
-    let providerID: UUID
-    let providerTitle: String
-    let models: [AIModelSelection]
-}
-
-private struct AIComposerLocalAgentPickerOption {
-    let configuration: LocalAgentPassthroughConfiguration
-}
-
-private struct AIComposerLegacyLocalAgentPickerOption {
-    let tool: LocalAgentTool
-}
-
-private struct AIComposerModelPickerSpecialOption {
-    let title: String
-    let selection: AIModelSelection?
-    let toolTip: String
-    let accessibilityIdentifier: String
-}
-
-private struct AIComposerModelPickerState {
-    let providerTitle: String
-    let currentSelection: AIModelSelection?
-    let currentRuntimeSelection: AgentRuntimeSelection?
-    let currentLegacyLocalAgentTool: LocalAgentTool?
-    let specialOptions: [AIComposerModelPickerSpecialOption]
-    let groups: [AIComposerModelPickerGroup]
-    let localAgentOptions: [AIComposerLocalAgentPickerOption]
-    let legacyLocalAgentOptions: [AIComposerLegacyLocalAgentPickerOption]
-    let localAgentSettingsActionTitle: String?
-    let reasoningItems: [(title: String, effort: AIReasoningEffortPreference)]
-    let currentReasoning: AIReasoningEffortPreference
-    let contextFraction: Double
-    let contextLabel: String
-    let runtimeSelectionEnabled: Bool
-}
-
-private final class AIComposerModelPickerViewController: NSViewController {
-    private static let width: CGFloat = 360
-    private static let verticalPadding: CGFloat = 32
-    private static let headerHeight: CGFloat = 62
-    private static let rootSpacingTotal: CGFloat = 56
-    private static let sectionLabelHeight: CGFloat = 14
-    private static let modelRowHeight: CGFloat = 30
-    private static let modelRowSpacing: CGFloat = 6
-    private static let reasoningHeight: CGFloat = 30
-    private static let minimumHeight: CGFloat = 246
-    private static let maximumHeight: CGFloat = 350
-    private static let maximumModelListHeight: CGFloat = 144
-
-    var onSelectModel: ((AIModelSelection?) -> Void)?
-    var onSelectLocalAgent: ((LocalAgentPassthroughConfiguration) -> Void)?
-    var onSelectLegacyLocalAgent: ((LocalAgentTool) -> Void)?
-    var onOpenLocalAgentSettings: (() -> Void)?
-    var onSelectReasoning: ((AIReasoningEffortPreference) -> Void)?
-
-    private let rootStack = NSStackView()
-    private let providerLabel = NSTextField(labelWithString: "")
-    private let contextRing = AIContextUsageRingView()
-    private let contextPercentLabel = NSTextField(labelWithString: "")
-    private let contextCaptionLabel = NSTextField(labelWithString: "上下文")
-    private let modelsScrollView = NSScrollView()
-    private let modelsDocumentView = AIAssistantFlippedView()
-    private let modelsStack = NSStackView()
-    private let reasoningHeader = NSTextField(labelWithString: "推理强度")
-    private let reasoningControl = NSSegmentedControl()
-    private var modelsScrollHeightConstraint: NSLayoutConstraint?
-    private var state: AIComposerModelPickerState
-
-    init(state: AIComposerModelPickerState) {
-        self.state = state
-        super.init(nibName: nil, bundle: nil)
-        preferredContentSize = Self.preferredSize(for: state)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override func loadView() {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.wantsLayer = true
-        StacioDesignSystem.setLayerBackgroundColor(container, color: NSColor.windowBackgroundColor)
-
-        rootStack.orientation = .vertical
-        rootStack.spacing = 14
-        rootStack.alignment = .leading
-        rootStack.distribution = .fill
-        rootStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let headerStack = NSStackView()
-        headerStack.orientation = .horizontal
-        headerStack.spacing = 14
-        headerStack.alignment = .top
-        headerStack.distribution = .fill
-        headerStack.translatesAutoresizingMaskIntoConstraints = false
-
-        let ringContainer = NSView()
-        ringContainer.translatesAutoresizingMaskIntoConstraints = false
-        ringContainer.wantsLayer = true
-        ringContainer.layer?.cornerRadius = 28
-        ringContainer.layer?.cornerCurve = .continuous
-        StacioDesignSystem.setLayerBackgroundColor(
-            ringContainer,
-            color: NSColor.controlBackgroundColor.withAlphaComponent(0.74)
-        )
-
-        contextRing.translatesAutoresizingMaskIntoConstraints = false
-        contextPercentLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        contextPercentLabel.textColor = .labelColor
-        contextPercentLabel.alignment = .center
-        contextPercentLabel.translatesAutoresizingMaskIntoConstraints = false
-        contextCaptionLabel.font = .systemFont(ofSize: 10, weight: .medium)
-        contextCaptionLabel.textColor = .secondaryLabelColor
-        contextCaptionLabel.alignment = .center
-        contextCaptionLabel.translatesAutoresizingMaskIntoConstraints = false
-        ringContainer.addSubview(contextRing)
-        ringContainer.addSubview(contextPercentLabel)
-        ringContainer.addSubview(contextCaptionLabel)
-
-        let titleStack = NSStackView()
-        titleStack.orientation = .vertical
-        titleStack.spacing = 3
-        titleStack.alignment = .leading
-        titleStack.distribution = .fill
-        titleStack.translatesAutoresizingMaskIntoConstraints = false
-        let titleLabel = NSTextField(labelWithString: "选择模型")
-        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        titleLabel.textColor = .labelColor
-        titleLabel.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.title")
-        providerLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        providerLabel.textColor = .secondaryLabelColor
-        providerLabel.lineBreakMode = .byTruncatingMiddle
-        providerLabel.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.provider")
-        titleStack.addArrangedSubview(titleLabel)
-        titleStack.addArrangedSubview(providerLabel)
-
-        headerStack.addArrangedSubview(ringContainer)
-        headerStack.addArrangedSubview(titleStack)
-        titleStack.widthAnchor.constraint(equalTo: headerStack.widthAnchor, constant: -76).isActive = true
-
-        let modelsHeader = makeSectionLabel("模型")
-        modelsScrollView.translatesAutoresizingMaskIntoConstraints = false
-        modelsScrollView.drawsBackground = false
-        modelsScrollView.borderType = .noBorder
-        modelsScrollView.hasVerticalScroller = true
-        modelsScrollView.autohidesScrollers = true
-        modelsScrollView.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.models")
-
-        modelsDocumentView.translatesAutoresizingMaskIntoConstraints = false
-        modelsStack.orientation = .vertical
-        modelsStack.spacing = 6
-        modelsStack.alignment = .leading
-        modelsStack.distribution = .fill
-        modelsStack.translatesAutoresizingMaskIntoConstraints = false
-        modelsStack.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.modelRows")
-        modelsDocumentView.addSubview(modelsStack)
-        modelsScrollView.documentView = modelsDocumentView
-
-        reasoningHeader.font = .systemFont(ofSize: 11, weight: .semibold)
-        reasoningHeader.textColor = .secondaryLabelColor
-        reasoningHeader.translatesAutoresizingMaskIntoConstraints = false
-        reasoningHeader.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.reasoningHeader")
-        reasoningControl.target = self
-        reasoningControl.action = #selector(reasoningChanged(_:))
-        reasoningControl.segmentStyle = .texturedRounded
-        reasoningControl.translatesAutoresizingMaskIntoConstraints = false
-        reasoningControl.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.reasoning")
-
-        [
-            headerStack,
-            modelsHeader,
-            modelsScrollView,
-            reasoningHeader,
-            reasoningControl
-        ].forEach { view in
-            rootStack.addArrangedSubview(view)
-            view.widthAnchor.constraint(equalTo: rootStack.widthAnchor).isActive = true
-        }
-        container.addSubview(rootStack)
-
-        let modelsScrollHeightConstraint = modelsScrollView.heightAnchor.constraint(
-            equalToConstant: Self.modelListHeight(for: state)
-        )
-        self.modelsScrollHeightConstraint = modelsScrollHeightConstraint
-
-        NSLayoutConstraint.activate([
-            rootStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            rootStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            rootStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
-            rootStack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -16),
-
-            ringContainer.widthAnchor.constraint(equalToConstant: 62),
-            ringContainer.heightAnchor.constraint(equalToConstant: 62),
-            contextRing.centerXAnchor.constraint(equalTo: ringContainer.centerXAnchor),
-            contextRing.centerYAnchor.constraint(equalTo: ringContainer.centerYAnchor, constant: -4),
-            contextRing.widthAnchor.constraint(equalToConstant: 42),
-            contextRing.heightAnchor.constraint(equalToConstant: 42),
-            contextPercentLabel.centerXAnchor.constraint(equalTo: ringContainer.centerXAnchor),
-            contextPercentLabel.centerYAnchor.constraint(equalTo: contextRing.centerYAnchor),
-            contextCaptionLabel.centerXAnchor.constraint(equalTo: ringContainer.centerXAnchor),
-            contextCaptionLabel.bottomAnchor.constraint(equalTo: ringContainer.bottomAnchor, constant: -8),
-            modelsDocumentView.leadingAnchor.constraint(equalTo: modelsScrollView.contentView.leadingAnchor),
-            modelsDocumentView.trailingAnchor.constraint(equalTo: modelsScrollView.contentView.trailingAnchor),
-            modelsDocumentView.topAnchor.constraint(equalTo: modelsScrollView.contentView.topAnchor),
-            modelsDocumentView.widthAnchor.constraint(equalTo: modelsScrollView.contentView.widthAnchor),
-            modelsStack.leadingAnchor.constraint(equalTo: modelsDocumentView.leadingAnchor),
-            modelsStack.trailingAnchor.constraint(equalTo: modelsDocumentView.trailingAnchor),
-            modelsStack.topAnchor.constraint(equalTo: modelsDocumentView.topAnchor),
-            modelsStack.bottomAnchor.constraint(equalTo: modelsDocumentView.bottomAnchor),
-            modelsScrollHeightConstraint,
-            reasoningControl.heightAnchor.constraint(equalToConstant: 30)
-        ])
-
-        view = container
-        update(state: state)
-    }
-
-    func update(state: AIComposerModelPickerState) {
-        self.state = state
-        preferredContentSize = Self.preferredSize(for: state)
-        guard isViewLoaded else { return }
-        providerLabel.stringValue = state.providerTitle
-        contextRing.fraction = state.contextFraction
-        contextRing.toolTip = state.contextLabel
-        contextRing.setAccessibilityLabel(state.contextLabel)
-        contextPercentLabel.stringValue = contextPercentText(for: state.contextFraction)
-        renderModels()
-        modelsScrollHeightConstraint?.constant = Self.modelListHeight(for: state)
-        renderReasoning()
-        let showsReasoning = Self.showsReasoningSection(for: state)
-        reasoningHeader.isHidden = showsReasoning == false
-        reasoningControl.isHidden = showsReasoning == false
-    }
-
-    private func renderModels() {
-        modelsStack.arrangedSubviews.forEach { view in
-            modelsStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        if state.specialOptions.isEmpty,
-           state.groups.isEmpty,
-           state.localAgentOptions.isEmpty,
-           state.localAgentSettingsActionTitle == nil {
-            let empty = NSTextField(labelWithString: "还没有可选模型")
-            empty.font = .systemFont(ofSize: 12)
-            empty.textColor = .secondaryLabelColor
-            modelsStack.addArrangedSubview(empty)
-            return
-        }
-        for option in state.specialOptions {
-            let button = AIComposerModelButton(
-                title: option.title,
-                target: self,
-                action: #selector(modelPressed(_:))
-            )
-            button.selection = option.selection
-            button.isEnabled = state.runtimeSelectionEnabled
-            button.bezelStyle = .regularSquare
-            button.isBordered = false
-            button.alignment = .left
-            button.font = .systemFont(ofSize: 12, weight: .medium)
-            button.cell?.lineBreakMode = .byTruncatingMiddle
-            let isCurrent = state.currentRuntimeSelection?.kind != .localAgent
-                && option.selection == state.currentSelection
-            button.image = isCurrent
-                ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "当前模型")
-                : NSImage(systemSymbolName: "circle", accessibilityDescription: "可选模型")
-            button.imagePosition = .imageLeading
-            button.contentTintColor = isCurrent
-                ? .controlAccentColor
-                : .secondaryLabelColor
-            button.toolTip = option.toolTip
-            button.setAccessibilityIdentifier(option.accessibilityIdentifier)
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.wantsLayer = true
-            button.layer?.cornerRadius = 8
-            button.layer?.cornerCurve = .continuous
-            StacioDesignSystem.setLayerBackgroundColor(
-                button,
-                color: isCurrent
-                    ? NSColor.controlAccentColor.withAlphaComponent(0.13)
-                    : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-            )
-            modelsStack.addArrangedSubview(button)
-            button.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-        }
-        for group in state.groups {
-            let heading = makeSectionLabel(group.providerTitle)
-            heading.setAccessibilityIdentifier(
-                "Stacio.AI.composer.modelPicker.provider.\(group.providerID.uuidString.lowercased())"
-            )
-            heading.toolTip = group.providerTitle
-            modelsStack.addArrangedSubview(heading)
-            heading.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-
-            for selection in group.models {
-                let button = AIComposerModelButton(
-                    title: selection.modelID,
-                    target: self,
-                    action: #selector(modelPressed(_:))
-                )
-                button.selection = selection
-                button.isEnabled = state.runtimeSelectionEnabled
-                button.bezelStyle = .regularSquare
-                button.isBordered = false
-                button.alignment = .left
-                button.font = .systemFont(ofSize: 12, weight: .medium)
-                button.cell?.lineBreakMode = .byTruncatingMiddle
-                let isCurrent = state.currentRuntimeSelection?.kind != .localAgent
-                    && selection == state.currentSelection
-                button.image = isCurrent
-                    ? NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "当前模型")
-                    : NSImage(systemSymbolName: "circle", accessibilityDescription: "可选模型")
-                button.imagePosition = .imageLeading
-                button.contentTintColor = isCurrent
-                    ? .controlAccentColor
-                    : .secondaryLabelColor
-                button.toolTip = "\(group.providerTitle) · \(selection.modelID)"
-                button.setAccessibilityIdentifier(
-                    "Stacio.AI.composer.modelPicker.model.\(selection.providerID.uuidString.lowercased()).\(selection.modelID)"
-                )
-                button.translatesAutoresizingMaskIntoConstraints = false
-                button.wantsLayer = true
-                button.layer?.cornerRadius = 8
-                button.layer?.cornerCurve = .continuous
-                StacioDesignSystem.setLayerBackgroundColor(
-                    button,
-                    color: isCurrent
-                        ? NSColor.controlAccentColor.withAlphaComponent(0.13)
-                        : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-                )
-                modelsStack.addArrangedSubview(button)
-                button.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-                button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-            }
-        }
-        if state.localAgentOptions.isEmpty == false
-            || state.legacyLocalAgentOptions.isEmpty == false
-            || state.localAgentSettingsActionTitle != nil {
-            let heading = makeSectionLabel("本地 Coding Agent")
-            heading.setAccessibilityIdentifier("Stacio.AI.composer.modelPicker.localAgents")
-            modelsStack.addArrangedSubview(heading)
-            heading.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-            for option in state.localAgentOptions {
-                let configuration = option.configuration
-                let button = AIComposerLocalAgentButton(
-                    title: configuration.displayName,
-                    target: self,
-                    action: #selector(localAgentPressed(_:))
-                )
-                button.configuration = configuration
-                button.isEnabled = state.runtimeSelectionEnabled
-                let isCurrent = state.currentRuntimeSelection?.kind == .localAgent
-                    && state.currentRuntimeSelection?.localAgentConfigurationID == configuration.configurationID
-                button.bezelStyle = .regularSquare
-                button.isBordered = false
-                button.alignment = .left
-                button.font = .systemFont(ofSize: 12, weight: .medium)
-                button.cell?.lineBreakMode = .byTruncatingMiddle
-                let isStructured = configuration.isReadyForStructuredRuntime
-                button.image = NSImage(
-                    systemSymbolName: isCurrent
-                        ? "checkmark.circle.fill"
-                        : (isStructured ? "sparkles" : "terminal"),
-                    accessibilityDescription: isCurrent
-                        ? "当前 Runtime"
-                        : (isStructured ? "结构化本地 Agent Runtime" : "本地终端 Runtime")
-                )
-                button.imagePosition = .imageLeading
-                button.contentTintColor = isCurrent ? .controlAccentColor : .secondaryLabelColor
-                button.toolTip = isStructured
-                    ? "\(configuration.displayName) · 结构化会话"
-                    : "\(configuration.displayName) · 本地终端透传"
-                button.setAccessibilityIdentifier(
-                    "Stacio.AI.composer.modelPicker.localAgent.\(configuration.tool.rawValue)"
-                )
-                button.translatesAutoresizingMaskIntoConstraints = false
-                button.wantsLayer = true
-                button.layer?.cornerRadius = 8
-                button.layer?.cornerCurve = .continuous
-                StacioDesignSystem.setLayerBackgroundColor(
-                    button,
-                    color: isCurrent
-                        ? NSColor.controlAccentColor.withAlphaComponent(0.13)
-                        : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-                )
-                modelsStack.addArrangedSubview(button)
-                button.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-                button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-            }
-            for option in state.legacyLocalAgentOptions {
-                let tool = option.tool
-                let button = AIComposerLocalAgentButton(
-                    title: "\(tool.displayName) · 兼容本地 CLI",
-                    target: self,
-                    action: #selector(legacyLocalAgentPressed(_:))
-                )
-                button.legacyTool = tool
-                button.isEnabled = state.runtimeSelectionEnabled
-                let isCurrent = state.currentRuntimeSelection?.kind != .localAgent
-                    && state.currentLegacyLocalAgentTool == tool
-                button.bezelStyle = .regularSquare
-                button.isBordered = false
-                button.alignment = .left
-                button.font = .systemFont(ofSize: 12, weight: .medium)
-                button.cell?.lineBreakMode = .byTruncatingMiddle
-                button.image = NSImage(
-                    systemSymbolName: isCurrent ? "checkmark.circle.fill" : "terminal",
-                    accessibilityDescription: isCurrent ? "当前兼容 Runtime" : "兼容本地终端 Runtime"
-                )
-                button.imagePosition = .imageLeading
-                button.contentTintColor = isCurrent ? .controlAccentColor : .secondaryLabelColor
-                button.toolTip = "\(tool.displayName) · 兼容本地 CLI，仅使用受管 PTY"
-                button.setAccessibilityIdentifier(
-                    "Stacio.AI.composer.modelPicker.legacyLocalAgent.\(tool.rawValue)"
-                )
-                button.translatesAutoresizingMaskIntoConstraints = false
-                button.wantsLayer = true
-                button.layer?.cornerRadius = 8
-                button.layer?.cornerCurve = .continuous
-                StacioDesignSystem.setLayerBackgroundColor(
-                    button,
-                    color: isCurrent
-                        ? NSColor.controlAccentColor.withAlphaComponent(0.13)
-                        : NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-                )
-                modelsStack.addArrangedSubview(button)
-                button.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-                button.heightAnchor.constraint(equalToConstant: 30).isActive = true
-            }
-            if let title = state.localAgentSettingsActionTitle {
-                let settingsButton = NSButton(
-                    title: title,
-                    target: self,
-                    action: #selector(openLocalAgentSettings)
-                )
-                settingsButton.bezelStyle = .regularSquare
-                settingsButton.isBordered = false
-                settingsButton.alignment = .left
-                settingsButton.font = .systemFont(ofSize: 12, weight: .medium)
-                settingsButton.image = NSImage(
-                    systemSymbolName: "gearshape",
-                    accessibilityDescription: title
-                )
-                settingsButton.imagePosition = .imageLeading
-                settingsButton.contentTintColor = .secondaryLabelColor
-                settingsButton.toolTip = "在设置 > AI > 本地 Agent 中检测、登录并启用 CLI"
-                settingsButton.setAccessibilityIdentifier(
-                    "Stacio.AI.composer.modelPicker.localAgent.settings"
-                )
-                settingsButton.translatesAutoresizingMaskIntoConstraints = false
-                settingsButton.wantsLayer = true
-                settingsButton.layer?.cornerRadius = StacioDesignSystem.theme.controlCornerRadius
-                settingsButton.layer?.cornerCurve = .continuous
-                StacioDesignSystem.setLayerBackgroundColor(
-                    settingsButton,
-                    color: NSColor.controlBackgroundColor.withAlphaComponent(0.56)
-                )
-                modelsStack.addArrangedSubview(settingsButton)
-                settingsButton.widthAnchor.constraint(equalTo: modelsStack.widthAnchor).isActive = true
-                settingsButton.heightAnchor.constraint(equalToConstant: 30).isActive = true
-            }
-        }
-    }
-
-    private func renderReasoning() {
-        reasoningControl.segmentCount = state.reasoningItems.count
-        for (index, item) in state.reasoningItems.enumerated() {
-            reasoningControl.setLabel(item.title, forSegment: index)
-            reasoningControl.setWidth(0, forSegment: index)
-            reasoningControl.setEnabled(true, forSegment: index)
-            reasoningControl.setToolTip("\(item.title)推理强度", forSegment: index)
-        }
-        reasoningControl.selectedSegment = state.reasoningItems.firstIndex {
-            $0.effort == state.currentReasoning
-        } ?? -1
-        reasoningControl.isEnabled = state.runtimeSelectionEnabled
-    }
-
-    private static func preferredSize(for state: AIComposerModelPickerState) -> NSSize {
-        let reasoningSectionHeight = showsReasoningSection(for: state)
-            ? sectionLabelHeight + reasoningHeight
-            : CGFloat(0)
-        let height = verticalPadding
-            + headerHeight
-            + rootSpacingTotal
-            + sectionLabelHeight
-            + modelListHeight(for: state)
-            + reasoningSectionHeight
-        return NSSize(width: width, height: min(max(height, minimumHeight), maximumHeight))
-    }
-
-    private static func showsReasoningSection(for state: AIComposerModelPickerState) -> Bool {
-        state.currentRuntimeSelection?.kind != .localAgent
-            && state.currentLegacyLocalAgentTool == nil
-            && state.reasoningItems.isEmpty == false
-    }
-
-    private static func modelListHeight(for state: AIComposerModelPickerState) -> CGFloat {
-        guard state.specialOptions.isEmpty == false
-                || state.groups.isEmpty == false
-                || state.localAgentOptions.isEmpty == false
-                || state.legacyLocalAgentOptions.isEmpty == false
-                || state.localAgentSettingsActionTitle != nil else {
-            return modelRowHeight
-        }
-        let modelCount = state.specialOptions.count
-            + state.groups.reduce(0) { $0 + $1.models.count }
-            + state.localAgentOptions.count
-            + state.legacyLocalAgentOptions.count
-            + (state.localAgentSettingsActionTitle == nil ? 0 : 1)
-        let headingCount = state.groups.count
-            + ((state.localAgentOptions.isEmpty
-                && state.legacyLocalAgentOptions.isEmpty
-                && state.localAgentSettingsActionTitle == nil) ? 0 : 1)
-        let rowCount = modelCount + headingCount
-        let spacing = CGFloat(max(rowCount - 1, 0)) * modelRowSpacing
-        let headingsHeight = CGFloat(headingCount) * sectionLabelHeight
-        let modelsHeight = CGFloat(modelCount) * modelRowHeight
-        return min(max(headingsHeight + modelsHeight + spacing, modelRowHeight), maximumModelListHeight)
-    }
-
-    private func makeSectionLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 11, weight: .semibold)
-        label.textColor = .secondaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        return label
-    }
-
-    private func contextPercentText(for fraction: Double) -> String {
-        "\(Int((min(max(fraction, 0), 1) * 100).rounded()))%"
-    }
-
-    @objc
-    private func modelPressed(_ sender: AIComposerModelButton) {
-        onSelectModel?(sender.selection)
-    }
-
-    @objc
-    private func localAgentPressed(_ sender: AIComposerLocalAgentButton) {
-        guard let configuration = sender.configuration else { return }
-        onSelectLocalAgent?(configuration)
-    }
-
-    @objc
-    private func legacyLocalAgentPressed(_ sender: AIComposerLocalAgentButton) {
-        guard let tool = sender.legacyTool else { return }
-        onSelectLegacyLocalAgent?(tool)
-    }
-
-    @objc
-    private func openLocalAgentSettings() {
-        onOpenLocalAgentSettings?()
-    }
-
-    @objc
-    private func reasoningChanged(_ sender: NSSegmentedControl) {
-        guard state.reasoningItems.indices.contains(sender.selectedSegment) else {
-            return
-        }
-        onSelectReasoning?(state.reasoningItems[sender.selectedSegment].effort)
-    }
-
-    var modelTitlesForTesting: [String] {
-        update(state: state)
-        return state.specialOptions.map(\.title)
-            + state.groups.flatMap { $0.models.map(\.modelID) }
-            + state.localAgentOptions.map { $0.configuration.displayName }
-            + state.legacyLocalAgentOptions.map { "\($0.tool.displayName) · 兼容本地 CLI" }
-            + [state.localAgentSettingsActionTitle].compactMap { $0 }
-    }
-
-    var groupTitlesForTesting: [String] {
-        update(state: state)
-        return state.groups.map(\.providerTitle)
-    }
-
-    var selectionsForTesting: [AIModelSelection] {
-        update(state: state)
-        return state.groups.flatMap(\.models)
-    }
-
-    var reasoningTitlesForTesting: [String] {
-        update(state: state)
-        return state.reasoningItems.map(\.title)
-    }
-
-    var contextTextForTesting: String {
-        loadViewIfNeeded()
-        update(state: state)
-        return contextPercentLabel.stringValue
-    }
-
-    var preferredSizeForTesting: NSSize {
-        preferredContentSize
-    }
-
-    var showsReasoningForTesting: Bool {
-        loadViewIfNeeded()
-        update(state: state)
-        return reasoningHeader.isHidden == false && reasoningControl.isHidden == false
-    }
-}
-
-private final class AIComposerLocalAgentButton: NSButton {
-    var configuration: LocalAgentPassthroughConfiguration?
-    var legacyTool: LocalAgentTool?
-}
-
-private final class AIComposerModelButton: NSButton {
-    var selection: AIModelSelection?
-}
-
-private final class AIContextUsageRingView: NSView {
-    var fraction: Double = 0 {
-        didSet {
-            fraction = min(max(fraction, 0), 1)
-            needsDisplay = true
-        }
-    }
-
-    override var isFlipped: Bool { false }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let size = min(bounds.width, bounds.height)
-        guard size > 4 else { return }
-        let rect = NSRect(
-            x: bounds.midX - size / 2 + 2,
-            y: bounds.midY - size / 2 + 2,
-            width: size - 4,
-            height: size - 4
-        )
-        let lineWidth: CGFloat = 3
-        let track = NSBezierPath(ovalIn: rect)
-        track.lineWidth = lineWidth
-        NSColor.separatorColor.withAlphaComponent(0.7).setStroke()
-        track.stroke()
-
-        let clamped = min(max(fraction, 0), 1)
-        guard clamped > 0 else { return }
-        let center = NSPoint(x: rect.midX, y: rect.midY)
-        let radius = rect.width / 2
-        let path = NSBezierPath()
-        path.lineWidth = lineWidth
-        path.lineCapStyle = .round
-        path.appendArc(
-            withCenter: center,
-            radius: radius,
-            startAngle: 90,
-            endAngle: 90 - CGFloat(clamped * 360),
-            clockwise: true
-        )
-        NSColor.controlAccentColor.setStroke()
-        path.stroke()
-    }
-}
-
-enum AIAssistantMarkdownRenderer {
-    static func attributedString(
-        from markdown: String,
-        baseFont: NSFont = .systemFont(ofSize: 12),
-        textColor: NSColor = StacioDesignSystem.theme.primaryTextColor
-    ) -> NSAttributedString {
-        let result = NSMutableAttributedString()
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
-        paragraph.paragraphSpacing = 5
-        let codeParagraph = NSMutableParagraphStyle()
-        codeParagraph.lineSpacing = 2
-        codeParagraph.paragraphSpacing = 6
-        var isInCodeBlock = false
-        let rawLines = markdown.components(separatedBy: .newlines)
-        var lineIndex = 0
-        while lineIndex < rawLines.count {
-            let rawLine = rawLines[lineIndex]
-            lineIndex += 1
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") {
-                isInCodeBlock.toggle()
-                continue
-            }
-            if isInCodeBlock {
-                append(
-                    rawLine + "\n",
-                    to: result,
-                    attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: max(11, baseFont.pointSize - 1), weight: .regular),
-                        .foregroundColor: textColor,
-                        .backgroundColor: StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.55),
-                        .paragraphStyle: codeParagraph
-                    ]
-                )
-                continue
-            }
-            if lineIndex < rawLines.count,
-               isTableSeparator(rawLines[lineIndex]),
-               tableCells(rawLine).count >= 2
-            {
-                let rowsStartIndex = lineIndex + 1
-                var rows = [tableCells(rawLine)]
-                lineIndex = rowsStartIndex
-                while lineIndex < rawLines.count {
-                    let cells = tableCells(rawLines[lineIndex])
-                    guard cells.count >= 2 else { break }
-                    rows.append(cells)
-                    lineIndex += 1
-                }
-                appendTable(
-                    rows,
-                    to: result,
-                    baseFont: baseFont,
-                    textColor: textColor
-                )
-                continue
-            }
-            let lineStyle = styledLine(rawLine, baseFont: baseFont)
-            let line = inlineMarkdown(lineStyle.text, baseFont: lineStyle.font, textColor: textColor)
-            line.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: line.length))
-            result.append(line)
-            result.append(NSAttributedString(string: "\n", attributes: [
-                .font: lineStyle.font,
-                .foregroundColor: textColor,
-                .paragraphStyle: paragraph
-            ]))
-        }
-        if result.string.hasSuffix("\n") {
-            result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
-        }
-        return result
-    }
-
-    private static func appendTable(
-        _ rows: [[String]],
-        to result: NSMutableAttributedString,
-        baseFont: NSFont,
-        textColor: NSColor
-    ) {
-        guard let columnCount = rows.map(\.count).max(), columnCount > 0 else { return }
-        let table = NSTextTable()
-        table.numberOfColumns = columnCount
-        table.collapsesBorders = true
-        table.hidesEmptyCells = false
-
-        for (rowIndex, cells) in rows.enumerated() {
-            for columnIndex in 0..<columnCount {
-                let block = NSTextTableBlock(
-                    table: table,
-                    startingRow: rowIndex,
-                    rowSpan: 1,
-                    startingColumn: columnIndex,
-                    columnSpan: 1
-                )
-                block.setContentWidth(
-                    100 / CGFloat(columnCount),
-                    type: .percentageValueType
-                )
-                block.setWidth(6, type: .absoluteValueType, for: .padding)
-                block.setWidth(0.5, type: .absoluteValueType, for: .border)
-                block.setBorderColor(StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.65))
-                if rowIndex == 0 {
-                    block.backgroundColor = StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.7)
-                }
-
-                let paragraph = NSMutableParagraphStyle()
-                paragraph.lineSpacing = 2
-                paragraph.paragraphSpacing = 0
-                paragraph.textBlocks = [block]
-                let font = NSFont.systemFont(
-                    ofSize: max(11, baseFont.pointSize - 1),
-                    weight: rowIndex == 0 ? .semibold : .regular
-                )
-                let cellText = columnIndex < cells.count ? cells[columnIndex] : ""
-                let renderedCell = inlineMarkdown(cellText, baseFont: font, textColor: textColor)
-                renderedCell.addAttribute(
-                    .paragraphStyle,
-                    value: paragraph,
-                    range: NSRange(location: 0, length: renderedCell.length)
-                )
-                result.append(renderedCell)
-                result.append(NSAttributedString(string: "\n", attributes: [
-                    .font: font,
-                    .foregroundColor: textColor,
-                    .paragraphStyle: paragraph
-                ]))
-            }
-        }
-    }
-
-    private static func tableCells(_ line: String) -> [String] {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("|") else { return [] }
-        return trimmed
-            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
-            .split(separator: "|", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = tableCells(line)
-        guard cells.count >= 2 else { return false }
-        return cells.allSatisfy { cell in
-            let marker = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return marker.count >= 3 && marker.allSatisfy { $0 == "-" }
-        }
-    }
-
-    private static func styledLine(_ line: String, baseFont: NSFont) -> (text: String, font: NSFont) {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("### ") {
-            return (String(trimmed.dropFirst(4)), .systemFont(ofSize: baseFont.pointSize + 1, weight: .semibold))
-        }
-        if trimmed.hasPrefix("## ") {
-            return (String(trimmed.dropFirst(3)), .systemFont(ofSize: baseFont.pointSize + 2, weight: .semibold))
-        }
-        if trimmed.hasPrefix("# ") {
-            return (String(trimmed.dropFirst(2)), .systemFont(ofSize: baseFont.pointSize + 3, weight: .semibold))
-        }
-        return (line, baseFont)
-    }
-
-    private static func inlineMarkdown(
-        _ line: String,
-        baseFont: NSFont,
-        textColor: NSColor
-    ) -> NSMutableAttributedString {
-        let output = NSMutableAttributedString()
-        var index = line.startIndex
-        var plainBuffer = ""
-
-        func flushPlain() {
-            guard plainBuffer.isEmpty == false else { return }
-            output.append(linkedPlainText(plainBuffer, baseFont: baseFont, textColor: textColor))
-            plainBuffer = ""
-        }
-
-        while index < line.endIndex {
-            if line[index] == "[",
-               let labelEnd = line[line.index(after: index)...].firstIndex(of: "]"),
-               line.index(after: labelEnd) < line.endIndex,
-               line[line.index(after: labelEnd)] == "(",
-               let urlEnd = line[line.index(labelEnd, offsetBy: 2)...].firstIndex(of: ")"),
-               urlEnd > line.index(labelEnd, offsetBy: 2)
-            {
-                let urlStart = line.index(labelEnd, offsetBy: 2)
-                let title = String(line[line.index(after: index)..<labelEnd])
-                let rawURL = String(line[urlStart..<urlEnd])
-                if let url = URL(string: rawURL), url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https" {
-                    flushPlain()
-                    append(
-                        title,
-                        to: output,
-                        attributes: [
-                            .font: baseFont,
-                            .foregroundColor: NSColor.linkColor,
-                            .underlineStyle: NSUnderlineStyle.single.rawValue,
-                            .link: url
-                        ]
-                    )
-                    index = line.index(after: urlEnd)
-                    continue
-                }
-            }
-            if line[index...].hasPrefix("**"),
-               let end = line[line.index(index, offsetBy: 2)...].range(of: "**") {
-                flushPlain()
-                let contentStart = line.index(index, offsetBy: 2)
-                let content = String(line[contentStart..<end.lowerBound])
-                append(
-                    content,
-                    to: output,
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: baseFont.pointSize, weight: .semibold),
-                        .foregroundColor: textColor
-                    ]
-                )
-                index = end.upperBound
-                continue
-            }
-            if line[index] == "`",
-               let end = line[line.index(after: index)...].firstIndex(of: "`") {
-                flushPlain()
-                let contentStart = line.index(after: index)
-                let content = String(line[contentStart..<end])
-                append(
-                    content,
-                    to: output,
-                    attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: max(11, baseFont.pointSize - 1), weight: .regular),
-                        .foregroundColor: textColor,
-                        .backgroundColor: StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.55)
-                    ]
-                )
-                index = line.index(after: end)
-                continue
-            }
-            plainBuffer.append(line[index])
-            index = line.index(after: index)
-        }
-        flushPlain()
-        return output
-    }
-
-    private static func linkedPlainText(
-        _ text: String,
-        baseFont: NSFont,
-        textColor: NSColor
-    ) -> NSAttributedString {
-        let output = NSMutableAttributedString(
-            string: text,
-            attributes: [.font: baseFont, .foregroundColor: textColor]
-        )
-        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
-            return output
-        }
-        let fullRange = NSRange(location: 0, length: (text as NSString).length)
-        for match in detector.matches(in: text, range: fullRange) {
-            guard let url = match.url,
-                  url.scheme?.lowercased() == "http" || url.scheme?.lowercased() == "https"
-            else { continue }
-            output.addAttributes(
-                [
-                    .link: url,
-                    .foregroundColor: NSColor.linkColor,
-                    .underlineStyle: NSUnderlineStyle.single.rawValue
-                ],
-                range: match.range
-            )
-        }
-        return output
-    }
-
-    private static func append(
-        _ string: String,
-        to output: NSMutableAttributedString,
-        attributes: [NSAttributedString.Key: Any]
-    ) {
-        output.append(NSAttributedString(string: string, attributes: attributes))
-    }
-}
-
-private enum AITranscriptRole {
-    case user
-    case assistant
-    case system
-    case command
-    case terminal
-    case plan
-    case step
-
-    var isProcessRole: Bool {
-        switch self {
-        case .command, .terminal, .plan, .step:
-            return true
-        case .user, .assistant, .system:
-            return false
-        }
-    }
-
-    init(historyRole: AIConversationHistoryRole) {
-        switch historyRole {
-        case .user:
-            self = .user
-        case .assistant:
-            self = .assistant
-        case .command:
-            self = .command
-        case .terminal:
-            self = .terminal
-        case .plan:
-            self = .plan
-        case .step:
-            self = .step
-        }
-    }
-
-    var historyRole: AIConversationHistoryRole {
-        switch self {
-        case .user:
-            return .user
-        case .assistant:
-            return .assistant
-        case .system:
-            return .assistant
-        case .command:
-            return .command
-        case .terminal:
-            return .terminal
-        case .plan:
-            return .plan
-        case .step:
-            return .step
-        }
-    }
-
-    var persistedHistoryRole: AIConversationHistoryRole? {
-        switch self {
-        case .system:
-            return nil
-        default:
-            return historyRole
-        }
-    }
-}
-
-private struct AITranscriptAttachment: Equatable {
-    let filename: String
-    let displayKind: String
-    let byteCount: Int
-    let isImage: Bool
-
-    init(_ attachment: AIAssistantAttachment) {
-        filename = attachment.filename
-        displayKind = attachment.displayKind
-        byteCount = attachment.byteCount
-        isImage = attachment.isImage
-    }
-
-    var metadataText: String {
-        let size = ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
-        return "\(displayKind) · \(size)"
-    }
-}
-
-private struct AITranscriptEntry {
-    let id: UUID
-    let role: AITranscriptRole
-    var text: String
-    var conversationContent: String? = nil
-    var attachments: [AITranscriptAttachment] = []
-    let requestID: String?
-    var isProcessEntry: Bool = false
-    var processGroupID: UUID? = nil
-    var isCollapsed: Bool = false
-    var createdAt: Date = Date()
-    var executionCard: ExecutionCardPresentation? = nil
-
-    init(
-        id: UUID = UUID(),
-        role: AITranscriptRole,
-        text: String,
-        conversationContent: String? = nil,
-        attachments: [AITranscriptAttachment] = [],
-        requestID: String?,
-        isProcessEntry: Bool = false,
-        processGroupID: UUID? = nil,
-        isCollapsed: Bool = false,
-        createdAt: Date = Date(),
-        executionCard: ExecutionCardPresentation? = nil
-    ) {
-        self.id = id
-        self.role = role
-        self.text = text
-        self.conversationContent = conversationContent
-        self.attachments = attachments
-        self.requestID = requestID
-        self.isProcessEntry = isProcessEntry
-        self.processGroupID = processGroupID
-        self.isCollapsed = isCollapsed
-        self.createdAt = createdAt
-        self.executionCard = executionCard
-    }
-
-    var displayText: String {
-        guard isCollapsed else { return text }
-        let firstLine = text.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? text
-        return "\(firstLine) · 已折叠，点击展开"
-    }
-
-    var font: NSFont {
-        switch role {
-        case .user:
-            return .systemFont(ofSize: 12, weight: .semibold)
-        case .assistant:
-            return .systemFont(ofSize: 12)
-        case .system:
-            return .systemFont(ofSize: 11, weight: .medium)
-        case .command:
-            return .monospacedSystemFont(ofSize: 11, weight: .regular)
-        case .terminal:
-            return .monospacedSystemFont(ofSize: 11, weight: .regular)
-        case .plan:
-            return .systemFont(ofSize: 12, weight: .medium)
-        case .step:
-            return .monospacedSystemFont(ofSize: 11, weight: .regular)
-        }
-    }
-
-    var textColor: NSColor {
-        switch role {
-        case .user:
-            return StacioDesignSystem.theme.primaryTextColor
-        case .assistant:
-            return StacioDesignSystem.theme.primaryTextColor
-        case .system:
-            return StacioDesignSystem.theme.secondaryTextColor
-        case .command:
-            return StacioDesignSystem.theme.primaryTextColor
-        case .terminal:
-            return StacioDesignSystem.theme.primaryTextColor
-        case .plan:
-            return StacioDesignSystem.theme.primaryTextColor
-        case .step:
-            return StacioDesignSystem.theme.secondaryTextColor
-        }
-    }
-
-    var bubbleAccessibilityIdentifier: String {
-        switch role {
-        case .user:
-            return "Stacio.AI.transcript.userBubble"
-        case .assistant:
-            return "Stacio.AI.transcript.assistantBubble"
-        case .system:
-            return "Stacio.AI.transcript.systemBubble"
-        case .command:
-            return "Stacio.AI.transcript.commandBubble"
-        case .terminal:
-            return "Stacio.AI.transcript.terminalBubble"
-        case .plan:
-            return "Stacio.AI.transcript.planBubble"
-        case .step:
-            return "Stacio.AI.transcript.stepBubble"
-        }
-    }
-
-    var textAccessibilityIdentifier: String {
-        switch role {
-        case .user:
-            return "Stacio.AI.transcript.userText"
-        case .assistant:
-            return "Stacio.AI.transcript.assistantText"
-        case .system:
-            return "Stacio.AI.transcript.systemText"
-        case .command:
-            return "Stacio.AI.transcript.commandText"
-        case .terminal:
-            return "Stacio.AI.transcript.terminalText"
-        case .plan:
-            return "Stacio.AI.transcript.planText"
-        case .step:
-            return "Stacio.AI.transcript.stepText"
-        }
-    }
-
-    var bubbleColor: NSColor {
-        switch role {
-        case .user:
-            return StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.48)
-        case .assistant:
-            return .clear
-        case .system:
-            return .clear
-        case .command:
-            return StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.34)
-        case .terminal:
-            return StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.36)
-        case .plan:
-            return StacioDesignSystem.theme.elevatedPanelColor.withAlphaComponent(0.72)
-        case .step:
-            return StacioDesignSystem.theme.controlBackgroundColor.withAlphaComponent(0.28)
-        }
-    }
-
-    var borderColor: NSColor? {
-        switch role {
-        case .user:
-            return StacioDesignSystem.theme.accentColor.withAlphaComponent(0.32)
-        case .assistant, .system:
-            return nil
-        case .command, .terminal:
-            return StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.2)
-        case .plan:
-            return StacioDesignSystem.theme.accentColor.withAlphaComponent(0.28)
-        case .step:
-            return StacioDesignSystem.theme.separatorColor.withAlphaComponent(0.18)
-        }
-    }
-
-    var bubbleCornerRadius: CGFloat {
-        switch role {
-        case .command, .terminal, .plan, .step:
-            return StacioDesignSystem.theme.panelCornerRadius
-        case .user:
-            return StacioDesignSystem.theme.panelCornerRadius
-        case .assistant, .system:
-            return 0
-        }
-    }
-
-    var horizontalPadding: CGFloat {
-        switch role {
-        case .command, .terminal, .plan, .step:
-            return 12
-        case .user:
-            return 13
-        case .assistant:
-            return 0
-        case .system:
-            return 8
-        }
-    }
-
-    var verticalPadding: CGFloat {
-        switch role {
-        case .command, .terminal, .plan, .step:
-            return 10
-        case .user:
-            return 10
-        case .assistant:
-            return 8
-        case .system:
-            return 4
-        }
-    }
-
-    var verticalInset: CGFloat {
-        switch role {
-        case .command, .terminal, .plan, .step:
-            return 2
-        case .user, .assistant:
-            return 1
-        case .system:
-            return 1
-        }
     }
 }

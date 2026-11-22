@@ -72,6 +72,15 @@
       "xattrClean": true
     },
     {
+      "id": "ai-model-icons",
+      "container": "Resources",
+      "source": "Stacio/Resources/AIModelIcons",
+      "destination": "AIModelIcons",
+      "kind": "tree-contents",
+      "required": true,
+      "xattrClean": true
+    },
+    {
       "id": "font-sarasa-regular",
       "container": "Resources",
       "source": "Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf",

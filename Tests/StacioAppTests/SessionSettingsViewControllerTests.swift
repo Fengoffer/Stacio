@@ -625,7 +625,7 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         XCTAssertEqual(controller.validationMessageForTesting, "")
     }
 
-    func testSaveAndConnectButtonValidatesAndPersistsCredentialsBeforeRequestingConnection() throws {
+    func testConnectButtonValidatesAndPersistsCredentialsBeforeRequestingConnection() throws {
         let saver = RecordingSessionSettingsCredentialSaver(savedCredentialID: "saved-credential")
         let controller = SessionSettingsViewController(
             existingSession: nil,
@@ -634,37 +634,36 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         )
         controller.loadView()
         let button = try XCTUnwrap(controller.view.firstSubview(
-            withIdentifier: "Stacio.SessionSettings.saveAndConnectButton"
+            withIdentifier: "Stacio.SessionSettings.connectButton"
         ) as? NSButton)
-        XCTAssertEqual(button.title, "保存并连接")
-        XCTAssertFalse(button.isHidden)
         XCTAssertFalse(button.isEnabled)
 
         controller.setSSHValuesForTesting(SessionSidebarSessionFormValues(
             name: "Production", host: "prod.example", port: "22", username: "ops",
             authMode: .password, privateKeyPath: "", credentialSecret: "test-secret", tags: "prod"
         ))
-        var savedDraft: SessionDraft?
+        var connectedDraft: SessionDraft?
         var saveOnlyCalls = 0
         controller.onSave = { _ in saveOnlyCalls += 1 }
-        controller.onSaveAndConnect = { draft in
+        controller.onConnect = { draft, password in
             XCTAssertEqual(saver.savedSecrets, ["test-secret"])
-            savedDraft = draft
+            XCTAssertNil(password, "连接应当先持久化凭据，不再传临时密码")
+            connectedDraft = draft
         }
         XCTAssertTrue(button.isEnabled)
         button.performClick(nil)
 
-        XCTAssertEqual(savedDraft?.credentialId, "saved-credential")
-        XCTAssertEqual(savedDraft?.folderId, "folder-prod")
-        XCTAssertEqual(savedDraft?.host, "prod.example")
-        XCTAssertEqual(saveOnlyCalls, 0)
-        XCTAssertFalse(savedDraft?.configJson?.contains("test-secret") ?? false)
+        XCTAssertEqual(connectedDraft?.credentialId, "saved-credential")
+        XCTAssertEqual(connectedDraft?.folderId, "folder-prod")
+        XCTAssertEqual(connectedDraft?.host, "prod.example")
+        XCTAssertEqual(saveOnlyCalls,0)
+        XCTAssertFalse(connectedDraft?.configJson?.contains("test-secret") ?? false)
 
         controller.typeHostForTesting("")
         XCTAssertFalse(button.isEnabled)
     }
 
-    func testSaveAndConnectDoesNotRequestConnectionWhenCredentialSaveFails() throws {
+    func testConnectDoesNotRequestConnectionWhenCredentialSaveFails() throws {
         let controller = SessionSettingsViewController(
             existingSession: makeExistingSSHSession(), selectedFolderID: nil,
             draftFactory: SessionSidebarSessionDraftFactory(credentialSaver: FailingSaveAndConnectCredentialSaver())
@@ -676,10 +675,10 @@ final class SessionSettingsViewControllerTests: XCTestCase {
         ))
         var connectionRequested = false
         var errorReported = false
-        controller.onSaveAndConnect = { _ in connectionRequested = true }
+        controller.onConnect = { _, _ in connectionRequested = true }
         controller.onError = { _ in errorReported = true }
         let button = try XCTUnwrap(controller.view.firstSubview(
-            withIdentifier: "Stacio.SessionSettings.saveAndConnectButton"
+            withIdentifier: "Stacio.SessionSettings.connectButton"
         ) as? NSButton)
         button.performClick(nil)
         XCTAssertTrue(errorReported)

@@ -126,7 +126,18 @@ public final class InspectorViewController: NSViewController {
     public private(set) var deviceMetricsViewController: DeviceMetricsDashboardViewController?
     public private(set) var terminalMacroViewController: TerminalMacroViewController?
     public private(set) var commandHistoryViewController: CommandHistoryViewController?
-    public private(set) var aiAssistantViewController: AIAssistantPanelViewController?
+    public private(set) var aiAssistantViewController: AgentPanelViewController?
+ public var aiAssistantFactory: (() -> AgentPanelViewController?)?
+
+ /// Marks the AI tab when the assistant is waiting on the user (a pending
+ /// approval or a stopped turn) so the state stays visible while another tab
+ /// is selected. Without this, switching tabs silently hides the block.
+ public func setAIBadge(_ text: String?) {
+ guard let index = Section.allCases.firstIndex(of: .ai) else { return }
+ let base = Section.ai.label
+ let title = text.map { base + " " + $0 } ?? base
+ sectionControl.setLabel(title, forSegment: index)
+ }
 
     public init(
         transferHistoryStore: SCPTransferHistoryStoring? = nil,
@@ -134,7 +145,7 @@ public final class InspectorViewController: NSViewController {
         multiExecAuditStore: MultiExecAuditListing? = nil,
         agentAuditStore: AgentActionAuditListing? = nil,
         importReportStore: ImportReportListing? = nil,
-        aiAssistantViewController: AIAssistantPanelViewController? = nil,
+        aiAssistantViewController: AgentPanelViewController? = nil,
         workspaceSessionProtocolProvider: @escaping () -> WorkspaceSessionProtocol = { .noSession },
         tunnelLiveSessionContextProvider: @escaping () -> TunnelLiveSessionContext? = { nil },
         remoteFilePathTerminalSender: @escaping (String) -> Void = { _ in },
@@ -211,7 +222,23 @@ public final class InspectorViewController: NSViewController {
         nil
     }
 
-    public override func loadView() {
+   
+ /// Resolves the AI section controller once and keeps it, so callers see the
+ /// instance the section actually shows. Returning it from the dictionary
+ /// alone left `aiAssistantViewController` nil even when the panel rendered.
+	private func resolveAISectionController() -> NSViewController {
+		if let existing = aiAssistantViewController { return existing }
+		guard let resolved = makeDefaultAIAssistantViewController() else {
+			// The factory is assigned by the window after this controller is built, so
+			// the first pass can legitimately find no panel. Keep a placeholder and
+			// retry on demand instead of freezing that miss for the whole session.
+			return NSViewController()
+		}
+		aiAssistantViewController = resolved
+		return resolved
+	}
+
+ public override func loadView() {
         let container = CompressibleInspectorRootView()
         container.translatesAutoresizingMaskIntoConstraints = true
         container.autoresizingMask = [.width, .height]
@@ -281,10 +308,10 @@ public final class InspectorViewController: NSViewController {
             }
         }
         files.onRemoveTransferHistory = { [weak self] jobID in
-            _ = self?.transferQueueCoordinator?.removeFinishedTransfer(jobID: jobID)
+            self?.transferQueueCoordinator?.removeFinishedTransfer(jobID: jobID)
         }
         files.onClearTransferHistory = { [weak self] in
-            _ = self?.transferQueueCoordinator?.clearFinishedTransfers()
+            self?.transferQueueCoordinator?.clearFinishedTransfers()
         }
         transferQueueCoordinator?.onSnapshotChanged = { [weak files] snapshot in
             files?.setTransferStatusSnapshot(snapshot)
@@ -350,17 +377,9 @@ public final class InspectorViewController: NSViewController {
         remoteBrowser.remoteDownloadDelegate = self
         remoteBrowserViewController = remoteBrowser
 
-        let aiAssistant = aiAssistantViewController ?? makeDefaultAIAssistantViewController()
-        aiAssistantViewController = aiAssistant
-        aiAssistant.currentRemoteFileAttachmentProvider = { [weak self] in
-            guard let filesCoordinator = self?.filesCoordinator else {
-                throw AIAssistantRemoteFileAttachmentError.unsupportedProtocol
-            }
-            return try filesCoordinator.makeSelectedRemoteFileAIContextAttachment()
-        }
-        aiAssistant.currentRemoteFileAttachmentAvailabilityProvider = { [weak self] in
-            self?.filesCoordinator?.canAttachSelectedRemoteFileAsAIContext() ?? false
-        }
+ if let aiAssistant = aiAssistantViewController ?? makeDefaultAIAssistantViewController() {
+ aiAssistantViewController = aiAssistant
+ }
         let commandHistory = CommandHistoryViewController()
         commandHistory.setEntries(commandHistoryProvider())
         commandHistory.onPasteCommand = { [commandHistoryPasteHandler] command in
@@ -391,15 +410,15 @@ public final class InspectorViewController: NSViewController {
         }
         terminalMacroViewController = terminalMacros
 
-        sectionViewControllers = [
-            .files: files,
-            .tunnels: tunnels,
-            .browser: remoteBrowser,
-            .logs: diagnostics,
-            .macros: terminalMacros,
-            .commandHistory: commandHistory,
-            .ai: aiAssistant
-        ]
+ sectionViewControllers = [
+ .files: files,
+ .tunnels: tunnels,
+ .browser: remoteBrowser,
+ .logs: diagnostics,
+ .macros: terminalMacros,
+ .commandHistory: commandHistory,
+ .ai: resolveAISectionController()
+ ]
 
         for controller in sectionViewControllers.values {
             addChild(controller)
@@ -998,10 +1017,7 @@ public final class InspectorViewController: NSViewController {
         guard allowsWorkspaceSection(.ai) else { return }
         selectAIAssistantTab()
         aiAssistantViewController?.refreshForCurrentContext()
-        aiAssistantViewController?.prefillQuestion(
-            request.question,
-            attachments: [request.attachment]
-        )
+ aiAssistantViewController?.prefillQuestion(request.question)
         aiAssistantViewController?.focusQuestionField()
     }
 
@@ -1020,6 +1036,15 @@ public final class InspectorViewController: NSViewController {
             subview.removeFromSuperview()
         }
 
+		// The AI panel may have been unavailable when this controller was built;
+		// retry now that the window has had a chance to supply its factory.
+		if section == .ai, aiAssistantViewController == nil,
+			let panel = makeDefaultAIAssistantViewController() {
+			aiAssistantViewController = panel
+			sectionViewControllers[.ai] = panel
+			addChild(panel)
+		}
+		
         guard let controller = sectionViewControllers[section] else {
             return
         }
@@ -1238,7 +1263,7 @@ public final class InspectorViewController: NSViewController {
                 completionNotificationPresenter: transferCompletionNotificationPresenter,
                 queueViewController: transferQueue
             )
-            try? coordinator.restoreHistory()
+            coordinator.loadHistoryWhenOpened()
             return coordinator
         }
         return TransferQueueCoordinator(
@@ -1247,15 +1272,9 @@ public final class InspectorViewController: NSViewController {
         )
     }
 
-    private func makeDefaultAIAssistantViewController() -> AIAssistantPanelViewController {
-        AIAssistantPanelViewController(
-            coordinator: AIAssistantCoordinator(
-                provider: RuleBasedAIAssistantProvider(),
-                executionCoordinator: UnavailableAgentCommandExecutor()
-            ),
-            contextProvider: { nil }
-        )
-    }
+    private func makeDefaultAIAssistantViewController() -> AgentPanelViewController? {
+		return aiAssistantFactory?()
+ }
 
     private static func makeHeaderButton(
         symbolName: String,

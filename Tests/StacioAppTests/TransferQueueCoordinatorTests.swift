@@ -734,7 +734,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(scpBridge.events, [])
         XCTAssertEqual(queue.transferCount, 1)
-        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "准备传输")
         XCTAssertFalse(queue.visibleTextSnapshot.localizedCaseInsensitiveContains("SFTP"))
 
         let completed = await eventually {
@@ -1382,7 +1382,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
 
         let firstStarted = await eventually { bridge.startedJobIDs == [firstJob.id] }
         XCTAssertTrue(firstStarted)
-        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "准备传输")
         XCTAssertEqual(queue.tableView.statusText(row: 1), "排队中")
 
         bridge.release(jobID: firstJob.id)
@@ -1390,7 +1390,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         let secondStarted = await eventually { bridge.startedJobIDs == [firstJob.id, secondJob.id] }
         XCTAssertTrue(secondStarted)
         XCTAssertEqual(queue.tableView.statusText(row: 0), "已完成")
-        XCTAssertEqual(queue.tableView.statusText(row: 1), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 1), "准备传输")
 
         bridge.release(jobID: secondJob.id)
 
@@ -1478,8 +1478,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             Set(bridge.startedJobIDs) == Set([firstJob.id, secondJob.id])
         }
         XCTAssertTrue(firstTwoStarted)
-        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
-        XCTAssertEqual(queue.tableView.statusText(row: 1), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "准备传输")
+        XCTAssertEqual(queue.tableView.statusText(row: 1), "准备传输")
         XCTAssertEqual(queue.tableView.statusText(row: 2), "排队中")
         XCTAssertTrue(snapshots.contains { snapshot in
             snapshot.rows.map(\.jobID) == [firstJob.id, secondJob.id, thirdJob.id]
@@ -1492,7 +1492,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             Set(bridge.startedJobIDs) == Set([firstJob.id, secondJob.id, thirdJob.id])
         }
         XCTAssertTrue(thirdStarted)
-        XCTAssertEqual(queue.tableView.statusText(row: 2), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 2), "准备传输")
 
         bridge.release(jobID: secondJob.id)
         bridge.release(jobID: thirdJob.id)
@@ -1705,12 +1705,23 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.requestedOffset), [0, 40])
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.forceRestart), [false, false])
 
+        // An interrupted range is retransmitted from its verified checkpoint,
+        // which can be behind the bytes displayed just before pausing.
+        bridge.progressBatchesByJobID[job.id] = [[
+            ScpTransferProgress(jobId: job.id, bytesDone: 0, bytesTotal: 100, status: "resuming"),
+            ScpTransferProgress(jobId: job.id, bytesDone: 10, bytesTotal: 100, status: "running")
+        ]]
+        coordinator.pollScheduledTransferProgressForTesting()
+        let resumedProgress = await eventually { snapshots.last?.rows.first?.bytesDone == 10 }
+        XCTAssertTrue(resumedProgress, "The verified resume baseline must replace the uncommitted display counter")
+
         bridge.release(jobID: job.id)
         let completed = await eventually { queue.tableView.statusText(row: 0) == "已完成" }
         XCTAssertTrue(completed)
         XCTAssertEqual(completionStatuses, ["completed"])
         XCTAssertEqual(presenter.payloads.first?.duration, 10)
-        XCTAssertEqual(presenter.payloads.first?.averageBytesPerSecond, 10)
+        // 40 bytes in the first run plus 100 after the checkpoint rolled back to zero.
+        XCTAssertEqual(presenter.payloads.first?.averageBytesPerSecond, 14)
         XCTAssertEqual(history.events.filter { $0.contains(":paused:40") }, [
             "progress:job_background_pause_resume:paused:40"
         ])
@@ -1839,7 +1850,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
 
         let restarted = await eventually { bridge.startedJobIDs == [job.id, job.id] }
         XCTAssertTrue(restarted)
-        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "准备传输")
         XCTAssertEqual(queue.tableView.progressText(row: 0), "0%")
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.requestedOffset), [0, 0])
         XCTAssertEqual(bridge.resumeOptionsByRun.map(\.forceRestart), [false, true])
@@ -3969,10 +3980,11 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         coordinator.replaceProgressForTesting(jobID: failedJob.id, status: "failed", bytesDone: 40)
         coordinator.replaceProgressForTesting(jobID: runningJob.id, status: "running", bytesDone: 25)
 
-        let removedCount = coordinator.clearFinishedTransfers()
+        var removedCount: Int?
+        coordinator.clearFinishedTransfers { removedCount = $0 }
 
         XCTAssertEqual(removedCount, 2)
-        XCTAssertEqual(history.events.last, "clear-finished")
+        XCTAssertEqual(history.events.suffix(2), ["clear-finished", "list-jobs"])
         XCTAssertEqual(queue.transferCount, 2)
         XCTAssertEqual(queue.tableView.fileText(row: 0), "queued.tar")
         XCTAssertEqual(queue.tableView.statusText(row: 0), "排队中")
@@ -4018,8 +4030,8 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         coordinator.replaceProgressForTesting(jobID: failedJob.id, status: "failed", bytesDone: 40)
         coordinator.replaceProgressForTesting(jobID: runningJob.id, status: "running", bytesDone: 25)
 
-        XCTAssertTrue(coordinator.removeFinishedTransfer(jobID: completedJob.id))
-        XCTAssertFalse(coordinator.removeFinishedTransfer(jobID: runningJob.id))
+        coordinator.removeFinishedTransfer(jobID: completedJob.id) { XCTAssertTrue($0) }
+        coordinator.removeFinishedTransfer(jobID: runningJob.id) { XCTAssertFalse($0) }
 
         XCTAssertTrue(history.events.contains("delete-finished:\(completedJob.id)"))
         XCTAssertFalse(history.events.contains("delete-finished:\(runningJob.id)"))
@@ -4048,9 +4060,24 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             bytesDone: 100
         )
 
-        XCTAssertFalse(coordinator.removeFinishedTransfer(jobID: completedJob.id))
+        coordinator.removeFinishedTransfer(jobID: completedJob.id) { XCTAssertFalse($0) }
         XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [completedJob.id])
         XCTAssertEqual(history.events.last, "delete-finished:\(completedJob.id)")
+    }
+
+    func testClearFinishedKeepsRowsThatStillExistInHistory() {
+        let saved = ScpTransferJob(id: "still-saved", direction: .upload, sourcePath: "/a", destinationPath: "/b", bytesTotal: 10)
+        let removed = ScpTransferJob(id: "removed", direction: .upload, sourcePath: "/c", destinationPath: "/d", bytesTotal: 10)
+        let history = RecordingTransferHistoryStore(jobs: [.init(job: saved, sessionId: nil, status: "queued", bytesDone: 0)])
+        let queue = TransferQueueViewController()
+        queue.loadView()
+        let coordinator = TransferQueueCoordinator(historyStore: history, queueViewController: queue)
+        for job in [saved, removed] {
+            coordinator.enqueueTransfer(job: job)
+            coordinator.replaceProgressForTesting(jobID: job.id, status: "completed", bytesDone: 10)
+        }
+        coordinator.clearFinishedTransfers { XCTAssertEqual($0, 1) }
+        XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [saved.id])
     }
 
     func testCoordinatorKeepsFinishedTransfersWhenPersistentClearFails() {
@@ -4075,7 +4102,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             bytesDone: 100
         )
 
-        XCTAssertEqual(coordinator.clearFinishedTransfers(), 0)
+        coordinator.clearFinishedTransfers { XCTAssertEqual($0, 0) }
         XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [completedJob.id])
         XCTAssertEqual(history.events.last, "clear-finished")
     }
@@ -4136,7 +4163,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertTrue(firstStarted)
 
         XCTAssertTrue(coordinator.stopTransfer(jobID: firstJob.id))
-        XCTAssertEqual(coordinator.clearFinishedTransfers(), 1)
+        coordinator.clearFinishedTransfers { XCTAssertEqual($0, 1) }
         XCTAssertEqual(queue.snapshotForTesting.rows.map(\.jobID), [secondJob.id])
         XCTAssertEqual(queue.snapshotForTesting.rows.first?.rawStatus, "queued")
         let overlappedBeforeFirstFinished = await eventually(timeout: 0.05) {
@@ -4238,7 +4265,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertTrue(didStart)
 
         XCTAssertFalse(coordinator.cancelTransfer(jobID: job.id))
-        XCTAssertEqual(queue.tableView.statusText(row: 0), "传输中")
+        XCTAssertEqual(queue.tableView.statusText(row: 0), "准备传输")
         XCTAssertNil(terminalProgress)
 
         bridge.release(jobID: job.id)
@@ -4543,6 +4570,40 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshots.last?.rows.first?.bytesDone, 10)
     }
 
+    func testDirectBatchStartsTimingOnlyWhenWorkerIsAvailable() async throws {
+        let files = CrossDeviceRecordingRemoteBridge()
+        files.entriesByPath["/archive"] = []
+        let bridge = RecordingRemoteToRemoteTransferBridge(delay: 0.65)
+        let view = TransferQueueViewController()
+        view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        let coordinator = CrossDeviceTransferCoordinator(remoteTransferBridge: bridge)
+        func endpoint(_ id: String) -> CrossDeviceRemoteEndpoint {
+            CrossDeviceRemoteEndpoint(runtimeID: id, title: id, context: Self.crossDeviceContext(host: id),
+                                      bridge: files, transferScheduler: queue)
+        }
+        var rows: [TransferQueueSnapshot.Row] = []
+        let observation = queue.observeQueue(runtimeIDs: { ["dst"] }) { rows = $0.rows }
+        defer { queue.removeQueueObservation(observation) }
+        let filesToCopy = (1...3).map { RemoteFileSelection(path: "/incoming/file-\($0)", size: 1_048_576) }
+        _ = coordinator.transfer(filesToCopy, from: endpoint("src"), to: endpoint("dst"),
+                                 destinationDirectory: "/archive", operation: .copy,
+                                 conflictResolution: .replace, statusHandler: { _ in })
+        let started = await eventually { bridge.requests.count == 2 && rows.count == 3 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(rows.filter { $0.rawStatus == "running" }.count, 2)
+        let queued = try XCTUnwrap(rows.first { $0.rawStatus == "queued" })
+        XCTAssertTrue(queue.pauseTransfer(jobID: queued.jobID))
+        XCTAssertTrue(queue.resumeTransfer(jobID: queued.jobID))
+        XCTAssertEqual(rows.first { $0.jobID == queued.jobID }?.rawStatus, "queued")
+        XCTAssertTrue(bridge.cancelledJobIDs.isEmpty)
+        let finished = await eventually(timeout: 4) { rows.filter { $0.rawStatus == "completed" }.count == 3 }
+        XCTAssertTrue(finished)
+        let rates = rows.map { $0.averageBytesPerSecond / 1_048_576 }.sorted()
+        XCTAssertGreaterThan(rates.first ?? 0, (rates.last ?? 0) * 0.8)
+        print("TRANSFER_BATCH_MIB_PER_SECOND=\(rates)")
+    }
+
     func testExternalTransferQueuePauseResumeAndCancelInvokeTransportControls() {
         let queueView = TransferQueueViewController()
         queueView.loadView()
@@ -4683,7 +4744,7 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(started)
 
-        XCTAssertTrue(task.pause())
+        XCTAssertNotNil(task.pauseWithProgress())
         try await Task.sleep(nanoseconds: 30_000_000)
         let pausedBytes = task.currentProgress.bytesDone
         try await Task.sleep(nanoseconds: 40_000_000)
@@ -5979,12 +6040,129 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         let didCancel = await eventually(timeout: 3) { statuses.last == .cancelled }
         XCTAssertTrue(didCancel)
         XCTAssertEqual(directBridge.requests.count, 2)
-        XCTAssertEqual(directBridge.cancelledJobIDs.count, 3)
+        XCTAssertEqual(Set(directBridge.cancelledJobIDs), Set(directBridge.requests.map { $0.job.id }))
         let didFinishEveryQueueRow = await eventually(timeout: 3) {
             latestQueueSnapshot.rows.count == 3
                 && latestQueueSnapshot.rows.allSatisfy { $0.rawStatus == "canceled" }
         }
         XCTAssertTrue(didFinishEveryQueueRow)
+    }
+
+    func testStopButtonRequiresTransportAcceptanceAndIgnoresLateExternalCallbacks() {
+        let view = TransferQueueViewController()
+        view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        let job = ScpTransferJob(id: "queued-stop", direction: .upload, sourcePath: "/src", destinationPath: "/dst", bytesTotal: 100)
+        var acceptsStop = false
+        var calls = 0
+        queue.registerExternalTransfer(runtimeID: "dest", job: job, startsQueued: true,
+            progressProvider: { [] }, resume: { true }, cancel: { calls += 1; return acceptsStop }, pauseWithProgress: { [] })
+        view.tableView.selectRowIndexes([0], byExtendingSelection: false)
+        view.performTransferActionForTesting(at: 1)
+        XCTAssertEqual(view.snapshotForTesting.rows.first?.rawStatus, "queued")
+        acceptsStop = true
+        view.performTransferActionForTesting(at: 1)
+        XCTAssertEqual(calls, 2)
+        queue.acquireExternalSlot(jobID: job.id)
+        queue.finishExternalTransfer(jobID: job.id, status: "completed", bytesDone: 100)
+        XCTAssertEqual(view.snapshotForTesting.rows.first?.rawStatus, "stopped")
+    }
+
+    func testStoppingDirectRowsLeavesOtherFilesRunning() async throws {
+        let listing = CrossDeviceRecordingRemoteBridge()
+        let bridge = RecordingRemoteToRemoteTransferBridge(delay: 0.4)
+        let view = TransferQueueViewController()
+        view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        let manager = CrossDeviceTransferCoordinator(remoteTransferBridge: bridge)
+        func endpoint(_ name: String) -> CrossDeviceRemoteEndpoint {
+            CrossDeviceRemoteEndpoint(runtimeID: name, title: name, context: Self.crossDeviceContext(host: name),
+                                      bridge: listing, transferScheduler: queue)
+        }
+        var status: CrossDeviceTransferStatus?
+        let files = (1...4).map { RemoteFileSelection(path: "/in/file-\($0)", size: 1024) }
+        let operation = manager.transfer(files, from: endpoint("stop-source"), to: endpoint("stop-target"),
+                                         destinationDirectory: "/out", operation: .copy, conflictResolution: .replace) { status = $0 }
+        defer { _ = manager.cancel(operationID: operation) }
+        let started = await eventually { bridge.requests.count == 2 }
+        XCTAssertTrue(started)
+        let rows = view.snapshotForTesting.rows
+        let queued = try XCTUnwrap(rows.first { $0.rawStatus == "queued" }).jobID
+        let running = try XCTUnwrap(rows.first { $0.rawStatus == "running" }).jobID
+        XCTAssertTrue(queue.stopTransfer(jobID: queued))
+        XCTAssertTrue(queue.stopTransfer(jobID: running))
+        let done = await eventually { status == .cancelled }
+        XCTAssertTrue(done)
+        XCTAssertEqual(bridge.cancelledJobIDs, [running])
+        XCTAssertFalse(bridge.requests.contains { $0.job.id == queued })
+        XCTAssertEqual(Set(view.snapshotForTesting.rows.filter { $0.rawStatus == "stopped" }.map(\.jobID)), [running, queued])
+        XCTAssertEqual(view.snapshotForTesting.rows.filter { $0.rawStatus == "completed" }.count, 2)
+    }
+
+    func testResumeAllRequeuesEveryPausedDirectTransferUntilAdmitted() {
+        let view = TransferQueueViewController()
+        view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        var resumed: [String] = []
+        let ids = (1...100).map { "direct-\($0)" }
+        for id in ids {
+            let job = ScpTransferJob(id: id, direction: .upload, sourcePath: "/src", destinationPath: "/dst", bytesTotal: 100)
+            queue.registerExternalTransfer(runtimeID: "dest", job: job, startsQueued: true,
+                progressProvider: { [] }, resume: { resumed.append(id); return true },
+                cancel: { true }, pauseWithProgress: { [] })
+        }
+        ids.prefix(2).forEach { queue.acquireExternalSlot(jobID: $0) }
+        var snapshots = 0
+        queue.onSnapshotChanged = { _ in snapshots += 1 }
+        XCTAssertEqual(queue.pauseAllTransfers(), ids.count)
+        XCTAssertEqual(snapshots, 1)
+        XCTAssertTrue(view.bulkActionAvailabilityForTesting.resume)
+        view.performResumeAllForTesting()
+        XCTAssertEqual(snapshots, 2)
+        XCTAssertEqual(resumed, ids)
+        XCTAssertEqual(view.snapshotForTesting.rows.map(\.rawStatus), ids.map { _ in "queued" })
+        XCTAssertFalse(view.bulkActionAvailabilityForTesting.resume)
+        ids.prefix(2).forEach { queue.acquireExternalSlot(jobID: $0) }
+        XCTAssertEqual(view.snapshotForTesting.rows.map(\.rawStatus), ["running", "running"] + ids.dropFirst(2).map { _ in "queued" })
+        ids.forEach { queue.finishExternalTransfer(jobID: $0, status: "completed", bytesDone: 100) }
+    }
+
+    func testPausedDirectJobsReleaseSlotsAndCancelOnlyLiveAttempts() async throws {
+        let listing = CrossDeviceRecordingRemoteBridge()
+        let bridge = RecordingRemoteToRemoteTransferBridge(blockUntilCancelled: true)
+        let view = TransferQueueViewController()
+        view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        let manager = CrossDeviceTransferCoordinator(remoteTransferBridge: bridge)
+        func endpoint(_ name: String) -> CrossDeviceRemoteEndpoint {
+            CrossDeviceRemoteEndpoint(runtimeID: name, title: name, context: Self.crossDeviceContext(host: name),
+                                      bridge: listing, transferScheduler: queue)
+        }
+        var rows: [TransferQueueSnapshot.Row] = []
+        let observer = queue.observeQueue(runtimeIDs: { ["target"] }) { rows = $0.rows }
+        defer { queue.removeQueueObservation(observer) }
+        var status: CrossDeviceTransferStatus?
+        let files = (1...4).map { RemoteFileSelection(path: "/incoming/file-\($0)", size: 1024) }
+        let operation = manager.transfer(files, from: endpoint("source"), to: endpoint("target"),
+                                         destinationDirectory: "/out", operation: .copy,
+                                         conflictResolution: .replace) { status = $0 }
+        defer { _ = manager.cancel(operationID: operation) }
+        let started = await eventually { bridge.requests.count == 2 }
+        XCTAssertTrue(started)
+        let paused = bridge.requests.map { $0.job.id }
+        for id in paused { XCTAssertTrue(queue.pauseTransfer(jobID: id)) }
+        let replaced = await eventually { bridge.requests.count == 4 }
+        XCTAssertTrue(replaced)
+        XCTAssertEqual(rows.filter { $0.rawStatus == "running" }.count, 2)
+        XCTAssertEqual(rows.filter { $0.rawStatus == "paused" }.count, 2)
+        let first = try XCTUnwrap(paused.first)
+        XCTAssertTrue(queue.resumeTransfer(jobID: first))
+        XCTAssertEqual(rows.first { $0.jobID == first }?.rawStatus, "queued")
+        XCTAssertTrue(queue.cancelTransfer(jobID: first))
+        let cancelled = await eventually { status == .cancelled }
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(bridge.cancelledJobIDs.sorted(), bridge.requests.map { $0.job.id }.sorted())
+        XCTAssertEqual(bridge.maximumConcurrentRequests, 2)
     }
 
     func testCrossDeviceDirectTransferFastPauseResumeConsumesExpectedTransportCancellation() async throws {
@@ -6099,6 +6277,15 @@ final class TransferQueueCoordinatorTests: XCTestCase {
             listingStarted.wait(timeout: .now()) == .success
         }
         XCTAssertTrue(didStartListing)
+        let other = CrossDeviceTransferCoordinator(remoteTransferBridge: directBridge)
+        var duplicate: CrossDeviceTransferStatus?
+        let duplicateID = other.transfer([.init(path: "/incoming", size: 1024, kind: .directory)],
+            from: source, to: destination, destinationDirectory: "/archive", operation: .copy,
+            conflictResolution: .replace) { duplicate = $0 }
+        let rejected = await eventually { if case .failed = duplicate { return true }; return false }
+        XCTAssertTrue(rejected)
+        XCTAssertFalse(other.cancel(operationID: duplicateID))
+        XCTAssertTrue(destinationBridge.deletedPaths.isEmpty)
         XCTAssertTrue(coordinator.cancel(operationID: operationID))
         allowListingToReturn.signal()
 
@@ -6107,6 +6294,73 @@ final class TransferQueueCoordinatorTests: XCTestCase {
         XCTAssertTrue(directBridge.requests.isEmpty)
         XCTAssertEqual(destinationBridge.deletedPaths.count, 1)
         XCTAssertTrue(destinationBridge.deletedPaths.first?.contains(".incoming.stacio-transfer-") == true)
+    }
+
+    func testStoppedSiblingDoesNotBlockDirectoryReplacement() async throws {
+        try await verifyDirectoryCommit(stoppingChild: false, renameFails: false)
+    }
+
+    func testStoppedChildPreservesEntireOldDirectory() async throws {
+        try await verifyDirectoryCommit(stoppingChild: true, renameFails: false)
+    }
+
+    func testFailedDirectoryRenameDoesNotPublishCompletedRows() async throws {
+        try await verifyDirectoryCommit(stoppingChild: false, renameFails: true)
+    }
+
+    private func verifyDirectoryCommit(stoppingChild: Bool, renameFails: Bool) async throws {
+        let src = CrossDeviceRecordingRemoteBridge(), dst = CrossDeviceRecordingRemoteBridge()
+        let target = "/archive/incoming"
+        let stopPath = stoppingChild ? "/incoming/other.txt" : "/other.txt"
+        src.entriesByPath["/incoming"] = [.init(kind: .file, path: "/incoming/new.txt", size: 3, linkTarget: nil)]
+        var selections = [RemoteFileSelection(path: "/incoming", size: 3, kind: .directory)]
+        if stoppingChild {
+            src.entriesByPath["/incoming", default: []].append(.init(kind: .file, path: stopPath, size: 3, linkTarget: nil))
+        } else {
+            selections.append(.init(path: stopPath, size: 3))
+        }
+        dst.entriesByPath["/archive"] = [.init(kind: .directory, path: target, size: 0, linkTarget: nil)]
+        dst.directoryChildren = [target: ["old.txt"]]
+        if renameFails { dst.renameFailuresByDestination = [target: 1] }
+        let bridge = RecordingRemoteToRemoteTransferBridge(delay: 0.35)
+        let manager = CrossDeviceTransferCoordinator(remoteTransferBridge: bridge)
+        let view = TransferQueueViewController(); view.loadView()
+        let queue = TransferQueueCoordinator(queueViewController: view)
+        func endpoint(_ name: String, _ files: CrossDeviceRecordingRemoteBridge) -> CrossDeviceRemoteEndpoint {
+            .init(runtimeID: name, title: name, context: Self.crossDeviceContext(host: name), bridge: files, transferScheduler: queue)
+        }
+        var statuses: [String] = []
+        var latest = TransferQueueSnapshot(rows: [])
+        let observer = queue.observeQueue(runtimeIDs: { ["commit-dst"] }) { snapshot in
+            latest = snapshot
+            guard let state = snapshot.rows.first(where: { $0.sourcePath == "/incoming/new.txt" })?.rawStatus else { return }
+            statuses.append(state)
+            if state == "completed" { XCTAssertTrue(dst.renamedPaths.contains { $0.to == target }) }
+        }
+        defer { queue.removeQueueObservation(observer) }
+        var terminal: CrossDeviceTransferStatus?
+        _ = manager.transfer(selections, from: endpoint("commit-src", src), to: endpoint("commit-dst", dst),
+            destinationDirectory: "/archive", operation: .copy, conflictResolution: .replace) { terminal = $0 }
+        let started = await eventually { bridge.requests.count == 2 }; XCTAssertTrue(started)
+        let stopped = try XCTUnwrap(bridge.requests.first { $0.job.sourcePath == stopPath })
+        XCTAssertTrue(queue.stopTransfer(jobID: stopped.job.id))
+        let done = await eventually {
+            if case .failed = terminal { return true }
+            return terminal == .cancelled
+        }
+        XCTAssertTrue(done)
+        XCTAssertTrue(statuses.contains("finalizing"))
+        XCTAssertEqual(statuses.last, renameFails ? "failed" : stoppingChild ? "canceled" : "completed")
+        if stoppingChild || renameFails {
+            XCTAssertFalse(statuses.contains("completed"))
+            XCTAssertEqual(dst.directoryChildren[target], ["old.txt"])
+        } else {
+            XCTAssertTrue(dst.renamedPaths.contains { $0.from.contains(".partial") && $0.to == target })
+        }
+        let popover = TransferQueuePopoverViewController(); popover.apply(snapshot: latest)
+        let stoppedRow = try XCTUnwrap(popover.rowsForTesting.first { $0.jobID == stopped.job.id })
+        XCTAssertNil(stoppedRow.primaryActionLabel)
+        XCTAssertTrue(stoppedRow.canDelete)
     }
 
     func testCrossDeviceDirectTransferReplacesDirectoryThroughStagingWithoutMerging() async throws {

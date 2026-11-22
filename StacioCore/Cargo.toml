@@ -24,6 +24,7 @@ hex = "0.4"
 libc = "0.2"
 sha2 = "0.10"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+libssh2-sys = "0.3.1"
 thiserror = "2"
 uniffi = { version = "0.29", features = ["cli"] }
 uuid = { version = "1", features = ["v4", "serde"] }

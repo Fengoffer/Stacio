@@ -342,6 +342,22 @@ final class AddAIProviderSheetControllerTests: XCTestCase {
         XCTAssertTrue(emptyState.isHidden)
     }
 
+    func testProviderProtocolDefaultsToChatCompletionsAndPersistsResponses() throws {
+        let controller = makeFixture().controller
+        controller.loadView()
+        let profilePopup = try XCTUnwrap(
+            controller.view.firstSubview(withIdentifier: "Stacio.Settings.addAIProvider.profile") as? NSPopUpButton
+        )
+        profilePopup.selectItem(withTitle: "OpenAI")
+        profilePopup.sendAction(profilePopup.action, to: profilePopup.target)
+        
+        XCTAssertEqual(controller.protocolForTesting, .chatCompletions)
+        controller.selectProtocolForTesting(.responses)
+        XCTAssertEqual(controller.protocolForTesting, .responses)
+        let configuration = try XCTUnwrap(controller.makeConfigurationForTesting(id: UUID()))
+        XCTAssertEqual(configuration.compatibilityProtocol, .responses)
+    }
+
     func testUnselectedProviderCollapsesConditionalRows() throws {
         let controller = makeFixture().controller
         controller.loadView()
@@ -359,12 +375,22 @@ final class AddAIProviderSheetControllerTests: XCTestCase {
         let baseURLFrame = baseURLField.convert(baseURLField.bounds, to: controller.view)
         let modelSearchFrame = modelSearchField.convert(modelSearchField.bounds, to: controller.view)
 
-        XCTAssertLessThanOrEqual(
+        // Only the website entry is still conditional once no template is chosen;
+        // the credential row now stays visible so the form cannot look complete
+        // without a key. Assert the row is present rather than absent.
+        XCTAssertGreaterThan(
             baseURLFrame.minY - modelSearchFrame.maxY,
             18,
-            "Hidden website, credential, and fetch rows must not leave an empty block"
+            "The credential row occupies space so it is never silently dropped"
         )
-        XCTAssertTrue(controller.isAPIKeyHiddenForTesting)
+        // The credential field stays visible but disabled: hiding it made the
+        // form look like a provider could be saved without a key.
+        XCTAssertFalse(controller.isAPIKeyHiddenForTesting)
+        XCTAssertFalse(controller.isAPIKeyEnabledForTesting)
+        XCTAssertEqual(
+            controller.apiKeyHintForTesting,
+            L10n.Settings.addAIProviderChooseTemplateForCredential
+        )
         XCTAssertNil(controller.websiteButtonTitleForTesting)
     }
 
@@ -531,6 +557,25 @@ final class AddAIProviderSheetControllerTests: XCTestCase {
         controller.clearDefaultModelForTesting()
 
         XCTAssertTrue(controller.canSaveForTesting)
+    }
+
+    /// A custom OpenAI-compatible endpoint commonly does expose /v1/models, so
+    /// the sheet must offer discovery there while keeping manual entry available
+    /// for endpoints that do not.
+    func testCustomCompatibleProviderOffersBothDiscoveryAndManualEntry() throws {
+        let fixture = makeFixture()
+        let controller = fixture.controller
+        controller.loadView()
+        controller.selectProviderForTesting(catalogID: "provider.openai-compatible.custom")
+        
+        XCTAssertFalse(
+                controller.fetchModelsButtonHiddenForTesting,
+                "A custom OpenAI-compatible provider can enumerate models"
+        )
+        XCTAssertTrue(
+                controller.manualModelInputEnabledForTesting,
+                "Manual entry stays available for endpoints without enumeration"
+        )
     }
 
     func testManualModelIsDraftOnlyForCustomNoEnumerationProvider() throws {

@@ -315,6 +315,26 @@ public final class AgentComposerTextView: NSTextView {
         }
     }
 
+    /// NSTextView does not post a text-change notification while the input method is
+    /// still composing: the characters live in marked text, not in string. Override
+    /// the composition entry point so placeholder and draft state stay truthful.
+    override public func setMarkedText(
+        _ string: Any,
+        selectedRange: NSRange,
+        replacementRange: NSRange
+    ) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        NotificationCenter.default.post(
+            name: AgentComposerTextView.compositionDidChangeNotification,
+            object: self
+        )
+    }
+
+    /// Posted whenever marked text appears or changes during IME composition.
+    public static let compositionDidChangeNotification = Notification.Name(
+        "Stacio.AgentComposerTextView.compositionDidChange"
+    )
+
     /// 供测试的同步分发入口。
     public func handleKeyForTesting(
         keyCode: UInt16, modifiers: ComposerKeyModifiers = [], hasSelection: Bool = false

@@ -260,6 +260,47 @@ final class StacioDesignSystemTests: XCTestCase {
 
         XCTAssertTrue(emptyPrompt.isHidden)
     }
+    func testStyleTextFieldKeepsSearchFieldCellForLayout() {
+        //回归：Issue #6 —— NSSearchField若被换成普通NSTextFieldCell，
+        //在macOS27上点击"添加模型供应商"会触发-[NSSearchField layout]崩溃。
+        let searchField = NSSearchField()
+        StacioDesignSystem.styleTextField(searchField)
+        XCTAssertTrue(
+            searchField.cell is NSSearchFieldCell,
+            "styleTextField必须保留NSSearchFieldCell，否则搜索框布局会崩溃"
+        )
+    }
+
+    func testStyleSearchFieldKeepsSearchFieldCell() {
+        let searchField = NSSearchField()
+        StacioDesignSystem.styleSearchField(searchField)
+        XCTAssertTrue(searchField.cell is NSSearchFieldCell)
+    }
+    func testTerminalThemesRenderAnsiBlackDistinctFromBackground() {
+        //回归：ANSI30(black)若与终端背景相同，低亮度提示文字会完全不可见。
+        //常见于把背景色误填进black色位的主题，以及背景为纯黑的Stacio Dark。
+        //提亮只发生在渲染层（swiftTermAnsiColors），主题数据本身保持原值。
+        let themes: [TerminalColorTheme] = [
+            .portDeskDark, .oneHalfDark, .graphite, .emberTerminal, .nightOwl,
+            .flexokiDark, .hackerGreen, .cyberpunk, .gruvboxDark, .tokyoNight,
+            .nordicOps, .rosePine, .kanagawaWave, .cobalt2, .solarizedDark
+        ]
+        for theme in themes {
+            let rendered = theme.swiftTermAnsiColors[0]
+            guard let backgroundHex = theme.backgroundHex as String?,
+                let background = TerminalThemeColor.swiftTermColor(from: backgroundHex)
+            else {
+                XCTFail("\(theme.name)的背景色无法解析")
+                continue
+            }
+            XCTAssertFalse(
+                rendered.red == background.red
+                    && rendered.green == background.green
+                    && rendered.blue == background.blue,
+                "\(theme.name)渲染后的ANSI black与背景相同，低亮度文字不可见"
+            )
+        }
+    }
 }
 
 private extension NSView {

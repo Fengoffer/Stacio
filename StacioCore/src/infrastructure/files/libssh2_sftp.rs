@@ -204,6 +204,7 @@ impl Libssh2SftpEngine {
         job: &ScpTransferJob,
     ) -> Result<u64, String> {
         self.transfer_with_resume(session, job, &ScpResumeOptions::fresh())
+            .map(|(bytes_done, _)| bytes_done)
     }
 
     pub fn transfer_with_resume(
@@ -211,7 +212,7 @@ impl Libssh2SftpEngine {
         session: &Libssh2ConnectedSession,
         job: &ScpTransferJob,
         resume_options: &ScpResumeOptions,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, u64), String> {
         let sftp = session.session().sftp().map_err(map_sftp_error)?;
         let bytes_total = match job.direction {
             ScpDirection::Upload => local_path_size(Path::new(&job.source_path))?,
@@ -221,7 +222,7 @@ impl Libssh2SftpEngine {
             }
         };
         let mut bytes_done = 0_u64;
-        match job.direction {
+        let resumed_from = match job.direction {
             ScpDirection::Upload => {
                 let remote = resolve_remote_path(&sftp, &job.destination_path)?;
                 let local = Path::new(&job.source_path);
@@ -234,9 +235,10 @@ impl Libssh2SftpEngine {
                         bytes_total,
                         resume_options,
                         &mut bytes_done,
-                    )?;
+                    )?
                 } else {
                     upload_local_path(&sftp, local, &remote, job, bytes_total, &mut bytes_done)?;
+                    0
                 }
             }
             ScpDirection::Download => {
@@ -256,13 +258,14 @@ impl Libssh2SftpEngine {
                         bytes_total,
                         resume_options,
                         &mut bytes_done,
-                    )?;
+                    )?
                 } else {
                     download_remote_path(&sftp, &remote, local, job, bytes_total, &mut bytes_done)?;
+                    0
                 }
             }
-        }
-        Ok(bytes_done)
+        };
+        Ok((bytes_done, resumed_from))
     }
 }
 
@@ -506,7 +509,7 @@ fn upload_single_file_with_resume(
     bytes_total: u64,
     resume_options: &ScpResumeOptions,
     bytes_done: &mut u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let local_metadata = fs::metadata(local).map_err(map_io_error)?;
     let identity = SftpResumeMetadata {
         source_size: local_metadata.len(),
@@ -553,13 +556,21 @@ fn upload_single_file_with_resume(
         .seek(SeekFrom::Start(resume_offset))
         .map_err(map_io_error)?;
     *bytes_done = resume_offset;
+    if resume_offset > 0 {
+        record_live_scp_transfer_progress(crate::domain::scp::ScpTransferProgress {
+            job_id: job.id.clone(),
+            bytes_done: resume_offset,
+            bytes_total,
+            status: "resuming".into(),
+        });
+    }
     copy_with_progress(&mut reader, &mut writer, job, bytes_total, bytes_done)?;
     writer.flush().map_err(map_io_error)?;
     if *bytes_done != identity.source_size {
         return Err("FILES_SIZE_MISMATCH".to_string());
     }
     let _ = sftp.unlink(&metadata_path);
-    Ok(())
+    Ok(resume_offset)
 }
 
 fn download_remote_path(
@@ -606,7 +617,7 @@ fn download_single_file_with_resume(
     bytes_total: u64,
     resume_options: &ScpResumeOptions,
     bytes_done: &mut u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let remote_stat = sftp.lstat(remote).map_err(map_sftp_error)?;
     let identity = SftpResumeMetadata {
         source_size: remote_stat.size.unwrap_or(0),
@@ -648,13 +659,21 @@ fn download_single_file_with_resume(
         .seek(SeekFrom::Start(resume_offset))
         .map_err(map_io_error)?;
     *bytes_done = resume_offset;
+    if resume_offset > 0 {
+        record_live_scp_transfer_progress(crate::domain::scp::ScpTransferProgress {
+            job_id: job.id.clone(),
+            bytes_done: resume_offset,
+            bytes_total,
+            status: "resuming".into(),
+        });
+    }
     copy_with_progress(&mut reader, &mut writer, job, bytes_total, bytes_done)?;
     writer.flush().map_err(map_io_error)?;
     if *bytes_done != identity.source_size {
         return Err("FILES_SIZE_MISMATCH".to_string());
     }
     let _ = fs::remove_file(metadata_path);
-    Ok(())
+    Ok(resume_offset)
 }
 
 fn read_remote_resume_metadata(

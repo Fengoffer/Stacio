@@ -111,6 +111,8 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     public let runtimeID: String
     public let shellPath: String
     public let terminalView: StacioLocalTerminalView
+    var styledRecording: StyledTerminalRecording?
+    var canStartStyledRecording: Bool { !didClose && styledRecording == nil }
     public var keyboardFocusView: NSView { terminalView }
     public var onUserInput: ((TerminalPaneViewController, [UInt8]) -> Bool)?
     public var onAIContextRequest: ((TerminalAIContextRequest) -> Void)?
@@ -503,6 +505,7 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
     }
 
     public func closeTerminal() {
+        styledRecording?.finish()
         sensitiveInputState.reset()
         terminalView.cancelPendingSemanticOutput()
         processLauncher.terminate(terminalView)
@@ -582,6 +585,12 @@ public final class TerminalPaneViewController: NSViewController, LocalProcessTer
             title: title ?? L10n.Workspace.local,
             event: event
         )
+    }
+
+    public var agentOutputPosition: Int { transcriptRecorder.outputPosition }
+
+    public func agentOutput(since position: Int, limit: Int) -> String {
+        transcriptRecorder.output(since: position, limit: limit)
     }
 
     public var terminalOutputTranscript: String {

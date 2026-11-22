@@ -5,6 +5,7 @@ public final class TranscriptRecorder {
 
     private var storage = ""
     private var storageByteCount = 0
+    public private(set) var outputPosition = 0
     private let maximumByteCount: Int
 
     public init() {
@@ -19,6 +20,13 @@ public final class TranscriptRecorder {
         storage
     }
 
+    public func output(since position: Int, limit: Int) -> String {
+        let count = min(outputPosition - position, storageByteCount, limit)
+        guard count > 0 else { return "" }
+        let bytes = storage.utf8.suffix(count).drop(while: { $0 & 0xC0 == 0x80 })
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     public func append(bytes: [UInt8]) {
         guard maximumByteCount > 0, bytes.isEmpty == false else {
             return
@@ -30,6 +38,7 @@ public final class TranscriptRecorder {
         }
         storage.append(text)
         storageByteCount += textByteCount
+        outputPosition += textByteCount
         retainRecentOutputIfNeeded()
     }
 

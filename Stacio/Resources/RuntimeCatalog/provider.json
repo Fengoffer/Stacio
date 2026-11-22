@@ -207,7 +207,7 @@
     "protocolFamily": "openAICompatible",
     "authenticationKind": "bearerAPIKey",
     "suggestedBaseURL": null,
-    "modelDiscoveryStrategy": "manualOnly",
+    "modelDiscoveryStrategy": "openAIModels",
     "permitsNoCredential": false,
     "websiteActionIDs": [],
     "usageRestriction": null,

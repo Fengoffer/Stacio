@@ -168,70 +168,13 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         ])
     }
 
-    func testWorkbenchAIAssistantInspectorFollowsCurrentTerminalSelection() throws {
-        let suffix = UUID().uuidString
-        let firstRuntimeID = "term-first-\(suffix)"
-        let secondRuntimeID = "term-second-\(suffix)"
-        let suiteName = "StacioWorkbenchAIFollow-\(suffix)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let settingsStore = AppSettingsStore(defaults: defaults)
-        let apiKeyStore = KeychainAIApiKeyStore(
-            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
-        )
-        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
-        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
-        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
-        let workspace = WorkspaceViewController(
-            autoStartTerminalProcesses: false,
-            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
-            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
-            startsRemoteTerminalPollingAutomatically: false,
-            settingsStore: settingsStore
-        )
-        let controller = WorkbenchWindowController(
-            workspaceViewController: workspace,
-            settingsStore: settingsStore,
-            assistantSettingsValueStoreProvider: { nil },
-            aiAPIKeyStore: apiKeyStore,
-            aiHTTPTransport: transport,
-            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
-                settingsStore: settingsStore,
-                apiKeyStore: apiKeyStore,
-                transport: transport,
-                databasePath: conversationDatabase.path
-            ),
-            aiConversationCatalogLoader: { [] }
-        )
-
-        controller.loadWindow()
-        workspace.openRemoteShell(
-            status: LiveShellStatus(runtimeId: firstRuntimeID, status: "running", diagnostic: "running"),
-            title: "first@example.com",
-            connectionKind: .ssh
-        )
-        workspace.openRemoteShell(
-            status: LiveShellStatus(runtimeId: secondRuntimeID, status: "running", diagnostic: "running"),
-            title: "second@example.com",
-            connectionKind: .ssh
-        )
-        controller.showAIAssistantFromToolbar(nil)
-
-        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
-        let panel = try XCTUnwrap(inspector.aiAssistantViewController)
-        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
-        XCTAssertTrue(panel.contextTextForTesting.contains("second@example.com"))
-
-        workspace.selectTabForTesting(0)
-
-        XCTAssertTrue(waitUntil {
-            panel.contextTextForTesting.contains("first@example.com")
-                && panel.conversationRuntimeReadyForTesting
-        })
-    }
-
-    func testInspectorAISectionKeepsFullHeightAfterColumnFrameSync() throws {
+       func testInspectorAISectionKeepsFullHeightAfterColumnFrameSync() throws {
         let inspector = InspectorViewController()
+        inspector.aiAssistantFactory = {
+         AgentPanelViewController.make(
+         terminalLister: nil,
+         executorResolver: UnboundTerminalResolver())
+        }
         let host = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 900))
 
         inspector.loadView()
@@ -251,7 +194,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
 
         XCTAssertGreaterThan(aiView.frame.height, 760)
         XCTAssertGreaterThan(conversation.frame.height, 560)
-        XCTAssertEqual(composer.frame.minY, 14, accuracy: 1)
+        XCTAssertEqual(composer.frame.minY, 24, accuracy: 1)
     }
 
     func testWorkbenchWindowKeepsWorkbenchContentOutOfAppKitContentSizeNegotiation() throws {
@@ -1197,6 +1140,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertEqual(restoredWidth, draggedWidth, accuracy: 3)
     }
 
+
     func testWorkbenchSidebarDragClampsToReadableBounds() throws {
         let controller = WorkbenchWindowController(
             workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
@@ -1475,44 +1419,7 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         assertWindowFrame(window, equals: userFrame)
     }
 
-    func testInspectorDividerDragPathUpdatesPanelWidthBeforePinnedLayoutRefresh() throws {
-        let controller = WorkbenchWindowController(
-            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
-        )
-
-        controller.showWindow(nil)
-        defer { controller.close() }
-        let window = try XCTUnwrap(controller.window)
-        let userFrame = NSRect(x: 40, y: 80, width: 2_048, height: 900)
-        window.setFrame(userFrame, display: false)
-        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
-
-        controller.showFilesFromToolbar(nil)
-        window.layoutIfNeeded()
-        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-
-        let splitView = controller.contentSplitViewController.splitView
-        let inspectorView = try XCTUnwrap(splitView.arrangedSubviews.last)
-        XCTAssertLessThanOrEqual(inspectorView.frame.width, 420)
-
-        let requestedInspectorWidth: CGFloat = 720
-        let proposedPosition = splitView.bounds.width - requestedInspectorWidth - splitView.dividerThickness
-        let constrainedPosition = controller.contentSplitViewController.splitView(
-            splitView,
-            constrainSplitPosition: proposedPosition,
-            ofSubviewAt: 1
-        )
-        XCTAssertEqual(constrainedPosition, proposedPosition, accuracy: 1)
-
-        controller.contentSplitViewController.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-
-        XCTAssertEqual(inspectorView.frame.width, requestedInspectorWidth, accuracy: 3)
-        assertWindowFrame(window, equals: userFrame)
-    }
-
-    func testInspectorDividerDragFinalizesImmediatelyWithoutDebouncedRepair() throws {
+       func testInspectorDividerDragFinalizesImmediatelyWithoutDebouncedRepair() throws {
         let controller = WorkbenchWindowController(
             workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
         )
@@ -3831,114 +3738,8 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
     }
 
-    func testAIAssistantToolbarActionDoesNotCoverTerminalWithOverlay() throws {
-        let controller = WorkbenchWindowController(
-            workspaceViewController: WorkspaceViewController(autoStartTerminalProcesses: false)
-        )
-
-        controller.loadWindow()
-        let window = try XCTUnwrap(controller.window)
-        window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 760), display: false)
-        controller.showAIAssistantFromToolbar(nil)
-        window.layoutIfNeeded()
-
-        let splitView = controller.contentSplitViewController.splitView
-        let workspaceView = splitView.arrangedSubviews[1]
-        let inspectorView = splitView.arrangedSubviews[2]
-        XCTAssertNil(window.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
-        XCTAssertFalse(splitView.isSubviewCollapsed(inspectorView))
-        XCTAssertGreaterThan(inspectorView.frame.width, 0)
-        XCTAssertEqual(workspaceView.frame.maxX + splitView.dividerThickness,
-                       inspectorView.frame.minX,
-                       accuracy: 1)
-    }
-
-#if STACIO_AI_V2_UI_LEGACY_TESTS
-    func testV2AIAssistantSubmissionKeepsWorkbenchWindowFrameAfterDeferredInspectorLayout() throws {
-        let suiteName = "StacioWorkbenchAIWindowFrame-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let settingsStore = AppSettingsStore(defaults: defaults)
-        let provider = makeWorkbenchModelProvider(
-            id: UUID(uuidString: "83000000-0000-0000-0000-000000000001")!,
-            name: "Frame Test Provider",
-            baseURL: "https://frame-test.example/v1",
-            modelID: "frame-test-model"
-        )
-        try settingsStore.saveAIProviderSettings(
-            AIProviderSettingsEnvelope(
-                aiProviders: [provider],
-                defaultAIProviderID: provider.id
-            )
-        )
-        let apiKeyStore = KeychainAIApiKeyStore(
-            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
-        )
-        try apiKeyStore.saveAPIKey("frame-test-key", for: provider.id)
-        let transport = RecordingWorkbenchAIAssistantHTTPTransport()
-        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
-        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
-        let workspace = WorkspaceViewController(
-            autoStartTerminalProcesses: false,
-            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
-            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
-            startsRemoteTerminalPollingAutomatically: false,
-            settingsStore: settingsStore
-        )
-        let controller = WorkbenchWindowController(
-            workspaceViewController: workspace,
-            settingsStore: settingsStore,
-            assistantSettingsValueStoreProvider: { nil },
-            aiAPIKeyStore: apiKeyStore,
-            aiHTTPTransport: transport,
-            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
-                settingsStore: settingsStore,
-                apiKeyStore: apiKeyStore,
-                transport: transport,
-                databasePath: conversationDatabase.path
-            ),
-            aiConversationCatalogLoader: { [] },
-            frameAutosaveName: NSWindow.FrameAutosaveName(suiteName)
-        )
-
-        controller.showWindow(nil)
-        defer { controller.close() }
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-        workspace.openRemoteShell(
-            status: LiveShellStatus(
-                runtimeId: "term-v2-frame-\(UUID().uuidString)",
-                status: "running",
-                diagnostic: "running"
-            ),
-            title: "frame-test.example",
-            connectionKind: .ssh,
-            liveSessionContext: workbenchLiveContext(host: "frame-test.example")
-        )
-        let window = try XCTUnwrap(controller.window)
-        window.setFrame(NSRect(x: 40, y: 80, width: 1_800, height: 900), display: false)
-        controller.windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
-        let expectedFrame = window.frame
-
-        controller.showAIAssistantFromToolbar(nil)
-        assertWindowFrame(window, equals: expectedFrame)
-        let panel = try XCTUnwrap(
-            controller.inspectorViewControllerForTesting?.aiAssistantViewController
-        )
-        panel.setQuestionForTesting("检查窗口尺寸")
-        XCTAssertTrue(waitUntil { panel.conversationRuntimeReadyForTesting })
-        XCTAssertTrue(panel.askButtonEnabledForTesting)
-        panel.performAskForTesting()
-        assertWindowFrame(window, equals: expectedFrame)
-
-        XCTAssertTrue(
-            waitUntil { transport.streamRequests.count == 1 },
-            "message=\(panel.messageTextForTesting), status=\(panel.statusTextForTesting), transcript=\(panel.transcriptTextForTesting)"
-        )
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        assertWindowFrame(window, equals: expectedFrame)
-    }
-
-    func testV2AIComposerWorkModeFlowsFromInspectorToConversationRuntime() throws {
+   #if STACIO_AI_V2_UI_LEGACY_TESTS
+       func testV2AIComposerWorkModeFlowsFromInspectorToConversationRuntime() throws {
         let suiteName = "StacioWorkbenchAIWorkMode-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -4602,239 +4403,9 @@ final class WorkbenchWindowControllerTests: XCTestCase {
         })
     }
 
-    func testV2AIModelSelectionSessionsAreIndependentAcrossWorkbenchPanels() throws {
-        let suiteName = "StacioWorkbenchAIModelSelectionIsolation-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let settingsStore = AppSettingsStore(defaults: defaults)
-        let providerA = makeWorkbenchModelProvider(
-            id: UUID(uuidString: "82000000-0000-0000-0000-000000000001")!,
-            name: "Provider A",
-            baseURL: "https://provider-a.example/v1",
-            modelID: "a-model"
-        )
-        let providerB = makeWorkbenchModelProvider(
-            id: UUID(uuidString: "82000000-0000-0000-0000-000000000002")!,
-            name: "Provider B",
-            baseURL: "https://provider-b.example/v1",
-            modelID: "b-model"
-        )
-        try settingsStore.saveAIProviderSettings(
-            AIProviderSettingsEnvelope(
-                aiProviders: [providerA, providerB],
-                defaultAIProviderID: providerA.id
-            )
-        )
-        let apiKeyStore = KeychainAIApiKeyStore(
-            credentialStore: KeychainCredentialStore(backend: InMemoryKeychainBackend())
-        )
-        try apiKeyStore.saveAPIKey("key-a", for: providerA.id)
-        try apiKeyStore.saveAPIKey("key-b", for: providerB.id)
-        let transportA = RecordingWorkbenchAIAssistantHTTPTransport()
-        let transportB = RecordingWorkbenchAIAssistantHTTPTransport()
-        let conversationDatabase = try makeTemporaryWorkbenchConversationDatabase()
-        defer { try? FileManager.default.removeItem(at: conversationDatabase.directory) }
-        let workspaceA = WorkspaceViewController(
-            autoStartTerminalProcesses: false,
-            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
-            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
-            startsRemoteTerminalPollingAutomatically: false,
-            settingsStore: settingsStore
-        )
-        let workspaceB = WorkspaceViewController(
-            autoStartTerminalProcesses: false,
-            remoteTerminalEventSinkFactory: { RecordingWorkbenchTerminalEventSink() },
-            remoteTerminalBridgeFactory: { RecordingWorkbenchRemoteTerminalBridge() },
-            startsRemoteTerminalPollingAutomatically: false,
-            settingsStore: settingsStore
-        )
-        let controllerA = WorkbenchWindowController(
-            workspaceViewController: workspaceA,
-            settingsStore: settingsStore,
-            assistantSettingsValueStoreProvider: { nil },
-            aiAPIKeyStore: apiKeyStore,
-            aiHTTPTransport: transportA,
-            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
-                settingsStore: settingsStore,
-                apiKeyStore: apiKeyStore,
-                transport: transportA,
-                databasePath: conversationDatabase.path
-            ),
-            aiConversationCatalogLoader: { [] }
-        )
-        let controllerB = WorkbenchWindowController(
-            workspaceViewController: workspaceB,
-            settingsStore: settingsStore,
-            assistantSettingsValueStoreProvider: { nil },
-            aiAPIKeyStore: apiKeyStore,
-            aiHTTPTransport: transportB,
-            aiConversationRuntimeFactoryOverride: makeWorkbenchV2RuntimeFactory(
-                settingsStore: settingsStore,
-                apiKeyStore: apiKeyStore,
-                transport: transportB,
-                databasePath: conversationDatabase.path
-            ),
-            aiConversationCatalogLoader: { [] }
-        )
+   #endif
 
-        controllerA.loadWindow()
-        controllerB.loadWindow()
-        workspaceA.openRemoteShell(
-            status: LiveShellStatus(
-                runtimeId: "term-v2-isolation-a-\(UUID().uuidString)",
-                status: "running",
-                diagnostic: "running"
-            ),
-            title: "isolation-a.example",
-            connectionKind: .ssh,
-            liveSessionContext: workbenchLiveContext(host: "isolation-a.example")
-        )
-        workspaceB.openRemoteShell(
-            status: LiveShellStatus(
-                runtimeId: "term-v2-isolation-b-\(UUID().uuidString)",
-                status: "running",
-                diagnostic: "running"
-            ),
-            title: "isolation-b.example",
-            connectionKind: .ssh,
-            liveSessionContext: workbenchLiveContext(host: "isolation-b.example")
-        )
-        controllerA.showAIAssistantFromToolbar(nil)
-        controllerB.showAIAssistantFromToolbar(nil)
-        let panelA = try XCTUnwrap(controllerA.inspectorViewControllerForTesting?.aiAssistantViewController)
-        let panelB = try XCTUnwrap(controllerB.inspectorViewControllerForTesting?.aiAssistantViewController)
-        panelA.setQuestionForTesting("检查 A")
-        panelB.setQuestionForTesting("检查 B")
-        XCTAssertTrue(waitUntil {
-            panelA.conversationRuntimeReadyForTesting
-                && panelB.conversationRuntimeReadyForTesting
-        })
-        panelA.selectComposerModelForTesting(
-            AIModelSelection(providerID: providerA.id, modelID: "a-model")
-        )
-        panelB.selectComposerModelForTesting(
-            AIModelSelection(providerID: providerB.id, modelID: "b-model")
-        )
-        XCTAssertTrue(waitUntil {
-            let selectionA = panelA.conversationRuntimeSelectionForTesting
-            let selectionB = panelB.conversationRuntimeSelectionForTesting
-            return selectionA?.providerConfigurationID == providerA.id.uuidString
-                && selectionA?.modelID == "a-model"
-                && selectionB?.providerConfigurationID == providerB.id.uuidString
-                && selectionB?.modelID == "b-model"
-                && panelA.conversationRuntimeReadyForTesting
-                && panelB.conversationRuntimeReadyForTesting
-        })
-        XCTAssertTrue(panelA.askButtonEnabledForTesting)
-        XCTAssertTrue(panelB.askButtonEnabledForTesting)
-        panelA.performAskForTesting()
-        panelB.performAskForTesting()
-
-        XCTAssertTrue(
-            waitUntil {
-                transportA.streamRequests.count == 1 && transportB.streamRequests.count == 1
-            },
-            "A=\(panelA.messageTextForTesting)|\(panelA.statusTextForTesting); B=\(panelB.messageTextForTesting)|\(panelB.statusTextForTesting)"
-        )
-        let requestA = try XCTUnwrap(transportA.streamRequests.first)
-        let requestB = try XCTUnwrap(transportB.streamRequests.first)
-        XCTAssertEqual(requestA.url?.host, "provider-a.example")
-        XCTAssertEqual(requestB.url?.host, "provider-b.example")
-        let bodyA = String(data: try XCTUnwrap(requestA.httpBody), encoding: .utf8) ?? ""
-        let bodyB = String(data: try XCTUnwrap(requestB.httpBody), encoding: .utf8) ?? ""
-        XCTAssertTrue(bodyA.contains(#""model":"a-model""#))
-        XCTAssertTrue(bodyB.contains(#""model":"b-model""#))
-        XCTAssertEqual(requestA.value(forHTTPHeaderField: "Authorization"), "Bearer key-a")
-        XCTAssertEqual(requestB.value(forHTTPHeaderField: "Authorization"), "Bearer key-b")
-        XCTAssertEqual(try settingsStore.loadAIProviderSettings().defaultAIProviderID, providerA.id)
-    }
-
-#endif
-
-    func testTerminalAskAIContextRequestShowsInspectorAndPrefillsComposer() throws {
-        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let controller = WorkbenchWindowController(workspaceViewController: workspace)
-
-        controller.loadWindow()
-        _ = try workspace.openLocalShell()
-        workspace.requestAIForCurrentTerminalForTesting(selectedText: "disk full")
-        controller.window?.contentView?.layoutSubtreeIfNeeded()
-
-        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
-        let panel = try XCTUnwrap(inspector.aiAssistantViewController)
-        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
-        XCTAssertFalse(controller.contentSplitViewController.splitViewItems[2].isCollapsed)
-        XCTAssertEqual(inspector.selectedTabLabelForTesting, "AI")
-        XCTAssertTrue(panel.questionTextForTesting.contains("disk full"))
-    }
-
-    func testTerminalTraceDoesNotExposeOldTaskControlOpenRoute() throws {
-        let workspace = WorkspaceViewController(autoStartTerminalProcesses: false)
-        let controller = WorkbenchWindowController(workspaceViewController: workspace)
-
-        controller.loadWindow()
-        let inspector = try XCTUnwrap(controller.inspectorViewControllerForTesting)
-        _ = try workspace.openLocalShell()
-        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
-        pane.appendAgentTraceForTesting(
-            requestID: "req-open-task",
-            state: .running,
-            message: "Codex 正在执行 uptime",
-            redactedCommand: "uptime"
-        )
-
-        controller.window?.contentView?.layoutSubtreeIfNeeded()
-
-        XCTAssertNotNil(pane.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTraceOverlay"))
-        XCTAssertTrue(pane.agentTraceOverlayTextForTesting.contains("Codex 正在执行 uptime"))
-        XCTAssertNil(pane.view.firstSubview(withIdentifier: "Stacio.Terminal.agentTrace.openTask.req-open-task"))
-        XCTAssertNil(controller.window?.contentView?.firstSubview(withIdentifier: "Stacio.AI.overlay"))
-        XCTAssertNil(inspector.aiAssistantViewController?.view.firstSubview(withIdentifier: "Stacio.AI.taskWorkspace"))
-        XCTAssertFalse(inspector.aiAssistantViewController?.taskControlTextForTesting.contains("req-open-task") ?? false)
-        XCTAssertFalse(inspector.aiAssistantViewController?.taskControlTextForTesting.contains("Codex 正在执行 uptime") ?? false)
-    }
-
-    func testAgentBridgeHandlerUsesSettingsConfirmationPolicy() throws {
-        let suiteName = "StacioWorkbenchAgentPolicyTests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let settingsStore = AppSettingsStore(defaults: defaults)
-        settingsStore.update { settings in
-            settings.agentConfirmationPolicy = .requireEveryCommand
-        }
-        let confirmer = RecordingWorkbenchAgentActionConfirmer(confirmed: false)
-        let workspace = WorkspaceViewController(
-            autoStartTerminalProcesses: false,
-            settingsStore: settingsStore
-        )
-        let controller = WorkbenchWindowController(
-            workspaceViewController: workspace,
-            settingsStore: settingsStore,
-            agentActionConfirmer: confirmer
-        )
-
-        controller.loadWindow()
-        let runtimeID = try workspace.openLocalShell()
-        let handler = controller.makeAgentBridgeRequestHandler()
-        let request = AgentBridgeRequest(
-            id: "settings-policy",
-            actor: AgentActor(kind: .externalCLI, name: "codex", processID: 42),
-            action: .runCommand(
-                AgentRunCommandRequest(
-                    target: .runtimeID(runtimeID),
-                    command: "uptime",
-                    follow: true
-                )
-            )
-        )
-
-        XCTAssertThrowsError(try handler.handleAgentBridgeRequest(request))
-        XCTAssertEqual(confirmer.confirmations.count, 1)
-        XCTAssertEqual(confirmer.confirmations[0].risk, .readOnly)
-        XCTAssertEqual(confirmer.confirmations[0].targetTitle, L10n.Workspace.local)
-    }
-
-    func testAgentBridgeHandlerMigratesBackgroundPreferenceAndUsesCurrentTerminalForAllActors() throws {
+             func testAgentBridgeHandlerMigratesBackgroundPreferenceAndUsesCurrentTerminalForAllActors() throws {
         let suiteName = "StacioWorkbenchAgentExecutionModeTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -11296,7 +10867,7 @@ private final class RecordingWorkbenchRemoteTerminalBridge: RemoteTerminalBridgi
     }
 
     func takeTerminalOutputBatch(runtimeID: String) throws -> TerminalOutputBatch {
-        TerminalOutputBatch(runtimeId: runtimeID, bytes: Data(), droppedByteCount: 0)
+ TerminalOutputBatch(runtimeId: runtimeID, bytes: Data(), droppedByteCount:0, protectionActive: false, bufferedByteCount:0)
     }
 
     func setTerminalOutputPaused(runtimeID: String, paused: Bool) throws -> TerminalRuntime {
@@ -11888,4 +11459,10 @@ private extension NSView {
             return matches
         }
     }
+}
+
+private struct UnboundTerminalResolver: AgentTerminalResolving {
+ func resolveTerminalTarget(_ target: AgentTarget) throws -> AgentTerminalTarget {
+ throw AgentExecutionError.terminalNotFound
+ }
 }

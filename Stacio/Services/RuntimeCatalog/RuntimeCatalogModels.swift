@@ -128,7 +128,12 @@ public struct ProviderCatalogEntry: Codable, Equatable, Sendable {
     }
 
     public var allowsManualModelIDs: Bool {
-        modelDiscoveryStrategy == .manualOnly
+        switch modelDiscoveryStrategy {
+        case .openAIModels, .manualOnly:
+            return true
+        case .anthropicModels, .cliManaged, .unavailable:
+            return false
+        }
     }
 }
 

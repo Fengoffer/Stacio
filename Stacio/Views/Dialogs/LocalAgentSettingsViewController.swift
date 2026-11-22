@@ -5,6 +5,14 @@ import Foundation
 /// from the Local Agent configuration/journal owners; every mutation still
 /// crosses the Settings Action Coordinator supplied by the window.
 @MainActor
+/// A scroll view document that anchors its content to the top.
+///
+/// Without this the clip view lays the content out from the bottom
+/// edge and a short page floats down out of sight.
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class LocalAgentSettingsViewController: NSViewController,
     NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSTokenFieldDelegate
 {
@@ -183,28 +191,48 @@ final class LocalAgentSettingsViewController: NSViewController,
         return container
     }
 
-    private func configureDetail() {
-        detailScrollView.hasVerticalScroller = true
-        detailScrollView.autohidesScrollers = true
-        detailScrollView.drawsBackground = false
-        detailScrollView.borderType = .noBorder
-        detailScrollView.translatesAutoresizingMaskIntoConstraints = false
-        detailScrollView.setAccessibilityIdentifier("Stacio.Settings.localAgent.detailScroll")
+        private func configureDetail() {
+            detailScrollView.hasVerticalScroller = true
+            detailScrollView.autohidesScrollers = true
+            detailScrollView.drawsBackground = false
+            detailScrollView.borderType = .noBorder
+            detailScrollView.translatesAutoresizingMaskIntoConstraints = false
+            detailScrollView.setAccessibilityIdentifier("Stacio.Settings.localAgent.detailScroll")
 
-        detailStack.orientation = .vertical
-        detailStack.alignment = .leading
-        detailStack.spacing = 12
-        detailStack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 22, right: 20)
-        detailStack.translatesAutoresizingMaskIntoConstraints = false
-        detailStack.setAccessibilityIdentifier("Stacio.Settings.localAgent.detail")
-        detailScrollView.documentView = detailStack
-        NSLayoutConstraint.activate([
-            detailStack.leadingAnchor.constraint(equalTo: detailScrollView.contentView.leadingAnchor),
-            detailStack.trailingAnchor.constraint(equalTo: detailScrollView.contentView.trailingAnchor),
-            detailStack.topAnchor.constraint(equalTo: detailScrollView.contentView.topAnchor),
-            detailStack.widthAnchor.constraint(equalTo: detailScrollView.contentView.widthAnchor)
-        ])
-    }
+            detailStack.orientation = .vertical
+            detailStack.alignment = .leading
+            detailStack.spacing = 12
+            detailStack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 22, right: 20)
+            detailStack.translatesAutoresizingMaskIntoConstraints = false
+            detailStack.setAccessibilityIdentifier("Stacio.Settings.localAgent.detail")
+
+            // A scroll view lays its document out from the frame, so anchoring
+            // the stack straight to the clip view fights that and the content
+            // drifts to the bottom. A flipped container owns the height instead.
+            let documentContainer = FlippedDocumentView()
+            documentContainer.translatesAutoresizingMaskIntoConstraints = false
+            documentContainer.addSubview(detailStack)
+            detailScrollView.documentView = documentContainer
+            NSLayoutConstraint.activate([
+                documentContainer.leadingAnchor.constraint(
+                    equalTo: detailScrollView.contentView.leadingAnchor
+                ),
+                documentContainer.topAnchor.constraint(
+                    equalTo: detailScrollView.contentView.topAnchor
+                ),
+                documentContainer.widthAnchor.constraint(
+                    equalTo: detailScrollView.contentView.widthAnchor
+                ),
+                documentContainer.heightAnchor.constraint(
+                    greaterThanOrEqualTo: detailScrollView.contentView.heightAnchor
+                ),
+
+                detailStack.leadingAnchor.constraint(equalTo: documentContainer.leadingAnchor),
+                detailStack.trailingAnchor.constraint(equalTo: documentContainer.trailingAnchor),
+                detailStack.topAnchor.constraint(equalTo: documentContainer.topAnchor),
+                detailStack.bottomAnchor.constraint(equalTo: documentContainer.bottomAnchor)
+            ])
+        }
 
     private func reloadData(selecting preferredConfigurationID: String? = nil) {
         let previous = preferredConfigurationID ?? selectedConfigurationID
@@ -657,6 +685,13 @@ final class LocalAgentSettingsViewController: NSViewController,
             profilePopup.lastItem?.representedObject = index
         }
         let workingDirectoryPopup = NSPopUpButton()
+        // Alert popups size to their longest item, which pushed the row
+        // wider than the accessory and clipped the right hand side.
+        let controlWidth: CGFloat = 360
+        for popup in [executablePopup, profilePopup, workingDirectoryPopup] {
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            popup.widthAnchor.constraint(equalToConstant: controlWidth).isActive = true
+        }
         for mode in workingDirectoryModes {
             workingDirectoryPopup.addItem(withTitle: workingDirectoryTitle(mode))
             workingDirectoryPopup.lastItem?.representedObject = mode.rawValue
@@ -670,6 +705,15 @@ final class LocalAgentSettingsViewController: NSViewController,
         accessory.orientation = .vertical
         accessory.alignment = .leading
         accessory.spacing = 8
+        // NSAlert lays the accessory out from its frame. Without one the
+        // stack keeps its fitting size and the fields are clipped.
+        let alertWidth: CGFloat = 470
+        accessory.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: alertWidth,
+            height: 144
+        )
 
         let alert = NSAlert()
         alert.alertStyle = .informational
@@ -766,7 +810,7 @@ final class LocalAgentSettingsViewController: NSViewController,
             "pathPolicy": .string(descriptor.defaultPATHPolicy.rawValue),
             "customPATHEntries": .stringArray([]),
             "environmentAllowlist": .stringArray(descriptor.defaultEnvironmentAllowlist),
-            "explicitlyEnabled": .bool(false)
+            "explicitlyEnabled": .bool(true)
         ]
         if let workingDirectoryReference {
             parameters["workingDirectoryReference"] = .string(workingDirectoryReference)

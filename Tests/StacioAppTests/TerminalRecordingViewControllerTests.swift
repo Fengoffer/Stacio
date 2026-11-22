@@ -322,7 +322,7 @@ final class TerminalRecordingViewControllerTests: XCTestCase {
         XCTAssertFalse(panel.canChooseDirectories)
         XCTAssertTrue(panel.canChooseFiles)
         XCTAssertFalse(panel.allowsMultipleSelection)
-        XCTAssertEqual(panel.allowedContentTypes, [try XCTUnwrap(UTType(filenameExtension: "cast"))])
+        XCTAssertEqual(panel.allowedContentTypes, [.rtf, try XCTUnwrap(UTType(filenameExtension: "cast"))])
     }
 
     func testRecordingWindowHostsPlaybackControllerAtStableMinimumSize() throws {
@@ -350,132 +350,89 @@ final class TerminalRecordingViewControllerTests: XCTestCase {
         XCTAssertTrue(closed)
     }
 
-    func testRecordingMenuUsesWorkspaceSelectedPaneWhenFocusIsOutsideTerminal() throws {
+    func testRecordingMenuUsesProductionWorkbenchSelectedPaneOutsideTerminalFocus() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
         let workspace = WorkspaceViewController(
-            shellPathProvider: { "/bin/zsh" },
-            eventSinkFactory: { NoopTerminalEventSink() },
+            shellPathProvider: { "/bin/zsh" }, eventSinkFactory: { NoopTerminalEventSink() },
             autoStartTerminalProcesses: false
         )
-        workspace.loadView()
+        let workbench = WorkbenchWindowController(workspaceViewController: workspace)
+        workbench.loadWindow()
+        let window = try XCTUnwrap(workbench.window)
         let runtimeA = try workspace.openLocalShell()
+        let paneA = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
         let runtimeB = try workspace.openLocalShell()
+        let paneB = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
         XCTAssertTrue(workspace.activateTerminal(runtimeID: runtimeB, bringAppToFront: false))
-
-        let window = NSWindow(contentViewController: workspace)
-        defer {
-            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeA)
-            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeB)
-            window.close()
-        }
-        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
-        let nonTerminalFocus = NSButton(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
-        workspace.view.addSubview(nonTerminalFocus)
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        XCTAssertTrue(window.makeFirstResponder(nonTerminalFocus))
-
-        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+        XCTAssertNil(window.contentViewController, "Exercise the actual contentView-based Workbench")
+        let button = NSButton(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
+        workspace.view.addSubview(button)
+        window.makeFirstResponder(button)
+        let selectedURL = directory.appendingPathComponent("chosen-folder/custom-recording.rtf")
+        var selection: ((URL?) -> Void)?
+        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window }, recordingDirectory: directory,
+            savePanelPresenter: { panel, parent, completion in
+                XCTAssertTrue(parent === window)
+                XCTAssertEqual(panel.allowedContentTypes, [.rtf])
+                XCTAssertTrue(panel.nameFieldStringValue.hasSuffix(".rtf"))
+                XCTAssertNotNil(panel.nameFieldStringValue.range(of: #"^\d{8}_\d{6}_\d{3}_"#, options: .regularExpression))
+                selection = completion
+            })
+        let item = NSMenuItem(title: "", action: #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)), keyEquivalent: "")
+        XCTAssertTrue(coordinator.validateMenuItem(item))
         coordinator.startRecordingCurrentTerminal(nil)
-
-        XCTAssertFalse(
-            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeA)?.isRecording ?? false
-        )
-        XCTAssertTrue(
-            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeB)?.isRecording ?? false
-        )
+        XCTAssertNil(paneB.styledRecording, "Recording starts only after choosing the location")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertFalse(coordinator.validateMenuItem(item), "Do not open duplicate save panels")
+        XCTAssertTrue(workspace.activateTerminal(runtimeID: runtimeA, bringAppToFront: false))
+        try XCTUnwrap(selection)(selectedURL)
+        XCTAssertNil(paneA.styledRecording)
+        let session = try XCTUnwrap(paneB.styledRecording)
+        XCTAssertEqual(session.fileURL, selectedURL)
+        XCTAssertTrue(workspace.activateTerminal(runtimeID: runtimeB, bringAppToFront: false))
+        XCTAssertTrue(session.isRecording)
+        XCTAssertFalse(coordinator.validateMenuItem(item))
+        XCTAssertEqual(item.state, .on)
+        XCTAssertTrue(item.title.contains("关闭时保存"))
+        paneB.terminalView.getTerminal().feed(text: "selected terminal")
+        paneB.closeTerminal()
+        session.waitUntilSaved()
+        XCTAssertNil(session.error)
+        let text = try NSAttributedString(url: session.fileURL, options: [.documentType: NSAttributedString.DocumentType.rtf], documentAttributes: nil)
+        XCTAssertTrue(text.string.contains("selected terminal"))
+        paneA.closeTerminal()
+        _ = runtimeA
+        window.orderOut(nil)
     }
 
-    func testRecordingMenuFreezesTheRealTerminalDimensions() throws {
-        let workspace = WorkspaceViewController(
-            shellPathProvider: { "/bin/zsh" },
-            eventSinkFactory: { NoopTerminalEventSink() },
-            autoStartTerminalProcesses: false
-        )
-        workspace.loadView()
-        let runtimeID = try workspace.openLocalShell()
-        let pane = try XCTUnwrap(workspace.currentTerminalPane as? TerminalPaneViewController)
-
-        let window = NSWindow(contentViewController: workspace)
-        defer {
-            TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeID)
-            window.close()
-        }
-        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        workspace.view.layoutSubtreeIfNeeded()
-        pane.terminalView.resize(cols: 113, rows: 37)
-
-        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
+    func testCancelSavePanelLeavesNoRecordingAndClosingPaneBeforeSelectionDoesNotRestartIt() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pane = TerminalPaneViewController(runtimeID: UUID().uuidString, shellPath: "/bin/zsh",
+                                             eventSink: NoopTerminalEventSink(), autoStartProcess: false)
+        let window = NSWindow(contentViewController: pane)
+        defer { pane.closeTerminal(); window.orderOut(nil) }
+        var selection: ((URL?) -> Void)?
+        var panelCount = 0
+        let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window }, recordingDirectory: directory,
+            savePanelPresenter: { _, _, completion in panelCount += 1; selection = completion })
+        let item = NSMenuItem(title: "", action: #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)), keyEquivalent: "")
         coordinator.startRecordingCurrentTerminal(nil)
+        coordinator.startRecordingCurrentTerminal(nil)
+        XCTAssertEqual(panelCount, 1)
+        try XCTUnwrap(selection)(nil)
+        XCTAssertNil(pane.styledRecording)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertTrue(coordinator.validateMenuItem(item))
 
-        let session = try XCTUnwrap(
-            TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeID)
-        )
-        let header = try XCTUnwrap(
-            try JSONSerialization.jsonObject(
-                with: Data(session.exportAsciinema(title: "sized").split(separator: "\n")[0].utf8)
-        ) as? [String: Any]
-        )
-        XCTAssertEqual((header["width"] as? NSNumber)?.intValue, 113)
-        XCTAssertEqual((header["height"] as? NSNumber)?.intValue, 37)
-
-        coordinator.stopRecordingCurrentTerminal(nil)
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("stacio-recording-size-\(UUID().uuidString).cast")
-        defer { try? FileManager.default.removeItem(at: url) }
-        let saved = expectation(description: "sized recording saves")
-        session.save(to: url, title: "sized") { result in
-            if case let .failure(error) = result {
-                XCTFail("save failed: \(error)")
-            }
-            saved.fulfill()
-        }
-        wait(for: [saved], timeout: 2)
-        let savedRecording = try TerminalRecordingDocument.load(from: url)
-        XCTAssertEqual(savedRecording.width, 113)
-        XCTAssertEqual(savedRecording.height, 37)
-    }
-
-    func testRecordingMenuFreezesDimensionsForSSHSerialAndTelnet() throws {
-        for connectionKind in [
-            RemoteTerminalConnectionKind.ssh,
-            .serial,
-            .telnet
-        ] {
-            let runtimeID = "recording-size-\(connectionKind)-\(UUID().uuidString)"
-            let pane = RemoteTerminalPaneViewController(
-                runtimeID: runtimeID,
-                title: "remote",
-                connectionKind: connectionKind,
-                eventSink: NoopTerminalEventSink(),
-                startsPollingAutomatically: false
-            )
-            pane.loadView()
-            let window = NSWindow(contentViewController: pane)
-            defer {
-                TerminalRecordingSessionRegistry.shared.remove(runtimeID: runtimeID)
-                window.close()
-            }
-            window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 600), display: false)
-            window.makeKeyAndOrderFront(nil)
-            pane.view.layoutSubtreeIfNeeded()
-            pane.terminalView.resize(cols: 97, rows: 29)
-
-            let coordinator = TerminalRecordingWindowCoordinator(windowProvider: { window })
-            coordinator.startRecordingCurrentTerminal(nil)
-
-            let session = try XCTUnwrap(
-                TerminalRecordingSessionRegistry.shared.existingSession(for: runtimeID)
-            )
-            let header = try XCTUnwrap(
-                try JSONSerialization.jsonObject(
-                    with: Data(session.exportAsciinema(title: "remote").split(separator: "\n")[0].utf8)
-                ) as? [String: Any]
-            )
-            XCTAssertEqual((header["width"] as? NSNumber)?.intValue, 97, String(describing: connectionKind))
-            XCTAssertEqual((header["height"] as? NSNumber)?.intValue, 29, String(describing: connectionKind))
-        }
+        coordinator.startRecordingCurrentTerminal(nil)
+        XCTAssertEqual(panelCount, 2)
+        pane.closeTerminal()
+        try XCTUnwrap(selection)(directory.appendingPathComponent("closed.rtf"))
+        XCTAssertNil(pane.styledRecording)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertFalse(coordinator.validateMenuItem(item))
     }
 
     private final class NoopTerminalEventSink: TerminalEventSink {

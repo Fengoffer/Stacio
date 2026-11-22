@@ -24,11 +24,6 @@ public final class TransferQueuePopoverViewController: NSViewController {
     public var onClearFinished: (() -> Void)?
     public var onCollapseRequested: (() -> Void)?
 
-    private struct SpeedSample {
-        let bytesDone: UInt64
-        let capturedAt: Date
-    }
-
     private let titleLabel = NSTextField(labelWithString: "传输队列")
     private let summaryLabel = NSTextField(labelWithString: "暂无传输任务")
     private let clearFinishedButton = NSButton()
@@ -38,11 +33,8 @@ public final class TransferQueuePopoverViewController: NSViewController {
     private let emptyStateLabel = NSTextField(labelWithString: "当前会话还没有传输记录")
     private var rowViewsByJobID: [String: TransferQueuePopoverRowView] = [:]
     private var rowWidthConstraintsByJobID: [String: NSLayoutConstraint] = [:]
-    private var speedSamplesByJobID: [String: SpeedSample] = [:]
-    private var measuredSpeedByJobID: [String: Double] = [:]
-    private var lastProgressAtByJobID: [String: Date] = [:]
+    private var speedSamplesByJobID: [String: TransferRateSampler] = [:]
     private var latestSnapshot = TransferQueueSnapshot(rows: [])
-    private let nowProvider: () -> Date
 
     public private(set) var rowsForTesting: [TransferQueuePopoverRowPresentation] = []
 
@@ -54,8 +46,7 @@ public final class TransferQueuePopoverViewController: NSViewController {
         backgroundButton
     }
 
-    public init(nowProvider: @escaping () -> Date = Date.init) {
-        self.nowProvider = nowProvider
+    public init(nowProvider _: @escaping () -> Date = Date.init) {
         super.init(nibName: nil, bundle: nil)
         preferredContentSize = NSSize(width: 520, height: 460)
     }
@@ -123,14 +114,14 @@ public final class TransferQueuePopoverViewController: NSViewController {
         var presentations: [TransferQueuePopoverRowPresentation] = []
         var actionsByJobID: [String: TransferQueueAction] = [:]
         var currentJobIDs = Set<String>()
-        let sampleTime = nowProvider()
+        let sampleTime = snapshot.capturedAt
 
         for row in snapshot.rows {
             currentJobIDs.insert(row.jobID)
             let speed = transferSpeed(for: row, capturedAt: sampleTime)
             let presentation = Self.presentation(for: row, speed: speed)
             presentations.append(presentation)
-            if let action = Self.primaryAction(for: row.rawStatus) {
+            if let action = Self.primaryAction(for: row) {
                 actionsByJobID[row.jobID] = action
             }
         }
@@ -142,8 +133,6 @@ public final class TransferQueuePopoverViewController: NSViewController {
                 rowView.removeFromSuperview()
             }
             speedSamplesByJobID.removeValue(forKey: jobID)
-            measuredSpeedByJobID.removeValue(forKey: jobID)
-            lastProgressAtByJobID.removeValue(forKey: jobID)
         }
 
         let desiredJobIDs = presentations.map(\.jobID)
@@ -174,7 +163,7 @@ public final class TransferQueuePopoverViewController: NSViewController {
             else { continue }
             rowView.apply(
                 presentation: presentation,
-                statusText: Self.statusText(for: snapshotRow.rawStatus),
+                statusText: L10n.Transfers.displayStatus(snapshotRow.rawStatus, bytesDone: snapshotRow.bytesDone, bytesTotal: snapshotRow.bytesTotal),
                 direction: snapshotRow.direction,
                 sourcePath: snapshotRow.sourcePath,
                 destinationPath: snapshotRow.destinationPath,
@@ -299,39 +288,9 @@ public final class TransferQueuePopoverViewController: NSViewController {
         return rowView
     }
 
-    private func transferSpeed(
-        for row: TransferQueueSnapshot.Row,
-        capturedAt: Date
-    ) -> Double {
-        let previous = speedSamplesByJobID[row.jobID]
-        speedSamplesByJobID[row.jobID] = SpeedSample(
-            bytesDone: row.bytesDone,
-            capturedAt: capturedAt
-        )
-        if let previous {
-            let interval = capturedAt.timeIntervalSince(previous.capturedAt)
-            if interval > 0, row.bytesDone >= previous.bytesDone {
-                let byteDelta = row.bytesDone - previous.bytesDone
-                if byteDelta > 0 {
-                    let measuredSpeed = Double(byteDelta) / interval
-                    measuredSpeedByJobID[row.jobID] = measuredSpeed
-                    lastProgressAtByJobID[row.jobID] = capturedAt
-                    return measuredSpeed
-                }
-                if Self.normalizedStatus(row.rawStatus) != "paused",
-                   let lastProgressAt = lastProgressAtByJobID[row.jobID],
-                   capturedAt.timeIntervalSince(lastProgressAt) <= 1.5
-                {
-                    return measuredSpeedByJobID[row.jobID] ?? 0
-                }
-                return 0
-            }
-        }
-        guard row.elapsedTime > 0 else { return 0 }
-        let averageSpeed = Double(row.bytesDone) / row.elapsedTime
-        measuredSpeedByJobID[row.jobID] = averageSpeed
-        lastProgressAtByJobID[row.jobID] = capturedAt
-        return averageSpeed
+    private func transferSpeed(for row: TransferQueueSnapshot.Row, capturedAt: Date) -> Double {
+        speedSamplesByJobID[row.jobID, default: TransferRateSampler()]
+            .update(bytesDone: row.bytesDone, status: row.rawStatus, at: capturedAt, baselineID: row.rateBaselineID) ?? 0
     }
 
     private func updateHeader() {
@@ -398,17 +357,11 @@ public final class TransferQueuePopoverViewController: NSViewController {
             } else {
                 byteCount = row.bytesDone
             }
-            let rateByteCount = row.bytesDone > 0
-                ? row.bytesDone
-                : (isCompleted(status: row.rawStatus) ? byteCount : 0)
-            let averageBytesPerSecond = row.elapsedTime > 0
-                ? Double(rateByteCount) / row.elapsedTime
-                : 0
             sizeText = "大小 \(byteCountText(byteCount))"
             elapsedText = "总用时 \(terminalDurationText(row.elapsedTime))"
             let timeLabel = isCompleted(status: row.rawStatus) ? "完成时间" : "结束时间"
             completionTimeText = "\(timeLabel) \(row.finishedAt.map(completedAtFormatter.string) ?? "--")"
-            displayedSpeedText = "平均速率 \(formattedSpeed(averageBytesPerSecond))"
+            displayedSpeedText = "平均速率 \(formattedSpeed(row.averageBytesPerSecond))"
             remainingText = isCompleted(status: row.rawStatus) ? "已完成" : statusText(for: row.rawStatus)
             metricsText = [
                 [sizeText, elapsedText].compactMap { $0 }.joined(separator: "  ·  "),
@@ -418,8 +371,12 @@ public final class TransferQueuePopoverViewController: NSViewController {
             sizeText = nil
             completionTimeText = nil
             elapsedText = "已用 \(durationText(row.elapsedTime))"
-            displayedSpeedText = speedText(speed, status: row.rawStatus)
-            remainingText = remainingSeconds.map { "剩余 \(durationText($0))" } ?? "剩余 --"
+            let finalizing = row.rawStatus == "finalizing" || (row.bytesTotal > 0 && row.bytesDone >= row.bytesTotal
+                && (row.rawStatus == "running" || row.rawStatus == "resuming"))
+            displayedSpeedText = finalizing ? "-- B/s"
+                : (speed <= 0 && row.bytesDone > 0 ? "0 B/s" : speedText(speed, status: row.rawStatus))
+            remainingText = finalizing ? L10n.Transfers.finalizing
+                : remainingSeconds.map { "剩余 \(durationText($0))" } ?? "剩余 --"
             metricsText = [displayedSpeedText, elapsedText, remainingText].joined(separator: "  ·  ")
         }
         return TransferQueuePopoverRowPresentation(
@@ -432,8 +389,8 @@ public final class TransferQueuePopoverViewController: NSViewController {
             sizeText: sizeText,
             completionTimeText: completionTimeText,
             metricsText: metricsText,
-            primaryActionLabel: primaryAction(for: row.rawStatus).map(actionLabel),
-            canCancel: isActive(status: row.rawStatus),
+            primaryActionLabel: primaryAction(for: row).map(actionLabel),
+            canCancel: isActive(status: row.rawStatus) && row.rawStatus != "finalizing",
             canDelete: isTerminal
         )
     }
@@ -450,7 +407,10 @@ public final class TransferQueuePopoverViewController: NSViewController {
     }
 
     private static func speedText(_ bytesPerSecond: Double, status: String) -> String {
-        guard isActive(status: status), bytesPerSecond > 0 else { return "-- B/s" }
+        guard isActive(status: status) else { return "-- B/s" }
+        //已开始传输但还没有可测得的增量时，明确告知正在准备，
+        //而不是显示0或者---，让用户知道任务确实已经启动。
+        guard bytesPerSecond > 0 else { return "准备中" }
         return formattedSpeed(bytesPerSecond)
     }
 
@@ -521,13 +481,13 @@ public final class TransferQueuePopoverViewController: NSViewController {
         !["completed", "failed", "canceled", "cancelled", "stopped"].contains(normalizedStatus(status))
     }
 
-    private static func primaryAction(for status: String) -> TransferQueueAction? {
-        switch normalizedStatus(status) {
+    private static func primaryAction(for row: TransferQueueSnapshot.Row) -> TransferQueueAction? {
+        switch normalizedStatus(row.rawStatus) {
         case "paused":
             return .resume
         case "failed", "canceled", "cancelled", "stopped":
-            return .retry
-        case "completed":
+            return row.allowsRetry ? .retry : nil
+        case "completed", "finalizing":
             return nil
         default:
             return .pause
@@ -547,6 +507,7 @@ public final class TransferQueuePopoverViewController: NSViewController {
     private static func statusText(for status: String) -> String {
         switch normalizedStatus(status) {
         case "queued": return "等待中"
+        case "finalizing": return L10n.Transfers.finalizing
         case "running", "uploading", "downloading": return "传输中"
         case "paused": return "已暂停"
         case "completed": return "已完成"

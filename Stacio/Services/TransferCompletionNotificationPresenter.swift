@@ -11,6 +11,7 @@ public struct TransferCompletionNotificationPayload: Equatable {
     public let status: TransferCompletionNotificationStatus
     public let title: String
     public let body: String
+    public let diagnostic: String?
     public let itemName: String
     public let byteCount: UInt64
     public let completedAt: Date
@@ -23,6 +24,7 @@ public struct TransferCompletionNotificationPayload: Equatable {
         status: TransferCompletionNotificationStatus,
         title: String,
         body: String,
+        diagnostic: String? = nil,
         itemName: String = "",
         byteCount: UInt64 = 0,
         completedAt: Date = Date(timeIntervalSince1970: 0),
@@ -34,6 +36,7 @@ public struct TransferCompletionNotificationPayload: Equatable {
         self.status = status
         self.title = title
         self.body = body
+        self.diagnostic = diagnostic
         self.itemName = itemName
         self.byteCount = byteCount
         self.completedAt = completedAt
@@ -42,15 +45,16 @@ public struct TransferCompletionNotificationPayload: Equatable {
     }
 
     public var listRow: TransferCompletionNotificationListRow {
-        TransferCompletionNotificationListRow(
+        let reasons = status == .failed ? diagnostic.map { [$0] } ?? [] : []
+        return TransferCompletionNotificationListRow(
             statusText: status == .completed ? L10n.Transfers.completed : L10n.Transfers.failed,
             itemName: itemName.isEmpty ? title : itemName,
-            detailText: [
+            detailText: (reasons + [
                 "\(L10n.Transfers.notificationSize) \(Self.formatByteCount(byteCount))",
                 "\(L10n.Transfers.notificationCompletedAt) \(Self.completedAtFormatter.string(from: completedAt))",
                 "\(L10n.Transfers.notificationDuration) \(Self.formatDuration(duration))",
                 "\(L10n.Transfers.notificationAverageSpeed) \(Self.formatSpeed(averageBytesPerSecond))"
-            ].joined(separator: " · ")
+            ]).joined(separator: " · ")
         )
     }
 

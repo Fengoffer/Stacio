@@ -7,6 +7,17 @@ import XCTest
 
 @MainActor
 final class TranscriptRecorderTests: XCTestCase {
+    func testOutputCursorStillFindsNewBytesWhenHistoryRollsOver() {
+        let recorder = TranscriptRecorder(maximumByteCount: 6)
+        recorder.append(bytes: Array("abcdef".utf8))
+        let start = recorder.outputPosition
+        recorder.append(bytes: Array("好!".utf8))
+        XCTAssertEqual(recorder.output(since: start, limit: 6), "好!")
+        XCTAssertEqual(recorder.output(since: start, limit: 2), "!")
+        recorder.reset()
+        recorder.append(bytes: Array("new".utf8))
+        XCTAssertEqual(recorder.output(since: start, limit: 6), "new")
+    }
     func testRecordingSessionIsDefaultOffAndLifecycleIsIdempotent() throws {
         let session = TerminalRecordingSession(
             recorder: TimestampedRecorder(maximumByteCount: 1_024, maximumEntryCount: 16)

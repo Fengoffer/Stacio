@@ -900,79 +900,120 @@ public final class TerminalRecordingSessionRegistry {
 @MainActor
 public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValidation {
     public static let shared = TerminalRecordingWindowCoordinator()
+    public typealias SavePanelPresenter = (NSSavePanel, NSWindow?, @escaping (URL?) -> Void) -> Void
 
     private let windowProvider: @MainActor () -> NSWindow?
+    private var recordingDirectory: URL
+    private let savePanelPresenter: SavePanelPresenter
+    private var isChoosingRecordingDestination = false
     private var windowController: TerminalRecordingWindowController?
     private var loadingTask: Task<Void, Never>?
     private var loadRequestID: UUID?
 
-    public init(windowProvider: @escaping @MainActor () -> NSWindow? = { NSApplication.shared.keyWindow }) {
+    public init(windowProvider: @escaping @MainActor () -> NSWindow? = { NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow },
+                recordingDirectory: URL? = nil, savePanelPresenter: SavePanelPresenter? = nil) {
         self.windowProvider = windowProvider
+        self.recordingDirectory = recordingDirectory ?? StyledTerminalRecording.defaultDirectory
+        self.savePanelPresenter = savePanelPresenter ?? { panel, window, completion in
+            let handler: (NSApplication.ModalResponse) -> Void = { [weak panel] response in
+                completion(response == .OK ? panel?.url : nil)
+            }
+            if let window, window.isVisible {
+                panel.beginSheetModal(for: window, completionHandler: handler)
+            } else {
+                panel.begin(completionHandler: handler)
+            }
+        }
         super.init()
     }
 
     @objc
     public func startRecordingCurrentTerminal(_ sender: Any?) {
-        guard let target = currentTerminalTarget() else { return }
-        let session = TerminalRecordingSessionRegistry.shared.session(
-            for: target.runtimeID,
-            title: target.agentTitle,
-            owner: target as AnyObject
-        )
-        let dimensions = terminalDimensions(for: target)
-        _ = session.start(width: dimensions.width, height: dimensions.height)
+        guard !isChoosingRecordingDestination, let target = currentTerminalTarget(),
+              canStartRecording(for: target), let controller = target as? NSViewController else { return }
+        let panel = Self.makeSavePanel(title: target.agentTitle, directory: recordingDirectory)
+        isChoosingRecordingDestination = true
+        savePanelPresenter(panel, windowProvider()) { [weak self, weak controller] url in
+            guard let self else { return }
+            self.isChoosingRecordingDestination = false
+            // Keep the original pane even if focus, selected tab or runtime ID
+            // changed while choosing. A pane closed in the meantime is ignored.
+            guard let url, let target = controller as? AgentTerminalTarget,
+                  self.canStartRecording(for: target) else { return }
+            self.startRecording(target: target, at: url)
+        }
     }
 
-    @objc
-    public func stopRecordingCurrentTerminal(_ sender: Any?) {
-        guard let target = currentTerminalTarget(),
-              let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID)
-        else { return }
-        _ = session.stop()
-    }
-
-    @objc
-    public func saveRecordingCurrentTerminal(_ sender: Any?) {
-        guard let target = currentTerminalTarget(),
-              let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID),
-              session.hasOutput
-        else { return }
-        _ = session.stop()
-
+    static func makeSavePanel(title: String, directory: URL, date: Date = Date()) -> NSSavePanel {
         let panel = NSSavePanel()
-        panel.title = "保存录制"
-        panel.message = "保存当前终端的 asciinema v2 录制文件。"
-        panel.prompt = "保存"
-        panel.nameFieldStringValue = "\(target.runtimeID).cast"
-        if let castType = UTType(filenameExtension: "cast") {
-            panel.allowedContentTypes = [castType]
+        panel.title = "选择终端录制保存位置"
+        panel.message = "确认后开始录制，关闭终端时自动保存到所选位置。断线重连不会停止录制。"
+        panel.prompt = "开始录制"
+        panel.nameFieldStringValue = StyledTerminalRecording.suggestedFileName(title: title, date: date)
+        panel.directoryURL = directory
+        panel.allowedContentTypes = [.rtf]
+        panel.allowsOtherFileTypes = false
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        return panel
+    }
+
+    private func canStartRecording(for target: AgentTerminalTarget) -> Bool {
+        if let local = target as? TerminalPaneViewController { return local.canStartStyledRecording }
+        if let remote = target as? RemoteTerminalPaneViewController { return remote.canStartStyledRecording }
+        return false
+    }
+
+    private func startRecording(target: AgentTerminalTarget, at url: URL) {
+        let terminalView: TerminalView
+        if let local = target as? TerminalPaneViewController { terminalView = local.terminalView }
+        else if let remote = target as? RemoteTerminalPaneViewController { terminalView = remote.terminalView }
+        else { return }
+        do {
+            let session = try StyledTerminalRecording(
+                view: terminalView, title: target.agentTitle, fileURL: url,
+                onError: { [weak self] error in self?.presentLoadError(error, title: "录制保存失败") }
+            )
+            if let local = target as? TerminalPaneViewController { local.styledRecording = session }
+            if let remote = target as? RemoteTerminalPaneViewController { remote.styledRecording = session }
+            recordingDirectory = url.deletingLastPathComponent()
+        } catch {
+            presentLoadError(error, title: "无法开始录制")
         }
-        let completion: (NSApplication.ModalResponse) -> Void = { [session, weak panel] response in
-            guard response == .OK, let url = panel?.url else { return }
-            session.save(to: url, title: target.agentTitle) { result in
-                if case let .failure(error) = result {
-                    let alert = NSAlert(error: error)
-                    alert.runModal()
-                }
+    }
+
+    @objc
+    public func revealRecordingFolder(_ sender: Any?) {
+        if let target = currentTerminalTarget(), let session = recording(for: target) {
+            if FileManager.default.fileExists(atPath: session.fileURL.path) {
+                NSWorkspace.shared.activateFileViewerSelecting([session.fileURL])
+            } else {
+                NSWorkspace.shared.open(session.fileURL.deletingLastPathComponent())
             }
-        }
-        if let window = windowProvider(), window.isVisible {
-            panel.beginSheetModal(for: window, completionHandler: completion)
         } else {
-            panel.begin(completionHandler: completion)
+            do {
+                try FileManager.default.createDirectory(at: recordingDirectory, withIntermediateDirectories: true)
+                NSWorkspace.shared.open(recordingDirectory)
+            } catch { presentLoadError(error, title: "无法打开录制文件夹") }
         }
+    }
+
+    private func recording(for target: AgentTerminalTarget) -> StyledTerminalRecording? {
+        if let local = target as? TerminalPaneViewController { return local.styledRecording }
+        if let remote = target as? RemoteTerminalPaneViewController { return remote.styledRecording }
+        return nil
     }
 
     public static func makeOpenPanel() -> NSOpenPanel {
         let panel = NSOpenPanel()
         panel.title = "打开录制文件"
-        panel.message = "选择 asciinema v2 .cast 录制文件。"
+        panel.message = "选择带颜色的 RTF 终端录制，或已有的 asciinema .cast 录制文件。"
         panel.prompt = "打开"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if let castType = UTType(filenameExtension: "cast") {
-            panel.allowedContentTypes = [castType]
+            panel.allowedContentTypes = [.rtf, castType]
         }
         return panel
     }
@@ -994,6 +1035,10 @@ public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValid
 
     private func loadRecording(at url: URL) {
         cancelPendingLoad()
+        if url.pathExtension.lowercased() == "rtf" {
+            NSWorkspace.shared.open(url)
+            return
+        }
         let requestID = UUID()
         loadRequestID = requestID
         loadingTask = Task { [weak self] in
@@ -1037,11 +1082,11 @@ public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValid
         controller.window?.makeKeyAndOrderFront(self)
     }
 
-    private func presentLoadError(_ error: Error) {
+    private func presentLoadError(_ error: Error, title: String = "无法打开录制文件") {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "无法打开录制文件"
-        alert.informativeText = error.localizedDescription
+        alert.messageText = title
+        alert.informativeText = [error.localizedDescription, (error as NSError).localizedRecoverySuggestion].compactMap { $0 }.joined(separator: "\n")
         alert.addButton(withTitle: "好")
         if let parentWindow = NSApp.keyWindow, parentWindow.isVisible {
             alert.beginSheetModal(for: parentWindow) { _ in }
@@ -1057,31 +1102,23 @@ public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValid
     }
 
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        guard menuItem.action == #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:))
-                || menuItem.action == #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:))
-                || menuItem.action == #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:))
-        else {
-            return true
-        }
-        guard let target = currentTerminalTarget() else { return false }
-        let session = TerminalRecordingSessionRegistry.shared.existingSession(for: target.runtimeID)
-
-        switch menuItem.action {
-        case #selector(TerminalRecordingWindowCoordinator.startRecordingCurrentTerminal(_:)):
-            return session?.canStart ?? true
-        case #selector(TerminalRecordingWindowCoordinator.stopRecordingCurrentTerminal(_:)):
-            return session?.isRecording ?? false
-        case #selector(TerminalRecordingWindowCoordinator.saveRecordingCurrentTerminal(_:)):
-            return session?.hasOutput == true && session?.isSaving == false
-        default:
-            return true
-        }
+        guard menuItem.action == #selector(startRecordingCurrentTerminal(_:)) else { return true }
+        let target = currentTerminalTarget()
+        let session = target.flatMap { recording(for: $0) }
+        menuItem.state = session?.isRecording == true ? .on : .off
+        menuItem.title = session?.error != nil ? "当前终端录制写入失败" :
+            (session?.isRecording == true ? "正在录制当前终端（关闭时保存）" : "开始录制当前终端")
+        menuItem.toolTip = session?.fileURL.path ?? "先选择保存位置，再开始录制。保留颜色和排版，关闭终端时自动保存，断线后继续录制。"
+        return !isChoosingRecordingDestination && target.map { canStartRecording(for: $0) } == true
     }
 
     private func currentTerminalTarget() -> AgentTerminalTarget? {
-        guard let window = windowProvider(),
-              let root = window.contentViewController
-        else { return nil }
+        guard let window = windowProvider() else { return nil }
+        // Production Workbench installs contentView, not contentViewController.
+        if let workbench = window.windowController as? WorkbenchWindowController {
+            return workbench.workspaceViewController.currentAgentTerminalTarget
+        }
+        guard let root = window.contentViewController else { return nil }
         let firstResponder = window.firstResponder as? NSView
 
         func descendants(of controller: NSViewController) -> [NSViewController] {
@@ -1111,20 +1148,4 @@ public final class TerminalRecordingWindowCoordinator: NSObject, NSMenuItemValid
         return candidates.first?.0
     }
 
-    private func terminalDimensions(for target: AgentTerminalTarget) -> (width: Int, height: Int) {
-        let dimensions: (Int, Int)
-        if let local = target as? TerminalPaneViewController {
-            let terminal = local.terminalView.getTerminal()
-            dimensions = (terminal.cols, terminal.rows)
-        } else if let remote = target as? RemoteTerminalPaneViewController {
-            let terminal = remote.terminalView.getTerminal()
-            dimensions = (terminal.cols, terminal.rows)
-        } else {
-            dimensions = (80, 24)
-        }
-        return (
-            min(max(dimensions.0, 1), 1_000),
-            min(max(dimensions.1, 1), 1_000)
-        )
-    }
 }

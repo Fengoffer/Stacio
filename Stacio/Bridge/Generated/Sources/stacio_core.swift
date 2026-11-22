@@ -13314,6 +13314,30 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeScpTransferProgress: FfiConverterRustBuffer {
+    typealias SwiftType = [ScpTransferProgress]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeScpTransferProgress.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeScpTransferProgress.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -15468,6 +15492,13 @@ public func parseRemoteListing(input: String)throws  -> [RemoteFileEntry]  {
     )
 })
 }
+public func pauseLiveScpTransfer(jobId: String) -> [ScpTransferProgress]?  {
+    return try!  FfiConverterOptionSequenceTypeScpTransferProgress.lift(try! rustCall() {
+    uniffi_stacio_core_fn_func_pause_live_scp_transfer(
+        FfiConverterString.lower(jobId),$0
+    )
+})
+}
 public func placeSessionSidebarItem(databasePath: String, kind: String, id: String, targetParentId: String?, targetIndex: UInt32)throws  -> SessionSidebarOrderItem  {
     return try  FfiConverterTypeSessionSidebarOrderItem_lift(try rustCallWithError(FfiConverterTypeSessionError_lift) {
     uniffi_stacio_core_fn_func_place_session_sidebar_item(
@@ -15800,6 +15831,22 @@ public func renameTerminalMacro(databasePath: String, macroId: String, name: Str
     )
 })
 }
+/**
+ * Preserve the clear's order relative to new jobs even while the database is locked.
+ */
+public func requestClearFinishedScpTransferJobs(databasePath: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_request_clear_finished_scp_transfer_jobs(
+        FfiConverterString.lower(databasePath),$0
+    )
+}
+}
+public func requestDeleteFinishedScpTransferJob(databasePath: String, jobId: String)throws   {try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
+    uniffi_stacio_core_fn_func_request_delete_finished_scp_transfer_job(
+        FfiConverterString.lower(databasePath),
+        FfiConverterString.lower(jobId),$0
+    )
+}
+}
 public func resolveScpConflictPath(destinationPath: String, policy: ScpConflictPolicy) -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_stacio_core_fn_func_resolve_scp_conflict_path(
@@ -15807,6 +15854,16 @@ public func resolveScpConflictPath(destinationPath: String, policy: ScpConflictP
         FfiConverterTypeScpConflictPolicy_lower(policy),$0
     )
 })
+}
+/**
+ * The direct-transfer coordinator still owns the route here. A cancel racing
+ * the worker's return must not be seen by the next attempt on that route.
+ */
+public func retireRemoteTransferAttempt(jobId: String)  {try! rustCall() {
+    uniffi_stacio_core_fn_func_retire_remote_transfer_attempt(
+        FfiConverterString.lower(jobId),$0
+    )
+}
 }
 public func runLiveFtpTransfer(config: FtpConnectionConfig, secret: FtpAuthSecret, job: ScpTransferJob)throws  -> [ScpTransferProgress]  {
     return try  FfiConverterSequenceTypeScpTransferProgress.lift(try rustCallWithError(FfiConverterTypeSshRuntimeError_lift) {
@@ -16653,6 +16710,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_parse_remote_listing() != 51859) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_pause_live_scp_transfer() != 29021) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_place_session_sidebar_item() != 10152) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16761,7 +16821,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_stacio_core_checksum_func_rename_terminal_macro() != 38185) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_stacio_core_checksum_func_request_clear_finished_scp_transfer_jobs() != 36495) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_request_delete_finished_scp_transfer_job() != 25600) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_stacio_core_checksum_func_resolve_scp_conflict_path() != 34249) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_stacio_core_checksum_func_retire_remote_transfer_attempt() != 36172) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_stacio_core_checksum_func_run_live_ftp_transfer() != 35778) {

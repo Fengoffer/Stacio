@@ -70,18 +70,20 @@ final class LocalAgentConfigurationStoreTests: XCTestCase {
         )
     }
 
-    func testNeedsLoginEvidenceIsPersistedAndCannotBecomeRunnable() throws {
+    func testNeedsLoginEvidenceIsPersistedButStillRunnable() throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
         let record = replacing(
-            makeRecord(fixture: fixture, configurationID: "local-agent-needs-login"),
-            authenticationState: .needsLogin
+                makeRecord(fixture: fixture, configurationID: "local-agent-needs-login"),
+                authenticationState: .needsLogin
         )
         let saved = try fixture.store.save(record, expectedRevision: nil)
-        XCTAssertEqual(saved.authenticationState, .needsLogin)
-        XCTAssertNil(
-            makeResolver(fixture: fixture, store: fixture.store)
-                .passthroughConfiguration(for: .codex)
+        XCTAssertEqual(saved.authenticationState, .needsLogin, "登录状态仍要如实记录")
+        // The CLI signs in inside the terminal it is launched in, so a stored
+        // credential is not a precondition for offering it.
+        XCTAssertNotNil(
+                makeResolver(fixture: fixture, store: fixture.store)
+                        .passthroughConfiguration(for: .codex)
         )
     }
 
@@ -200,9 +202,15 @@ final class LocalAgentConfigurationStoreTests: XCTestCase {
             environment: fixture.environment.merging(["PATH": fixture.root.path]) { _, new in new },
             allowsLegacyPathDiscovery: true
         )
-        XCTAssertNil(
+        // Compatibility is deliberately independent of the stored digest. A CLI
+        // that updates itself rewrites its entry point, which looks identical to
+        // a replacement; refusing to launch it kept an installed Codex out of the
+        // Assistant entirely. The verified authority above still refuses it, so
+        // the changed binary can only ever reach the labelled compatibility PTY.
+        XCTAssertEqual(
             compatibilityResolver.legacyExecutablePath(for: .codex),
-            "A persisted but invalid authority must not be bypassed through compatibility mode"
+            fixture.executableURL.path,
+            "Compatibility mode reports the installed CLI regardless of the stored digest"
         )
     }
 

@@ -608,13 +608,13 @@ public struct AgentActionAuthorizer: AgentActionAuthorizing {
     private func policySummary(for policy: AgentAuthorizationPolicy) -> String {
         switch policy {
         case .allowAllCommandsWithoutPrompt:
-            return "全局策略：全部自动"
+            return "全局策略：\(L10n.Settings.allowAllCommands)"
         case .allowLowRiskCommandsWithoutPrompt:
-            return "全局策略：低风险自动"
+            return "全局策略：\(L10n.Settings.allowLowRisk)"
         case .allowReadOnlyExternalCommands:
-            return "全局策略：只读自动"
+            return "全局策略：\(L10n.Settings.allowReadOnly)"
         case .requireConfirmationForAll:
-            return "全局策略：每次确认"
+            return "全局策略：\(L10n.Settings.requireEveryCommand)"
         }
     }
 

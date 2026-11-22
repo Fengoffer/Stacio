@@ -26,6 +26,35 @@ public enum StacioDesignSystem {
         public let fastAnimationDuration: TimeInterval
         public let standardAnimationDuration: TimeInterval
 
+        // MARK: spacing ramp (8pt grid)
+        //
+        //4pt half-steps plus8pt main steps cover everything from the gap
+        // between an icon and its label to the breathing room between
+        // paragraphs. New layout should take these tokens instead of literals,
+        // otherwise spacing loses its rhythm as features accumulate.
+        public let spacingHairline: CGFloat
+        public let spacingTight: CGFloat
+        public let spacingCompact: CGFloat
+        public let spacingRegular: CGFloat
+        public let spacingRoomy: CGFloat
+        public let spacingLoose: CGFloat
+        public let spacingSection: CGFloat
+
+        // MARK: - typography ramp
+        //
+        // Roles only, no concrete fonts: callers take the size and decide weight
+        // and family, so the same size does not acquire a dozen variants.
+        public let fontSizeCaption: CGFloat
+        public let fontSizeFootnote: CGFloat
+        public let fontSizeBody: CGFloat
+        public let fontSizeBodyEmphasis: CGFloat
+        public let fontSizeTitle: CGFloat
+
+        // MARK: - line height multipliers
+        public let lineHeightTight: CGFloat
+        public let lineHeightRegular: CGFloat
+        public let lineHeightRelaxed: CGFloat
+
         public static let codex = Theme(
             windowBackgroundColor: .windowBackgroundColor,
             toolbarBackgroundColor: .windowBackgroundColor,
@@ -47,7 +76,22 @@ public enum StacioDesignSystem {
             panelCornerRadius: 8,
             controlCornerRadius: 7,
             fastAnimationDuration: 0.12,
-            standardAnimationDuration: 0.18
+            standardAnimationDuration:0.18,
+            spacingHairline:2,
+            spacingTight:4,
+            spacingCompact:6,
+            spacingRegular:8,
+            spacingRoomy:12,
+            spacingLoose:16,
+            spacingSection:24,
+            fontSizeCaption:10,
+            fontSizeFootnote:11,
+            fontSizeBody:12,
+            fontSizeBodyEmphasis:13,
+            fontSizeTitle:15,
+            lineHeightTight:1.2,
+            lineHeightRegular:1.4,
+            lineHeightRelaxed:1.6
         )
     }
 
@@ -207,6 +251,12 @@ public enum StacioDesignSystem {
     }
 
     public static func styleTextField(_ textField: NSTextField) {
+        // NSSearchField依赖专用的NSSearchFieldCell做布局，
+        //替换成普通cell会在macOS27上触发-[NSSearchField layout]崩溃。
+        if let searchField = textField as? NSSearchField {
+            styleSearchField(searchField)
+            return
+        }
         if let comboBox = textField as? NSComboBox {
             styleComboBox(comboBox)
             return

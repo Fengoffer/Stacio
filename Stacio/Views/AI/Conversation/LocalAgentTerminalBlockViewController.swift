@@ -100,6 +100,9 @@ final class LocalAgentTerminalBlockViewController: NSViewController {
     private(set) var lastPreparedWorkingDirectoryForTesting: String?
     private var userCollapsed = false
     private var compactPresentation = false
+    /// The preferred 220pt body is a card inside the transcript. When the
+    /// Inspector hands the whole panel to the CLI, the terminal takes it all.
+    private var preferredTerminalHeightConstraint: NSLayoutConstraint?
 
     init(
         resolver: LocalAgentToolResolving,
@@ -174,10 +177,53 @@ final class LocalAgentTerminalBlockViewController: NSViewController {
         return session.launchState.isRunning
     }
 
+    var fillsPanelForTesting: Bool {
+        isViewLoaded && headerView.isHidden
+    }
+
+    /// Removes the card chrome so the terminal fills whatever container it is
+    /// in. The Inspector uses this when the agent owns the panel: a header bar
+    /// and a 220pt body inside a full-height column is not a terminal.
+    func setFillsPanel(_ fills: Bool) {
+        guard isViewLoaded else { return }
+        headerView.isHidden = fills
+        separator.isHidden = fills
+        preferredTerminalHeightConstraint?.isActive = fills == false
+        view.needsLayout = true
+    }
+
+    /// True when this CLI is already running in compatibility mode, so the
+    /// caller may return to it without stopping anything first.
+    func isRunningLegacy(tool: LocalAgentTool) -> Bool {
+        state.preventsRuntimeChange
+            && selectedConfiguration == nil
+            && selectedTool == tool
+            && selectedLegacyExecutablePath != nil
+    }
+
     /// Restores the pre-V2 Inspector behavior for an already-installed CLI
     /// when Settings has no verified profile yet. The caller must present this
     /// as compatibility mode; it never enters the durable V2 Runtime router.
+    /// Selects a CLI found on this machine and launches it right away.
+    ///
+    /// This is the path a reader expects: whatever is installed is
+    /// usable, in a terminal, without first creating a profile.
     @discardableResult
+    func activateLegacy(tool: LocalAgentTool) -> Bool {
+        guard selectLegacy(tool: tool) else { return false }
+        guard let executablePath = selectedLegacyExecutablePath else { return false }
+        guard let session = legacySession(for: tool, executablePath: executablePath) else {
+            return false
+        }
+        let prepared = LocalAgentPreparedWorkingDirectory(
+            mode: .managedWorkspace,
+            localPathReference: nil
+        )
+        session.startIfNeeded(preparedWorkingDirectory: prepared)
+        synchronizeState(from: session.launchState, tool: tool)
+        return session.launchState.isRunning
+    }
+
     func selectLegacy(tool: LocalAgentTool) -> Bool {
         loadViewIfNeeded()
         if state.preventsRuntimeChange {
@@ -215,13 +261,14 @@ final class LocalAgentTerminalBlockViewController: NSViewController {
 
     /// 选择下一轮 Runtime 只准备 UI，不启动 CLI。启动与首条 PTY 写入发生在 durable
     /// Turn/outbox 已提交之后。
-    func canSelect(configuration: LocalAgentPassthroughConfiguration) -> Bool {
-        let changesRunningRuntime = state.preventsRuntimeChange
-            && (selectedTool != configuration.tool || selectedConfiguration != configuration)
-        return changesRunningRuntime == false
-            && configuration.isReadyForTerminalPassthrough
-            && resolver.passthroughConfiguration(for: configuration.tool) == configuration
-    }
+        func canSelect(configuration: LocalAgentPassthroughConfiguration) -> Bool {
+                let changesRunningRuntime = state.preventsRuntimeChange
+                        && (selectedTool != configuration.tool || selectedConfiguration != configuration)
+                let ready = configuration.isReadyForTerminalPassthrough
+                let resolved = resolver.passthroughConfiguration(for: configuration.tool)
+                let same = resolved == configuration
+                return changesRunningRuntime == false && ready && same
+        }
 
     @discardableResult
     func select(configuration: LocalAgentPassthroughConfiguration) -> Bool {
@@ -652,6 +699,7 @@ final class LocalAgentTerminalBlockViewController: NSViewController {
         minimumTerminalHeight.priority = .defaultHigh
         let preferredTerminalHeight = terminalHost.heightAnchor.constraint(equalToConstant: 220)
         preferredTerminalHeight.priority = .defaultLow
+        preferredTerminalHeightConstraint = preferredTerminalHeight
         NSLayoutConstraint.activate([minimumTerminalHeight, preferredTerminalHeight])
 
         let stack = NSStackView(views: [headerView, separator, terminalHost])

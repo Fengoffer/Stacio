@@ -5,6 +5,9 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class StacioShortcutRecorderField: NSTextField {
+    var onReset: (() -> Void)?
+    @objc func restoreDefault() { onReset?() }
+
     var onBindingChanged: ((StacioShortcutBinding) -> Void)?
     var binding = StacioShortcutBinding(key: "") {
         didSet { stringValue = binding.displayString }
@@ -28,6 +31,12 @@ final class StacioShortcutRecorderField: NSTextField {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         stringValue = "按下快捷键…"
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        stringValue = binding.displayString
+        return true
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -187,6 +196,9 @@ public final class AppKitAppSettingsUpdateChannelConfirmation: AppSettingsUpdate
 
 @MainActor
 public final class AppSettingsWindowController: NSWindowController {
+    func showAIModels() { settingsViewController.showAIModels() }
+    func showAIExecutionPermissions() { settingsViewController.showAIExecutionPermissions() }
+
     private let settingsViewController: AppSettingsViewController
 
     public init(
@@ -240,6 +252,13 @@ public final class AppSettingsWindowController: NSWindowController {
         )
         window.title = L10n.Settings.title
         window.minSize = AppSettingsLayout.minWindowSize
+        // Content must never drive the window size; the reader may still drag it
+        // larger. A generous cap keeps a runaway label from stretching the frame.
+        window.maxSize = NSSize(
+                width: AppSettingsLayout.windowSize.width * 2,
+                height: AppSettingsLayout.windowSize.height * 2
+        )
+        window.contentMaxSize = window.maxSize
         window.appearance = nil
         window.titleVisibility = .visible
         window.toolbarStyle = .automatic
@@ -553,7 +572,6 @@ private final class AppSettingsSwitchProxy: NSView {
             nativeSwitch.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsSwitchSize.height),
 
             backingButton.widthAnchor.constraint(equalToConstant: 0),
-            backingButton.heightAnchor.constraint(equalToConstant: 0),
             backingButton.trailingAnchor.constraint(equalTo: trailingAnchor),
             backingButton.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
@@ -868,8 +886,8 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     private let aiSummaryProviderLabel = NSTextField(labelWithString: "")
     private let aiSummaryApprovalLabel = NSTextField(labelWithString: "")
     private let aiSummaryExecutionLabel = NSTextField(labelWithString: "")
-    private let agentApprovalRiskMatrixLabel = NSTextField(labelWithString: "")
-    private let securityApprovalRiskMatrixLabel = NSTextField(labelWithString: "")
+    private let agentApprovalSummaryLabel = NSTextField(labelWithString: "")
+    private let openAIExecutionPermissionsButton = NSButton(title: L10n.Settings.openAIExecutionPermissions, target: nil, action: nil)
     private let agentBridgeSocketLabel = NSTextField(labelWithString: "")
     private let copyAgentBridgeSocketButton = NSButton(title: L10n.Settings.copySocketPath, target: nil, action: nil)
     private let filesSummaryDirectoryFollowLabel = NSTextField(labelWithString: "")
@@ -898,21 +916,19 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     private let copyApplicationSupportPathButton = NSButton(title: L10n.Settings.copyPath, target: nil, action: nil)
     private let copyDatabasePathButton = NSButton(title: L10n.Settings.copyPath, target: nil, action: nil)
     private let copyLogPathButton = NSButton(title: L10n.Settings.copyPath, target: nil, action: nil)
-    private let confirmationControl = NSSegmentedControl(
-        labels: [
-            L10n.Settings.allowAllCommands,
-            L10n.Settings.allowLowRisk,
-            L10n.Settings.allowReadOnly,
-            L10n.Settings.requireEveryCommand
-        ],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
+        /// Shared names; this edits the global policy, not a conversation.
+        private let confirmationControl = NSSegmentedControl(
+            labels: [
+                L10n.Settings.requireEveryCommand,
+                L10n.Settings.allowLowRisk,
+                L10n.Settings.allowAllCommands
+            ],
+            trackingMode: .selectOne,
+            target: nil,
+            action: nil
+        )
     private let agentCommandAllowPatternsField = NSTextField()
     private let agentCommandDenyPatternsField = NSTextField()
-    private let securityAgentCommandAllowPatternsField = NSTextField()
-    private let securityAgentCommandDenyPatternsField = NSTextField()
     private let diagnosticsAuditExportLimitField = NSTextField()
     private let diagnosticsAppLogLineLimitField = NSTextField()
     private let diagnosticsIncludeAppLogsButton = NSButton(
@@ -992,17 +1008,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     private let deviceMetricsMemoryAlertThresholdPercentField = NSTextField()
     private let deviceMetricsDiskAlertThresholdPercentField = NSTextField()
     private let deviceMetricsAlertConsecutiveRefreshCountField = NSTextField()
-    private let securityConfirmationControl = NSSegmentedControl(
-        labels: [
-            L10n.Settings.allowAllCommands,
-            L10n.Settings.allowLowRisk,
-            L10n.Settings.allowReadOnly,
-            L10n.Settings.requireEveryCommand
-        ],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
     private let updateChannelControl = NSSegmentedControl(
         labels: ProductOpsReleaseChannel.allCases.map(\.displayName),
         trackingMode: .selectOne,
@@ -1215,6 +1220,18 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         select(section: section)
     }
 
+    func showAIModels() {
+        loadViewIfNeeded()
+        select(section: .ai)
+        aiSettingsViewController?.selectTab(.models)
+    }
+
+    @objc func showAIExecutionPermissions() {
+        loadViewIfNeeded()
+        select(section: .ai)
+        aiSettingsViewController?.selectTab(.executionPermissions)
+    }
+
     private func select(section: AppSettingsSection) {
         selectedSection = section
         for (candidate, button) in navigationButtons {
@@ -1323,77 +1340,65 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     private func makeShortcutsPane() -> NSView {
         let stack = makePaneStack(section: .shortcuts)
         let store = StacioShortcutStore.shared
-        let rows = StacioShortcutAction.allCases.map { makeShortcutRow(for: $0, store: store) }
-        let list = NSStackView(views: rows)
-        list.orientation = .vertical
-        list.alignment = .width
-        list.spacing = 1
-        list.translatesAutoresizingMaskIntoConstraints = false
-        list.setAccessibilityIdentifier("Stacio.Settings.shortcutsList")
-        stack.addArrangedSubview(list)
-        NSLayoutConstraint.activate([
-            list.widthAnchor.constraint(equalToConstant: AppSettingsLayout.paneWidth)
-        ])
+        let groups: [(String, String, [StacioShortcutAction])] = [
+            ("sessions", "会话与终端", [.newSession, .newLocalTerminal, .closeTerminal, .find, .multiExec]),
+            ("layout", "窗口布局", [.toggleSidebar, .splitSingle, .splitVertical, .splitHorizontal, .splitGrid]),
+            ("panels", "工具面板", [.showFiles, .showBrowser, .showTunnels, .showDiagnostics, .showMacros, .showCommandHistory, .toggleDeviceDashboard, .showAIAssistant]),
+            ("application", "应用", [.settings, .quit])
+        ]
+        stack.setAccessibilityIdentifier("Stacio.Settings.shortcutsList")
+        for (id, name, actions) in groups {
+            let heading = makeGroupTitleLabel(name)
+            stack.addArrangedSubview(heading)
+            stack.setCustomSpacing(8, after: heading)
+            let list = makeSettingsListSurface(identifier: "Stacio.Settings.shortcuts.\(id)", rows: actions.map { makeShortcutRow(for: $0, store: store) })
+            stack.addArrangedSubview(list)
+            stack.setCustomSpacing(20, after: list)
+        }
         return stack
     }
 
     private func makeShortcutRow(for action: StacioShortcutAction, store: StacioShortcutStore) -> NSView {
         let title = NSTextField(labelWithString: action.title)
-        title.font = .systemFont(ofSize: 14, weight: .medium)
-        title.textColor = StacioDesignSystem.theme.primaryTextColor
-        let detail = NSTextField(labelWithString: action.detail)
-        detail.font = .systemFont(ofSize: 12)
-        detail.textColor = StacioDesignSystem.theme.secondaryTextColor
-        let labels = NSStackView(views: [title, detail])
-        labels.orientation = .vertical
-        labels.alignment = .leading
-        labels.spacing = 2
-
+        title.font = .systemFont(ofSize: NSFont.systemFontSize)
+        title.toolTip = action.detail
         let recorder = StacioShortcutRecorderField()
         recorder.binding = store.binding(for: action)
         recorder.setAccessibilityIdentifier("Stacio.Settings.shortcut.\(action.rawValue)")
-        let conflict = NSTextField(labelWithString: "")
-        conflict.font = .systemFont(ofSize: 11)
+        recorder.setAccessibilityLabel(action.title + "快捷键")
+        recorder.toolTip = "点击后按下组合键，按 Esc 取消"
+        let conflict = NSTextField(wrappingLabelWithString: "")
+        conflict.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         conflict.textColor = .systemRed
-        conflict.maximumNumberOfLines = 1
-        conflict.lineBreakMode = .byTruncatingTail
-        let reset = NSButton(title: "恢复默认", target: nil, action: nil)
-        reset.bezelStyle = .inline
-        reset.target = self
-        reset.action = #selector(resetShortcut(_:))
-        reset.tag = StacioShortcutAction.allCases.firstIndex(of: action) ?? 0
+        conflict.isHidden = true
+        let labels = NSStackView(views: [title, conflict])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 3
 
-        recorder.onBindingChanged = { [weak recorder, weak conflict] binding in
-            let result = store.set(binding, for: action)
-            if let message = result.message {
-                conflict?.stringValue = message
-                recorder?.binding = store.binding(for: action)
-            } else {
-                conflict?.stringValue = ""
-                recorder?.binding = binding
-            }
+        let reset = NSButton(image: NSImage(systemSymbolName: "arrow.counterclockwise", accessibilityDescription: "恢复默认快捷键")!, target: recorder, action: #selector(StacioShortcutRecorderField.restoreDefault))
+        reset.bezelStyle = .inline
+        reset.toolTip = "恢复默认快捷键 " + store.defaultBinding(for: action).displayString
+        reset.setAccessibilityLabel("恢复“\(action.title)”的默认快捷键")
+        reset.isEnabled = recorder.binding != store.defaultBinding(for: action)
+        recorder.onBindingChanged = { [weak recorder, weak conflict, weak reset] proposed in
+            let message = store.set(proposed, for: action).message
+            recorder?.binding = store.binding(for: action)
+            conflict?.stringValue = message ?? ""
+            conflict?.isHidden = message == nil
+            reset?.isEnabled = store.binding(for: action) != store.defaultBinding(for: action)
         }
-        let row = NSStackView(views: [labels, NSView(), recorder, conflict, reset])
+        recorder.onReset = { [weak recorder] in
+            recorder?.onBindingChanged?(store.defaultBinding(for: action))
+        }
+        let row = NSStackView(views: [labels, NSView(), recorder, reset])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
-        row.wantsLayer = true
-        row.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.45).cgColor
-        row.layer?.cornerRadius = 8
-        labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        recorder.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        conflict.widthAnchor.constraint(equalToConstant: 145).isActive = true
-        reset.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        row.edgeInsets = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
+        row.widthAnchor.constraint(equalToConstant: AppSettingsLayout.settingsListContentWidth).isActive = true
+        recorder.widthAnchor.constraint(equalToConstant: 108).isActive = true
         return row
-    }
-
-    @objc private func resetShortcut(_ sender: NSButton) {
-        guard StacioShortcutAction.allCases.indices.contains(sender.tag)
-        else { return }
-        let action = StacioShortcutAction.allCases[sender.tag]
-        StacioShortcutStore.shared.reset(action)
-        select(section: .shortcuts)
     }
 
     private func makeTerminalPane() -> NSView {
@@ -1806,9 +1811,9 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
                         identifier: "Stacio.Settings.agentCommandPatternHelp"
                     )
                 ]),
-                makeApprovalRiskMatrixLabel(
-                    agentApprovalRiskMatrixLabel,
-                    identifier: "Stacio.Settings.agentApprovalRiskMatrix"
+                makeApprovalSummaryLabel(
+                    agentApprovalSummaryLabel,
+                    identifier: "Stacio.Settings.agentApprovalSummary"
                 ),
                 makeSettingsDetailBlock([
                     makeControlColumnRow(aiAutoRunProposedCommandsButton),
@@ -2144,11 +2149,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     private func makeSecurityPane() -> NSView {
         configureSecurityControls()
         let stack = makePaneStack(section: .security)
-        let form = makeForm(rows: [
-            (L10n.Settings.confirmationPolicy, securityConfirmationControl),
-            (L10n.Settings.agentCommandAllowPatterns, securityAgentCommandAllowPatternsField),
-            (L10n.Settings.agentCommandDenyPatterns, securityAgentCommandDenyPatternsField)
-        ])
         stack.addArrangedSubview(makeSecurityStatusOverview())
         stack.addArrangedSubview(makeSettingsGroup(
             title: L10n.Settings.securityApprovalGroupTitle,
@@ -2156,16 +2156,12 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             identifier: "Stacio.Settings.group.securityApproval",
             content: [
                 makeSettingsDetailBlock([
-                    form,
-                    makeControlColumnHelpLabel(
+                    makeHelpLabel(
                         L10n.Settings.securityCommandPolicyHelp,
                         identifier: "Stacio.Settings.securityCommandPolicyHelp"
-                    )
-                ]),
-                makeApprovalRiskMatrixLabel(
-                    securityApprovalRiskMatrixLabel,
-                    identifier: "Stacio.Settings.securityApprovalRiskMatrix"
-                )
+                    ),
+                    openAIExecutionPermissionsButton
+                ])
             ]
         ))
         stack.addArrangedSubview(makeSessionPolicyGroup())
@@ -2905,14 +2901,14 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         return row
     }
 
-    private func makeApprovalRiskMatrixLabel(_ label: NSTextField, identifier: String) -> NSTextField {
+    private func makeApprovalSummaryLabel(_ label: NSTextField, identifier: String) -> NSTextField {
         label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
         label.textColor = StacioDesignSystem.theme.secondaryTextColor
         label.lineBreakMode = .byWordWrapping
         label.maximumNumberOfLines = 0
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setAccessibilityIdentifier(identifier)
-        label.stringValue = approvalRiskMatrixText(for: settingsStore.snapshot().agentConfirmationPolicy)
+        label.stringValue = approvalSummaryText(for: settingsStore.snapshot())
         NSLayoutConstraint.activate([
             label.widthAnchor.constraint(lessThanOrEqualToConstant: AppSettingsLayout.readableTextWidth)
         ])
@@ -4502,7 +4498,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             terminalCommandSuggestionHistoryMinLengthField.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsTextFieldHeight),
             terminalCommandSuggestionHistoryMaxLengthField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.compactFieldWidth),
             terminalCommandSuggestionHistoryMaxLengthField.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsTextFieldHeight),
-            terminalCommandSuggestionWordSeparatorsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.controlColumnWidth),
+            terminalCommandSuggestionWordSeparatorsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.settingsListContentWidth - AppSettingsLayout.labelColumnWidth - 24),
             terminalCommandSuggestionWordSeparatorsField.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsTextFieldHeight),
             terminalDuplicateSessionCommandDelayMillisecondsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.compactFieldWidth),
             terminalDuplicateSessionCommandDelayMillisecondsField.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsTextFieldHeight),
@@ -5259,9 +5255,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
 
     private func configureSecurityControls() {
         let snapshot = settingsStore.snapshot()
-        securityConfirmationControl.selectedSegment = segment(for: snapshot.agentConfirmationPolicy)
-        securityAgentCommandAllowPatternsField.stringValue = snapshot.agentCommandAllowPatterns
-        securityAgentCommandDenyPatternsField.stringValue = snapshot.agentCommandDenyPatterns
         diagnosticsAuditExportLimitField.stringValue = "\(snapshot.diagnosticsAuditExportLimit)"
         diagnosticsAppLogLineLimitField.stringValue = "\(snapshot.diagnosticsAppLogLineLimit)"
         diagnosticsIncludeAppLogsButton.state = snapshot.diagnosticsIncludeAppLogs ? .on : .off
@@ -5271,20 +5264,11 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             return
         }
         securityControlsConfigured = true
-        securityConfirmationControl.target = self
-        securityConfirmationControl.action = #selector(securityConfirmationPolicyChanged(_:))
-        securityConfirmationControl.setAccessibilityIdentifier("Stacio.Settings.securityAgentConfirmationPolicy")
-        StacioDesignSystem.styleSegmentedControl(securityConfirmationControl)
-        configureCommandPatternField(
-            securityAgentCommandAllowPatternsField,
-            identifier: "Stacio.Settings.securityAgentCommandAllowPatterns",
-            action: #selector(agentCommandAllowPatternsChanged(_:))
-        )
-        configureCommandPatternField(
-            securityAgentCommandDenyPatternsField,
-            identifier: "Stacio.Settings.securityAgentCommandDenyPatterns",
-            action: #selector(agentCommandDenyPatternsChanged(_:))
-        )
+        openAIExecutionPermissionsButton.target = self
+        openAIExecutionPermissionsButton.action = #selector(showAIExecutionPermissions)
+        openAIExecutionPermissionsButton.setAccessibilityIdentifier("Stacio.Settings.openAIExecutionPermissions")
+        openAIExecutionPermissionsButton.translatesAutoresizingMaskIntoConstraints = false
+        StacioDesignSystem.styleSheetButton(openAIExecutionPermissionsButton)
         configureDiagnosticsLimitField(
             diagnosticsAuditExportLimitField,
             identifier: "Stacio.Settings.diagnosticsAuditExportLimit",
@@ -5302,12 +5286,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         diagnosticsIncludeAppLogsButton.contentTintColor = StacioDesignSystem.theme.primaryTextColor
         diagnosticsIncludeAppLogsButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            securityConfirmationControl.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
-            securityConfirmationControl.heightAnchor.constraint(equalToConstant: 32),
-            securityAgentCommandAllowPatternsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
-            securityAgentCommandAllowPatternsField.heightAnchor.constraint(equalToConstant: 56),
-            securityAgentCommandDenyPatternsField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.segmentedWidth),
-            securityAgentCommandDenyPatternsField.heightAnchor.constraint(equalToConstant: 56),
             diagnosticsAuditExportLimitField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.compactFieldWidth),
             diagnosticsAuditExportLimitField.heightAnchor.constraint(equalToConstant: AppSettingsLayout.settingsTextFieldHeight),
             diagnosticsAppLogLineLimitField.widthAnchor.constraint(equalToConstant: AppSettingsLayout.compactFieldWidth),
@@ -6061,6 +6039,9 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
                 case .success:
                     statusLabel.textColor = StacioDesignSystem.theme.successColor
                     statusLabel.stringValue = L10n.Settings.aiAssistantSettingSaved
+                    if id == "assistant.history.retention", case .int(let days) = value, self.conversationHistoryStore is CoreBridgeAIAssistantConversationHistoryStore {
+                        AgentStore.shared.removeHistory(before: Date().addingTimeInterval(-Double(days) * 86400))
+                    }
                 case .failure(.historyPruningFailed):
                     statusLabel.textColor = StacioDesignSystem.theme.warningColor
                     statusLabel.stringValue = L10n.Settings.aiHistoryRetentionSavedPruningFailed
@@ -6136,10 +6117,10 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     }
 
     @objc private func confirmationPolicyChanged(_ sender: NSSegmentedControl) {
+        guard (0..<sender.segmentCount).contains(sender.selectedSegment) else { return }
         settingsStore.update { settings in
             settings.agentConfirmationPolicy = confirmationPolicy(for: sender.selectedSegment)
         }
-        securityConfirmationControl.selectedSegment = sender.selectedSegment
         refreshAISummary()
         refreshSecuritySummary()
     }
@@ -6149,6 +6130,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             settings.aiAutoRunProposedCommands = sender.state == .on
         }
         refreshAISummary()
+        refreshSecuritySummary()
     }
 
     @objc private func agentCommandAllowPatternsChanged(_ sender: NSTextField) {
@@ -6223,6 +6205,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         }
         do {
             try conversationHistoryStore.clearConversationHistory()
+            if conversationHistoryStore is CoreBridgeAIAssistantConversationHistoryStore { AgentStore.shared.removeHistory() }
             aiConversationHistoryStatusLabel.stringValue = L10n.Settings.aiConversationHistoryCleared
         } catch {
             aiConversationHistoryStatusLabel.stringValue = RuntimeDiagnosticFormatter.userMessage(for: error)
@@ -6347,15 +6330,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             apply(&settings, normalizedValue)
         }
         refreshMetricsSummary()
-    }
-
-    @objc private func securityConfirmationPolicyChanged(_ sender: NSSegmentedControl) {
-        settingsStore.update { settings in
-            settings.agentConfirmationPolicy = confirmationPolicy(for: sender.selectedSegment)
-        }
-        confirmationControl.selectedSegment = sender.selectedSegment
-        refreshAISummary()
-        refreshSecuritySummary()
     }
 
     @objc private func diagnosticsAuditExportLimitChanged(_ sender: NSTextField) {
@@ -6684,27 +6658,30 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
 
     private func segment(for policy: AgentConfirmationPolicyPreference) -> Int {
         switch policy {
-        case .allowAllWithoutPrompt:
+        case .requireEveryCommand:
             return 0
         case .allowLowRiskWithoutPrompt:
             return 1
-        case .allowReadOnlyWithoutPrompt:
+        case .allowAllWithoutPrompt:
             return 2
-        case .requireEveryCommand:
-            return 3
+        case .allowReadOnlyWithoutPrompt:
+            // Preserve the legacy value without displaying a different policy.
+            // The summary explains it until the user explicitly chooses a level.
+            return -1
         }
     }
+    
 
+    /// Maps the three-segment control to the stored preference. The order
+    /// matches the conversation permission names; scopes remain independent.
     private func confirmationPolicy(for segment: Int) -> AgentConfirmationPolicyPreference {
         switch segment {
         case 0:
-            return .allowAllWithoutPrompt
+            return .requireEveryCommand
         case 1:
             return .allowLowRiskWithoutPrompt
-        case 2:
-            return .allowReadOnlyWithoutPrompt
         default:
-            return .requireEveryCommand
+            return .allowAllWithoutPrompt
         }
     }
 
@@ -6767,7 +6744,7 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         aiSummaryProviderLabel.stringValue = "\(L10n.Settings.aiProviderSummaryPrefix)：\(title(forAIProvider: snapshot.aiProvider))"
         aiSummaryApprovalLabel.stringValue = "\(L10n.Settings.aiApprovalSummaryPrefix)：\(title(forConfirmationPolicy: snapshot.agentConfirmationPolicy))\(commandPatternSummarySuffix(snapshot))"
         aiSummaryExecutionLabel.stringValue = "\(L10n.Settings.aiExecutionSummaryPrefix)：\(title(forExecutionMode: snapshot.agentExecutionMode))"
-        agentApprovalRiskMatrixLabel.stringValue = approvalRiskMatrixText(for: snapshot.agentConfirmationPolicy)
+        agentApprovalSummaryLabel.stringValue = approvalSummaryText(for: snapshot)
     }
 
     private func refreshAIModelCatalogControls(status: String? = nil) {
@@ -6900,8 +6877,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
         let snapshot = settingsStore.snapshot()
         agentCommandAllowPatternsField.stringValue = snapshot.agentCommandAllowPatterns
         agentCommandDenyPatternsField.stringValue = snapshot.agentCommandDenyPatterns
-        securityAgentCommandAllowPatternsField.stringValue = snapshot.agentCommandAllowPatterns
-        securityAgentCommandDenyPatternsField.stringValue = snapshot.agentCommandDenyPatterns
     }
 
     private func refreshCustomTerminalThemeLabel() {
@@ -7081,7 +7056,6 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
             ? "日志 \(snapshot.diagnosticsAppLogLineLimit) 行"
             : "不包含应用日志"
         securitySummaryAuditLabel.stringValue = "\(L10n.Settings.securityAuditSummary) · 最近 \(snapshot.diagnosticsAuditExportLimit) 条 · \(logSummary)"
-        securityApprovalRiskMatrixLabel.stringValue = approvalRiskMatrixText(for: snapshot.agentConfirmationPolicy)
     }
 
     private func refreshCredentialCenter() {
@@ -7159,20 +7133,11 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
     }
 
     private func title(forConfirmationPolicy policy: AgentConfirmationPolicyPreference) -> String {
-        switch policy {
-        case .allowAllWithoutPrompt:
-            return L10n.Settings.allowAllCommands
-        case .allowLowRiskWithoutPrompt:
-            return L10n.Settings.allowLowRisk
-        case .allowReadOnlyWithoutPrompt:
-            return L10n.Settings.allowReadOnly
-        case .requireEveryCommand:
-            return L10n.Settings.requireEveryCommand
-        }
+        policy.displayName
     }
 
-    private func approvalRiskMatrixText(for policy: AgentConfirmationPolicyPreference) -> String {
-        let authorizationPolicy = policy.authorizationPolicy
+    private func approvalSummaryText(for settings: AppSettings) -> String {
+        let authorizationPolicy = settings.agentConfirmationPolicy.authorizationPolicy
         let rows: [(String, AgentActionRisk)] = [
             ("只读", .readOnly),
             ("普通写入", .write),
@@ -7187,7 +7152,8 @@ private final class AppSettingsViewController: NSViewController, NSTextFieldDele
                 return "\(title)：\(decision)"
             }
             .joined(separator: " · ")
-        return "审批矩阵：\(summary)"
+        let modes = AgentPermissionMode.allCases.map { "\($0.label)：\($0.shortDescription)" }.joined(separator: "\n")
+        return "内置助手 · 当前对话权限\n\(modes)\n\(AgentPermissionPolicy.globalConstraintDescription(preferences: settings))\n\n外部 Agent · 默认审批规则\n\(summary)\n命令模式与目标终端策略另行生效；危险命令仍受安全规则限制。"
     }
 
     private func title(forExecutionMode mode: AgentExecutionModePreference) -> String {

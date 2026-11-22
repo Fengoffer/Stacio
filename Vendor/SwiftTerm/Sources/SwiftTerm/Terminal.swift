@@ -340,6 +340,11 @@ open class Terminal {
      */
     public private(set) var buffer: Buffer
 
+    /// Optional transcript observer. Called synchronously before reusable screen
+    /// rows are overwritten, including rows lost within a single large feed.
+    public weak var contentObserver: TerminalContentObserver?
+    public var screenStartRow: Int { buffer.linesTop + buffer.yBase }
+
     private let synchronizedOutputTimeoutSeconds: TimeInterval = 1.0
     public private(set) var synchronizedOutputActive: Bool = false
     private var synchronizedOutputTimeoutItem: DispatchWorkItem?
@@ -799,6 +804,7 @@ open class Terminal {
         if buffer === normalBuffer {
             return
         }
+        contentObserver?.terminalWillDiscardScreen(self)
         normalBuffer.x = altBuffer.x
         normalBuffer.y = altBuffer.y
         
@@ -817,6 +823,7 @@ open class Terminal {
         if buffer === altBuffer {
             return
         }
+        contentObserver?.terminalWillDiscardScreen(self)
         altBuffer.x = normalBuffer.x
         altBuffer.y = normalBuffer.y
         
@@ -2411,6 +2418,24 @@ open class Terminal {
     func cmdEraseInDisplay (_ pars: [Int], _ collect: cstring)
     {
         let p = pars.count == 0 ? 0 : pars [0]
+        if let observer = contentObserver, (0...2).contains(p) {
+            // ED0/ED1 may discard complete rows without scrolling. Do not
+            // checkpoint a prompt on every keystroke when a shell merely clears
+            // its already-empty remainder, however.
+            let erasedAttribute = eraseAttr()
+            let firstRow = p == 0 ? buffer.y : 0
+            let lastRow = p == 1 ? buffer.y : rows - 1
+            let discardsContent = (firstRow...lastRow).contains { row in
+                let start = p == 0 && row == buffer.y ? min(buffer.x, cols) : 0
+                let end = p == 1 && row == buffer.y ? min(buffer.x + 1, cols) : cols
+                let line = buffer.lines[buffer.yBase + row]
+                return (start..<end).contains { column in
+                    let cell = line[column]
+                    return (cell.code != 0 && cell.code != 32) || cell.attribute != erasedAttribute
+                }
+            }
+            if discardsContent { observer.terminalWillDiscardScreen(self) }
+        }
         var j: Int
         switch p {
         case 0:
@@ -2495,6 +2520,7 @@ open class Terminal {
         if buffer.y < buffer.scrollTop || buffer.y > buffer.scrollBottom {
             return
         }
+        contentObserver?.terminalWillDiscardScreen(self)
         // to prevent a Denial of Service
         let maxLines = buffer.lines.maxLength * 2
         var p = min (maxLines, max (pars.count == 0 ? 1 : pars [0], 1))
@@ -4741,6 +4767,7 @@ open class Terminal {
     //
     func cmdScrollDown (_ pars: [Int])
     {
+        contentObserver?.terminalWillDiscardScreen(self)
         let p = min (max (pars.count == 0 ? 1 : pars [0], 1), rows)
         let da = CharData.defaultAttr
 
@@ -4777,6 +4804,7 @@ open class Terminal {
     //
     func cmdScrollUp (_ pars: [Int], _ collect: cstring)
     {
+        contentObserver?.terminalWillDiscardScreen(self)
         let p = min (rows*2, max (pars.count == 0 ? 1 : pars [0], 1))
         let da = CharData.defaultAttr
 
@@ -4841,6 +4869,7 @@ open class Terminal {
     //
     func cmdDeleteLines (_ pars: [Int], _ collect: cstring)
     {
+        contentObserver?.terminalWillDiscardScreen(self)
         restrictCursor()
         let buffer = self.buffer
         // No point deleting more lines than the available rows, prevents
@@ -5020,6 +5049,7 @@ open class Terminal {
     public func parse (buffer: ArraySlice<UInt8>)
     {
         parser.parse(data: buffer)
+        contentObserver?.terminalDidUpdate(self)
     }
      
     /**
@@ -5203,6 +5233,7 @@ open class Terminal {
     /// for a soft reset see `softReset`
     public func resetToInitialState ()
     {
+        contentObserver?.terminalWillDiscardScreen(self)
         endSynchronizedOutput ()
         options.rows = rows
         options.cols = cols
@@ -5212,6 +5243,7 @@ open class Terminal {
         cursorHidden = savedCursorHidden
         refresh (startRow: 0, endRow: rows-1)
         syncScrollArea ()
+        contentObserver?.terminalDidUpdate(self)
     }
 
     // Support for:
@@ -5313,6 +5345,9 @@ open class Terminal {
 
         let topRow = buffer.yBase + scrollTop
         let bottomRow = buffer.yBase + scrollBottom
+        if topRow < lines.count {
+            contentObserver?.terminal(self, willScrollOut: lines[topRow])
+        }
 
         // When margin mode is active with left/right margins that are narrower than full width,
         // we cannot use scrollback (can't push partial lines), so we do in-place scrolling
@@ -5529,6 +5564,7 @@ open class Terminal {
         if newCols == self.cols && newRows == self.rows {
             return
         }
+        contentObserver?.terminalWillDiscardScreen(self)
         endSynchronizedOutput ()
         let oldCols = self.cols
         resizeBuffers(newColumns: newCols, newRows: newRows)
@@ -5539,6 +5575,7 @@ open class Terminal {
         normalBuffer.setupTabStops (index: oldCols, tabStopWidth: tabStopWidth)
         altBuffer.setupTabStops (index: oldCols, tabStopWidth: tabStopWidth)
         refresh (startRow: 0, endRow: self.rows - 1)
+        contentObserver?.terminalDidResize(self)
     }
     
     /**
@@ -5808,6 +5845,7 @@ open class Terminal {
 
         if buffer.y == buffer.scrollTop {
             if canScroll {
+                contentObserver?.terminalWillDiscardScreen(self)
                 // possibly move the code below to term.reverseScroll()
                 // test: echo -ne '\e[1;1H\e[44m\eM\e[0m'
                 // blankLine(true) is xterm/linux behavior

@@ -480,11 +480,14 @@ if [[ "$ALLOW_INCOMPLETE_PRODUCT_OPS_CONFIG" != "1" ]]; then
 fi
 
 swift_release_build() {
+  # An explicit STACIO_CORE_LIBRARY_DIR wins, so a prebuilt core can be linked
+  # from wherever it lives.
+  local core_link_dir="${STACIO_CORE_LIBRARY_DIR:-$CORE_LINK_LIBRARY_DIR}"
   if (( ${#SWIFT_BUILD_TARGET_ARGS[@]} == 0 )); then
-    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+    STACIO_CORE_LIBRARY_DIR="$core_link_dir" \
       swift build -c release --sdk "$MACOS_SDK_PATH" "${SWIFT_SDK_LINK_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
   else
-    STACIO_CORE_LIBRARY_DIR="$CORE_LINK_LIBRARY_DIR" \
+    STACIO_CORE_LIBRARY_DIR="$core_link_dir" \
       swift build -c release --sdk "$MACOS_SDK_PATH" "${SWIFT_SDK_LINK_ARGS[@]}" "${SWIFT_BUILD_TARGET_ARGS[@]}" --package-path "$ROOT_DIR" "$@"
   fi
 }
@@ -637,7 +640,13 @@ if [[ "${STACIO_SKIP_BUILD:-0}" != "1" ]]; then
  #C依赖（openssl-sys等）用 -fdebug-prefix-map重写，RUSTFLAGS不覆盖C代码。
  export CFLAGS="${CFLAGS:-} -fdebug-prefix-map=$ROOT_DIR=/stacio -fdebug-prefix-map=$HOME=/build"
  export CXXFLAGS="${CXXFLAGS:-} -fdebug-prefix-map=$ROOT_DIR=/stacio -fdebug-prefix-map=$HOME=/build"
-  if (( ${#CARGO_BUILD_TARGET_ARGS[@]} == 0 )); then
+  if [[ "${STACIO_SKIP_CORE_BUILD:-0}" == "1" ]]; then
+    echo "Skipping the Rust core build by request; using $CORE_DYLIB_DEFAULT" >&2
+    [[ -f "$CORE_DYLIB_DEFAULT" ]] || {
+      echo "STACIO_SKIP_CORE_BUILD=1 but $CORE_DYLIB_DEFAULT is missing" >&2
+      exit 1
+    }
+  elif (( ${#CARGO_BUILD_TARGET_ARGS[@]} == 0 )); then
     cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release
   else
     cargo build --manifest-path "$ROOT_DIR/StacioCore/Cargo.toml" --release "${CARGO_BUILD_TARGET_ARGS[@]}"
@@ -876,6 +885,10 @@ cp -R "$ROOT_DIR/Stacio/Resources/SessionIcons/." "$RESOURCES_DIR/SessionIcons/"
 mkdir -p "$RESOURCES_DIR/ImportSourceIcons"
 cp -R "$ROOT_DIR/Stacio/Resources/ImportSourceIcons/." "$RESOURCES_DIR/ImportSourceIcons/"
 /usr/bin/xattr -cr "$RESOURCES_DIR/ImportSourceIcons"
+
+mkdir -p "$RESOURCES_DIR/AIModelIcons"
+cp -R "$ROOT_DIR/Stacio/Resources/AIModelIcons/." "$RESOURCES_DIR/AIModelIcons/"
+/usr/bin/xattr -cr "$RESOURCES_DIR/AIModelIcons"
 
 mkdir -p "$RESOURCES_DIR/Fonts"
 cp "$ROOT_DIR/Stacio/Resources/Fonts/SarasaTermSC-Regular.ttf" "$RESOURCES_DIR/Fonts/SarasaTermSC-Regular.ttf"

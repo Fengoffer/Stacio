@@ -21,7 +21,6 @@ enum L10n {
         static let close = "关闭"
         static let stop = "停止"
         static let save = "保存"
-        static let saveAndConnect = "保存并连接"
         static let connect = "连接"
         static let delete = "删除"
     }
@@ -402,7 +401,7 @@ enum L10n {
         static let aiCompatibilityProtocol = "兼容协议"
         static let aiModelCatalogHelp = "刷新会读取当前供应商的 OpenAI-compatible /models 接口；本地列表保存在本机设置中，不包含 API Key。"
         static let aiExecutionGroupTitle = "执行与审批"
-        static let aiExecutionGroupDescription = "控制排查助手如何执行终端命令，以及每轮自动排查的资源边界。"
+        static let aiExecutionGroupDescription = "内置助手在每个对话中单独选择权限；这里管理共用的全局审批策略和命令规则。"
         static let aiConversationHistoryGroupTitle = "对话历史"
         static let aiConversationHistoryGroupDescription = "排查会话按终端保存在本机 SQLite；不会作为遥测上传。"
         static let clearAIConversationHistory = "清除 AI 对话历史..."
@@ -416,19 +415,19 @@ enum L10n {
         static let agentCommandAllowPatterns = "自动放行模式"
         static let agentCommandDenyPatterns = "禁止模式"
         static let agentCommandPatternPlaceholder = "每行一个命令片段，例如 systemctl status"
-        static let agentCommandPatternHelp = "按行填写命令模式，大小写不敏感，并从命令开头匹配；sudo/env 等包装器会自动跳过。禁止模式优先于自动放行；生产环境和会话强制确认仍会覆盖自动放行。"
+        static let agentCommandPatternHelp = "按行填写命令模式，大小写不敏感，并从命令开头匹配；sudo/env 等包装器会自动跳过。禁止模式优先；生产环境和终端强制确认仍会覆盖自动放行。内置助手仅对已识别的安全只读命令使用放行模式，不会因此跳过对话审批。"
         static let agentBridgeGroupTitle = "Agent Bridge"
         static let agentBridgeGroupDescription = "受信任的终端桥接客户端可复用 Stacio 当前打开的真实终端和后台虚拟终端。"
         static let agentBridgeSocket = "Socket"
         static let agentBridgeHint = "CLI 示例：stacio agent sessions，然后 stacio agent run --runtime <runtimeID> --command \"uptime\" --follow（stacio 仍作为兼容命令保留）"
         static let copySocketPath = "复制 Socket 路径"
         static let aiProviderSummaryPrefix = "AI 来源"
-        static let aiApprovalSummaryPrefix = "审批策略"
+        static let aiApprovalSummaryPrefix = "全局审批策略"
         static let aiExecutionSummaryPrefix = "执行方式"
         static let aiProviderHelp = "OpenAI、DeepSeek、OpenRouter、Qwen、Kimi、Ollama 和 LM Studio 都走 OpenAI-compatible 通道；选择供应商后仍可手动微调 Base URL 和模型名。"
         static let aiRequestAdvancedHelp = "失败重试只用于超时、限流和服务端瞬时错误；鉴权失败、模型不存在等配置错误不会重复请求。User-Agent 可用于代理网关识别 Stacio 流量。"
         static let aiSettingsTabModels = "模型"
-        static let aiSettingsTabLocalAgent = "本地 Agent"
+        static let aiSettingsTabLocalAgent = "本地 CLI 工具"
         static let aiSettingsTabContext = "上下文"
         static let aiSettingsTabExecutionPermissions = "执行与权限"
         static let aiSettingsTabHistory = "历史"
@@ -443,6 +442,9 @@ enum L10n {
         static let addAIProviderSave = "保存供应商"
         static let addAIProviderSaveDraft = "保存草稿"
         static let addAIProviderSaveCredentialAndFetchModels = "保存凭证并获取模型"
+        /// Shown under the disabled API Key field before a template is chosen, so
+        /// the greyed field is explained rather than looking broken.
+        static let addAIProviderChooseTemplateForCredential = "先选择供应商，以确定是否需要 API Key。"
         static let addAIProviderSaveAndFetchModels = "保存并获取模型"
         static let addAIProviderCancel = "取消"
         static let addAIProviderAddManualModel = "添加模型"
@@ -473,7 +475,7 @@ enum L10n {
         static let aiIncludeRecentTerminalTranscript = "附带最近终端输出"
         static let aiContextCharacterLimit = "上下文字符上限"
         static let aiContextHelp = "终端输出会先脱敏，再按所选范围加入当前请求。模型容量和推理强度在模型页配置。"
-        static let aiExecutionHelp = "真实终端会把命令写入当前标签页；后台虚拟终端不会抢占前台输入；每次选择会在每轮发送前要求确认执行位置。三种方式都遵守同一套审批与审计策略。"
+        static let aiExecutionHelp = "内置助手在对话框选中的终端执行命令。关闭自动审批/执行后，每条命令都需人工确认；开启后仍按对话权限和目标终端策略审批。"
         static let aiSessionGroupTitle = "会话与输入"
         static let aiSessionGroupDescription = "控制排查会话恢复方式和输入框的发送按键。"
         static let aiRestoreLastConversation = "恢复上次排查会话"
@@ -488,7 +490,7 @@ enum L10n {
         static let aiTerminalOutputExcluded = "不附带"
         static let aiAutoCompressContext = "自动压缩长上下文"
         static let aiAutoCompressContextHelp = "接近模型上下文上限时保留错误线索与最近输出，降低长日志导致的截断。"
-        static let aiDefaultTerminalMode = "默认执行终端"
+        static let aiDefaultTerminalMode = "后台任务的执行终端"
         static let aiRealTerminal = "真实终端"
         static let aiBackgroundTerminal = "后台虚拟终端"
         static let aiAskTerminalEveryTurn = "每次选择"
@@ -514,7 +516,7 @@ enum L10n {
         static let aiHistoryRetentionSavedPruningFailed = "保留期已保存，但旧历史清理失败；请重新提交保留期以重试清理。"
         static let aiAssistantSettingUnavailable = "排查助手设置存储不可用，当前使用默认值。"
         static let aiAssistantSettingSaveFailed = "保存失败，已恢复原值。"
-        static let confirmationPolicy = "命令确认"
+        static let confirmationPolicy = "全局审批策略"
         static let executionMode = "执行方式"
         static let filesDirectoryFollowDefault = "默认开启目录跟随"
         static let filesDirectoryFollowHelp = "新打开的 Files 面板会跟随当前远程终端的 cd 目录变化；面板内仍可临时关闭。"
@@ -597,10 +599,11 @@ enum L10n {
         static let securityStatusGroupTitle = "安全状态"
         static let securityStatusGroupDescription = "快速确认命令审批、凭据存储和本地审计。"
         static let securityApprovalGroupTitle = "命令审批"
-        static let securityApprovalGroupDescription = "审批策略同时作用于内置 AI 助手、Codex/Agent Bridge 和外部自动化写入终端。"
+        static let securityApprovalGroupDescription = "统一在 AI 助手设置中管理审批策略与命令规则。"
+        static let openAIExecutionPermissions = "打开执行与权限设置…"
         static let securityAuditGroupTitle = "凭据与审计"
         static let securityAuditGroupDescription = "控制 Diagnostics 默认读取与导出的审计记录和应用日志范围。"
-        static let securityApprovalSummaryPrefix = "命令审批"
+        static let securityApprovalSummaryPrefix = "全局审批策略"
         static let securityCredentialSummary = "凭据库：Stacio 本地凭据库"
         static let securityAuditSummary = "本地审计：Agent 操作记录"
         static let securityAuditHelp = "审批、拒绝、取消和执行结果会用于本地追踪；诊断包导出会再次脱敏，并按这里的数量限制读取最近记录。"
@@ -608,10 +611,10 @@ enum L10n {
         static let diagnosticsAppLogLineLimit = "日志导出行数"
         static let diagnosticsIncludeAppLogs = "诊断包包含应用日志"
         static let diagnosticsExportLimitHelp = "审计条数会同时作用于 MultiExec 和 AI/Agent 记录；日志行数设为 0 时，导出诊断包仍保留 appLogs 字段但内容为空。"
-        static let securityCommandPolicyHelp = "控制内置 AI 和外部 Codex/Agent 写入终端前的全局审批策略。低风险自动放行只读和普通写入命令，网络与破坏性命令仍需确认；禁止模式会优先生效。"
+        static let securityCommandPolicyHelp = "在「AI 助手 → 执行与权限」修改全局审批策略、自动放行模式和禁止模式。内置助手还会结合当前对话权限与目标终端策略决定是否执行。"
         static let sessionPolicyGroupTitle = "会话策略覆盖"
         static let sessionPolicyGroupDescription = "解释全局设置、会话环境和单会话 AI 执行策略之间的优先级。"
-        static let sessionPolicyOverrideSummary = "全局命令确认是默认规则；生产环境强制确认；会话 AI 执行策略可进一步设为禁用、命令卡、只读自动或每次确认。"
+        static let sessionPolicyOverrideSummary = "全局审批策略与当前对话权限共同生效；生产环境强制确认；目标终端的 AI 执行策略可进一步设为禁用、命令卡或请求批准。"
         static let sessionPolicyEntry = "在新建/编辑会话里配置环境与 AI 执行策略；保存后 Agent Bridge、内置 AI 助手和后台任务都会读取同一套策略。"
         static let credentialCenterGroupTitle = "凭据中心"
         static let credentialCenterGroupDescription = "查看 Stacio 数据库中的凭据引用，删除失效引用时不会读取或展示本地凭据库密钥内容。"
@@ -643,9 +646,11 @@ enum L10n {
         static let copyPath = "复制路径"
         static let portDeskRules = "Stacio 规则"
         static let openAICompatible = "OpenAI Compatible"
-        static let allowAllCommands = "全部自动"
-        static let allowLowRisk = "低风险自动"
-        static let requireEveryCommand = "每次确认"
+        /// Shared names for global policy and conversation permissions. Their
+        /// scopes and constraints are explained separately at each entry point.
+        static let allowAllCommands = "完全权限"
+        static let allowLowRisk = "智能审批"
+        static let requireEveryCommand = "请求批准"
         static let allowReadOnly = "只读自动"
         static let visibleTerminal = "可见终端"
         static let backgroundTask = "后台任务"
@@ -1333,8 +1338,18 @@ enum L10n {
             return "\(summary) \(diagnostic)"
         }
 
+        static let finalizing = "等待确认传输结果"
+
+        static func displayStatus(_ rawStatus: String, bytesDone: UInt64, bytesTotal: UInt64) -> String {
+            guard rawStatus == "running" || rawStatus == "resuming" else { return status(rawStatus) }
+            if bytesTotal > 0 && bytesDone >= bytesTotal { return finalizing }
+            if bytesDone == 0 { return "准备传输" }
+            return status(rawStatus)
+        }
+
         static func status(_ rawStatus: String) -> String {
             switch rawStatus {
+            case "finalizing": return finalizing
             case "queued":
                 return "排队中"
             case "running":
